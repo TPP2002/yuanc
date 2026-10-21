@@ -1,0 +1,21 @@
+{
+  "_comment": "测试向量,不是真凭据",
+  "context": {
+    "server_host": "203.0.113.10",
+    "reality": {
+      "private_key": "dwdtCnMYpX08FsFyUbJmRd9ML4frwJkqsXf7pR25LCo",
+      "public_key": "hSDwCYkwp1R0i33ctD73Wg2_Og0mOBr066SpjqqbTmo",
+      "short_id": "01234567"
+    }
+  },
+  "device": {
+    "device_id": "device-1",
+    "account_id": "account-1",
+    "platform": "windows",
+    "name": "测试设备 / 一",
+    "uuid": "00000000-0000-4000-8000-000000000001",
+    "hy2_password": "TEST-ONLY-hy2-password",
+    "created_at": "2026-10-22T00:00:00+00:00",
+    "revoked_at": null
+  }
+}

@@ -1,0 +1,75 @@
+{
+  "_comment": "测试向量,不是真凭据",
+  "log": {
+    "disabled": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "tag": "upstream",
+        "address": "1.1.1.1"
+      }
+    ],
+    "final": "upstream"
+  },
+  "inbounds": [
+    {
+      "type": "vless",
+      "tag": "in-reality",
+      "listen": "::",
+      "listen_port": 443,
+      "users": [
+        {
+          "uuid": "00000000-0000-4000-8000-000000000001",
+          "flow": "xtls-rprx-vision"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "www.microsoft.com",
+        "reality": {
+          "enabled": true,
+          "handshake": {
+            "server": "www.microsoft.com",
+            "server_port": 443
+          },
+          "private_key": "dwdtCnMYpX08FsFyUbJmRd9ML4frwJkqsXf7pR25LCo",
+          "short_id": [
+            "01234567"
+          ]
+        }
+      }
+    },
+    {
+      "type": "hysteria2",
+      "tag": "in-hy2",
+      "listen": "::",
+      "listen_port": 24443,
+      "users": [
+        {
+          "name": "device-1",
+          "password": "TEST-ONLY-hy2-password"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "exitnode",
+        "certificate_path": "/var/lib/exitnode/secrets/hy2.crt",
+        "key_path": "/var/lib/exitnode/secrets/hy2.key"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    },
+    {
+      "type": "block",
+      "tag": "block"
+    }
+  ],
+  "route": {
+    "final": "direct"
+  }
+}
