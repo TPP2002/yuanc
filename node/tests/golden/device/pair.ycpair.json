@@ -1,0 +1,15 @@
+{
+  "_comment": "测试向量,不是真凭据",
+  "format": "ycpair/1",
+  "exported_at": "2026-10-22T00:00:00+00:00",
+  "node": {
+    "host": "203.0.113.10",
+    "reality_port": 443,
+    "hy2_port": 24443,
+    "sni": "www.microsoft.com",
+    "reality_public_key": "hSDwCYkwp1R0i33ctD73Wg2_Og0mOBr066SpjqqbTmo",
+    "short_id": "01234567",
+    "uuid": "00000000-0000-4000-8000-000000000001",
+    "hy2_password": "TEST-ONLY-hy2-password"
+  }
+}

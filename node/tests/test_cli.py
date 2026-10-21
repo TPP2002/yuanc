@@ -16,8 +16,8 @@ CONFIG = "/etc/exitnode/config.toml"
 TEXT = (Path(__file__).parents[1] / "examples" / "config.example.toml").read_text(encoding="utf-8")
 
 
-def fake():
-    return FakeRunner(files={
+def fake(*, pairing=False):
+    runner = FakeRunner(files={
         CONFIG: TEXT, "/usr/bin/sing-box": "测试内核",
         "/var/lib/exitnode/secrets/hy2.crt": "测试证书",
         "/var/lib/exitnode/secrets/hy2.key": "测试私钥占位",
@@ -31,6 +31,9 @@ def fake():
         ("nft", "-f"): CompletedResult(),
         ("/usr/bin/sing-box", "check"): CompletedResult(),
     }, connections={("8.8.8.8", 443): True})
+    if pairing:
+        runner.responses[("curl",)] = CompletedResult(out="ip=203.0.113.9\n")
+    return runner
 
 
 @pytest.mark.parametrize("command", ["init", "check", "status", "diagnose", "upgrade", "rollback", "uninstall"])
@@ -141,7 +144,7 @@ def test_runner_log_and_diagnostic_archive_do_not_read_secrets(capsys):
 
 
 def test_repeated_init_does_not_repeat_commands_and_uninstall_keeps_secrets():
-    runner = fake()
+    runner = fake(pairing=True)
     runner.files["/var/lib/exitnode/secrets/identity"] = "保留"
     assert main(["init"], runner) == 0
     before = [c for c in runner.calls if c[0] == "run"]
@@ -156,7 +159,7 @@ def test_repeated_init_does_not_repeat_commands_and_uninstall_keeps_secrets():
 
 
 def test_init_failure_can_resume_without_rewriting_completed_units():
-    runner = fake()
+    runner = fake(pairing=True)
     runner.responses[("systemctl", "enable")] = CompletedResult(1)
     assert main(["init"], runner) == 1
     writes = [c[1] for c in runner.calls if c[0] == "write_file" and c[1].endswith(".service")]
@@ -180,3 +183,17 @@ def test_existing_unowned_service_is_not_overwritten_or_deleted():
     assert main(["init"], runner) == 1
     assert main(["rollback"], runner) == 0
     assert runner.files[path] == "已有服务定义"
+
+
+def test_device_help_and_subcommands(capsys):
+    with pytest.raises(SystemExit) as exc:
+        main(["--help"], FakeRunner())
+    assert exc.value.code == 0
+    assert "device" in capsys.readouterr().out
+    with pytest.raises(SystemExit) as exc:
+        main(["device", "--help"], FakeRunner())
+    assert exc.value.code == 0
+    text = capsys.readouterr().out
+    assert all(name in text for name in ("add", "list", "revoke", "export"))
+    args = parser().parse_args(["device", "add", "--name", "电脑"])
+    assert args.platform == "windows" and args.host is None

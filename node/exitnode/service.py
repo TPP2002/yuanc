@@ -8,6 +8,7 @@ from .manifest import Manifest
 from .proxy.context import ProxyContext
 from .proxy.keys import ensure_reality_keys
 from .proxy.registry import DeviceRegistry
+from .proxy.reload import reload
 from .proxy.server_config import render_server
 
 SECRETS = "/var/lib/exitnode/secrets"
@@ -134,28 +135,59 @@ def build_context(config, keys):
     )
 
 
-def publish(config, runner):
+class ReloadRunner(ProxyRunner):
+    """将代理层重载操作限定到本项目安装的服务。"""
+
+    def run(self, argv):
+        if argv[:2] in (["systemctl", "reload"], ["systemctl", "restart"]):
+            argv = [*argv[:2], UNIT]
+        return super().run(argv)
+
+
+def _publish_checked(config, runner, devices, registry=None):
+    adapter = ProxyRunner(runner)
+    keys = ensure_reality_keys(config.node.secrets_dir, adapter)
+    text = json.dumps(render_server(build_context(config, keys), devices),
+                      ensure_ascii=False, indent=2) + "\n"
+    temporary = LIVE + ".check.tmp"
+    try:
+        runner.write_file(temporary, text, 0o600)
+        result = runner.run([config.proxy.binary, "check", "-c", temporary], check=False)
+        if result.code:
+            raise ValueError("隧道配置校验失败，线上配置与登记表未变；命令输出已隐藏")
+        old_text = runner.read_file(LIVE) if registry is not None else None
+        runner.replace(temporary, LIVE)
+        if registry is not None:
+            try:
+                registry.save(devices)
+            except (OSError, RuntimeError, ValueError):
+                adapter.write_file(LIVE, old_text, 0o600)
+                raise ValueError("登记表写入失败，线上配置已回退，未重载") from None
+            try:
+                reload(ReloadRunner(runner))
+            except (OSError, RuntimeError):
+                raise ValueError("设备已登记但服务重载未成功，请联系维护人员") from None
+    finally:
+        runner.write_file(temporary, "", 0o600)
+
+
+def publish(config, runner, *, devices=None):
     manifest = _manifest(config, runner)
     step = "渲染隧道配置"
     if runner.exists(LIVE) and not any(s["step"] == step for s in manifest.steps):
         raise ValueError("已有隧道配置未在本安装清单中，请联系维护人员")
 
+    if devices is not None:
+        if not runner.exists(LIVE):
+            raise ValueError("节点尚未安装成功，请先完成 init")
+        registry = DeviceRegistry(SECRETS + "/devices.json", ProxyRunner(runner))
+        _publish_checked(config, runner, devices, registry)
+        return
+
     def action():
         adapter = ProxyRunner(runner)
-        keys = ensure_reality_keys(config.node.secrets_dir, adapter)
         registry = DeviceRegistry(SECRETS + "/devices.json", adapter)
-        text = json.dumps(render_server(build_context(config, keys), registry.all()),
-                          ensure_ascii=False, indent=2) + "\n"
-        temporary = LIVE + ".check.tmp"
-        try:
-            runner.write_file(temporary, text, 0o600)
-            result = runner.run([config.proxy.binary, "check", "-c", temporary], check=False)
-            if result.code:
-                raise ValueError("隧道配置校验失败，线上配置未变；命令输出已隐藏")
-            runner.replace(temporary, LIVE)
-        finally:
-            # 无论校验还是替换失败，都不在临时文件中遗留凭据。
-            runner.write_file(temporary, "", 0o600)
+        _publish_checked(config, runner, registry.all())
 
     manifest.apply(step, action, {"kind": "remove_file", "path": LIVE})
 

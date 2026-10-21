@@ -9,12 +9,17 @@ from exitnode.manifest import Manifest
 from exitnode.proxy.keys import ensure_reality_keys
 from exitnode.runner import CompletedResult
 from exitnode.service import LIVE, SECRETS, UNIT, ProxyRunner, build_context, publish
-from test_cli import CONFIG, fake
+from test_cli import CONFIG
+from test_cli import fake as cli_fake
 
 MANIFEST = "/var/lib/exitnode/manifest.json"
 UNIT_PATH = "/etc/systemd/system/" + UNIT
 CHECK = ("/usr/bin/sing-box", "check", "-c", LIVE + ".check.tmp")
 ENABLE = ("systemctl", "enable", "--now", UNIT)
+
+
+def fake():
+    return cli_fake(pairing=True)
 
 
 def commands(runner):
@@ -57,10 +62,16 @@ def test_install_manifest_order_permissions_and_repeat(monkeypatch, capsys):
     keys = json.loads(runner.files[files[0]])
     assert set(keys) == {"private_key", "public_key", "short_id"}
     assert len(keys["short_id"]) == 8
-    assert json.loads(runner.files[SECRETS + "/devices.json"]) == []
+    devices = json.loads(runner.files[SECRETS + "/devices.json"])
+    assert len(devices) == 1
+    first = devices[0]
+    assert first["name"] == "第一台电脑" and first["platform"] == "windows"
+    assert first["revoked_at"] is None
     config = json.loads(runner.files[LIVE])
     assert config["inbounds"][0]["tls"]["reality"]["private_key"] == keys["private_key"]
-    assert all(inbound["users"] == [] for inbound in config["inbounds"])
+    assert all(len(inbound["users"]) == 1 for inbound in config["inbounds"])
+    assert config["inbounds"][0]["users"][0]["uuid"] == first["uuid"]
+    assert config["inbounds"][1]["users"][0]["password"] == first["hy2_password"]
     steps = Manifest(MANIFEST, runner).steps
     names = [s["step"] for s in steps]
     for name in ("检查 sing-box 二进制", "生成 Reality 凭据", "生成备用通道证书",
@@ -71,8 +82,11 @@ def test_install_manifest_order_permissions_and_repeat(monkeypatch, capsys):
     assert names.index("启用管理面") < names.index("渲染隧道配置") < names.index("写入" + UNIT)
     assert names.index("写入" + UNIT) < names.index("重载隧道服务定义") < names.index("启用隧道服务")
     calls = commands(runner)
-    assert calls.count(ENABLE) == 1 and calls.count(CHECK) == 1
+    assert calls.count(ENABLE) == 1 and calls.count(CHECK) == 2
     assert calls.index(CHECK) < calls.index(ENABLE)
+    check_indices = [i for i, cmd in enumerate(calls) if cmd == CHECK]
+    assert check_indices[1] > calls.index(ENABLE)
+    assert check_indices[1] < calls.index(("systemctl", "reload", UNIT))
     openssl = next(cmd for cmd in calls if cmd[0] == "openssl")
     assert openssl == (
         "openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt",
