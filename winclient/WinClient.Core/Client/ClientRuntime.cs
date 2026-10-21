@@ -1,4 +1,5 @@
 using System.Runtime.Versioning;
+using System.Security.Cryptography;
 using WinClient.Core.Auth;
 using WinClient.Core.Firewall;
 using WinClient.Core.Process;
@@ -10,21 +11,31 @@ using WinClient.Core.Kernel;
 namespace WinClient.Core.Client;
 
 [SupportedOSPlatform("windows")]
-public sealed class ClientRuntime : IDisposable
+public sealed class ClientRuntime : IClientFacade, IDisposable
 {
     private HttpClient? http;
     private readonly KillSwitchApplier firewall;
     private readonly PairingStore pairingStore;
     private readonly RedactingLog log;
+    private readonly string? storeRoot;
+    private readonly DataProtectionScope scope;
     public ClientController Controller { get; }
-    private ClientRuntime(ClientController controller, KillSwitchApplier firewall, HttpClient? http, PairingStore pairingStore, RedactingLog log)
-    { Controller = controller; this.firewall = firewall; this.http = http; this.pairingStore = pairingStore; this.log = log; }
+    public ClientSnapshot Snapshot => Controller.Snapshot;
+    public event Action<ClientSnapshot>? Changed { add => Controller.Changed += value; remove => Controller.Changed -= value; }
+    public Task ConnectAsync() => Controller.ConnectAsync();
+    public Task DisconnectAsync() => Controller.DisconnectAsync();
+    public Task RedeemAsync(string code) => Controller.RedeemAsync(code);
+    public string? ReadAudit() => File.Exists(firewall.AuditPath) ? File.ReadAllText(firewall.AuditPath) : null;
+    private ClientRuntime(ClientController controller, KillSwitchApplier firewall, HttpClient? http, PairingStore pairingStore, RedactingLog log,
+        string? storeRoot, DataProtectionScope scope)
+    { Controller = controller; this.firewall = firewall; this.http = http; this.pairingStore = pairingStore; this.log = log; this.storeRoot = storeRoot; this.scope = scope; }
 
-    public static async Task<ClientRuntime> CreateAsync(IKernelInstaller installer)
+    public static async Task<ClientRuntime> CreateAsync(IKernelInstaller installer, string? storeRoot = null,
+        DataProtectionScope scope = DataProtectionScope.CurrentUser)
     {
         var firewall = new KillSwitchApplier(Path.Combine(ClientSettings.DataDirectory, "run"));
         await firewall.RecoverAsync(); // Recovery precedes even reading server.json.
-        var pairingStore = new PairingStore();
+        var pairingStore = new PairingStore(root: storeRoot, scope: scope);
         var log = new RedactingLog(new RollingFileLog(Path.Combine(ClientSettings.DataDirectory, "run", "sing-box.log")));
         var settings = ClientSettings.Load();
         HttpClient? http = null;
@@ -35,13 +46,13 @@ public sealed class ClientRuntime : IDisposable
                 if (settings is null) return null;
                 http = new HttpClient(new HttpClientHandler { AllowAutoRedirect = false })
                 { BaseAddress = new Uri(settings.ServerUrl), Timeout = TimeSpan.FromSeconds(15) };
-                return new AuthServerSessionSource(new AuthApiClient(http, log), new DpapiCredentialStore(ClientSettings.ProductName));
+                return new AuthServerSessionSource(new AuthApiClient(http, log), new DpapiCredentialStore(ClientSettings.ProductName, root: storeRoot, scope: scope));
             }, log);
             var program = settings?.SingBoxPath ?? installer.Ensure();
             var transport = new TunnelTransport(new SingBoxProcessManager(program, ClientSettings.ProductName, logger: log));
             var controller = new ClientController(source, firewall,
-                transport, program, new DeviceInfo { Platform = "windows", Name = Environment.MachineName, Fingerprint = ClientSettings.GetDeviceFingerprint() });
-            return new(controller, firewall, http, pairingStore, log);
+                transport, program, new DeviceInfo { Platform = "windows", Name = Environment.MachineName, Fingerprint = ClientSettings.GetDeviceFingerprint(storeRoot, scope) });
+            return new(controller, firewall, http, pairingStore, log, storeRoot, scope);
         }
         catch { http?.Dispose(); throw; }
     }
@@ -75,7 +86,7 @@ public sealed class ClientRuntime : IDisposable
         try { pairingStore.Clear(); }
         catch { nextHttp?.Dispose(); throw; }
         http?.Dispose(); http = nextHttp;
-        return http is null ? null : new AuthServerSessionSource(new AuthApiClient(http, log), new DpapiCredentialStore(ClientSettings.ProductName));
+        return http is null ? null : new AuthServerSessionSource(new AuthApiClient(http, log), new DpapiCredentialStore(ClientSettings.ProductName, root: storeRoot, scope: scope));
     }, "已清除配对文件；可导入新的配对文件，或在已配置服务器时使用邀请码。");
 
     /// <summary>Only the firewall audit was added to the diagnostic placeholder by the third dispatch decision.</summary>

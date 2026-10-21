@@ -48,7 +48,7 @@ public sealed class ClientController : IDisposable
         tunnel.TunnelDown += OnTunnelDown;
     }
 
-    public async Task InitializeAsync()
+    public async Task InitializeAsync(bool autoConnect = true)
     {
         await gate.WaitAsync();
         try
@@ -58,7 +58,7 @@ public sealed class ClientController : IDisposable
         }
         catch (Exception ex) when (IsOperational(ex)) { await FailAsync(); }
         finally { Publish(); gate.Release(); }
-        if (sessionSource is not null && machine.State != ConnectionState.NeedsManual)
+        if (autoConnect && sessionSource is not null && machine.State != ConnectionState.NeedsManual)
         {
             try { if (sessionSource is PairingSessionSource || sessionSource is AuthServerSessionSource { HasCredentials: true }) await ConnectAsync(); }
             catch (Exception ex) when (IsOperational(ex)) { message = "无法读取本地登录凭据，请重新兑换邀请码。"; Publish(); }

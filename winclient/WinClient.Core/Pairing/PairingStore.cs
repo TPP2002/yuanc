@@ -9,9 +9,11 @@ public sealed class PairingStore
 {
     public string FilePath { get; }
     public bool Exists => File.Exists(FilePath);
-    public PairingStore(string? localAppDataRoot = null)
+    private readonly DataProtectionScope scope;
+    public PairingStore(string? localAppDataRoot = null, DataProtectionScope scope = DataProtectionScope.CurrentUser, string? root = null)
     {
-        FilePath = Path.Combine(localAppDataRoot ?? Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "YuanC", "pairing.bin");
+        this.scope = scope;
+        FilePath = Path.Combine(root ?? Path.Combine(localAppDataRoot ?? Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "YuanC"), "pairing.bin");
     }
 
     public void Save(PairingFile pairing)
@@ -19,7 +21,7 @@ public sealed class PairingStore
         var plain = Encoding.UTF8.GetBytes(pairing.RawJson);
         try
         {
-            var encrypted = ProtectedData.Protect(plain, null, DataProtectionScope.CurrentUser);
+            var encrypted = ProtectedData.Protect(plain, null, scope);
             Directory.CreateDirectory(Path.GetDirectoryName(FilePath)!);
             var temporary = FilePath + ".tmp";
             try
@@ -36,7 +38,7 @@ public sealed class PairingStore
     public PairingFile? Load()
     {
         if (!Exists) return null;
-        var plain = ProtectedData.Unprotect(File.ReadAllBytes(FilePath), null, DataProtectionScope.CurrentUser);
+        var plain = ProtectedData.Unprotect(File.ReadAllBytes(FilePath), null, scope);
         try { return PairingFile.Parse(Encoding.UTF8.GetString(plain)); }
         finally { CryptographicOperations.ZeroMemory(plain); }
     }
