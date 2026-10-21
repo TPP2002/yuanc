@@ -1,0 +1,2 @@
+# Only this explicitly authorized public test key belongs in source control.
+!test-public-key.pem

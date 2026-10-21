@@ -10,6 +10,8 @@ using WinClient.Core.Hosting;
 using WinClient.Core.Ipc;
 using WinClient.Core.Kernel;
 using WinClient.Core.Logging;
+using WinClient.Core.Update;
+using System.Reflection;
 using TimeoutException = System.TimeoutException;
 
 namespace WinClient.App.Hosting;
@@ -22,6 +24,8 @@ public sealed class ControlService : ServiceBase
     private static readonly RedactingLog Log = new(new RollingFileLog(Path.Combine(ClientSettings.DataDirectory, "run", "service.log")));
     private Task? hosting;
     private ClientRuntime? runtime;
+    private UpdateCoordinator? updates;
+    private HttpUpdateSource? updateSource;
     private int stopped;
 
     public ControlService()
@@ -39,20 +43,34 @@ public sealed class ControlService : ServiceBase
         {
             try
             {
+                var updateStore = new UpdateStore();
+                PrepareSecureDirectory(updateStore.Root);
+                UpdateRecovery.Run(updateStore, InstallerRunner.CurrentExecutable, new UpdateWindowsHost(), UpdatePlanner.DefaultAppRoot, UpdateWindowsHost.Log);
                 var secure = Path.Combine(ClientSettings.DataDirectory, "secure");
                 PrepareSecureDirectory(secure);
                 runtime = await ClientRuntime.CreateAsync(new KernelInstaller(new EmbeddedKernelSource()), secure, DataProtectionScope.LocalMachine).ConfigureAwait(false);
                 if (lifetime.IsCancellationRequested) return;
                 var desired = new DesiredStateStore();
-                await runtime.Controller.InitializeAsync(autoConnect: desired.Read() != false).ConfigureAwait(false);
+                // Expose status while connecting: network delay must not look like a dead new service.
+                var initializing = InitializeRuntimeAsync(desired);
                 if (lifetime.IsCancellationRequested) return;
-                var server = new ControlServer(runtime, desired);
+                var version = ServiceInstaller.ReleaseVersion(Assembly.GetExecutingAssembly().GetCustomAttribute<AssemblyInformationalVersionAttribute>()!.InformationalVersion);
+                updateSource = new HttpUpdateSource();
+                updates = new UpdateCoordinator(updateSource, updateStore, () => runtime.Snapshot, () => DateTimeOffset.UtcNow, version, Log);
+                updates.Start();
+                var server = new ControlServer(runtime, desired, updates, version);
                 Log.Write("后台服务已启动。");
-                await Task.WhenAll(Enumerable.Range(0, 4).Select(_ => ListenAsync(server))).ConfigureAwait(false);
+                await Task.WhenAll(Enumerable.Range(0, 4).Select(_ => ListenAsync(server)).Append(initializing)).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (lifetime.IsCancellationRequested) { }
             catch (Exception) { Fatal(); }
         });
+    }
+
+    private async Task InitializeRuntimeAsync(DesiredStateStore desired)
+    {
+        try { await runtime!.Controller.InitializeAsync(autoConnect: desired.Read() != false).ConfigureAwait(false); }
+        catch (Exception) { Fatal(); }
     }
 
     public static void PrepareSecureDirectory(string path)
@@ -107,8 +125,11 @@ public sealed class ControlService : ServiceBase
         try
         {
             lifetime.Cancel();
+            updates?.Cancel();
             foreach (var pipe in pipes.Keys) pipe.Dispose();
             if (hosting is not null && !hosting.Wait(TimeSpan.FromSeconds(25))) throw new TimeoutException();
+            if (updates is not null && !updates.StopAsync().Wait(TimeSpan.FromSeconds(5))) throw new TimeoutException();
+            updates?.Dispose(); updateSource?.Dispose();
             runtime?.Dispose(); // No disconnect command: protection remains in place.
             Log.Write("后台服务已停止，已有断网保护保持。");
         }

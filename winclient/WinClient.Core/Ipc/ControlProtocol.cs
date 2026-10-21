@@ -2,12 +2,25 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using WinClient.Core.Client;
+using WinClient.Core.State;
+using WinClient.Core.Update;
+using WinClient.Core.Hosting;
+using System.Reflection;
 
 namespace WinClient.Core.Ipc;
 
 public sealed record ControlRequest(long Id, string Op, string? Code = null, string? PairingJson = null);
-public sealed record ControlResponse(long? Id, bool Ok, string? Error = null, ClientSnapshot? Snapshot = null, string? Audit = null);
-public sealed record SnapshotEvent(string Event, ClientSnapshot Snapshot);
+public sealed record ControlResponse(long? Id, bool Ok, string? Error = null, ControlSnapshot? Snapshot = null, string? Audit = null);
+public sealed record SnapshotEvent(string Event, ControlSnapshot Snapshot);
+public sealed record ControlSnapshot(ConnectionState State, string Status, string Message, bool ProtectionActive)
+{
+    public static string CurrentVersion => ServiceInstaller.ReleaseVersion(typeof(ControlProtocol).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()!.InformationalVersion);
+    public string Mode { get; init; } = "未配置";
+    public string ServiceVersion { get; init; } = CurrentVersion;
+    public UpdateStatus Update { get; init; } = new();
+    public static implicit operator ControlSnapshot(ClientSnapshot value) => new(value.State, value.Status, value.Message, value.ProtectionActive) { Mode = value.Mode };
+    public static implicit operator ClientSnapshot(ControlSnapshot value) => new(value.State, value.Status, value.Message, value.ProtectionActive) { Mode = value.Mode };
+}
 
 public static class ControlProtocol
 {

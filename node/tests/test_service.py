@@ -261,5 +261,5 @@ def test_tunnel_check_requires_active_service_and_valid_config(active, valid, ca
     runner.responses[("systemctl", "is-active", "exitnode-proxy")] = CompletedResult(active)
     runner.responses[("/usr/bin/sing-box", "check")] = CompletedResult(valid)
     assert main(["check", "--json"], runner) == 1
-    layer = json.loads(capsys.readouterr().out)["layers"][-1]
+    layer = json.loads(capsys.readouterr().out)["layers"][-2]
     assert layer["name"] == "隧道服务" and layer["result"] == "失败"

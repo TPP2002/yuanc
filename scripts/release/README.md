@@ -2,6 +2,16 @@
 
 脚本只需要 Python 标准库与现有 cryptography。Windows 开发机不执行 Linux 内核。
 
+## Windows 客户端签名与托管
+
+当前密钥登记：私钥为维护机仓库外 `C:/Users/Administrator/.secrets/yuanc-winclient-signing.pem`，公钥已内置于客户端。施工方不读取真实私钥；测试使用临时生成的密钥。
+
+1. 按 `docs/winclient/打包与发布说明.md` 出包；本单不提高默认版本。
+2. 执行 `python scripts/release/sign-winclient.py --exe build/release/YuanC-Client-<版本>.exe --key C:/Users/Administrator/.secrets/yuanc-winclient-signing.pem`。可指定 `--out`、`--version` 核对文件名及 `--min-service-version`（默认 0.1.0）。
+3. 经管理通道把 exe、manifest.json、manifest.json.sig 三件复制到节点临时目录，执行 `exitnode winclient publish --exe <exe> --manifest <清单> --signature <签名>`，用 `exitnode winclient status` 核对。
+
+清单使用排序键、UTF-8 紧凑 JSON；签名是对原始清单字节的 ECDSA P-256 / SHA-256 DER 签名。节点检查大小与哈希，客户端验签。发布后不要重新排版清单。生成新客户端密钥用 `gen-key.py --kind winclient --out <仓库外路径>`，输出的 SubjectPublicKeyInfo PEM 仅为公钥；换信任密钥需要独立安排可信过渡。
+
 1. **生成密钥一次**：`python scripts/release/gen-key.py --out C:/secure/exitnode-signing.pem`。
    先创建仓库外的安全目录。私钥文件不得存在，脚本以 0600 创建；Windows 还应使用仅维护人员可访问的目录权限。
    把输出的公开 `PUBLIC_KEY` 常量填入 `node/exitnode/updater/trust.py`，然后安装初始可信节点。

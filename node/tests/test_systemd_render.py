@@ -21,7 +21,7 @@ def test_unit_matches_golden(name):
 def test_admin_and_proxy_have_independent_entrypoints():
     admin, proxy = render(UNITS[0], {}), render(UNITS[1], {})
     assert admin != proxy
-    assert "--placeholder admin" in admin
+    assert 'ExecStart=/usr/bin/python3 -m exitnode --config "/etc/exitnode/config.toml" admin serve\n' in admin
     assert "ExecStart=/opt/exitnode/current/bin/sing-box run -c /var/lib/exitnode/secrets/sing-box.json\n" in proxy
     assert "Restart=always\n" in proxy
     assert "RestartSec=3\n" in proxy

@@ -9,6 +9,8 @@ import zipfile
 from pathlib import PurePosixPath
 
 from . import __version__, device, nft, service, systemd
+from .admin import publish as winclient_publish
+from .admin import server as admin_server
 from .config import ConfigError, load
 from .log import redact
 from .manifest import UNITS, Manifest
@@ -94,6 +96,21 @@ def parser():
     for name, description in (("status", "查看最近救援记录"), ("refresh", "手动更新救援程序")):
         action = actions.add_parser(name, help=description)
         action.add_argument("--config", default=argparse.SUPPRESS, help="配置文件路径")
+    packages = sub.add_parser("winclient", help="托管 Windows 客户端包")
+    packages.add_argument("--config", default=argparse.SUPPRESS, help="配置文件路径")
+    actions = packages.add_subparsers(dest="winclient_action", required=True)
+    upload = actions.add_parser("publish", help="发布客户端包")
+    upload.add_argument("--config", default=argparse.SUPPRESS, help="配置文件路径")
+    for name in ("exe", "manifest", "signature"):
+        upload.add_argument("--" + name, required=True, help="待发布文件路径")
+    upload.add_argument("--allow-downgrade", action="store_true", help="允许发布旧版本")
+    status = actions.add_parser("status", help="查看已托管版本")
+    status.add_argument("--config", default=argparse.SUPPRESS, help="配置文件路径")
+    admin = sub.add_parser("admin", help="客户端包托管服务")
+    admin.add_argument("--config", default=argparse.SUPPRESS, help="配置文件路径")
+    actions = admin.add_subparsers(dest="admin_action", required=True)
+    foreground = actions.add_parser("serve", help="前台运行只读托管服务")
+    foreground.add_argument("--config", default=argparse.SUPPRESS, help="配置文件路径")
     return root
 
 
@@ -323,9 +340,11 @@ def _diagnose(runner, config, result, output):
 
 def main(argv=None, runner=None, rescue_runner=None):
     args = parser().parse_args(argv)
-    if args.placeholder:
+    if args.placeholder == "proxy":
         print("服务尚未接入，此入口仅为安装占位。", file=sys.stderr)
         return 2
+    if args.placeholder == "admin":
+        args.command, args.admin_action = "admin", "serve"
     if not args.command:
         parser().print_help()
         return 0
@@ -335,6 +354,31 @@ def main(argv=None, runner=None, rescue_runner=None):
     try:
         runner = runner if runner is not None else RealRunner()
         config = load(args.config, runner)
+        if args.command == "admin":
+            from .log import configure
+
+            configure(runner, level=config.node.log_level)
+            try:
+                admin_server.serve(config)
+                return 0
+            except OSError:
+                print(redact("客户端包托管服务启动失败，请检查监听配置。"), file=sys.stderr)
+                return 1
+        if args.command == "winclient":
+            try:
+                if args.winclient_action == "publish":
+                    value = winclient_publish.publish(config, runner, args.exe, args.manifest,
+                                                      args.signature,
+                                                      allow_downgrade=args.allow_downgrade)
+                    print("客户端包已发布：" + value["version"])
+                else:
+                    value = winclient_publish.latest(config, runner)
+                    print((f"客户端版本：{value['version']}；大小：{value['size']} 字节；"
+                           f"发布时间：{value['published_at']}") if value else "尚未托管客户端包")
+                return 0
+            except (OSError, ValueError):
+                print(redact("客户端包操作失败，请检查文件和发布版本。"), file=sys.stderr)
+                return 1
         if args.command == "rescue":
             if args.rescue_action == "status":
                 print(redact(rescue_state.summary(_rescue_record(runner))))
@@ -384,6 +428,7 @@ def main(argv=None, runner=None, rescue_runner=None):
             if args.command == "check":
                 result["layers"].insert(-1, watchdog_check(config, runner))
                 result["layers"].insert(-1, _rescue_check(runner))
+                result["layers"].append(admin_server.check(config))
             if args.command == "status":
                 result["public_ipv4"] = public_ipv4(runner)
                 try:

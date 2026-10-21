@@ -40,6 +40,11 @@ def render_server(ctx: ProxyContext, devices: list[Device]) -> dict:
             },
             hy2,
         ],
-        "outbounds": [{"type": "direct", "tag": "direct"}, {"type": "block", "tag": "block"}],
-        "route": {"final": "direct"},
+        "outbounds": [
+            {"type": "direct", "tag": "direct"}, {"type": "block", "tag": "block"},
+            {"type": "direct", "tag": "admin-local", "override_address": ctx.admin_bind,
+             "override_port": ctx.admin_port},
+        ],
+        "route": {"rules": [{"ip_cidr": ["198.18.255.1/32"], "outbound": "admin-local"}],
+                  "final": "direct"},
     }

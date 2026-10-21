@@ -13,6 +13,7 @@ public sealed class ControlClient : IDisposable
     private readonly Task receiving;
     private long nextId;
     public event Action<ClientSnapshot>? Changed;
+    public event Action<ControlSnapshot>? SnapshotChanged;
     public event Action? ConnectionClosed;
     public ControlClient(Stream stream) { this.stream = stream; receiving = ReceiveAsync(); }
 
@@ -41,7 +42,11 @@ public sealed class ControlClient : IDisposable
             {
                 using var json = JsonDocument.Parse(line);
                 if (json.RootElement.TryGetProperty("event", out var kind) && kind.GetString() == "snapshot")
-                    Changed?.Invoke(ControlProtocol.DecodeEvent(line).Snapshot);
+                {
+                    var snapshot = ControlProtocol.DecodeEvent(line).Snapshot;
+                    SnapshotChanged?.Invoke(snapshot);
+                    Changed?.Invoke(snapshot);
+                }
                 else
                 {
                     var response = ControlProtocol.DecodeResponse(line);
