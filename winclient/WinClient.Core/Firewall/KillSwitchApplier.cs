@@ -9,6 +9,10 @@ public interface IKillSwitch
     Task UpdateNodeAsync(IReadOnlyList<IPAddress> ips, string program, int hy2Port);
     Task RemoveAsync();
     Task RecoverAsync();
+    Task ApplyAsync(IReadOnlyList<IPAddress> ips, string program, int hy2Port, int realityPort) =>
+        realityPort == 443 ? ApplyAsync(ips, program, hy2Port) : throw new InvalidOperationException("当前断网保护不支持此出口端口。");
+    Task UpdateNodeAsync(IReadOnlyList<IPAddress> ips, string program, int hy2Port, int realityPort) =>
+        realityPort == 443 ? UpdateNodeAsync(ips, program, hy2Port) : throw new InvalidOperationException("当前断网保护不支持此出口端口。");
 }
 
 public sealed class KillSwitchApplier : IKillSwitch
@@ -28,6 +32,10 @@ public sealed class KillSwitchApplier : IKillSwitch
         ExecuteAsync(KillSwitchPlanner.Plan(ips, KillSwitchPlanner.TunAlias, program, hy2Port, KillSwitchMode.Apply));
     public Task UpdateNodeAsync(IReadOnlyList<IPAddress> ips, string program, int hy2Port) =>
         ExecuteAsync(KillSwitchPlanner.UpdateNode(ips, program, hy2Port));
+    public Task ApplyAsync(IReadOnlyList<IPAddress> ips, string program, int hy2Port, int realityPort) =>
+        ExecuteAsync(KillSwitchPlanner.Plan(ips, KillSwitchPlanner.TunAlias, program, hy2Port, KillSwitchMode.Apply, realityPort));
+    public Task UpdateNodeAsync(IReadOnlyList<IPAddress> ips, string program, int hy2Port, int realityPort) =>
+        ExecuteAsync(KillSwitchPlanner.UpdateNode(ips, program, hy2Port, realityPort));
     public Task RemoveAsync() => ExecuteAsync([new RemoveRulesByPrefix(KillSwitchPlanner.Prefix), new RestoreProfileDefault()]);
     // A snapshot with applied=false also needs recovery: the process may have died partway through Apply.
     public Task RecoverAsync() => File.Exists(StatePath) ? RemoveAsync() : Task.CompletedTask;

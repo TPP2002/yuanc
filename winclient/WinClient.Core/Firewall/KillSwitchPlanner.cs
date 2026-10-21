@@ -21,7 +21,7 @@ public static class KillSwitchPlanner
     public const string TunAlias = "YuanC-TUN";
 
     public static IReadOnlyList<FirewallAction> Plan(IReadOnlyList<IPAddress> nodeIps,
-        string tunInterfaceName, string programPath, int hy2Port, KillSwitchMode mode)
+        string tunInterfaceName, string programPath, int hy2Port, KillSwitchMode mode, int realityPort = 443)
     {
         if (mode == KillSwitchMode.Remove) return [new RemoveRulesByPrefix(Prefix), new RestoreProfileDefault()];
         if (mode == KillSwitchMode.Audit) return [new Audit()];
@@ -32,7 +32,7 @@ public static class KillSwitchPlanner
             new SetProfileDefault("Private", "Block"),
             new SetProfileDefault("Public", "Block")
         };
-        actions.AddRange(NodeRules(nodeIps, programPath, hy2Port));
+        actions.AddRange(NodeRules(nodeIps, programPath, hy2Port, realityPort));
         actions.Add(new AddRule(Prefix + "Tun", "Outbound", "Allow", InterfaceAlias: tunInterfaceName));
         actions.Add(new AddRule(Prefix + "Loopback", "Outbound", "Allow", RemoteAddress: ["127.0.0.0/8", "::1"]));
         actions.Add(new AddRule(Prefix + "Dhcp", "Outbound", "Allow", Protocol: "UDP", LocalPort: "68", RemotePort: "67"));
@@ -40,18 +40,19 @@ public static class KillSwitchPlanner
         return actions.AsReadOnly();
     }
 
-    public static IReadOnlyList<FirewallAction> UpdateNode(IReadOnlyList<IPAddress> newIps, string programPath, int hy2Port)
-        => new FirewallAction[] { new RemoveRulesByPrefix(NodePrefix) }.Concat(NodeRules(newIps, programPath, hy2Port)).ToArray();
+    public static IReadOnlyList<FirewallAction> UpdateNode(IReadOnlyList<IPAddress> newIps, string programPath, int hy2Port, int realityPort = 443)
+        => new FirewallAction[] { new RemoveRulesByPrefix(NodePrefix) }.Concat(NodeRules(newIps, programPath, hy2Port, realityPort)).ToArray();
 
-    private static IEnumerable<FirewallAction> NodeRules(IReadOnlyList<IPAddress> ips, string program, int hy2Port)
+    private static IEnumerable<FirewallAction> NodeRules(IReadOnlyList<IPAddress> ips, string program, int hy2Port, int realityPort)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(program);
         if (!Path.IsPathFullyQualified(program)) throw new ArgumentException("连接内核路径必须是绝对路径。", nameof(program));
         if (ips.Count == 0 || ips.Any(ip => ip.AddressFamily != AddressFamily.InterNetwork))
             throw new ArgumentException("节点必须提供至少一个 IPv4 地址。", nameof(ips));
         if (hy2Port is < 1 or > 65535) throw new ArgumentOutOfRangeException(nameof(hy2Port));
+        if (realityPort is < 1 or > 65535) throw new ArgumentOutOfRangeException(nameof(realityPort));
         var addresses = ips.Select(ip => ip.ToString()).Distinct().Order().ToArray();
-        return [new AddRule(NodePrefix + "Tcp", "Outbound", "Allow", program, addresses, "TCP", RemotePort: "443"),
+        return [new AddRule(NodePrefix + "Tcp", "Outbound", "Allow", program, addresses, "TCP", RemotePort: realityPort.ToString(System.Globalization.CultureInfo.InvariantCulture)),
             new AddRule(NodePrefix + "Udp", "Outbound", "Allow", program, addresses, "UDP", RemotePort: hy2Port.ToString(System.Globalization.CultureInfo.InvariantCulture))];
     }
 

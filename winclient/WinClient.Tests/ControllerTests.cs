@@ -12,6 +12,44 @@ namespace WinClient.Tests;
 public sealed class ControllerTests
 {
     [Fact]
+    public async Task PairingRetriesReachManualWithAddressHintAndKeepProtection()
+    {
+        var pending = System.Threading.Channels.Channel.CreateUnbounded<(TimeSpan Delay, TaskCompletionSource Completion)>();
+        var expiryTokens = new List<CancellationToken>();
+        Task Delay(TimeSpan duration, CancellationToken token)
+        {
+            if (duration >= TimeSpan.FromDays(1)) { expiryTokens.Add(token); return Task.Delay(Timeout.Infinite, token); }
+            var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            token.Register(() => completion.TrySetCanceled(token));
+            pending.Writer.TryWrite((duration, completion));
+            return completion.Task;
+        }
+        var order = new List<string>();
+        using var controller = new ClientController(new PairingSessionSource(PairingTests.ValidPairing()),
+            new PairingTests.FakeFirewall(order), new PairingTests.FakeTunnel(order, fail: true), Path.GetFullPath("fake.exe"), TestData.Device, Delay);
+        var manual = new TaskCompletionSource<ClientSnapshot>(TaskCreationOptions.RunContinuationsAsynchronously);
+        controller.Changed += snapshot => { if (snapshot.State == ConnectionState.NeedsManual && snapshot.Message.Contains("出口地址可能已变")) manual.TrySetResult(snapshot); };
+        await controller.ConnectAsync();
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        foreach (var seconds in new[] { 2, 4, 8, 16, 32, 60, 60, 60, 60, 60, 60 })
+        {
+            var scheduled = await pending.Reader.ReadAsync(timeout.Token);
+            Assert.Equal(TimeSpan.FromSeconds(seconds), scheduled.Delay);
+            scheduled.Completion.SetResult();
+        }
+        var result = await manual.Task.WaitAsync(timeout.Token);
+        Assert.Equal(ConnectionState.NeedsManual, result.State);
+        Assert.Contains("出口地址可能已变", result.Message);
+        Assert.Contains("重新导出配对文件再导入", result.Message);
+        Assert.True(result.ProtectionActive);
+        Assert.Equal(12, order.Count(x => x == "start"));
+        Assert.DoesNotContain("remove", order);
+        var previousExpiry = Assert.Single(expiryTokens);
+        await controller.ConnectAsync();
+        Assert.True(previousExpiry.IsCancellationRequested);
+        Assert.Equal(2, expiryTokens.Count);
+    }
+    [Fact]
     public async Task StartupRecoveryPrecedesConnectAndNodeChangeNeverRestores()
     {
         var order = new List<string>(); var host = "192.0.2.5";

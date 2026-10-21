@@ -1,7 +1,7 @@
 <Window x:Class="WinClient.App.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="澳洲出口客户端" Width="480" Height="520" MinWidth="430" MinHeight="500"
+        Title="澳洲出口客户端" Width="480" Height="630" MinWidth="430" MinHeight="610"
         WindowStartupLocation="CenterScreen" Background="#F5F7FA">
   <Grid Margin="28">
     <Grid.RowDefinitions>
@@ -10,6 +10,9 @@
     </Grid.RowDefinitions>
     <TextBlock Text="澳洲出口客户端" FontSize="25" FontWeight="SemiBold" Margin="0,0,0,22"/>
     <StackPanel Grid.Row="1">
+      <TextBlock Text="{Binding Mode}" Margin="0,0,0,10"/>
+      <Button Content="导入配对文件" Command="{Binding ImportPairingCommand}" Height="38" Margin="0,0,0,16"
+              ToolTip="选择小主机导出的配对文件；更换前请先断开连接。"/>
       <Label Content="邀请码" Target="{Binding ElementName=InviteCode}" Padding="0,0,0,6"/>
       <DockPanel>
         <Button DockPanel.Dock="Right" Content="兑换" Command="{Binding RedeemCommand}" Width="80" Margin="10,0,0,0"/>
@@ -23,6 +26,10 @@
     </StackPanel>
     <TextBlock Grid.Row="4" Text="{Binding Message}" TextWrapping="Wrap" Margin="0,18,0,0" AutomationProperties.LiveSetting="Polite"/>
     <TextBlock Grid.Row="5" Text="部分程序自带防火墙放行规则，断线时可能仍可直连。" TextWrapping="Wrap" Foreground="#6B4B20" VerticalAlignment="Bottom" Margin="0,16"/>
-    <Button Grid.Row="6" Content="导出诊断" Click="Export_Click" Height="36" ToolTip="当前仅导出其他程序的防火墙放行规则审计；完整诊断功能待后续提供。"/>
+    <StackPanel Grid.Row="6">
+      <Button Content="清除配对文件" Command="{Binding ClearPairingCommand}" HorizontalAlignment="Right" Padding="8,4" Margin="0,0,0,8"
+              ToolTip="删除本机保存的配对资料；请先断开连接。"/>
+      <Button Content="导出诊断" Click="Export_Click" Height="36" ToolTip="当前仅导出其他程序的防火墙放行规则审计；完整诊断功能待后续提供。"/>
+    </StackPanel>
   </Grid>
 </Window>
