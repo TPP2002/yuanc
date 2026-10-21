@@ -42,3 +42,30 @@ def test_invalid_toml_does_not_echo_secret():
         load("/config.toml", FakeRunner(files={"/config.toml": 'token = "PRIVATE\n'}))
     assert "PRIVATE" not in str(error.value)
     assert "格式" in str(error.value)
+
+
+def test_proxy_defaults():
+    text = EXAMPLE.read_text(encoding="utf-8")
+    for name, value in (("sni", "www.microsoft.com"),
+                        ("handshake_server", "www.microsoft.com"),
+                        ("hy2_server_name", "exitnode"), ("binary", "/usr/bin/sing-box")):
+        text = text.replace(f'{name} = "{value}"\n', "")
+    proxy = load("/config", FakeRunner(files={"/config": text})).proxy
+    assert proxy.sni == proxy.handshake_server == "www.microsoft.com"
+    assert proxy.hy2_server_name == "exitnode"
+    assert proxy.binary == "/usr/bin/sing-box"
+
+
+@pytest.mark.parametrize("field,value", [
+    ("sni", '"bad/name"'), ("sni", '"-bad.example"'), ("sni", '"a..b"'),
+    ("handshake_server", '"bad name"'), ("hy2_server_name", '"bad/name"'),
+    ("sni", "12"), ("binary", "false"), ("binary", '"relative"'),
+    ("binary", '"/usr/../bin/sing-box"'), ("binary", '"/usr/bin/$bad"'),
+    ("unknown", '"value"'),
+])
+def test_proxy_strict_fields(field, value):
+    text = EXAMPLE.read_text(encoding="utf-8")
+    lines = [line for line in text.splitlines() if not line.startswith(field + " =")]
+    text = "\n".join(lines).replace("[proxy]", f"[proxy]\n{field} = {value}")
+    with pytest.raises(ConfigError, match="proxy." + field):
+        load("/config", FakeRunner(files={"/config": text}))

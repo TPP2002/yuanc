@@ -1,5 +1,5 @@
 [Unit]
-Description=出口节点代理服务（待接入）
+Description=出口节点隧道服务
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=300
@@ -7,9 +7,10 @@ StartLimitBurst=3
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 -m exitnode --placeholder proxy --config "$config_path"
-Restart=on-failure
-RestartSec=30
+ExecStart=$binary run -c /var/lib/exitnode/secrets/sing-box.json
+ExecReload=/bin/kill -HUP $$MAINPID
+Restart=always
+RestartSec=3
 NoNewPrivileges=true
 UMask=0077
 

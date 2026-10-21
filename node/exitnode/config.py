@@ -31,6 +31,11 @@ class Network:
 class Proxy:
     hy2_port: int
     reality_port: int = 443
+    # 可改为澳洲本地大站，客户端须使用相同的握手名称。
+    sni: str = "www.microsoft.com"
+    handshake_server: str = "www.microsoft.com"
+    hy2_server_name: str = "exitnode"
+    binary: str = "/usr/bin/sing-box"
 
 
 @dataclass
@@ -107,6 +112,17 @@ def load(path: str, runner: Runner | None = None) -> Config:
                 invalid(f"{name}.{key}", "不能为空或含控制字符")
         values[name] = model(**section)
     config = Config(**values)
+    for name in ("sni", "handshake_server", "hy2_server_name"):
+        hostname = getattr(config.proxy, name)
+        if len(hostname) > 253 or not re.fullmatch(
+            r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+            r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*", hostname
+        ):
+            invalid(f"proxy.{name}", "主机名格式不正确")
+    binary = PurePosixPath(config.proxy.binary)
+    if (not re.fullmatch(r"/[A-Za-z0-9_./-]+", config.proxy.binary)
+            or ".." in binary.parts or str(binary) == "/"):
+        invalid("proxy.binary", "必须为安全的可执行文件绝对路径")
     for key, value in (("node.data_dir", config.node.data_dir),
                        ("node.secrets_dir", config.node.secrets_dir)):
         p = PurePosixPath(value)

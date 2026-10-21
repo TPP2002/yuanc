@@ -12,6 +12,11 @@ probe_targets = ["1.1.1.1", "8.8.8.8"]
 [proxy]
 reality_port = 443
 hy2_port = 24443
+# 下面两个名称可改为澳洲本地大站，客户端握手名称须一致。
+sni = "www.microsoft.com"
+handshake_server = "www.microsoft.com"
+hy2_server_name = "exitnode"
+binary = "/usr/bin/sing-box"
 
 [admin]
 bind = "127.0.0.1"

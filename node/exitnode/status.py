@@ -1,5 +1,6 @@
 """四档状态；正常仅表示已接入检查通过。"""
 
+import ipaddress
 import json
 from dataclasses import asdict, dataclass
 from enum import Enum
@@ -22,6 +23,7 @@ class Status:
     path: str = "unknown"
     last_ok_at: str | None = None
     reason: str = ""
+    public_ipv4: str | None = None
 
     def to_json(self):
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -41,4 +43,7 @@ def evaluate(check_result):
     else:
         state = State.NORMAL
         reason = "已接入的网络检查通过；入口、代理和真实出口未接入，尚不能确认可上网"
-    return Status(state, __version__, check_result["network"], reason=reason)
+    address = check_result.get("public_ipv4")
+    if address and ipaddress.IPv4Address(address) in ipaddress.IPv4Network("100.64.0.0/10"):
+        reason += "；疑似运营商内网地址(CGNAT),外网无法直连"
+    return Status(state, __version__, check_result["network"], reason=reason, public_ipv4=address)
