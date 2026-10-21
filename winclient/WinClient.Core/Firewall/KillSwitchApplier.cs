@@ -59,7 +59,7 @@ public sealed class KillSwitchApplier : IKillSwitch
         await gate.WaitAsync().ConfigureAwait(false);
         try
         {
-            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(45));
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(180));
             var result = await runner.RunAsync(CreateStartInfo(KillSwitchPlanner.ToPowerShellScript(actions, StatePath, AuditPath)), timeout.Token).ConfigureAwait(false);
             if (result.ExitCode != 0) throw new InvalidOperationException("防火墙操作失败，恢复记录已保留，请联系管理员。");
         }
