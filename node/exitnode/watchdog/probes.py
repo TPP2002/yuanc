@@ -42,7 +42,7 @@ def probe(config, runner):
         ok = False
     rows.append(row("L-proxy", "隧道服务", "通过" if ok else "失败",
                     "服务运行且配置可用" if ok else "隧道服务未运行或配置不能使用"))
-    results = [_listen(runner, ["ss", "-ltnH"], 443),
+    results = [_listen(runner, ["ss", "-ltnH"], config.proxy.reality_port),
                _listen(runner, ["ss", "-lunH"], config.proxy.hy2_port)]
     result = "失败" if "失败" in results else "未知" if "未知" in results else "通过"
     rows.append(row("L-listen", "本机连接入口", result,
