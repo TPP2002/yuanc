@@ -1,0 +1,139 @@
+{
+  "schemaVersion": 1,
+  "taskId": "WINCLIENT-KILLSWITCH-HARDEN-1022",
+  "slug": "yc-winclient-killswitch-harden-1022",
+  "title": "Windows 客户端断网保护加固:连接期间把系统里其他程序自带的「允许出站」规则临时停用(先记录再停用),断开时按记录逐条恢复;组策略来源改不了的规则记入审计供界面与文档说明;崩溃恢复同样恢复这些规则",
+  "goal": "做完后:①KillSwitchPlanner 新增动作 DisableForeignAllowRules(record 类型),Plan(...Apply) 的顺序改为:三条 SetProfileDefault → DisableForeignAllowRules → 本项目 AddRule 四类 → Audit;Remove/Recover 的顺序改为:RemoveRulesByPrefix(Prefix) → RestoreProfileDefault(其中先恢复被停用规则再恢复默认策略再删状态文件)。②ToPowerShellScript 对 DisableForeignAllowRules 生成的脚本必须:a) 只查本机持久化存储 Get-NetFirewallRule -PolicyStore PersistentStore -Enabled True -Direction Outbound -Action Allow,过滤掉 Name 以 YuanC-KS- 开头的;b) 先把这些规则的 Name 列表写进状态文件($state.disabledRules = @(名字数组),Write-State)——写盘成功之后才执行 Disable-NetFirewallRule(逐条或管道都行,但任何一条失败不得中止整段:用 -ErrorAction SilentlyContinue 并把失败的名字收进 $state.disableFailed 再 Write-State 一次);c) 状态文件已有 disabledRules(重复 Apply、或上次中途失败)时不覆盖已有列表,只把新发现的名字并进去(并集),保证恢复时一条不漏;d) 绝不 Remove-NetFirewallRule 任何非 YuanC-KS- 规则,绝不碰 -Action Block 规则,绝不碰入站规则;e) 另外查 ActiveStore 里 Enabled True、Outbound、Allow、非 YuanC-KS- 且不在 PersistentStore 里的规则(= 组策略等本机改不了的来源),把 Name 与 Program 写进 $state.unmanagedRules(只记录,不操作)。③RestoreProfileDefault 的脚本在恢复三个 profile 默认策略之前,先对 $state.disabledRules 里每个名字执行 Get-NetFirewallRule -Name <名字> -ErrorAction SilentlyContinue | Enable-NetFirewallRule(规则已被用户删掉就跳过),全部尝试完再恢复默认策略、再删状态文件;状态文件是旧格式(没有 disabledRules 字段)时照旧只恢复默认策略;状态文件不存在时行为不变(设回 Allow)。④Audit 动作的输出 run/firewall-audit.json 从数组改为对象 {\"foreign_allow_rules\":[{Name,Program}...](口径同现在),\"unmanaged_rules\":[{Name,Program}...](来自 ②e,没有状态文件时现查),\"generated_at\":ISO8601};既有读审计的地方(ClientRuntime.ReadAudit 只是读文件全文返回,界面只落盘)不需要改。⑤KillSwitchApplier.ExecuteAsync 的超时从 45 秒提到 180 秒(几百条规则逐条停用/启用要时间),其余不改;IKillSwitch 接口不改,状态文件路径与审计路径不改。⑥测试:FirewallTests.cs 只加不改既有断言;新建 KillSwitchHardenTests.cs 断言生成脚本的文本性质:Apply 脚本里「写 disabledRules 的 Write-State」出现在「Disable-NetFirewallRule」之前;查询用 -PolicyStore PersistentStore 且带 -Enabled True -Direction Outbound -Action Allow;过滤 YuanC-KS-*;Disable 一段带 -ErrorAction SilentlyContinue 且有 disableFailed 记录;Restore 脚本里 Enable-NetFirewallRule 出现在 Set-NetFirewallProfile 恢复之前、Remove-Item 状态文件之前;Restore 对缺 disabledRules 字段的旧状态不报错(脚本里对该字段判空);整个脚本任何位置不出现对非前缀规则的 Remove-NetFirewallRule(即 Remove-NetFirewallRule 只紧跟在 -Name 'YuanC-KS-…' 查询之后);Audit 输出含 foreign_allow_rules 与 unmanaged_rules 两个键;Plan(Apply) 动作序列类型顺序精确断言;Remove 序列不含 DisableForeignAllowRules;UpdateNode 序列不变。⑦文档:新建 docs/winclient/断网保护加固说明.md(为什么原来有洞、现在怎么堵:停用哪些规则、为什么不删、为什么先记录再停用、断开/崩溃恢复怎么把它们恢复、记录丢了会怎样(默认出站已恢复为允许,所以只是那些规则停着、不影响上网,审计文件可查)、组策略规则改不了只能提示、对 Windows 自带「核心网络」规则的影响(连接期间 DNS/IPv6 相关系统规则停用,流量全走隧道网卡是设计意图)、真机待验证清单:断线时抓包无直连、恢复后规则状态与连接前一致、几百条规则时的耗时);不改 docs/winclient/架构说明.md 等既有文档(另一张正在施工的单会改它们,避免冲突;派单方收单后自己补一行链接)。",
+  "background": "项目:外包,中国客户端经加密隧道到澳洲家宽出口。Windows 客户端(.NET 9,winclient/)的断网保护在 WinClient.Core/Firewall/:KillSwitchPlanner 把动作列表(SetProfileDefault/AddRule/RemoveRulesByPrefix/RestoreProfileDefault/Audit)翻成一段 PowerShell 脚本,KillSwitchApplier 用 powershell.exe -Command 执行(CreateNoWindow,45 秒超时,状态文件 run/killswitch-state.json 在改系统前先写原始默认策略、applied 标记,审计文件 run/firewall-audit.json)。现状洞:连接期间三个 profile 的默认出站改为 Block,只放行隧道内核进程到节点、YuanC-TUN 网卡别名上的全部出站、回环、DHCP;但系统里原有的「允许」出站规则(第三方软件安装时自建的、Windows 自带的核心网络规则)仍然生效,隧道一断(内核崩了、路由没了)这些程序就能从物理网卡直连,真实 IP 暴露——与「断线即断网」承诺不符。看板卡 WINCLIENT-KILLSWITCH-HARDEN-1022 列了三条修法,派单方拍板选①「临时停用非本项目的允许出站规则并记录、恢复时还原」,理由:WFP 过滤层要本机代码或大包、四周工期内风险高;只在界面明示局限等于不修。为什么安全:默认出站恢复为 Allow 后,被停用的 Allow 规则对连通性毫无影响,所以「记录丢了没恢复」的最坏结果只是那些规则停着,用户照常上网;本单只停用、不删除、不碰 Block 规则、不碰入站规则。为什么不动组策略规则:本机管理员改不了 GPO 下发的规则(Set/Disable 会报错),只能记录并在文档里说明。连接期间所有应用流量经 YuanC-TUN 网卡出去,由 YuanC-KS-Tun 规则放行,所以停用其他 Allow 规则不影响应用经隧道上网。先读:winclient/WinClient.Core/Firewall/{KillSwitchPlanner,KillSwitchApplier,CommandRunner}.cs、winclient/WinClient.Tests/FirewallTests.cs、docs/winclient/架构说明.md 第 55~80 行「防火墙计划与恢复」。环境:工位无外网,只用框架自带与 NuGet 缓存已有的包(本单不该新增任何包);CI 是本机自托管 Windows runner 跑 dotnet test winclient;首轮 dotnet build 会生成 winclient/third_party/bin 让自测指纹漂一次属正常;构建报 Access denied 先 dotnet build-server shutdown。另一张单(yc-winclient-update-1022)正在并行施工,它的禁区包含 Core/Firewall/**,本单禁区包含它要改的一切,两单文件不重叠;本单不要碰 docs/winclient/ 下任何既有文件。\n硬规矩:①先记录再停用,记录写盘失败就不停用(脚本 $ErrorActionPreference='Stop' 下 Write-State 抛错即整段中止,此时尚未改任何规则);②不删、不改任何非 YuanC-KS- 规则的属性,只 Disable/Enable;③状态文件格式向后兼容(旧文件没有新字段也能恢复);④脚本文本不含用户路径以外的任何凭据,错误文案中文;⑤既有测试只加不改断言;⑥不改 IKillSwitch 接口、不改 ClientController/状态机、不改 Audit 的读取方(只改写出的 JSON 形状);⑦拿不准(例如 PersistentStore 与 ActiveStore 差集的写法、Enable 顺序)停下交 blocked + forks;需要真机的验证写进文档清单,不模拟成通过。搜索用 rg 或 git grep。",
+  "nonGoals": [
+    "不做 WFP(Windows Filtering Platform)过滤层",
+    "不改默认出站策略、放行规则四类、节点规则替换(UpdateNode)的既有口径",
+    "不处理组策略下发的规则(只记录与说明)",
+    "不改 docs/winclient/架构说明.md、服务化与自启说明.md、打包与发布说明.md(并行单在改;派单方收单后补链接)",
+    "不在真机实测(断线抓包、规则恢复一致性、几百条规则耗时):写进真机清单"
+  ],
+  "allowedPaths": [
+    "winclient/WinClient.Core/Firewall/KillSwitchPlanner.cs",
+    "winclient/WinClient.Core/Firewall/KillSwitchApplier.cs",
+    "winclient/WinClient.Tests/FirewallTests.cs",
+    "winclient/WinClient.Tests/KillSwitchHardenTests.cs",
+    "docs/winclient/断网保护加固说明.md"
+  ],
+  "forbiddenPaths": [
+    "node/**",
+    "authserver/**",
+    "scripts/**",
+    "docs/开工须知.md",
+    "docs/口径速查表.md",
+    "docs/design/**",
+    "docs/交接/**",
+    "docs/node/**",
+    "docs/plans/**",
+    "docs/acceptance/**",
+    "docs/authserver/**",
+    "docs/winclient/架构说明.md",
+    "docs/winclient/服务化与自启说明.md",
+    "docs/winclient/打包与发布说明.md",
+    ".github/**",
+    ".codex/**",
+    ".gitignore",
+    "pyproject.toml",
+    "winclient/third_party/**",
+    "winclient/Directory.Build.props",
+    "winclient/NuGet.Config",
+    "winclient/WinClient.Core/Firewall/CommandRunner.cs",
+    "winclient/WinClient.Core/Auth/**",
+    "winclient/WinClient.Core/Client/**",
+    "winclient/WinClient.Core/Hosting/**",
+    "winclient/WinClient.Core/Ipc/**",
+    "winclient/WinClient.Core/Kernel/**",
+    "winclient/WinClient.Core/Logging/**",
+    "winclient/WinClient.Core/Pairing/**",
+    "winclient/WinClient.Core/Process/**",
+    "winclient/WinClient.Core/State/**",
+    "winclient/WinClient.Core/Storage/**",
+    "winclient/WinClient.Core/Update/**",
+    "winclient/WinClient.Core/WinClient.Core.csproj",
+    "winclient/WinClient.App/**",
+    "winclient/WinClient.Tests/AuthTests.cs",
+    "winclient/WinClient.Tests/ControllerTests.cs",
+    "winclient/WinClient.Tests/HostingTests.cs",
+    "winclient/WinClient.Tests/IpcTests.cs",
+    "winclient/WinClient.Tests/KernelInstallerTests.cs",
+    "winclient/WinClient.Tests/PairingCertificateTests.cs",
+    "winclient/WinClient.Tests/PairingTests.cs",
+    "winclient/WinClient.Tests/ProcessStorageTests.cs",
+    "winclient/WinClient.Tests/StateTests.cs",
+    "winclient/WinClient.Tests/TestData.cs",
+    "winclient/WinClient.Tests/WinClient.Tests.csproj"
+  ],
+  "expectArtifacts": [
+    "winclient/WinClient.Core/Firewall/KillSwitchPlanner.cs",
+    "winclient/WinClient.Core/Firewall/KillSwitchApplier.cs",
+    "winclient/WinClient.Tests/KillSwitchHardenTests.cs",
+    "docs/winclient/断网保护加固说明.md"
+  ],
+  "acceptance": [
+    {
+      "id": "BUILD",
+      "kind": "command",
+      "argv": ["dotnet", "build", "winclient/WinClient.sln", "-c", "Release", "--nologo"],
+      "required": true,
+      "timeoutSec": 1200,
+      "note": "首轮会生成 third_party/bin 让指纹漂一次,正常"
+    },
+    {
+      "id": "TEST",
+      "kind": "command",
+      "argv": ["dotnet", "test", "winclient/WinClient.sln", "-c", "Release", "--no-build", "--nologo"],
+      "required": true,
+      "timeoutSec": 900,
+      "note": "既有测试全过且断言未改;新增 KillSwitchHardenTests 见 goal ⑥"
+    },
+    {
+      "id": "SCRIPTSHAPE",
+      "kind": "command",
+      "argv": ["python", "-c", "import pathlib,sys;t=pathlib.Path('winclient/WinClient.Core/Firewall/KillSwitchPlanner.cs').read_text(encoding='utf-8');need=('DisableForeignAllowRules','Disable-NetFirewallRule','Enable-NetFirewallRule','PersistentStore','disabledRules','unmanagedRules','disableFailed','foreign_allow_rules','unmanaged_rules');miss=[k for k in need if k not in t];print(miss);sys.exit(1 if miss else 0)"],
+      "required": true,
+      "timeoutSec": 60,
+      "note": "新动作、先记录再停用的字段、审计新形状都在"
+    },
+    {
+      "id": "NOWINDOW",
+      "kind": "command",
+      "argv": ["python", "-c", "import pathlib,sys;norm=lambda p:str(p).replace(chr(92),'/');files=[p for root in ('winclient/WinClient.Core','winclient/WinClient.App') for p in pathlib.Path(root).rglob('*.cs') if '/obj/' not in norm(p) and '/bin/' not in norm(p)];bad=[norm(p) for p in files if 'ProcessStartInfo' in p.read_text(encoding='utf-8') and p.parent.name!='Process' and 'CreateNoWindow = true' not in p.read_text(encoding='utf-8')];print(bad);sys.exit(1 if bad else 0)"],
+      "required": true,
+      "timeoutSec": 60,
+      "note": "起子进程的文件显式 CreateNoWindow=true(含 Firewall 目录)"
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "argv": ["python", "-c", "import pathlib,sys;a=pathlib.Path('docs/winclient/断网保护加固说明.md');ok=a.exists() and all(k in a.read_text(encoding='utf-8') for k in ('先记录','停用','组策略','恢复','真机','killswitch-state.json','firewall-audit.json'));print(ok);sys.exit(0 if ok else 1)"],
+      "required": true,
+      "timeoutSec": 60,
+      "note": "新文档齐全"
+    },
+    {
+      "id": "NOBIN",
+      "kind": "command",
+      "argv": ["python", "-c", "import subprocess,sys;out=subprocess.run(['git','ls-files','winclient','build'],capture_output=True,text=True).stdout.split();bad=[f for f in out if f.endswith(('.exe','.dll','.zip','.pdb'))];print(bad);sys.exit(1 if bad else 0)"],
+      "required": true,
+      "timeoutSec": 60,
+      "note": "二进制不入库"
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "model": null,
+  "timeoutSec": 7200,
+  "repoRoot": "E:/yuanc",
+  "engine": "codex",
+  "reasoningEffort": "high",
+  "steps": [
+    "读 background 列的三份源文件与既有测试;确认现有脚本的 Write-State、RestoreProfileDefault、Audit 段落。",
+    "先写 KillSwitchHardenTests.cs 的红测试(顺序、字段、过滤、兼容),再改 Planner:新动作 + Apply/Remove 序列 + 脚本段落 + Audit 形状;Applier 超时 180 秒。",
+    "本机跑 BUILD/TEST 与各断言;写文档;交活说明列出真机待验证清单与未动的既有断言。"
+  ]
+}
