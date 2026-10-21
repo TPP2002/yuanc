@@ -16,3 +16,4 @@ secrets/
 *.key
 *.pem
 .codex/worktrees/
+winclient/third_party/cache/

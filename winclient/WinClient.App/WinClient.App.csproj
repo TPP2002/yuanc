@@ -13,4 +13,12 @@
     <PublishTrimmed>false</PublishTrimmed>
   </PropertyGroup>
   <ItemGroup><ProjectReference Include="../WinClient.Core/WinClient.Core.csproj" /></ItemGroup>
+  <Target Name="FetchPinnedKernel" BeforeTargets="PrepareForBuild">
+    <Exec Command="powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File &quot;$(MSBuildThisFileDirectory)..\..\scripts\release\fetch-third-party.ps1&quot;" />
+  </Target>
+  <ItemGroup>
+    <EmbeddedResource Include="../third_party/bin/sing-box.exe" LogicalName="YuanC.Kernel.sing-box.exe" />
+    <EmbeddedResource Include="../third_party/bin/wintun.dll" LogicalName="YuanC.Kernel.wintun.dll" />
+    <EmbeddedResource Include="../third_party/bin/kernel-manifest.json" LogicalName="YuanC.Kernel.manifest.json" />
+  </ItemGroup>
 </Project>

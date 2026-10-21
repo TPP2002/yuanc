@@ -4,6 +4,7 @@ using System.Windows;
 using System.Windows.Input;
 using WinClient.Core.Client;
 using WinClient.Core.State;
+using WinClient.Core.Kernel;
 
 namespace WinClient.App;
 
@@ -42,7 +43,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         snapshot.State is not (ConnectionState.Connected or ConnectionState.Connecting or ConnectionState.Reconnecting);
     public async Task InitializeAsync() => await RunAsync(async () =>
     {
-        runtime = await ClientRuntime.CreateAsync();
+        runtime = await ClientRuntime.CreateAsync(new KernelInstaller(new EmbeddedKernelSource()));
         runtime.Controller.Changed += Update;
         await runtime.Controller.InitializeAsync();
         Update(runtime.Controller.Snapshot);
@@ -53,6 +54,8 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         try { await action(); }
         catch (System.IO.InvalidDataException ex)
         { Update(snapshot with { Message = ex.Message }); }
+        catch (InvalidOperationException ex) when (ex.Message == KernelInstaller.VerificationFailureMessage)
+        { Update(snapshot with { Status = "需人工处理", Message = ex.Message }); }
         catch (Exception ex) when (ex is System.IO.IOException or UnauthorizedAccessException or InvalidOperationException or
             System.Text.Json.JsonException or System.Security.Cryptography.CryptographicException or ArgumentException or OperationCanceledException)
         { Update(snapshot with { Status = "需人工处理", Message = "操作未完成，请检查服务器配置和恢复记录，或联系管理员。" }); }
