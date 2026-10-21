@@ -8,12 +8,15 @@ namespace WinClient.Core.Storage;
 public sealed class DpapiCredentialStore : ICredentialStore
 {
     private readonly string path;
-    public DpapiCredentialStore(string productName, string? localAppDataRoot = null)
+    private readonly DataProtectionScope scope;
+    public DpapiCredentialStore(string productName, string? localAppDataRoot = null,
+        DataProtectionScope scope = DataProtectionScope.CurrentUser, string? root = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(productName);
         if (productName is "." or ".." || productName.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0 || productName.Contains('/') || productName.Contains('\\'))
             throw new ArgumentException("产品名必须是单个目录名称。", nameof(productName));
-        path = Path.Combine(localAppDataRoot ?? Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), productName, "credential.bin");
+        this.scope = scope;
+        path = Path.Combine(root ?? Path.Combine(localAppDataRoot ?? Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), productName), "credential.bin");
     }
 
     public void Save(string refreshToken)
@@ -22,7 +25,7 @@ public sealed class DpapiCredentialStore : ICredentialStore
         var plain = Encoding.UTF8.GetBytes(refreshToken);
         try
         {
-            var encrypted = ProtectedData.Protect(plain, optionalEntropy: null, DataProtectionScope.CurrentUser);
+            var encrypted = ProtectedData.Protect(plain, optionalEntropy: null, scope);
             Directory.CreateDirectory(Path.GetDirectoryName(path)!);
             var temp = path + ".tmp";
             try
@@ -39,7 +42,7 @@ public sealed class DpapiCredentialStore : ICredentialStore
     public string? Load()
     {
         if (!File.Exists(path)) return null;
-        var plain = ProtectedData.Unprotect(File.ReadAllBytes(path), optionalEntropy: null, DataProtectionScope.CurrentUser);
+        var plain = ProtectedData.Unprotect(File.ReadAllBytes(path), optionalEntropy: null, scope);
         try { return Encoding.UTF8.GetString(plain); }
         finally { CryptographicOperations.ZeroMemory(plain); }
     }

@@ -24,16 +24,28 @@ public sealed class ClientSettings
         return settings;
     }
 
-    public static string GetDeviceFingerprint(string? root = null)
+    public static string GetDeviceFingerprint(string? root = null, DataProtectionScope scope = DataProtectionScope.CurrentUser)
     {
         var directory = root ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), ProductName);
         var path = Path.Combine(directory, "device-id");
         Directory.CreateDirectory(directory);
-        if (File.Exists(path)) return File.ReadAllText(path).Trim();
+        // Preserve the original default user identity format; the service uses machine encryption.
+        if (File.Exists(path))
+        {
+            if (scope == DataProtectionScope.CurrentUser) return File.ReadAllText(path).Trim();
+            var decoded = ProtectedData.Unprotect(File.ReadAllBytes(path), null, scope);
+            try { return System.Text.Encoding.UTF8.GetString(decoded); }
+            finally { CryptographicOperations.ZeroMemory(decoded); }
+        }
         var identity = Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
         using var stream = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None);
-        using var writer = new StreamWriter(stream);
-        writer.Write(identity);
+        var plain = System.Text.Encoding.UTF8.GetBytes(identity);
+        try
+        {
+            stream.Write(scope == DataProtectionScope.CurrentUser ? plain : ProtectedData.Protect(plain, null, scope));
+            stream.Flush(true);
+        }
+        finally { CryptographicOperations.ZeroMemory(plain); }
         return identity;
     }
 }
