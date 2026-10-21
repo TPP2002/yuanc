@@ -5,6 +5,7 @@ StartLimitIntervalSec=300
 StartLimitBurst=3
 
 [Service]
+Environment=PYTHONPATH=/opt/exitnode/current
 Type=oneshot
 ExecStart=/usr/bin/python3 -m exitnode --config "/etc/exitnode/config.toml" watchdog tick
 Restart=no

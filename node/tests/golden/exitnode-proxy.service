@@ -6,8 +6,9 @@ StartLimitIntervalSec=300
 StartLimitBurst=3
 
 [Service]
+Environment=PYTHONPATH=/opt/exitnode/current
 Type=simple
-ExecStart=/usr/bin/sing-box run -c /var/lib/exitnode/secrets/sing-box.json
+ExecStart=/opt/exitnode/current/bin/sing-box run -c /var/lib/exitnode/secrets/sing-box.json
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=always
 RestartSec=3

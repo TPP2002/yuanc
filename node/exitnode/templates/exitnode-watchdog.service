@@ -5,6 +5,7 @@ StartLimitIntervalSec=300
 StartLimitBurst=3
 
 [Service]
+Environment=PYTHONPATH=$program_path
 Type=oneshot
 ExecStart=/usr/bin/python3 -m exitnode --config "$config_path" watchdog tick
 Restart=no

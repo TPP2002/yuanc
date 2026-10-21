@@ -44,7 +44,7 @@ def parser():
     root.add_argument("--placeholder", choices=["admin", "proxy"], help=argparse.SUPPRESS)
     sub = root.add_subparsers(dest="command", title="可用命令")
     descriptions = {"init": "安装基础组件", "check": "按层检查网络", "status": "查看运行状态",
-                    "diagnose": "导出脱敏诊断包", "upgrade": "更新程序（尚未实现）",
+                    "diagnose": "导出脱敏诊断包", "upgrade": "检查并安全更新程序",
                     "rollback": "撤回安装步骤", "uninstall": "卸载本项目组件"}
     for name, description in descriptions.items():
         command = sub.add_parser(name, help=description, description=description)
@@ -54,7 +54,10 @@ def parser():
         if name == "diagnose":
             command.add_argument("--output", required=True, help="诊断压缩包保存路径")
         if name == "upgrade":
-            command.add_argument("--version", help="目标版本")
+            command.add_argument("--version", help=argparse.SUPPRESS)
+            command.add_argument("--file", help="本地升级包路径")
+            command.add_argument("--signature", help="签名路径，默认升级包路径加 .sig")
+            command.add_argument("--check", action="store_true", help="只检查升级包，不安装")
         if name == "rollback":
             command.add_argument("--to-step", help="保留该步骤及之前的步骤")
         if name == "uninstall":
@@ -90,19 +93,27 @@ def _install(config, config_path, runner, manifest):
     def apply(step, action, undo):
         changed = manifest.apply(step, action, undo)
         successful.append(step + ("：已完成" if changed else "：已完成，跳过"))
+        return changed
 
     try:
+        from .updater import layout
+
+        layout.repair(config, runner)
+        program_path = layout.root(config) + "/current"
         # 先做无命令的前置核对，缺内核时不得写入任何服务单元。
-        if not runner.exists(config.proxy.binary):
+        if not runner.exists(program_path + "/bin/sing-box") and not runner.exists(config.proxy.binary):
             raise ValueError("未找到 sing-box，请先安装 sing-box 二进制并确认 proxy.binary 路径；不会自动下载")
         for name, directory in (("数据目录", config.node.data_dir),
                                 ("凭据目录", config.node.secrets_dir)):
             # 数据与凭据在撤回时保留，卸载只清除清单管理的产物。
             apply(name, lambda p=directory: runner.mkdir(p),
                   {"kind": "remove_file", "path": directory, "preserve": True})
+        if not apply("安装程序目录", lambda: layout.bootstrap(config, runner),
+                     {"kind": "remove_file", "path": layout.releases(config), "preserve": True}):
+            layout.bootstrap(config, runner)
         for unit in sorted(UNITS - {service.UNIT}):
             path = "/etc/systemd/system/" + unit
-            text = systemd.render(unit, {"config_path": config_path})
+            text = systemd.render(unit, {"config_path": config_path, "program_path": program_path})
             step = "写入" + unit
 
             def write_unit(p=path, content=text, step_id=step):
@@ -135,7 +146,9 @@ def _install(config, config_path, runner, manifest):
         step = "写入" + service.UNIT
         if runner.exists(path) and not any(s["step"] == step for s in manifest.steps):
             raise ValueError("已有同名服务文件未在本安装清单中，请联系维护人员")
-        text = systemd.render(service.UNIT, {"config_path": config_path}, binary=config.proxy.binary)
+        text = systemd.render(service.UNIT,
+                              {"config_path": config_path, "program_path": program_path},
+                              binary=config.proxy.binary)
 
         def write_proxy():
             if runner.exists(path) and runner.read_file(path) != text:
@@ -206,12 +219,24 @@ def main(argv=None, runner=None):
     if not args.command:
         parser().print_help()
         return 0
-    if args.command == "upgrade":
-        print("未实现，见卡 UPDATER", file=sys.stderr)
+    if args.command == "upgrade" and args.version:
+        print("按版本号选择未实现，请使用 --file 或配置发布来源。", file=sys.stderr)
         return 2
     try:
         runner = runner if runner is not None else RealRunner()
         config = load(args.config, runner)
+        if args.command == "upgrade":
+            try:
+                from .updater.upgrade import upgrade
+
+                if args.signature and not args.file:
+                    print("签名路径须与本地升级包一起指定。", file=sys.stderr)
+                    return 2
+                return upgrade(config, runner, file=args.file, signature=args.signature,
+                               check=args.check, config_path=args.config)
+            except Exception:
+                print("更新失败：更新组件异常，请联系维护人员。", file=sys.stderr)
+                return 1
         if args.command == "watchdog":
             if args.watchdog_action == "tick":
                 return watchdog_tick(config, runner)

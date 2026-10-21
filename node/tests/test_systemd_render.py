@@ -15,13 +15,14 @@ def test_unit_matches_golden(name):
     assert "StartLimitBurst=" in text
     if name.endswith(".service"):
         assert "Restart=" in text
+        assert "Environment=PYTHONPATH=/opt/exitnode/current\n" in text
 
 
 def test_admin_and_proxy_have_independent_entrypoints():
     admin, proxy = render(UNITS[0], {}), render(UNITS[1], {})
     assert admin != proxy
     assert "--placeholder admin" in admin
-    assert "ExecStart=/usr/bin/sing-box run -c /var/lib/exitnode/secrets/sing-box.json\n" in proxy
+    assert "ExecStart=/opt/exitnode/current/bin/sing-box run -c /var/lib/exitnode/secrets/sing-box.json\n" in proxy
     assert "Restart=always\n" in proxy
     assert "RestartSec=3\n" in proxy
     assert "ExecReload=/bin/kill -HUP $MAINPID\n" in proxy
