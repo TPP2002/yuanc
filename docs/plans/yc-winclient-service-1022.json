@@ -1,0 +1,143 @@
+{
+  "schemaVersion": 1,
+  "taskId": "WINCLIENT-SERVICE-1022",
+  "slug": "yc-winclient-service-1022",
+  "title": "Windows 客户端服务化:同一个 exe 按参数分角色——后台 Windows 服务(LocalSystem、开机自启、崩溃自动重启)持有连接内核与断网保护,界面进程不再要求管理员、经本机命名管道发指令看状态、随登录自启到托盘;首次点「安装后台服务」只弹一次 UAC;凭据与配对文件改存本机 DPAPI 的 ProgramData 安全目录;「期望状态」文件决定开机是否自动连",
+  "goal": "做完后:①角色分发:WinClient.App 新增 Program.cs 自定义入口([STAThread] Main;csproj 关掉自动生成的 ApplicationDefinition 入口或等价做法),按第一个参数分角色:无参数或 --tray → 界面(默认启动即显示窗口;--tray 启动时只在托盘不显示窗口);--service → Windows 服务宿主(不创建 WPF Application);--install / --uninstall / --repair → 需管理员的安装动作(由界面用 UseShellExecute=true + Verb=runas 重新拉起自己来跑,这是产品里唯一允许的 UAC 弹窗);未知参数退出码 2 并写 stderr 中文说明。app.manifest 的 requestedExecutionLevel 改为 asInvoker(界面不再要求管理员)。②服务宿主(WinClient.App/Hosting/ControlService.cs,ServiceBase 子类,包 System.ServiceProcess.ServiceController 用 NuGet 缓存里已有的版本;服务名 YuanCService,显示名「YuanC 澳洲出口连接服务」,CanStop=true、CanShutdown=true):OnStart 里 RequestAdditionalTime 后在后台任务完成 → ClientRuntime.CreateAsync(new KernelInstaller(new EmbeddedKernelSource()), storeRoot) → 读 DesiredState → Controller.InitializeAsync(autoConnect: desired != false) → 起 ControlServer 监听命名管道 \\\\.\\pipe\\YuanC-Control(NamedPipeServerStreamAcl.Create,PipeSecurity:SYSTEM 与 BUILTIN\\Administrators FullControl、BUILTIN\\Users ReadWrite,拒绝网络来源即只本机;最多 4 个并发实例;每个连接一个读循环);OnStop / OnShutdown:关管道、runtime.Dispose()(= 停内核、不撤断网保护,与「关窗口不等于断开」同一口径),不写 Windows 事件日志(不引入 EventLog 包);服务内任何未捕获异常写 run/service.log 后以非零 ExitCode 结束让 SCM 的失败动作重启它。服务日志:RollingFileLog 写 %ProgramData%\\YuanC\\run\\service.log,经 RedactingLog。③管道协议(WinClient.Core/Ipc/ControlProtocol.cs,纯数据与编解码,可测):UTF-8、每行一个 JSON 对象、\\n 结尾、单行上限 1 MiB(超限断开该连接);请求 {\"id\":<客户端自增整数>,\"op\":\"status|connect|disconnect|redeem|import_pairing|clear_pairing|read_audit|subscribe\",\"code\"?:string,\"pairing_json\"?:string};应答 {\"id\":同请求,\"ok\":bool,\"error\"?:中文,\"snapshot\"?:{state,status,message,protection_active,mode},\"audit\"?:string};subscribe 之后服务端每次 Controller.Changed 推 {\"event\":\"snapshot\",\"snapshot\":{...}};未知 op → ok=false error=「不支持的指令」且连接保持;坏 JSON → ok=false error=「指令格式错误」(id 为 null)且连接保持。ControlServer(WinClient.Core/Ipc/ControlServer.cs)只依赖 Stream 与 IClientFacade,不直接依赖命名管道类型(管道的创建在 App 的服务宿主里),这样测试用内存双向流;ControlClient(WinClient.Core/Ipc/ControlClient.cs)同样基于 Stream,App 层给它 NamedPipeClientStream(连接超时 3 秒)。IClientFacade(WinClient.Core/Client/IClientFacade.cs):Snapshot、Changed、ConnectAsync、DisconnectAsync、RedeemAsync(code)、ImportPairingAsync(json)、ClearPairingAsync、ReadAudit()(返回审计文件全文或 null);ClientRuntime 实现它;ControlServer 在 connect 成功受理后写 DesiredState=true、disconnect 后写 false。④DesiredState(WinClient.Core/Client/DesiredStateStore.cs):%ProgramData%\\YuanC\\run\\desired.json {\"connect\":bool,\"updated_at\":ISO8601},原子写(.tmp + Move overwrite);读:文件不存在或解析失败 → null,不抛;ClientController.InitializeAsync 加参数 autoConnect(默认 true 保持既有测试语义):false 时仍做防火墙恢复与 Publish,但不自动 ConnectAsync。⑤安全存储搬家(服务是 LocalSystem,读不到用户的 CurrentUser DPAPI):DpapiCredentialStore、PairingStore、ClientSettings.GetDeviceFingerprint 各加可选参数 (string? root, DataProtectionScope scope),默认值保持现状(CurrentUser + LOCALAPPDATA,既有测试不变);服务宿主传 root=%ProgramData%\\YuanC\\secure、scope=LocalMachine;服务启动时若 secure 目录不存在则创建并设 ACL:关闭继承、只给 SYSTEM 与 BUILTIN\\Administrators FullControl(System.IO.FileSystem.AccessControl,框架自带);ClientRuntime.CreateAsync 加参数 storeRoot/scope 透传到三处;不做从用户目录到 secure 的迁移(产品尚未交付过任何客户,文档写明)。⑥安装动作(WinClient.Core/Hosting/ServiceInstaller.cs 纯函数生成命令与注册表值,WinClient.App/Hosting/InstallerRunner.cs 执行;sc.exe 与任何子进程 ProcessStartInfo 必须 CreateNoWindow=true、UseShellExecute=false,运行目录与路径都用完整路径):--install:a)目标目录 %ProgramFiles%\\YuanC\\app\\<Version>\\(Version 读自己程序集的 InformationalVersion 去掉 + 后缀,与 Directory.Build.props 一致),把当前 exe 复制为该目录下 YuanC-Client.exe(已存在且 SHA256 相同则跳过);b)服务不存在 → sc create YuanCService binPath= \"<目标exe>\" --service start= auto depend= BFE DisplayName= 「YuanC 澳洲出口连接服务」,存在 → sc config 到同样参数;sc description 「保持澳洲出口隧道与断网保护在后台运行」;sc failure YuanCService reset= 86400 actions= restart/5000/restart/10000/restart/30000;sc failureflag YuanCService 1;c)HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Run 值 YuanC = \"<目标exe>\" --tray;d)服务未运行则 sc start;e)第二次 --install 零变更(复制跳过、sc config 幂等、注册表同值);任一步失败退出码 1、stderr 中文原因、不回滚已成功的步骤但下次可重跑。--repair:只做 d)。--uninstall:先连管道发 disconnect(撤断网保护;连不上就跳过并在 stderr 说明),sc stop(等最多 30 秒)、sc delete,删 Run 值;保留 %ProgramData%\\YuanC(文档写明手动清理)。⑦界面(WinClient.App):MainViewModel 不再直接 new ClientRuntime,改为通过 ControlClient 发指令并订阅快照;启动流程:ServiceController 查 YuanCService——未安装 → 状态「需安装后台服务」、主按钮变「安装后台服务(需管理员确认一次)」→ runas 拉起 --install,成功后重连管道;已安装未运行 → 状态「后台服务未运行」、按钮「修复」→ runas --repair;运行中但管道 3 秒连不上 → 重试 5 次(间隔 1 秒)后显示「无法连接后台服务,请重启电脑或联系管理员」;导入配对文件:界面读所选 .ycpair 文本发 import_pairing,服务端校验与保存;导出诊断:read_audit 拿内容后由界面写到用户选的路径;托盘(csproj 加 UseWindowsForms=true,用 NotifyIcon):菜单「打开窗口 / 连接 / 断开 / 退出界面(隧道不受影响)」,关窗口 = 隐藏到托盘而不是退出,托盘「退出界面」才退出进程;单实例:第二个界面实例用 Local\\YuanC-ShowWindow 命名事件通知第一个显示窗口后静默退出(替换现在的弹框);界面任何异常不触碰防火墙与内核(它们都在服务里)。⑧测试(WinClient.Tests,新增 IpcTests.cs / HostingTests.cs,既有测试文件只许加不许改断言):协议编解码往返、未知 op 与坏 JSON 的应答与连接保持、单行超限断开;ControlServer 用内存双向流 + 假 IClientFacade:subscribe 收到 Changed 推送、connect 写 DesiredState=true、disconnect 写 false、read_audit 返回内容、两个客户端并发互不串台;DesiredStateStore 缺文件/坏文件返回 null;ClientController.InitializeAsync(autoConnect:false) 有凭据也不连;ServiceInstaller:sc 参数列表逐项精确断言(含 binPath 带引号与 --service、start= auto、depend= BFE、failure 参数)、Run 值字符串、复制跳过判定、所有 ProcessStartInfo CreateNoWindow=true;三个存储以 LocalMachine scope + 临时目录往返(Windows 上跑)。⑨文档:新建 docs/winclient/服务化与自启说明.md(角色与参数、服务名与安装位置、管道协议、安全目录与 ACL、期望状态语义、首次安装 UAC 一次、怎么卸载、真机待验证清单);更新 docs/winclient/架构说明.md 把「本单不做服务化」「界面要求管理员」「凭据在 LOCALAPPDATA」等过时句子改成新口径;更新 docs/winclient/打包与发布说明.md 的「客户电脑首次运行」节(双击 → 安装后台服务 → 托盘)。",
+  "background": "项目:外包,Windows 客户端(.NET 9 WPF,winclient/)已能导入配对文件连接澳洲出口节点(sing-box TUN + 防火墙断网保护),刚合并的 WINCLIENT-PACKAGE-1022(PR #15)把 sing-box.exe/wintun.dll 内嵌进单文件 exe,首次运行由 KernelInstaller.Ensure() 幂等解包到 %ProgramData%\\YuanC\\bin\\<内核版本>\\;发布脚本 scripts/release/build-winclient.ps1 出 build/release/YuanC-Client-0.1.0.exe。现状问题:单进程 WPF、app.manifest requireAdministrator 每次启动弹 UAC、关窗口隧道就断、开机不自动连。方案正本 docs/design/方案v2-中国客户端-澳洲出口.md §6 第 94 行:「TUN 需要管理员权限:首次运行安装一个 Windows 服务负责起 TUN 与 sing-box,之后界面程序不再弹 UAC;服务和界面分进程,界面崩了隧道不掉」;客户要求常年自动运行。先读 docs/winclient/架构说明.md(状态机、断网保护、配对文件、存储位置全在里面)、docs/winclient/打包与发布说明.md、ClientRuntime/ClientController/ClientSettings、Storage/DpapiCredentialStore、Pairing/PairingStore、Process/SingBoxProcessManager(子进程隐藏窗口的既有写法)、Firewall/CommandRunner.cs(ICommandRunner 可复用,文件本身禁改)、App.xaml.cs/MainWindow/MainViewModel、现有测试。环境:NuGet.Config 只有 nuget.org 源;工位无外网,所以只能用本机 NuGet 缓存(%USERPROFILE%\\.nuget\\packages)里已有的包:system.serviceprocess.servicecontroller、system.security.accesscontrol、system.security.principal.windows、system.io.filesystem.accesscontrol、microsoft.win32.registry 都在缓存里(用缓存里有的版本;Registry 与 System.IO.Pipes.AccessControl 其实是 .NET 9 框架自带,优先不加包);不许引入缓存里没有的包(缺就交 blocked)。CI 是本机自托管 Windows runner 跑 dotnet test winclient。\n硬规矩:①服务侧与界面侧严格分离:只有服务进程碰防火墙、内核、凭据、配对文件;界面只经管道;Core 继续不引用 WPF/WinForms。②所有新起子进程(sc.exe、runas 拉起自己除外——它必须 UseShellExecute=true 才能提权,但目标是无控制台的 WPF exe 不会弹黑窗)CreateNoWindow=true、UseShellExecute=false;服务宿主内任何子进程同样。③安装动作幂等可重跑,第二次零变更;失败不假装成功。④管道只本机、ACL 明确,不监听 TCP。⑤既有状态机迁移表、退避常数、断网保护语义(关窗口/服务停止不撤防;只有用户点断开撤防)一律不改;不改 Firewall/**、Auth/**、Pairing/PairingFile.cs、Pairing/LocalConfigRenderer.cs、State/**、Kernel/**(只许用)。⑥既有测试只加不改断言;遇到既有测试因新增可选参数需补夹具按全局持续授权处理并在交活说明里列出。⑦凭据与配对文件在服务侧用 LocalMachine DPAPI + 仅 SYSTEM/管理员可读的目录,日志经 RedactingLog,任何日志与管道错误文案不含令牌、密码、UUID。⑧不做自动更新(只把安装位置放到 %ProgramFiles%\\YuanC\\app\\<Version>\\ 为它预留)、不做代码签名、不做 MSI、不做看门狗探测(SCM 失败动作负责拉起)。⑨中文文案面向不懂电脑的客户,不出现英文术语(「后台服务」而不是 service)。遇到施工面外文件、包缺失、拿不准的设计点,停下交 blocked + forks,不要自己定。搜索用 rg 或 git grep。",
+  "nonGoals": [
+    "不做客户端自动更新(WINCLIENT-UPDATE-1022;本单只把安装位置定在 %ProgramFiles%\\YuanC\\app\\<Version>\\)",
+    "不做断网保护加固(WINCLIENT-KILLSWITCH-HARDEN-1022)",
+    "不做代码签名、MSI、安装向导",
+    "不写 Windows 事件日志、不加看门狗探测;服务存活靠 SCM 失败动作自动重启",
+    "不迁移旧位置(LOCALAPPDATA、CurrentUser DPAPI)的凭据与配对文件;产品尚未交付任何客户",
+    "不在干净虚拟机实测(真机项:UAC 一次、服务开机自启、托盘、管道 ACL、SmartScreen;写进文档待验证清单)"
+  ],
+  "allowedPaths": [
+    "winclient/**",
+    "docs/winclient/**"
+  ],
+  "forbiddenPaths": [
+    "node/**",
+    "authserver/**",
+    "scripts/**",
+    "docs/开工须知.md",
+    "docs/口径速查表.md",
+    "docs/design/**",
+    "docs/交接/**",
+    "docs/node/**",
+    "docs/plans/**",
+    ".github/**",
+    ".codex/**",
+    ".gitignore",
+    "winclient/third_party/**",
+    "winclient/Directory.Build.props",
+    "winclient/NuGet.Config",
+    "winclient/WinClient.Core/Firewall/**",
+    "winclient/WinClient.Core/Auth/**",
+    "winclient/WinClient.Core/State/**",
+    "winclient/WinClient.Core/Kernel/**",
+    "winclient/WinClient.Core/Pairing/PairingFile.cs",
+    "winclient/WinClient.Core/Pairing/LocalConfigRenderer.cs",
+    "winclient/WinClient.Core/Logging/**",
+    "winclient/WinClient.Core/Process/**",
+    "winclient/WinClient.App/Properties/**",
+    "winclient/WinClient.App/EmbeddedKernelSource.cs"
+  ],
+  "expectArtifacts": [
+    "winclient/WinClient.App/Program.cs",
+    "winclient/WinClient.App/Hosting/ControlService.cs",
+    "winclient/WinClient.App/Hosting/InstallerRunner.cs",
+    "winclient/WinClient.Core/Ipc/ControlProtocol.cs",
+    "winclient/WinClient.Core/Ipc/ControlServer.cs",
+    "winclient/WinClient.Core/Ipc/ControlClient.cs",
+    "winclient/WinClient.Core/Client/IClientFacade.cs",
+    "winclient/WinClient.Core/Client/DesiredStateStore.cs",
+    "winclient/WinClient.Core/Hosting/ServiceInstaller.cs",
+    "winclient/WinClient.Tests/IpcTests.cs",
+    "winclient/WinClient.Tests/HostingTests.cs",
+    "docs/winclient/服务化与自启说明.md"
+  ],
+  "acceptance": [
+    {
+      "id": "BUILD",
+      "kind": "command",
+      "argv": ["dotnet", "build", "winclient/WinClient.sln", "-c", "Release", "--nologo"],
+      "required": true,
+      "timeoutSec": 1200,
+      "note": "只用 NuGet 缓存里已有的包;构建期第三方件走已校验缓存"
+    },
+    {
+      "id": "TEST",
+      "kind": "command",
+      "argv": ["dotnet", "test", "winclient/WinClient.sln", "-c", "Release", "--no-build", "--nologo"],
+      "required": true,
+      "timeoutSec": 900,
+      "note": "既有测试全过且断言未改;新增 IpcTests / HostingTests 见 goal ⑧"
+    },
+    {
+      "id": "PUBLISH",
+      "kind": "command",
+      "argv": ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", "scripts/release/build-winclient.ps1"],
+      "required": true,
+      "timeoutSec": 1800,
+      "note": "服务化后单文件出包仍成立(WinForms 托盘与 ServiceController 都进单文件)"
+    },
+    {
+      "id": "ASINVOKER",
+      "kind": "command",
+      "argv": ["python", "-c", "import pathlib,sys;t=pathlib.Path('winclient/WinClient.App/app.manifest').read_text(encoding='utf-8');print('asInvoker' in t, 'requireAdministrator' in t);sys.exit(0 if 'level=\"asInvoker\"' in t and 'requireAdministrator' not in t else 1)"],
+      "required": true,
+      "timeoutSec": 60,
+      "note": "界面不再要求管理员"
+    },
+    {
+      "id": "COREPURE",
+      "kind": "command",
+      "argv": ["python", "-c", "import pathlib,sys;t=pathlib.Path('winclient/WinClient.Core/WinClient.Core.csproj').read_text(encoding='utf-8');bad=[k for k in ('UseWPF','UseWindowsForms','PresentationFramework','System.Windows.Forms') if k in t];src=[str(p) for p in pathlib.Path('winclient/WinClient.Core').rglob('*.cs') if 'System.Windows' in p.read_text(encoding='utf-8') or 'System.IO.Pipes.NamedPipe' in p.read_text(encoding='utf-8')];print(bad,src);sys.exit(1 if bad or src else 0)"],
+      "required": true,
+      "timeoutSec": 60,
+      "note": "Core 不引用 WPF/WinForms,也不直接依赖命名管道类型(管道在 App 宿主里创建,Core 只认 Stream)"
+    },
+    {
+      "id": "NOWINDOW",
+      "kind": "command",
+      "argv": ["python", "-c", "import pathlib,re,sys;bad=[];\nfor p in list(pathlib.Path('winclient/WinClient.Core').rglob('*.cs'))+list(pathlib.Path('winclient/WinClient.App').rglob('*.cs')):\n  if any(s in str(p) for s in ('/obj/','\\\\obj\\\\','/bin/','\\\\bin\\\\')): continue\n  t=p.read_text(encoding='utf-8')\n  if 'ProcessStartInfo' in t and 'Firewall' not in str(p) and 'Process' not in p.parent.name and 'CreateNoWindow = true' not in t: bad.append(str(p))\nprint(bad);sys.exit(1 if bad else 0)"],
+      "required": true,
+      "timeoutSec": 60,
+      "note": "新写的任何起子进程的文件都显式 CreateNoWindow=true(runas 拉起自己那一处也要写,虽然目标无控制台)"
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "argv": ["python", "-c", "import pathlib,sys;a=pathlib.Path('docs/winclient/服务化与自启说明.md');b=pathlib.Path('docs/winclient/架构说明.md').read_text(encoding='utf-8');ok=a.exists() and all(k in a.read_text(encoding='utf-8') for k in ('YuanCService','--service','--install','--uninstall','desired.json','YuanC-Control','secure','真机')) and '本单不做服务化' not in b and '不实施 Windows 服务' not in b;print(ok);sys.exit(0 if ok else 1)"],
+      "required": true,
+      "timeoutSec": 60,
+      "note": "新文档齐全;架构说明里的过时口径已改"
+    },
+    {
+      "id": "NOBIN",
+      "kind": "command",
+      "argv": ["python", "-c", "import subprocess,sys;out=subprocess.run(['git','ls-files','winclient','build'],capture_output=True,text=True).stdout.split();bad=[f for f in out if f.endswith(('.exe','.dll','.zip','.pdb'))];print(bad);sys.exit(1 if bad else 0)"],
+      "required": true,
+      "timeoutSec": 60,
+      "note": "二进制不入库(只查已跟踪文件,不要求工人做 git 操作)"
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "model": null,
+  "timeoutSec": 10800,
+  "repoRoot": "E:/yuanc",
+  "engine": "codex",
+  "reasoningEffort": "high",
+  "steps": [
+    "读 background 列的材料;确认 NuGet 缓存里 System.ServiceProcess.ServiceController 的版本号;确认 .NET 9 框架自带 Microsoft.Win32.Registry 与 NamedPipeServerStreamAcl。",
+    "Core:Ipc/ControlProtocol + ControlServer + ControlClient(基于 Stream)、Client/IClientFacade(ClientRuntime 实现)、Client/DesiredStateStore、ClientController.InitializeAsync(autoConnect)、三个存储加 root/scope 可选参数、ClientRuntime.CreateAsync 透传;先写红测试再转绿。",
+    "Core:Hosting/ServiceInstaller 纯函数(sc 参数、Run 值、复制判定、ProcessStartInfo 工厂)+ 测试。",
+    "App:Program.cs 角色分发、Hosting/ControlService(ServiceBase + 管道 ACL + secure 目录 ACL)、Hosting/InstallerRunner(--install/--repair/--uninstall)、app.manifest 改 asInvoker、csproj 加 UseWindowsForms 与 ServiceController 包。",
+    "App:MainViewModel 改走 ControlClient;服务未安装/未运行/连不上的三种界面状态;托盘 NotifyIcon;关窗口隐藏;第二实例用命名事件唤起第一实例。",
+    "文档三处;本机跑 BUILD/TEST/PUBLISH 与各 python 断言;交活说明列出:补过夹具的既有测试、用到的包与版本、真机待验证清单。"
+  ]
+}
