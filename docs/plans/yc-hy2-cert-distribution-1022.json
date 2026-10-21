@@ -1,0 +1,81 @@
+{
+  "schemaVersion": 1,
+  "taskId": "HY2-CERT-DISTRIBUTION-1022",
+  "slug": "yc-hy2-cert-distribution-1022",
+  "title": "备用通道证书下发:配对文件升 ycpair/2(新增 hy2_server_name 与 hy2_certificate 两键、reality_port 取配置),节点三处渲染器 / 鉴权服务器下发 node / Windows 客户端解析与渲染同步,客户端 hysteria2 出站写 tls.certificate 显式信任自签证书,黄金文件同步;禁止用 insecure 关校验",
+  "goal": "做完后,备用通道(Hysteria2)在客户端真正能过 TLS 校验:①节点侧 ProxyContext 新增 reality_port(默认 443)并在 render_client_windows / vless_link / render_server 中取 ctx 值而不是写死 443;service.build_context 传 config.proxy.reality_port,并经 runner 读 secrets/hy2.crt 填 ctx.hy2_certificate(按行拆成 tuple,去掉空行);②render_client_windows 的 hysteria2 出站 tls 必须含 server_name=ctx.hy2_server_name 与 certificate=[PEM 各行](沿用 context.hy2_certificate 既有字段);黄金文件 node/tests/golden/proxy/inputs.json 加 hy2_certificate(测试向量 PEM,头部 _comment 注明不是真证书)、client-windows.json 对应加 tls.certificate,其余字段不变;③配对文件格式升为 ycpair/2:node 对象在原八键之外新增 hy2_server_name(字符串)与 hy2_certificate(字符串数组,PEM 各行),reality_port 取 ctx.reality_port;device.render_pair / 黄金 node/tests/golden/device/pair.ycpair.json 同步;format 字段写 \"ycpair/2\";④鉴权服务器:config.Node 新增 hy2_server_name(默认 exitnode)与 hy2_certificate_path(必填,启动时经 Path 读取为行数组,读不到启动失败并给中文原因,不回显路径以外的内容);service.session() 下发的 node 对象新增 hy2_server_name、hy2_certificate 两键;clientconfig.render 的 hysteria2 tls 用 node_ctx 的 hy2_server_name 与 certificate(不再用 sni 当备用通道证书名);authserver 测试里「node 键集合」断言更新为十键;⑤Windows 客户端:NodeInfo 新增 Hy2ServerName(string)与 Hy2Certificate(string[]);PairingFile 接受 format 为 ycpair/1 或 ycpair/2——v2 必须有这两键且 hy2_certificate 每行非空、首行为 -----BEGIN CERTIFICATE-----、末行为 -----END CERTIFICATE-----、hy2_server_name 为合法主机名,v1 没有这两键时渲染行为与现在完全一致(server_name 写 exitnode、不写 certificate)并在界面消息里提示「配对文件是旧版,备用线路可能不可用,建议在小主机上重新导出」;LocalConfigRenderer 对 v2 写 tls.server_name 与 tls.certificate;PairingTests 黄金比对改为读新的 inputs.json(含证书)与 client-windows.json;⑥三处渲染器(node client_config、authserver clientconfig、winclient LocalConfigRenderer)对同一输入渲染出的 hysteria2 出站 tls 字段必须相同,写一个 node 侧测试把 authserver.clientconfig.render 的 hysteria2 tls 与 client_config 的比对(两包都在 pyproject pythonpath 里,可直接 import);⑦全程不出现 \"insecure\": true。",
+  "background": "项目:客户自购小主机放在澳大利亚家庭宽带下当出口节点,客户自用版第一优先。正本:docs/design/方案v2-中国客户端-澳洲出口.md §3(主 VLESS+Reality、备 Hysteria2,两条都不通才报人工、不回落裸网)、§5.1(配对文件字段与鉴权服务器 /client/session 的 node 完全相同,客户端走同一渲染路径);docs/node/隧道配置说明.md 已写明「使用自签证书时,客户端必须明确配置所信任的证书,不能关闭证书校验」。现状缺口:节点 init 用 openssl 生成自签 ECDSA 证书 secrets/hy2.crt(NODE-PROXY-INTEGRATE-1024),服务端 render_server 用它;但三处客户端渲染器的 hysteria2 tls 只有 enabled+server_name,ProxyContext.hy2_certificate 字段一直是空 tuple,配对文件也不带证书 → 客户端备用通道 TLS 必失败。已落地可复用:node/exitnode/proxy/context.py(hy2_certificate: tuple[str,...] 字段已存在,client_config 已有「有证书就写 certificate」分支)、service.build_context、device.render_pair / PairFile TypedDict、authserver/authserver/{config,service,clientconfig}.py、winclient/WinClient.Core/{Auth/AuthModels.cs(NodeInfo),Pairing/*}.py、winclient/WinClient.Tests/PairingTests.cs(读节点黄金文件)。测试向量证书:用 cryptography 在测试里现生成或写死一张自签 ECDSA 测试证书 PEM 到 inputs.json(注明测试向量),不许把真机证书放进仓库。\n硬规矩:①不许在任何渲染器写 insecure: true、不许在客户端关闭证书校验;②配对文件与 /client/session 的 node 键集合必须逐字相同(十键:host, reality_port, hy2_port, sni, reality_public_key, short_id, uuid, hy2_password, hy2_server_name, hy2_certificate),node 侧测试把两边键集合比一遍(authserver 可 import);③不改 node/exitnode/cli.py、config.py、manifest.py、systemd.py、templates(看门狗单正在改这些文件);④不改 ConnectionStateMachine、KillSwitch;⑤既有测试断言只许因格式升级而改的那些(黄金文件、键集合、format 字段),其余不动;NuGet 不加包;Python 不加依赖(cryptography 已在 requirements-dev);⑥winclient 自测的编译产物已配置输出到仓库根 build/,不会落在 winclient/ 里。\n遇到要改施工面外文件、缺依赖、要放宽断言,停下交 blocked + forks。搜索用 rg 或 git grep。",
+  "nonGoals": [
+    "不做三处渲染器合并为一处(CLIENT-RENDERER-UNIFY-1022 另卡),本单只把三处的 hysteria2 tls 口径对齐并用测试锁住",
+    "不做证书轮换、不做 CA 签发",
+    "不改节点 init 流程与 cli(看门狗单在改)",
+    "不改 docs/ 正本;可修订 docs/node/隧道配置说明.md、docs/node/自用配对说明.md、docs/winclient/架构说明.md 对应段落"
+  ],
+  "allowedPaths": [
+    "node/exitnode/proxy/context.py",
+    "node/exitnode/proxy/client_config.py",
+    "node/exitnode/proxy/subscription.py",
+    "node/exitnode/proxy/server_config.py",
+    "node/exitnode/service.py",
+    "node/exitnode/device.py",
+    "node/tests/**",
+    "authserver/**",
+    "winclient/**",
+    "docs/node/隧道配置说明.md",
+    "docs/node/自用配对说明.md",
+    "docs/winclient/**"
+  ],
+  "forbiddenPaths": [
+    "node/exitnode/cli.py",
+    "node/exitnode/config.py",
+    "node/exitnode/manifest.py",
+    "node/exitnode/systemd.py",
+    "node/exitnode/templates/**",
+    "node/exitnode/runner.py",
+    "node/exitnode/netinfo.py",
+    "node/exitnode/status.py",
+    "node/exitnode/log.py",
+    "node/exitnode/nft.py",
+    "node/exitnode/watchdog/**",
+    "docs/开工须知.md",
+    "docs/口径速查表.md",
+    "docs/design/**",
+    "docs/交接/**",
+    "pyproject.toml",
+    "requirements-dev.txt",
+    ".github/**",
+    ".codex/**"
+  ],
+  "expectArtifacts": [
+    "node/tests/golden/proxy/inputs.json",
+    "node/tests/golden/proxy/client-windows.json",
+    "node/tests/golden/device/pair.ycpair.json",
+    "node/tests/test_renderer_parity.py",
+    "winclient/WinClient.Core/Pairing/PairingFile.cs"
+  ],
+  "acceptance": [
+    { "id": "NODESUITE", "kind": "command", "argv": ["python", "-m", "pytest", "-q", "node/tests"], "required": true, "timeoutSec": 600, "note": "黄金文件含证书;render_client_windows / vless_link / render_server 取 ctx.reality_port;配对文件 ycpair/2 十键与 authserver session node 键集合相同;三处渲染器 hysteria2 tls 一致;源码与黄金文件无 insecure" },
+    { "id": "AUTHSUITE", "kind": "command", "argv": ["python", "-m", "pytest", "-q", "authserver/tests"], "required": true, "timeoutSec": 600, "note": "config 缺 hy2_certificate_path 或文件读不到 → 启动失败中文原因;session 下发十键;clientconfig hysteria2 tls 含 server_name 与 certificate" },
+    { "id": "RUFF", "kind": "command", "argv": ["python", "-m", "ruff", "check", "."], "required": true, "timeoutSec": 300 },
+    { "id": "BUILD", "kind": "command", "argv": ["dotnet", "build", "winclient/WinClient.sln", "--nologo", "-v", "q"], "required": true, "timeoutSec": 900 },
+    { "id": "TEST", "kind": "command", "argv": ["dotnet", "test", "winclient/WinClient.sln", "--nologo", "-v", "q"], "required": true, "timeoutSec": 900, "note": "ycpair/2 每条新校验各一个失败样本;v1 仍能导入并给旧版提示且渲染不变;v2 渲染与新黄金文件深比对相等;既有用例保持通过" },
+    { "id": "NOINSECURE", "kind": "command", "argv": ["python", "-c", "import pathlib,sys;bad=[str(p) for p in list(pathlib.Path('node').rglob('*.py'))+list(pathlib.Path('authserver').rglob('*.py'))+list(pathlib.Path('winclient').rglob('*.cs'))+list(pathlib.Path('node/tests/golden').rglob('*.json')) if 'obj' not in p.parts and 'bin' not in p.parts and 'insecure' in p.read_text(encoding='utf-8',errors='ignore').lower()];print(bad);sys.exit(1 if bad else 0)"], "required": true, "timeoutSec": 60, "note": "三端源码与黄金文件都不许出现 insecure" },
+    { "id": "NOSECRET", "kind": "command", "argv": ["python", "-c", "import pathlib,re,sys;pat=re.compile(r'(BEGIN (EC )?PRIVATE KEY|vless://|[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})');bad=[str(p) for p in list(pathlib.Path('node/exitnode').rglob('*.py'))+list(pathlib.Path('authserver/authserver').rglob('*.py'))+[q for q in pathlib.Path('winclient').rglob('*.cs') if 'obj' not in q.parts and 'bin' not in q.parts and 'Tests' not in str(q)] if pat.search(p.read_text(encoding='utf-8',errors='ignore'))];print(bad);sys.exit(1 if bad else 0)"], "required": true, "timeoutSec": 60, "note": "生产源码里没有私钥、链接或写死的 UUID" }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "model": null,
+  "timeoutSec": 7200,
+  "repoRoot": "E:/yuanc",
+  "engine": "codex",
+  "reasoningEffort": "medium",
+  "steps": [
+    "读方案 §3 §5.1、docs/node/隧道配置说明.md;通读 node/exitnode/proxy/**、service.py、device.py、node/tests/golden/**、authserver/authserver/{config,service,clientconfig}.py 与其测试、winclient Pairing/* 与 Auth/AuthModels.cs、PairingTests.cs。",
+    "节点:context.py 加 reality_port=443;client_config / subscription / server_config 用 ctx.reality_port;service.build_context 传 reality_port 并读 hy2.crt 行填 hy2_certificate;device.render_pair 输出 ycpair/2 十键;黄金 inputs.json / client-windows.json / pair.ycpair.json 同步(测试向量证书注明);新增 node/tests/test_renderer_parity.py 比对 authserver.clientconfig.render 与 client_config 的 hysteria2 tls,并比对 ycpair node 键集合与 authserver session 的 node 键集合。",
+    "鉴权服务器:config.Node 加 hy2_server_name / hy2_certificate_path(读文件为行数组,失败中文报错);service.session node 加两键;clientconfig hysteria2 tls 用 hy2_server_name 与 certificate;测试更新。",
+    "客户端:NodeInfo 加 Hy2ServerName / Hy2Certificate;PairingFile 接受 v1/v2 并按 goal ⑤ 校验、v1 给旧版提示(通过 DisplayName 或单独的 Warning 属性,界面消息里带出);LocalConfigRenderer 写 tls.server_name 与 tls.certificate;PairingTests 新增 v2 失败样本与 v1 兼容用例,黄金比对改读新文件。",
+    "文档:隧道配置说明补「备用通道证书怎么到电脑上」一段;自用配对说明补「旧版配对文件要重新导出」;架构说明补 ycpair/2。",
+    "交活:changedFiles 列全;逐条列出因格式升级而改动的既有断言。"
+  ]
+}

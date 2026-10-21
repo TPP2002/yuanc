@@ -1,0 +1,83 @@
+{
+  "schemaVersion": 1,
+  "taskId": "NODE-WATCHDOG-1030",
+  "slug": "yc-node-watchdog-1030",
+  "title": "节点看门狗:每分钟一次分层探测(网卡/默认路由 → 上游 → 隧道服务进程与配置 → 本机监听入口 → 公网地址),恢复梯子「重探 → 有限重试 → 重启本项目服务 → 回滚上一个已知可用配置 → 报人工」带退避与频率上限,持续失联 ≥30 分钟且 6 小时内未重启过才有界整机重启;systemd timer 驱动;init 接入并可撤回;硬件看门狗 drop-in 可选",
+  "goal": "做完后:①新包 node/exitnode/watchdog/(probes.py 探测、ladder.py 恢复梯子、state.py 状态文件、__init__.py),`exitnode watchdog tick` 跑一轮:按层探测,全过 → 状态 normal、把 secrets/sing-box.json 复制为 secrets/sing-box.last-good.json(仅当内容变化且隧道层通过时)、清零失败计数;某层失败 → 按梯子选下一动作并执行一步,写状态文件 <data_dir>/watchdog/state.json(0600;含 state、consecutive_failures、first_failure_at、last_ok_at、actions[] 最近 50 条动作与时间、restart_count_window、last_rollback_at、last_reboot_at),退出码 0=normal/1=degraded 在恢复中/2=manual 需人工;②梯子与上限(全部可在 config.watchdog 段配置并有默认值):第 1 次失败 → 立即重探一次(同一 tick 内,最多 1 次);仍失败 → 「有限重试」:连续失败 2~3 次(即 2~3 分钟)只记录不动作;第 4 次 → 重启受影响服务(只许 systemctl restart exitnode-proxy.service / exitnode-admin.service,1 小时窗口内最多 3 次);重启满额仍失败 → 回滚:把 sing-box.last-good.json 经 sing-box check 后替换 LIVE 并 restart(6 小时内最多 1 次,没有 last-good 就跳过这级);回滚后仍失败 → state=manual、退出码 2,并写 reason;③有界整机重启:只有 state=manual 且 first_failure_at 距今 ≥ reboot_after_minutes(默认 30)且 last_reboot_at 距今 ≥ reboot_min_interval_hours(默认 6)且 config.watchdog.reboot_enabled(默认 true)时,先把 last_reboot_at 写进状态文件再 `systemctl reboot`;其余任何情况不许重启;「网卡/默认路由」层失败(本机没网)不算入重启判据之外——它同样计入,因为拔网线 30 分钟后重启一次无害且符合方案;④探测层定义(全部经 Runner,FakeRunner 可测):L-link = netinfo.read_network 有默认路由与地址;L-upstream = runner.tcp_connect 到 config.network.probe_targets 任一 443 成功;L-proxy = systemctl is-active exitnode-proxy.service 为 active 且 `<binary> check -c LIVE` 退出 0;L-listen = `ss -ltnH` 输出里有 :443 监听且 `ss -lunH` 有 :<hy2_port>(命令缺失当未知、不算失败但记录);L-public = netinfo.public_ipv4 非 None(只在前四层都过时探,失败只降级为 degraded 不触发重启服务——那是外网问题);受影响服务判定:L-proxy / L-listen 失败 → exitnode-proxy;其余层失败不重启服务只走重探/等待/有界重启;⑤systemd:templates/exitnode-watchdog.service 改为 ExecStart=/usr/bin/python3 -m exitnode --config \"$config_path\" watchdog tick,Type=oneshot;timer OnBootSec=90、OnUnitActiveSec=60、Persistent=false;init 新增步骤「启用看门狗定时器」(systemctl enable --now exitnode-watchdog.timer,undo kind systemctl unit exitnode-watchdog.timer),放在「启用隧道服务」之后、自动发第一台设备之前;⑥硬件看门狗(可选步骤):config.watchdog.hardware(默认 true)且 runner.exists('/dev/watchdog') 时,写 /etc/systemd/system.conf.d/exitnode-watchdog.conf 内容 [Manager]\\nRuntimeWatchdogSec=60\\nRebootWatchdogSec=10min\\n(manifest 步骤「硬件看门狗」,undo remove_file 该文件 + daemon-reexec 经 systemctl;已有同名文件不是本清单写的拒绝),不存在 /dev/watchdog 则记录跳过、不算失败;⑦`exitnode status` 输出新增 watchdog 字段(state、last_ok_at、consecutive_failures、last_action)——读状态文件,没有就 null;status 的四档映射:watchdog manual → 需人工处理,degraded → 重连中;⑧check 命令增加「看门狗」层(timer is-active 且状态文件 24 小时内有更新 = 通过);⑨每周例行重启:config.watchdog.weekly_reboot(默认 false)时才生成 exitnode-weekly-reboot.timer,本单只留配置字段与默认 false,不生成单元(写进 nonGoals)。",
+  "background": "项目:客户自购小主机放在澳大利亚家庭宽带下当出口节点,要求常年无人值守。正本:docs/design/方案v2-中国客户端-澳洲出口.md §7(watchdog 模块定义)、§7.1 L1/L2/L5(分层探测、恢复顺序、退避与频率上限、有界重启 30 分钟 / 6 小时一次、硬件看门狗)、§9 A05/A06/A07/A08;docs/口径速查表.md。已落地可复用:node/exitnode/netinfo.py(read_network、check 分层结果、public_ipv4)、status.py(四档 State 与 evaluate)、service.py(UNIT、LIVE、check(runner, config) 隧道层;不要改它,证书单正在改)、manifest.py(apply/undo 种类 remove_file/restore_file/systemctl/nft;UNITS 已含 exitnode-watchdog.service/.timer)、cli.py(init 步骤、check/status/diagnose;device 子命令组可参考怎么挂子命令)、config.py(严格校验未知键;加 watchdog 段要给全默认值并同步 node/examples/config.example.toml)、runner.py(Runner 协议;需要复制文件就用 read_file+write_file 不加新方法)、templates/exitnode-watchdog.{service,timer}(现为占位)。时间全部可注入(clock 参数,默认 datetime.now(UTC)),状态文件里的时间用 ISO 字符串。\n硬规矩:①所有主机副作用只经 Runner,测试全部 FakeRunner,一个真实系统调用都不许;②只许 restart / reboot 本项目的单元与整机(systemctl restart 只能带 exitnode- 前缀单元;reboot 只能是 systemctl reboot 且必须先落 last_reboot_at);③频率上限是机器闸不是文案:测试要证明 1 小时内第 4 次重启被拒、6 小时内第 2 次回滚被拒、29 分钟不重启 / 30 分钟重启、6 小时内第二次重启被拒;④回滚前必须 sing-box check 通过,失败不动 LIVE;⑤日志与状态文件不含凭据(用 log.redact);⑥第二次 init 零新命令(既有测试 test_repeated_init_does_not_repeat_commands_and_uninstall_keeps_secrets 等继续通过,扩到新步骤);rollback/uninstall 逆序撤回 timer 与硬件 drop-in;⑦不改 service.py、device.py、proxy/**(证书单在改);⑧探测层失败原因文案给人看(中文、不含术语堆砌),进 status reason。\n遇到要改施工面外文件、缺依赖、要放宽断言、systemd 字段拿不准,停下交 blocked + forks,不要猜。搜索用 rg 或 git grep。",
+  "nonGoals": [
+    "不做每周例行重启单元(只留 config 字段默认 false)",
+    "不做 WatchdogSec 心跳接入 sing-box(它不实现 sd_notify;L1 由 Restart=always 覆盖)",
+    "不做入口发布器 / UPnP / DDNS、不做更新器、不做救援单元",
+    "不改 service.py / device.py / proxy/**(HY2-CERT-DISTRIBUTION-1022 并行施工)",
+    "不改 docs/ 正本;可新增 docs/node/看门狗说明.md"
+  ],
+  "allowedPaths": [
+    "node/exitnode/watchdog/**",
+    "node/exitnode/cli.py",
+    "node/exitnode/config.py",
+    "node/exitnode/status.py",
+    "node/exitnode/netinfo.py",
+    "node/exitnode/manifest.py",
+    "node/exitnode/systemd.py",
+    "node/exitnode/templates/exitnode-watchdog.service",
+    "node/exitnode/templates/exitnode-watchdog.timer",
+    "node/examples/config.example.toml",
+    "node/tests/**",
+    "docs/node/看门狗说明.md"
+  ],
+  "forbiddenPaths": [
+    "node/exitnode/service.py",
+    "node/exitnode/device.py",
+    "node/exitnode/proxy/**",
+    "node/exitnode/runner.py",
+    "node/exitnode/log.py",
+    "node/exitnode/nft.py",
+    "node/exitnode/templates/exitnode-proxy.service",
+    "node/exitnode/templates/exitnode-admin.service",
+    "authserver/**",
+    "winclient/**",
+    "docs/开工须知.md",
+    "docs/口径速查表.md",
+    "docs/design/**",
+    "docs/交接/**",
+    "pyproject.toml",
+    "requirements-dev.txt",
+    ".github/**",
+    ".codex/**"
+  ],
+  "expectArtifacts": [
+    "node/exitnode/watchdog/__init__.py",
+    "node/exitnode/watchdog/probes.py",
+    "node/exitnode/watchdog/ladder.py",
+    "node/exitnode/watchdog/state.py",
+    "node/tests/test_watchdog.py",
+    "docs/node/看门狗说明.md"
+  ],
+  "acceptance": [
+    { "id": "WATCHDOG", "kind": "test:targeted", "target": "node/tests/test_watchdog.py", "required": true, "failsOnBase": true, "note": "FakeRunner + 注入时钟:全过 → normal 且 last-good 更新且退出 0;第 1 次失败同 tick 重探一次;连续 2~3 次只记录;第 4 次 restart exitnode-proxy;1 小时内第 4 次 restart 被拒;restart 满额后回滚且先 check、check 失败 LIVE 不变;6 小时内第二次回滚被拒;无 last-good 跳过回滚进 manual;manual 29 分钟不重启、30 分钟 reboot 且先写 last_reboot_at;6 小时内第二次 reboot 被拒;reboot_enabled=false 永不 reboot;L-public 失败只 degraded 不 restart;ss 缺失当未知;状态文件 0600 且不含 uuid/密码;只对 exitnode- 前缀单元 restart" },
+    { "id": "CLI", "kind": "test:targeted", "target": "node/tests/test_cli.py", "required": true, "note": "既有用例保持通过;init 多「启用看门狗定时器」与(有 /dev/watchdog 时)「硬件看门狗」两步且第二次 init 零命令;rollback 撤回 timer 与 drop-in;status --json 多 watchdog 字段;check 多「看门狗」层;help 列出 watchdog" },
+    { "id": "CONFIG", "kind": "test:targeted", "target": "node/tests/test_config.py", "required": true, "note": "watchdog 段全部默认值;非法值(负数、reboot_after_minutes<5)拒绝;示例文件能 load" },
+    { "id": "SYSTEMD", "kind": "test:targeted", "target": "node/tests/test_systemd_render.py", "required": true, "note": "watchdog.service ExecStart 为 watchdog tick、Type=oneshot;timer OnUnitActiveSec=60、Persistent=false;模板注入仍被拒" },
+    { "id": "SUITE", "kind": "command", "argv": ["python", "-m", "pytest", "-q", "node/tests"], "required": true, "timeoutSec": 600 },
+    { "id": "RUFF", "kind": "command", "argv": ["python", "-m", "ruff", "check", "node"], "required": true, "timeoutSec": 300 },
+    { "id": "ONLYOURUNITS", "kind": "command", "argv": ["python", "-c", "import pathlib,re,sys;bad=[];\nfor p in pathlib.Path('node/exitnode/watchdog').rglob('*.py'):\n    t=p.read_text(encoding='utf-8')\n    for m in re.finditer(r'\"systemctl\",\\s*\"(restart|stop|start|disable|enable)\",\\s*\"([^\"]+)\"',t):\n        if not m.group(2).startswith('exitnode-'): bad.append(str(p)+':'+m.group(0))\n    if re.search(r'\"(shutdown|poweroff|halt)\"',t): bad.append(str(p)+':shutdown')\nprint(bad);sys.exit(1 if bad else 0)"], "required": true, "timeoutSec": 60, "note": "看门狗源码里 systemctl 只操作 exitnode- 前缀单元,不出现 shutdown/poweroff/halt" },
+    { "id": "SECRETS", "kind": "command", "argv": ["python", "-c", "import pathlib,re,sys;bad=[str(p) for p in pathlib.Path('node/exitnode').rglob('*.py') if re.search(r'(BEGIN (EC )?PRIVATE KEY|[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})', p.read_text(encoding='utf-8'))];print(bad);sys.exit(1 if bad else 0)"], "required": true, "timeoutSec": 60 }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "model": null,
+  "timeoutSec": 7200,
+  "repoRoot": "E:/yuanc",
+  "engine": "codex",
+  "reasoningEffort": "medium",
+  "steps": [
+    "读方案 §7 §7.1 §9、口径速查表;通读 cli.py、config.py、manifest.py、systemd.py、netinfo.py、status.py、service.py(只读)、runner.py、现有模板与 node/tests/**。",
+    "config.py:Watchdog 段(enabled=True, restart_limit_per_hour=3, rollback_min_interval_hours=6, reboot_enabled=True, reboot_after_minutes=30, reboot_min_interval_hours=6, hardware=True, weekly_reboot=False)带校验;examples 同步;test_config 补用例。",
+    "watchdog/state.py:状态文件读写(0600、原子替换、损坏则重建并记录);watchdog/probes.py:五层探测返回 [{layer,name,result,reason}];watchdog/ladder.py:decide(state, probes, now, config) -> action 与 execute(action, runner, config);tick(config, runner, clock) 组合三者并返回退出码。",
+    "cli.py:watchdog 子命令组(tick / status);init 追加「启用看门狗定时器」「硬件看门狗(可选)」;status 读状态文件加 watchdog 字段并影响四档;check 加「看门狗」层。模板与 systemd.render 按 goal ⑤ 改。",
+    "测试 test_watchdog.py(注入时钟与 FakeRunner,覆盖 acceptance 注释里每一条);test_cli / test_config / test_systemd_render 扩展;不放宽任何既有断言。",
+    "docs/node/看门狗说明.md:给维护人员看的「它每分钟干什么、什么情况会重启服务、什么情况会重启整机、怎么看它的状态、怎么临时关掉」;交活总结不含术语。"
+  ]
+}
