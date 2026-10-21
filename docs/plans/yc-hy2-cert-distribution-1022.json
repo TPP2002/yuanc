@@ -54,13 +54,100 @@
     "winclient/WinClient.Core/Pairing/PairingFile.cs"
   ],
   "acceptance": [
-    { "id": "NODESUITE", "kind": "command", "argv": ["python", "-m", "pytest", "-q", "node/tests"], "required": true, "timeoutSec": 600, "note": "黄金文件含证书;render_client_windows / vless_link / render_server 取 ctx.reality_port;配对文件 ycpair/2 十键与 authserver session node 键集合相同;三处渲染器 hysteria2 tls 一致;源码与黄金文件无 insecure" },
-    { "id": "AUTHSUITE", "kind": "command", "argv": ["python", "-m", "pytest", "-q", "authserver/tests"], "required": true, "timeoutSec": 600, "note": "config 缺 hy2_certificate_path 或文件读不到 → 启动失败中文原因;session 下发十键;clientconfig hysteria2 tls 含 server_name 与 certificate" },
-    { "id": "RUFF", "kind": "command", "argv": ["python", "-m", "ruff", "check", "."], "required": true, "timeoutSec": 300 },
-    { "id": "BUILD", "kind": "command", "argv": ["dotnet", "build", "winclient/WinClient.sln", "--nologo", "-v", "q"], "required": true, "timeoutSec": 900 },
-    { "id": "TEST", "kind": "command", "argv": ["dotnet", "test", "winclient/WinClient.sln", "--nologo", "-v", "q"], "required": true, "timeoutSec": 900, "note": "ycpair/2 每条新校验各一个失败样本;v1 仍能导入并给旧版提示且渲染不变;v2 渲染与新黄金文件深比对相等;既有用例保持通过" },
-    { "id": "NOINSECURE", "kind": "command", "argv": ["python", "-c", "import pathlib,sys;bad=[str(p) for p in list(pathlib.Path('node').rglob('*.py'))+list(pathlib.Path('authserver').rglob('*.py'))+list(pathlib.Path('winclient').rglob('*.cs'))+list(pathlib.Path('node/tests/golden').rglob('*.json')) if 'obj' not in p.parts and 'bin' not in p.parts and 'insecure' in p.read_text(encoding='utf-8',errors='ignore').lower()];print(bad);sys.exit(1 if bad else 0)"], "required": true, "timeoutSec": 60, "note": "三端源码与黄金文件都不许出现 insecure" },
-    { "id": "NOSECRET", "kind": "command", "argv": ["python", "-c", "import pathlib,re,sys;pat=re.compile(r'(BEGIN (EC )?PRIVATE KEY|vless://|[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})');bad=[str(p) for p in list(pathlib.Path('node/exitnode').rglob('*.py'))+list(pathlib.Path('authserver/authserver').rglob('*.py'))+[q for q in pathlib.Path('winclient').rglob('*.cs') if 'obj' not in q.parts and 'bin' not in q.parts and 'Tests' not in str(q)] if pat.search(p.read_text(encoding='utf-8',errors='ignore'))];print(bad);sys.exit(1 if bad else 0)"], "required": true, "timeoutSec": 60, "note": "生产源码里没有私钥、链接或写死的 UUID" }
+    {
+      "id": "NODESUITE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+        "node/tests"
+      ],
+      "required": true,
+      "timeoutSec": 600,
+      "note": "黄金文件含证书;render_client_windows / vless_link / render_server 取 ctx.reality_port;配对文件 ycpair/2 十键与 authserver session node 键集合相同;三处渲染器 hysteria2 tls 一致;源码与黄金文件无 insecure"
+    },
+    {
+      "id": "AUTHSUITE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+        "authserver/tests"
+      ],
+      "required": true,
+      "timeoutSec": 600,
+      "note": "config 缺 hy2_certificate_path 或文件读不到 → 启动失败中文原因;session 下发十键;clientconfig hysteria2 tls 含 server_name 与 certificate"
+    },
+    {
+      "id": "RUFF",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "ruff",
+        "check",
+        "."
+      ],
+      "required": true,
+      "timeoutSec": 300
+    },
+    {
+      "id": "BUILD",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "build",
+        "winclient/WinClient.sln",
+        "--nologo",
+        "-v",
+        "q"
+      ],
+      "required": true,
+      "timeoutSec": 900
+    },
+    {
+      "id": "TEST",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "test",
+        "winclient/WinClient.sln",
+        "--nologo",
+        "-v",
+        "q"
+      ],
+      "required": true,
+      "timeoutSec": 900,
+      "note": "ycpair/2 每条新校验各一个失败样本;v1 仍能导入并给旧版提示且渲染不变;v2 渲染与新黄金文件深比对相等;既有用例保持通过"
+    },
+    {
+      "id": "NOINSECURE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;bad=[str(p) for p in list(pathlib.Path('node/exitnode').rglob('*.py'))+list(pathlib.Path('authserver/authserver').rglob('*.py'))+list(pathlib.Path('winclient/WinClient.Core').rglob('*.cs'))+list(pathlib.Path('winclient/WinClient.App').rglob('*.cs'))+list(pathlib.Path('node/tests/golden').rglob('*.json')) if 'obj' not in p.parts and 'bin' not in p.parts and 'insecure' in p.read_text(encoding='utf-8',errors='ignore').lower()];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60,
+      "note": "三端生产源码与黄金文件都不许出现 insecure(测试文件里的反向断言不算)"
+    },
+    {
+      "id": "NOSECRET",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,re,sys;pat=re.compile(r'(BEGIN (EC )?PRIVATE KEY|[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})');bad=[str(p) for p in list(pathlib.Path('node/exitnode').rglob('*.py'))+list(pathlib.Path('authserver/authserver').rglob('*.py'))+[q for q in pathlib.Path('winclient').rglob('*.cs') if 'obj' not in q.parts and 'bin' not in q.parts and 'Tests' not in str(q)] if pat.search(p.read_text(encoding='utf-8',errors='ignore'))];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60,
+      "note": "生产源码里没有私钥或写死的 UUID"
+    }
   ],
   "sandbox": "workspace-write",
   "cwd": null,
