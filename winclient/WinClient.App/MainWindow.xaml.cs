@@ -6,12 +6,18 @@ namespace WinClient.App;
 
 public partial class MainWindow : Window
 {
-    private readonly MainViewModel model = new();
+    private readonly MainViewModel model;
     public MainWindow()
     {
         InitializeComponent();
+        model = new MainViewModel(ChoosePairingFile);
         DataContext = model;
         Loaded += async (_, _) => await model.InitializeAsync();
+    }
+    private string? ChoosePairingFile()
+    {
+        var dialog = new OpenFileDialog { Title = "导入配对文件", Filter = "配对文件 (*.ycpair)|*.ycpair", CheckFileExists = true, Multiselect = false };
+        return dialog.ShowDialog(this) == true ? dialog.FileName : null;
     }
     private void Export_Click(object sender, RoutedEventArgs e)
     {

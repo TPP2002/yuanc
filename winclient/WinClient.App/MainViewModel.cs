@@ -15,19 +15,31 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
     public string Code { get => code; set { code = value; Notify(); } }
     public string Status => snapshot.Status;
     public string Message => snapshot.Message;
+    public string Mode => "当前模式：" + snapshot.Mode;
     public bool IsBusy { get; private set; }
     public string ConnectLabel => snapshot.ProtectionActive || snapshot.State is ConnectionState.Connected or ConnectionState.Connecting or ConnectionState.Reconnecting ? "断开" : "连接";
     public ICommand RedeemCommand { get; }
     public ICommand ConnectCommand { get; }
+    public ICommand ImportPairingCommand { get; }
+    public ICommand ClearPairingCommand { get; }
     public event PropertyChangedEventHandler? PropertyChanged;
 
-    public MainViewModel()
+    public MainViewModel(Func<string?> choosePairingFile)
     {
         RedeemCommand = new AsyncCommand(() => RunAsync(async () =>
         { await runtime!.Controller.RedeemAsync(Code); Code = ""; }), () => runtime is not null && !IsBusy);
         ConnectCommand = new AsyncCommand(() => RunAsync(() => ConnectLabel == "断开"
             ? runtime!.Controller.DisconnectAsync() : runtime!.Controller.ConnectAsync()), () => runtime is not null && !IsBusy);
+        ImportPairingCommand = new AsyncCommand(() => RunAsync(async () =>
+        {
+            var path = choosePairingFile();
+            if (path is not null) await runtime!.ImportPairingAsync(await System.IO.File.ReadAllTextAsync(path));
+        }), CanChangePairing);
+        ClearPairingCommand = new AsyncCommand(() => RunAsync(() => runtime!.ClearPairingAsync()),
+            () => CanChangePairing() && snapshot.Mode == "自用模式");
     }
+    private bool CanChangePairing() => runtime is not null && !IsBusy && !snapshot.ProtectionActive &&
+        snapshot.State is not (ConnectionState.Connected or ConnectionState.Connecting or ConnectionState.Reconnecting);
     public async Task InitializeAsync() => await RunAsync(async () =>
     {
         runtime = await ClientRuntime.CreateAsync();
@@ -39,6 +51,8 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
     {
         IsBusy = true; Notify(nameof(IsBusy)); CommandManager.InvalidateRequerySuggested();
         try { await action(); }
+        catch (System.IO.InvalidDataException ex)
+        { Update(snapshot with { Message = ex.Message }); }
         catch (Exception ex) when (ex is System.IO.IOException or UnauthorizedAccessException or InvalidOperationException or
             System.Text.Json.JsonException or System.Security.Cryptography.CryptographicException or ArgumentException or OperationCanceledException)
         { Update(snapshot with { Status = "需人工处理", Message = "操作未完成，请检查服务器配置和恢复记录，或联系管理员。" }); }
@@ -48,7 +62,8 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
     {
         if (!Application.Current.Dispatcher.CheckAccess()) { Application.Current.Dispatcher.InvokeAsync(() => Update(value)); return; }
         snapshot = value;
-        Notify(nameof(Status)); Notify(nameof(Message)); Notify(nameof(ConnectLabel));
+        Notify(nameof(Status)); Notify(nameof(Message)); Notify(nameof(ConnectLabel)); Notify(nameof(Mode));
+        CommandManager.InvalidateRequerySuggested();
     }
     public void ExportAudit(string path)
     {

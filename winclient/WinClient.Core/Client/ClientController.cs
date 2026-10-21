@@ -7,13 +7,16 @@ using WinClient.Core.Storage;
 
 namespace WinClient.Core.Client;
 
-public sealed record ClientSnapshot(ConnectionState State, string Status, string Message, bool ProtectionActive);
+public sealed record ClientSnapshot(ConnectionState State, string Status, string Message, bool ProtectionActive)
+{
+    public string Mode { get; init; } = "未配置";
+}
 
 /// <summary>Owns the serialized user flow, effects and session lifetime; no UI dependencies.</summary>
 public sealed class ClientController : IDisposable
 {
-    private readonly AuthApiClient? auth;
-    private readonly ICredentialStore credentials;
+    private ISessionSource? sessionSource;
+    private readonly Func<TimeSpan, CancellationToken, Task> delayAsync;
     private readonly IKillSwitch firewall;
     private readonly ITunnelTransport tunnel;
     private readonly string program;
@@ -26,14 +29,18 @@ public sealed class ClientController : IDisposable
     private bool disposed;
     private long generation;
     private string message = "";
-    public ClientSnapshot Snapshot => new(machine.State, machine.StatusText, message, protection);
+    public ClientSnapshot Snapshot => new(machine.State, machine.StatusText, message, protection) { Mode = sessionSource?.Mode ?? "未配置" };
     public event Action<ClientSnapshot>? Changed;
 
     public ClientController(AuthApiClient? auth, ICredentialStore credentials, IKillSwitch firewall,
         ITunnelTransport tunnel, string program, DeviceInfo device)
+        : this(auth is null ? null : new AuthServerSessionSource(auth, credentials), firewall, tunnel, program, device) { }
+
+    public ClientController(ISessionSource? sessionSource, IKillSwitch firewall,
+        ITunnelTransport tunnel, string program, DeviceInfo device, Func<TimeSpan, CancellationToken, Task>? delayAsync = null)
     {
-        this.auth = auth;
-        this.credentials = credentials;
+        this.sessionSource = sessionSource;
+        this.delayAsync = delayAsync ?? ((delay, token) => Task.Delay(delay, token));
         this.firewall = firewall;
         this.tunnel = tunnel;
         this.program = program;
@@ -47,13 +54,13 @@ public sealed class ClientController : IDisposable
         try
         {
             await firewall.RecoverAsync();
-            if (auth is null) message = "未配置服务器";
+            if (sessionSource is null) message = "未配置服务器";
         }
         catch (Exception ex) when (IsOperational(ex)) { await FailAsync(); }
         finally { Publish(); gate.Release(); }
-        if (auth is not null && machine.State != ConnectionState.NeedsManual)
+        if (sessionSource is not null && machine.State != ConnectionState.NeedsManual)
         {
-            try { if (credentials.Load() is not null) await ConnectAsync(); }
+            try { if (sessionSource is PairingSessionSource || sessionSource is AuthServerSessionSource { HasCredentials: true }) await ConnectAsync(); }
             catch (Exception ex) when (IsOperational(ex)) { message = "无法读取本地登录凭据，请重新兑换邀请码。"; Publish(); }
         }
     }
@@ -63,12 +70,12 @@ public sealed class ClientController : IDisposable
         await gate.WaitAsync();
         try
         {
-            if (auth is null) { message = "未配置服务器"; return; }
+            if (sessionSource is not AuthServerSessionSource auth)
+            { message = sessionSource is PairingSessionSource ? "当前为自用模式；如需使用邀请码，请先清除配对文件。" : "未配置服务器"; return; }
             if (string.IsNullOrWhiteSpace(code)) { message = "请输入邀请码。"; return; }
-            var response = await auth.RedeemAsync(new RedeemRequest { Code = code.Trim(), Device = device, RefreshToken = credentials.Load() });
+            var response = await auth.RedeemAsync(code.Trim(), device);
             if (response.Result == AuthResult.Ok && response.Value is not null)
             {
-                credentials.Save(response.Value.RefreshToken);
                 message = "兑换成功，请点击连接。";
             }
             else message = AuthMessage(response.Result);
@@ -82,8 +89,9 @@ public sealed class ClientController : IDisposable
         await gate.WaitAsync();
         try
         {
-            if (auth is null) { message = "未配置服务器"; return; }
+            if (sessionSource is null) { message = "未配置服务器"; return; }
             if (machine.State is ConnectionState.Connected or ConnectionState.Connecting or ConnectionState.Reconnecting) return;
+            lifetime.Cancel();
             lifetime.Dispose();
             lifetime = new();
             Interlocked.Increment(ref generation);
@@ -125,10 +133,7 @@ public sealed class ClientController : IDisposable
 
     private async Task FetchSessionAsync()
     {
-        var refresh = credentials.Load();
-        if (string.IsNullOrWhiteSpace(refresh))
-        { await ExecuteAsync(machine.Handle(new(ConnectionEventKind.AuthRejected, AuthResult.InvalidToken))); return; }
-        var response = await auth!.SessionAsync(refresh, lifetime.Token);
+        var response = await sessionSource!.GetSessionAsync(lifetime.Token);
         lifetime.Token.ThrowIfCancellationRequested();
         if (response.Result != AuthResult.Ok || response.Value is null)
         { await ExecuteAsync(machine.Handle(new(ConnectionEventKind.AuthRejected, response.Result))); return; }
@@ -141,7 +146,7 @@ public sealed class ClientController : IDisposable
         session = next;
         if (protection && previous is not null)
         {
-            if (!NodeIps(previous).SequenceEqual(nextIps) || previous.Node.Hy2Port != next.Node.Hy2Port)
+            if (!NodeIps(previous).SequenceEqual(nextIps) || previous.Node.Hy2Port != next.Node.Hy2Port || previous.Node.RealityPort != next.Node.RealityPort)
                 await ExecuteAsync(machine.Handle(new(ConnectionEventKind.NodeChanged, OldIps: NodeIps(previous), NewIps: nextIps)));
             // Refresh can change credentials as well as addresses: restart under the existing protection.
             await ExecuteAsync(machine.Handle(new(machine.HasSession ? ConnectionEventKind.TunnelDown : ConnectionEventKind.SessionOk)));
@@ -157,13 +162,17 @@ public sealed class ClientController : IDisposable
         {
             switch (effect.Kind)
             {
-                case EffectKind.ShowMessage: message = effect.Message ?? ""; break;
+                case EffectKind.ShowMessage:
+                    message = sessionSource is PairingSessionSource && transition.State == ConnectionState.NeedsManual && machine.HasSession
+                        ? "连不上澳洲出口，出口地址可能已变，请在小主机上重新导出配对文件再导入。断网保护仍保持。"
+                        : effect.Message ?? "";
+                    break;
                 case EffectKind.ApplyKillSwitch:
                     protection = true; // Even partial Apply must be treated as requiring explicit recovery.
-                    await firewall.ApplyAsync(NodeIps(session!), program, session!.Node.Hy2Port);
+                    await firewall.ApplyAsync(NodeIps(session!), program, session!.Node.Hy2Port, session.Node.RealityPort);
                     break;
                 case EffectKind.UpdateKillSwitchNode:
-                    await firewall.UpdateNodeAsync(effect.NewIps!, program, session!.Node.Hy2Port);
+                    await firewall.UpdateNodeAsync(effect.NewIps!, program, session!.Node.Hy2Port, session.Node.RealityPort);
                     break;
                 case EffectKind.RemoveKillSwitch:
                     await firewall.RemoveAsync(); protection = false; break;
@@ -217,7 +226,13 @@ public sealed class ClientController : IDisposable
     {
         try
         {
-            await Task.Delay(delay, token);
+            // Task.Delay cannot accept a year-9999 session lifetime. Recheck in bounded chunks.
+            while (delay > TimeSpan.FromDays(1))
+            {
+                await delayAsync(TimeSpan.FromDays(1), token);
+                delay -= TimeSpan.FromDays(1);
+            }
+            await delayAsync(delay, token);
             await gate.WaitAsync(token);
             try
             {
@@ -231,6 +246,23 @@ public sealed class ClientController : IDisposable
     }
     private void OnTunnelDown(object? sender, EventArgs e) => Schedule(TimeSpan.Zero,
         () => ExecuteAsync(machine.Handle(new(ConnectionEventKind.TunnelDown))));
+
+    public async Task ChangeSessionSourceAsync(Func<ISessionSource?> change, string notice)
+    {
+        await gate.WaitAsync();
+        try
+        {
+            if (protection || machine.State is ConnectionState.Connected or ConnectionState.Connecting or ConnectionState.Reconnecting)
+                throw new InvalidOperationException("请先点击断开，再更换配对文件。");
+            var next = change();
+            lifetime.Cancel();
+            Interlocked.Increment(ref generation);
+            sessionSource = next;
+            session = null;
+            message = notice;
+        }
+        finally { Publish(); gate.Release(); }
+    }
 
     private async Task FailAsync()
     {
