@@ -1,0 +1,170 @@
+{
+  "schemaVersion": 1,
+  "taskId": "WINCLIENT-PACKAGE-1022",
+  "slug": "yc-winclient-package-1022",
+  "title": "Windows 客户端打包:内嵌钉死版本与哈希的 sing-box.exe + wintun.dll,首次运行幂等解包到 ProgramData 下 YuanC/bin/<内核版本>/ 并校验;ClientRuntime 默认用解包路径;发布脚本 scripts/release/build-winclient.ps1 一条命令 dotnet publish 出单文件自包含 exe 与 .sha256",
+  "goal": "做完后:①第三方件钉死:新增 winclient/third_party/manifest.json(入库),结构 {items:[{name,version,url,zip_sha256,zip_member,file,file_sha256}]},两项:sing-box 1.10.7 windows-amd64(url=https://github.com/SagerNet/sing-box/releases/download/v1.10.7/sing-box-1.10.7-windows-amd64.zip,zip_member=sing-box-1.10.7-windows-amd64/sing-box.exe,file=sing-box.exe)与 wintun 0.14.1(url=https://www.wintun.net/builds/wintun-0.14.1.zip,zip_member=wintun/bin/amd64/wintun.dll,file=wintun.dll);zip_sha256 与 file_sha256 由施工方第一次下载后实测填入,交活说明里写明来源 URL 与算出的值;zip 内成员路径以实际为准(先列 zip 目录核对)。②构建期:WinClient.App.csproj 加 MSBuild Target(BeforeTargets=PrepareForBuild)调用 scripts/release/fetch-third-party.ps1(PowerShell 5.1 可跑;-NoProfile -NonInteractive;不弹窗):按 manifest 下载到 winclient/third_party/cache/(已存在且 zip_sha256 一致则不下载)、校验 zip 哈希、解出成员到 winclient/third_party/bin/、校验 file_sha256,任何不符即构建失败并打印中文原因(不许自动改 manifest);同时生成 winclient/third_party/bin/kernel-manifest.json(内核版本、两文件 sha256);三者以 EmbeddedResource(LogicalName 固定:YuanC.Kernel.sing-box.exe / YuanC.Kernel.wintun.dll / YuanC.Kernel.manifest.json)嵌进 WinClient.App;.gitignore 加 winclient/third_party/cache/(third_party/bin/ 已被根 .gitignore 的 bin/ 规则命中,确认即可)。③运行期:WinClient.Core 新增 Kernel/KernelInstaller.cs:接口 IKernelInstaller { string Ensure(); }、IKernelSource(给出清单 JSON 与按逻辑名打开 Stream 的工厂);目标目录 ProgramData 下 YuanC/bin/<内核版本>/,对每个文件:存在且 sha256 等于清单 → 跳过;否则写到同目录 .tmp 再 File.Move(overwrite:true) 原子替换;写完读回校验,不符则删掉并抛 InvalidOperationException「连接内核文件校验失败,请重新安装客户端」;返回 sing-box.exe 完整路径;Core 不引用 WPF、不直接读嵌入资源,App 层用 Assembly.GetManifestResourceStream 实现 IKernelSource 注入;ClientRuntime.CreateAsync 改为:server.json 有 sing_box_path 用它(兼容旧配置),否则 installer.Ensure();Ensure 抛错时界面显示该中文原因。④发布脚本 scripts/release/build-winclient.ps1(-Version 可选,默认读 winclient/Directory.Build.props 的 <Version>;本单在 Directory.Build.props 写 <Version>0.1.0</Version>):dotnet publish winclient/WinClient.App -c Release -p:PublishProfile=SingleFile → 把产物 exe 复制为 build/release/YuanC-Client-<Version>.exe,旁边写 YuanC-Client-<Version>.exe.sha256(小写十六进制 + 两个空格 + 文件名);脚本自带断言:产物目录里除 exe 与 pdb 外没有 dll、exe < 200MB;脚本所有子进程不弹新窗口。⑤文档 docs/winclient/打包与发布说明.md:维护人员怎么出包、第三方件怎么升级版本(改 manifest 的 url 与哈希、理由、先在干净虚拟机实测)、首次运行会在哪里落文件、SmartScreen 未签名提示怎么处理(给客户的文案)。",
+  "background": "项目:外包,首要交付物是客户能直接双击的 Windows 单文件 exe(方案 docs/design/方案v2-中国客户端-澳洲出口.md §6:单文件自包含、内嵌 sing-box.exe 与 wintun.dll、运行时解包到 ProgramData 下产品目录;Win10 1809+/Win11 x64)。现状:winclient/WinClient.App/WinClient.App.csproj 已有 PublishProfile=SingleFile 的属性组(PublishSingleFile/SelfContained/win-x64/IncludeNativeLibrariesForSelfExtract),Directory.Build.props 把产物放仓库根 build/winclient/(UseArtifactsOutput);ClientSettings.ProductName=YuanC、DataDirectory=ProgramData 下 YuanC;ClientRuntime.CreateAsync 现把内核路径定为 settings.SingBoxPath 或 DataDirectory/sing-box.exe;SingBoxProcessManager 内核不存在时抛中文 FileNotFoundException;所有子进程 CreateNoWindow=true;测试工程 WinClient.Tests(xunit,net9.0,不依赖 WPF)。sing-box 在 Windows 上要求 wintun.dll 与 sing-box.exe 同目录。CI 用本机自托管 runner(有外网),跑 dotnet test winclient。\n硬规矩:①第三方件只认 manifest 钉死的 URL 与 sha256,哈希不符一律失败,不许静默换源、不许自动更新 manifest;②下载缓存与解出的二进制不入库,manifest.json 与生成逻辑入库;③运行期解包幂等且原子(临时文件 + 覆盖移动),哈希一致不重写;校验失败不许继续启动内核;④Core 不引用 WPF、不直接读嵌入资源(由 App 注入),测试用假源;⑤所有新起的子进程(PowerShell、dotnet)隐藏窗口,脚本里不许 Start-Process 弹窗;⑥不改 Firewall/**、Pairing/**、Auth/** 的既有行为与既有测试断言(只许加);⑦不做代码签名、不做安装程序、不做 Windows 服务、不做自动更新;⑧版本号 0.1.0 只写 Directory.Build.props 一处。遇到施工面外文件、依赖拿不准、下载源不可达,停下交 blocked + forks。搜索用 rg 或 git grep。",
+  "nonGoals": [
+    "不做 Windows 服务 / 开机自启 / 托盘(WINCLIENT-SERVICE-1022)",
+    "不做客户端自动更新(WINCLIENT-UPDATE-1022)",
+    "不做代码签名与 SmartScreen 信誉;只在文档写明用户如何处理警告",
+    "不做 MSI/安装向导;交付物就是单个 exe",
+    "不在干净虚拟机实测(真机项另记)"
+  ],
+  "allowedPaths": [
+    "winclient/**",
+    "scripts/release/build-winclient.ps1",
+    "scripts/release/fetch-third-party.ps1",
+    "docs/winclient/打包与发布说明.md",
+    ".gitignore"
+  ],
+  "forbiddenPaths": [
+    "node/**",
+    "authserver/**",
+    "scripts/release/build-node-package.py",
+    "scripts/release/gen-key.py",
+    "docs/开工须知.md",
+    "docs/口径速查表.md",
+    "docs/design/**",
+    "docs/交接/**",
+    ".github/**",
+    ".codex/**",
+    "winclient/WinClient.Core/Firewall/**",
+    "winclient/WinClient.Core/Pairing/**",
+    "winclient/WinClient.Core/Auth/**"
+  ],
+  "expectArtifacts": [
+    "winclient/third_party/manifest.json",
+    "scripts/release/fetch-third-party.ps1",
+    "scripts/release/build-winclient.ps1",
+    "winclient/WinClient.Core/Kernel/KernelInstaller.cs",
+    "winclient/WinClient.Tests/KernelInstallerTests.cs",
+    "docs/winclient/打包与发布说明.md"
+  ],
+  "acceptance": [
+    {
+      "id": "BUILD",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "build",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1200,
+      "note": "构建期自动下载并校验第三方件;产物在 build/winclient/"
+    },
+    {
+      "id": "TEST",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "test",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--no-build",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 900,
+      "note": "既有测试全过;KernelInstallerTests:首次解包写两文件并返回 exe 路径;第二次零写入;篡改一个字节后重写恢复;假源哈希不符 → 抛中文异常、目录无残留 .tmp、不返回路径;目录按内核版本分"
+    },
+    {
+      "id": "THIRDPARTY",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import json,hashlib,pathlib,sys;m=json.load(open('winclient/third_party/manifest.json',encoding='utf-8'));bad=[e['file'] for e in m['items'] if not pathlib.Path('winclient/third_party/bin',e['file']).exists() or hashlib.sha256(pathlib.Path('winclient/third_party/bin',e['file']).read_bytes()).hexdigest()!=e['file_sha256']];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120,
+      "note": "构建后解出的两文件与 manifest 的 file_sha256 一致"
+    },
+    {
+      "id": "PUBLISH",
+      "kind": "command",
+      "argv": [
+        "powershell",
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "scripts/release/build-winclient.ps1"
+      ],
+      "required": true,
+      "timeoutSec": 1800,
+      "note": "产出 build/release/YuanC-Client-0.1.0.exe 与 .sha256;脚本自带断言"
+    },
+    {
+      "id": "ARTIFACT",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import hashlib,pathlib,sys;p=pathlib.Path('build/release/YuanC-Client-0.1.0.exe');s=pathlib.Path('build/release/YuanC-Client-0.1.0.exe.sha256').read_text().split()[0];print(p.stat().st_size);sys.exit(0 if p.stat().st_size<200*1024*1024 and hashlib.sha256(p.read_bytes()).hexdigest()==s else 1)"
+      ],
+      "required": true,
+      "timeoutSec": 300
+    },
+    {
+      "id": "MANIFEST-TRACKED",
+      "kind": "command",
+      "argv": [
+        "git",
+        "ls-files",
+        "--error-unmatch",
+        "winclient/third_party/manifest.json"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "NOBIN",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess,sys;out=subprocess.run(['git','ls-files','winclient/third_party','build'],capture_output=True,text=True).stdout.split();bad=[f for f in out if f.endswith(('.exe','.dll','.zip'))];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60,
+      "note": "二进制与缓存不入库"
+    },
+    {
+      "id": "NOWINDOW",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,re,sys;bad=[str(p) for p in pathlib.Path('scripts/release').glob('*.ps1') if re.search(r'Start-Process(?!.*-WindowStyle Hidden)',p.read_text(encoding='utf-8'))];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60,
+      "note": "发布脚本里不许弹窗起进程"
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "model": null,
+  "timeoutSec": 9000,
+  "repoRoot": "E:/yuanc",
+  "engine": "codex",
+  "reasoningEffort": "high",
+  "steps": [
+    "读方案 §6、docs/winclient/架构说明.md、WinClient.App.csproj、Directory.Build.props、ClientSettings/ClientRuntime/SingBoxProcessManager、现有测试与根 .gitignore。",
+    "winclient/third_party/manifest.json + scripts/release/fetch-third-party.ps1:下载、校验 zip 哈希、取出成员、校验文件哈希、生成 kernel-manifest.json;第一次实跑拿到真实哈希填入 manifest;重复执行走缓存零下载。",
+    "WinClient.App.csproj:BeforeTargets=PrepareForBuild 调脚本;EmbeddedResource 三项;Directory.Build.props 加 <Version>0.1.0</Version>。",
+    "WinClient.Core/Kernel/KernelInstaller.cs(IKernelInstaller、IKernelSource);ClientRuntime 接线;App 层实现 IKernelSource。",
+    "WinClient.Tests/KernelInstallerTests.cs 用临时目录与假源;先写红再转绿。",
+    "scripts/release/build-winclient.ps1 + docs/winclient/打包与发布说明.md;本机跑一遍 PUBLISH 与 ARTIFACT 断言。",
+    "交活说明:两处哈希的来源 URL 与数值、产物路径与大小、未做的真机项。"
+  ]
+}
