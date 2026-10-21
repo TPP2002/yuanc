@@ -3,7 +3,7 @@
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
-PUBLIC_KEY = b""  # 32 字节原始公钥；gen-key.py 打印可粘贴的公开常量。
+PUBLIC_KEY = bytes.fromhex("1363592e51ed392b5ce1e940537f22a67b4093632b6a8f6e55d055c05a3d1d3d")  # 2026-10-22 生成;私钥在维护机仓库外 .secrets/yuanc-exitnode-signing.pem
 
 
 def verify_signature(data: bytes, signature: bytes) -> None:
