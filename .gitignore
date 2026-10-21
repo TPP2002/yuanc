@@ -1,0 +1,18 @@
+# 看板板文件另由 .git/info/exclude 排除;这里只放通用项
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+bin/
+obj/
+*.user
+.vs/
+secrets/
+*.key
+*.pem
+.codex/worktrees/
