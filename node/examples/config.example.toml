@@ -1,0 +1,27 @@
+# 此文件不保存密码、令牌或密钥；凭据文件由后续授权模块管理。
+[node]
+name = "请填写节点名称"
+data_dir = "/var/lib/exitnode"
+secrets_dir = "/var/lib/exitnode/secrets"
+log_level = "INFO"
+
+[network]
+iface = "auto"
+probe_targets = ["1.1.1.1", "8.8.8.8"]
+
+[proxy]
+reality_port = 443
+hy2_port = 24443
+
+[admin]
+bind = "127.0.0.1"
+port = 8443
+
+[publisher]
+mode = "upnp"
+ddns_provider = "请填写服务商"
+domain = "请填写域名"
+
+[updater]
+channel = "stable"
+check_interval = 3600

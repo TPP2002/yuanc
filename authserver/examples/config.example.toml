@@ -1,0 +1,22 @@
+# 所有值均为占位符，必须替换；数字字段替换为不带引号的整数。
+[server]
+bind = "<监听地址>"
+port = "<监听端口>"
+
+[security]
+admin_key = "<独立生成的管理员密钥>"
+node_key = "<独立生成的节点密钥>"
+token_salt = "<独立生成且备份的服务器盐>"
+
+[node]
+host = "<节点地址>"
+reality_port = "<主通道端口>"
+hy2_port = "<备用通道端口>"
+reality_public_key = "<Reality公钥>"
+short_id = "<十六进制短标识>"
+sni = "<服务端证书与Reality使用的域名>"
+
+[limits]
+session_hours = "<会话小时数，默认6>"
+default_device_limit = "<设备上限，默认2>"
+redeem_per_ip_per_hour = "<每个IP每类接口每小时上限，默认10>"
