@@ -8,7 +8,7 @@ public sealed class ClientSettings
 {
     public const string ProductName = "YuanC";
     [JsonPropertyName("server_url")] public required string ServerUrl { get; init; }
-    [JsonPropertyName("sing_box_path")] public required string SingBoxPath { get; init; }
+    [JsonPropertyName("sing_box_path")] public string? SingBoxPath { get; init; }
     public static string DataDirectory => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), ProductName);
     public static ClientSettings? Load(string? dataDirectory = null)
     {
@@ -19,7 +19,8 @@ public sealed class ClientSettings
         if (!Uri.TryCreate(settings.ServerUrl, UriKind.Absolute, out var uri) || uri.Scheme != Uri.UriSchemeHttps ||
             !string.IsNullOrEmpty(uri.UserInfo) || !string.IsNullOrEmpty(uri.Query) || !string.IsNullOrEmpty(uri.Fragment))
             throw new InvalidDataException("服务器必须配置为不含凭据的 HTTPS 地址。");
-        if (!Path.IsPathFullyQualified(settings.SingBoxPath)) throw new InvalidDataException("连接内核必须配置为绝对路径。");
+        if (settings.SingBoxPath is not null && !Path.IsPathFullyQualified(settings.SingBoxPath))
+            throw new InvalidDataException("连接内核必须配置为绝对路径。");
         return settings;
     }
 

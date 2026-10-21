@@ -5,6 +5,7 @@ using WinClient.Core.Process;
 using WinClient.Core.Storage;
 using WinClient.Core.Logging;
 using WinClient.Core.Pairing;
+using WinClient.Core.Kernel;
 
 namespace WinClient.Core.Client;
 
@@ -19,7 +20,7 @@ public sealed class ClientRuntime : IDisposable
     private ClientRuntime(ClientController controller, KillSwitchApplier firewall, HttpClient? http, PairingStore pairingStore, RedactingLog log)
     { Controller = controller; this.firewall = firewall; this.http = http; this.pairingStore = pairingStore; this.log = log; }
 
-    public static async Task<ClientRuntime> CreateAsync()
+    public static async Task<ClientRuntime> CreateAsync(IKernelInstaller installer)
     {
         var firewall = new KillSwitchApplier(Path.Combine(ClientSettings.DataDirectory, "run"));
         await firewall.RecoverAsync(); // Recovery precedes even reading server.json.
@@ -36,7 +37,7 @@ public sealed class ClientRuntime : IDisposable
                 { BaseAddress = new Uri(settings.ServerUrl), Timeout = TimeSpan.FromSeconds(15) };
                 return new AuthServerSessionSource(new AuthApiClient(http, log), new DpapiCredentialStore(ClientSettings.ProductName));
             }, log);
-            var program = settings?.SingBoxPath ?? Path.Combine(ClientSettings.DataDirectory, "sing-box.exe");
+            var program = settings?.SingBoxPath ?? installer.Ensure();
             var transport = new TunnelTransport(new SingBoxProcessManager(program, ClientSettings.ProductName, logger: log));
             var controller = new ClientController(source, firewall,
                 transport, program, new DeviceInfo { Platform = "windows", Name = Environment.MachineName, Fingerprint = ClientSettings.GetDeviceFingerprint() });
