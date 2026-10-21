@@ -21,10 +21,15 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
     private bool disposed;
     private readonly CancellationTokenSource lifetime = new();
     private ClientSnapshot snapshot = new(ConnectionState.Disconnected, "正在检查后台服务", "", false);
+    private string serviceVersion = "";
+    private string updateMessage = "";
     private string code = "";
     public string Code { get => code; set { code = value; Notify(); } }
     public string Status => snapshot.Status;
-    public string Message => snapshot.Message;
+    public string Message => snapshot.Message + (serviceVersion.Length != 0 && serviceVersion != ControlSnapshot.CurrentVersion
+        ? $" 后台已更新到 {serviceVersion}，下次打开界面将使用新版" : "");
+    public string ServiceVersion => serviceVersion.Length == 0 ? "后台版本：等待连接" : "后台版本 " + serviceVersion;
+    public string UpdateMessage => updateMessage;
     public string Mode => "当前模式：" + snapshot.Mode;
     public bool IsBusy { get; private set; }
     public bool CanUseConnection => client is not null && availability == Availability.Ready && !IsBusy;
@@ -40,10 +45,12 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
     public ICommand ConnectCommand { get; }
     public ICommand ImportPairingCommand { get; }
     public ICommand ClearPairingCommand { get; }
+    public ICommand CheckUpdateCommand { get; }
     public event PropertyChangedEventHandler? PropertyChanged;
 
     public MainViewModel(Func<string?> choosePairingFile)
     {
+        CheckUpdateCommand = new AsyncCommand(() => RunAsync(() => SendAsync("check_update")), () => CanUseConnection);
         RedeemCommand = new AsyncCommand(() => RunAsync(async () =>
         { await SendAsync("redeem", Code); Code = ""; }), () => CanUseConnection);
         ConnectCommand = new AsyncCommand(() => RunAsync(MainActionAsync), () => !IsBusy);
@@ -82,12 +89,12 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
             {
                 await pipe.ConnectAsync(3000, lifetime.Token);
                 client = new ControlClient(pipe);
-                client.Changed += Update;
+                client.SnapshotChanged += UpdateProtocol;
                 client.ConnectionClosed += OnConnectionClosed;
                 var response = await client.SendAsync("subscribe", cancellationToken: lifetime.Token);
                 if (!response.Ok || response.Snapshot is null) throw new IOException();
                 availability = Availability.Ready;
-                Update(response.Snapshot);
+                UpdateProtocol(response.Snapshot);
                 return;
             }
             catch (Exception ex) when (ex is TimeoutException or IOException or UnauthorizedAccessException)
@@ -119,7 +126,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
     private async Task SendAsync(string op, string? code = null, string? pairingJson = null)
     {
         var response = await (client ?? throw new IOException()).SendAsync(op, code, pairingJson, lifetime.Token);
-        if (response.Snapshot is not null) Update(response.Snapshot);
+        if (response.Snapshot is not null) UpdateProtocol(response.Snapshot);
         if (!response.Ok) Update(snapshot with { Message = response.Error ?? "操作未完成，请联系管理员。" });
     }
     private async Task RunAsync(Func<Task> action)
@@ -152,10 +159,18 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         if (!Application.Current.Dispatcher.CheckAccess()) { Application.Current.Dispatcher.InvokeAsync(() => Update(value)); return; }
         snapshot = value; Refresh();
     }
+    private void UpdateProtocol(ControlSnapshot value)
+    {
+        if (disposed || Application.Current.Dispatcher.HasShutdownStarted) return;
+        if (!Application.Current.Dispatcher.CheckAccess()) { Application.Current.Dispatcher.InvokeAsync(() => UpdateProtocol(value)); return; }
+        serviceVersion = value.ServiceVersion; updateMessage = value.Update.Message;
+        Update(value);
+    }
     private void Refresh()
     {
         if (disposed) return;
         Notify(nameof(Status)); Notify(nameof(Message)); Notify(nameof(ConnectLabel)); Notify(nameof(Mode)); Notify(nameof(IsBusy)); Notify(nameof(CanUseConnection));
+        Notify(nameof(ServiceVersion)); Notify(nameof(UpdateMessage));
         CommandManager.InvalidateRequerySuggested();
     }
     public Task ExportAuditAsync(string path) => RunAsync(async () =>
@@ -172,7 +187,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
     private void DropClient()
     {
         if (client is null) return;
-        client.Changed -= Update; client.ConnectionClosed -= OnConnectionClosed;
+        client.SnapshotChanged -= UpdateProtocol; client.ConnectionClosed -= OnConnectionClosed;
         client.Dispose(); client = null;
     }
     public void Dispose() { disposed = true; lifetime.Cancel(); DropClient(); }

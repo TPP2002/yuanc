@@ -73,12 +73,14 @@ def test_status_json_fields_and_four_states(capsys):
     assert {s.value for s in State} == {"normal", "reconnecting", "reauth", "manual"}
 
 
-def test_check_unintegrated_layers_are_not_passed(capsys):
+def test_check_unintegrated_layers_are_not_passed(capsys, monkeypatch):
     from datetime import UTC, datetime
 
     from exitnode.watchdog import state
 
     runner = fake()
+    monkeypatch.setattr("exitnode.admin.server.check", lambda config: {
+        "layer": "winclient", "name": "客户端托管服务", "result": "通过", "reason": "测试响应"})
     config = load(CONFIG, runner)
     state.save(config, runner, state.fresh(), datetime.now(UTC))
     runner.responses[("systemctl", "is-active", "exitnode-watchdog.timer")] = CompletedResult(out="active")
@@ -89,10 +91,11 @@ def test_check_unintegrated_layers_are_not_passed(capsys):
     runner.responses[("systemctl", "is-active", "exitnode-rescue.timer")] = CompletedResult(out="active")
     assert main(["check", "--json"], runner) == 0
     layers = json.loads(capsys.readouterr().out)["layers"]
-    assert [layer["result"] for layer in layers] == ["通过", "通过", "未接入", "未接入", "未接入", "通过", "通过", "通过"]
-    assert layers[-3]["name"] == "看门狗"
-    assert layers[-2]["name"] == "救援单元"
-    assert layers[-1]["name"] == "隧道服务"
+    assert [layer["result"] for layer in layers] == ["通过", "通过", "未接入", "未接入", "未接入", "通过", "通过", "通过", "通过"]
+    assert layers[-4]["name"] == "看门狗"
+    assert layers[-3]["name"] == "救援单元"
+    assert layers[-2]["name"] == "隧道服务"
+    assert layers[-1]["name"] == "客户端托管服务"
 
 
 def test_upgrade_is_explicit_failure_without_config_or_system(capsys):
@@ -486,3 +489,27 @@ def test_refresh_directory_exchange_error_records_manual_and_preserves_old():
     assert runner.files["/target/old"] == b"old"
     assert state.read(runner)["state"] == "manual"
     assert json.loads(runner.files[state.HISTORY].splitlines()[-1])["status"] == "failed"
+
+
+def test_winclient_publish_status_and_parser(capsys):
+    from test_admin_publish import package
+
+    runner = fake()
+    assert main(["winclient", "status"], runner) == 0
+    assert "尚未托管客户端包" in capsys.readouterr().out
+    paths, files = package()
+    runner.files.update(files)
+    assert main(["winclient", "publish", "--exe", paths[0], "--manifest", paths[1],
+                 "--signature", paths[2]], runner) == 0
+    assert main(["winclient", "status"], runner) == 0
+    output = capsys.readouterr().out
+    assert "1.2.3" in output and "7 字节" in output and "发布时间" in output
+    assert "/var/lib" not in output and "/input" not in output
+
+
+@pytest.mark.parametrize("argv", [["admin", "serve"], ["--placeholder", "admin"]])
+def test_admin_entrypoints_are_equivalent(argv, monkeypatch):
+    calls = []
+    monkeypatch.setattr("exitnode.admin.server.serve", calls.append)
+    assert main(argv, fake()) == 0
+    assert len(calls) == 1 and calls[0].admin.bind == "127.0.0.1"

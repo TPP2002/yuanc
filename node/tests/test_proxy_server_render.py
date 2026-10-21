@@ -55,3 +55,14 @@ def test_server_custom_targets_and_certificate_paths(inputs):
 def test_empty_allowlist_has_no_users(inputs):
     ctx, _ = inputs
     assert all(not inbound["users"] for inbound in render_server(ctx, [])["inbounds"])
+
+
+def test_admin_route_uses_configured_listener(inputs):
+    ctx, device = inputs
+    config = render_server(replace(ctx, admin_bind="127.0.0.2", admin_port=9443), [device])
+    assert config["route"]["rules"][0] == {
+        "ip_cidr": ["198.18.255.1/32"], "outbound": "admin-local"}
+    assert config["route"]["final"] == "direct"
+    assert next(v for v in config["outbounds"] if v["tag"] == "admin-local") == {
+        "type": "direct", "tag": "admin-local", "override_address": "127.0.0.2",
+        "override_port": 9443}

@@ -22,6 +22,8 @@ public static class Program
                 case "--service":
                     using (var service = new ControlService()) ServiceBase.Run(service);
                     return Environment.ExitCode;
+                case "--apply-update":
+                    return UpdateWindowsHost.ApplyAsync().GetAwaiter().GetResult();
                 case "--install":
                 case "--uninstall":
                 case "--repair":

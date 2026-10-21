@@ -23,6 +23,8 @@ class ProxyContext:
     masquerade: str = ""
     urltest_url: str = "https://www.gstatic.com/generate_204"
     urltest_interval: str = "1m"
+    admin_bind: str = "127.0.0.1"
+    admin_port: int = 8443
 
 
 def ipv4_host(ctx: ProxyContext) -> str:

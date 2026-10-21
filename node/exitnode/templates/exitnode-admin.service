@@ -1,5 +1,5 @@
 [Unit]
-Description=出口节点管理服务（待接入）
+Description=出口节点客户端包托管服务
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=300
@@ -8,7 +8,7 @@ StartLimitBurst=3
 [Service]
 Environment=PYTHONPATH=$program_path
 Type=simple
-ExecStart=/usr/bin/python3 -m exitnode --placeholder admin --config "$config_path"
+ExecStart=/usr/bin/python3 -m exitnode --config "$config_path" admin serve
 Restart=on-failure
 RestartSec=30
 NoNewPrivileges=true

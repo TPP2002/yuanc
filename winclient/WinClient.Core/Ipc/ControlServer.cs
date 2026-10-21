@@ -3,13 +3,16 @@ using System.Text;
 using System.Text.Json;
 using System.Threading.Channels;
 using WinClient.Core.Client;
+using WinClient.Core.Update;
 
 namespace WinClient.Core.Ipc;
 
-public sealed class ControlServer(IClientFacade facade, DesiredStateStore desired)
+public sealed class ControlServer(IClientFacade facade, DesiredStateStore desired, IUpdateCoordinator? updates = null, string? serviceVersion = null)
 {
     // One ordering across connections keeps persisted intent consistent with completed commands.
     private readonly SemaphoreSlim commands = new(1, 1);
+    private ControlSnapshot Snapshot() => ((ControlSnapshot)facade.Snapshot) with
+    { ServiceVersion = serviceVersion ?? ControlSnapshot.CurrentVersion, Update = updates?.Status ?? new() };
 
     public async Task ServeAsync(Stream stream, CancellationToken cancellationToken = default)
     {
@@ -28,7 +31,8 @@ public sealed class ControlServer(IClientFacade facade, DesiredStateStore desire
                     if (!queue.Writer.TryWrite(value)) closed.Cancel();
                 }
             }
-            void Changed(ClientSnapshot snapshot) => Enqueue(new SnapshotEvent("snapshot", snapshot));
+            void Changed(ClientSnapshot snapshot) => Enqueue(new SnapshotEvent("snapshot", Snapshot()));
+            void UpdateChanged(UpdateStatus status) => Enqueue(new SnapshotEvent("snapshot", Snapshot()));
             async Task WriteLoop()
             {
                 try
@@ -50,8 +54,8 @@ public sealed class ControlServer(IClientFacade facade, DesiredStateStore desire
                     { Enqueue(new ControlResponse(null, false, "指令格式错误")); continue; }
                     if (request.Op == "subscribe")
                     {
-                        if (!subscribed) { facade.Changed += Changed; subscribed = true; }
-                        Enqueue(new ControlResponse(request.Id, true, Snapshot: facade.Snapshot));
+                        if (!subscribed) { facade.Changed += Changed; if (updates is not null) updates.Changed += UpdateChanged; subscribed = true; }
+                        Enqueue(new ControlResponse(request.Id, true, Snapshot: Snapshot()));
                     }
                     else Enqueue(await ExecuteAsync(request, closed.Token).ConfigureAwait(false));
                 }
@@ -63,6 +67,7 @@ public sealed class ControlServer(IClientFacade facade, DesiredStateStore desire
                 {
                     active = false;
                     if (subscribed) facade.Changed -= Changed;
+                    if (subscribed && updates is not null) updates.Changed -= UpdateChanged;
                     queue.Writer.TryComplete();
                     closed.Cancel();
                 }
@@ -74,6 +79,11 @@ public sealed class ControlServer(IClientFacade facade, DesiredStateStore desire
 
     private async Task<ControlResponse> ExecuteAsync(ControlRequest request, CancellationToken token)
     {
+        if (request.Op == "check_update")
+        {
+            if (updates is not null) _ = updates.CheckNowAsync();
+            return new(request.Id, true, Snapshot: Snapshot());
+        }
         await commands.WaitAsync(token).ConfigureAwait(false);
         try
         {
@@ -97,7 +107,7 @@ public sealed class ControlServer(IClientFacade facade, DesiredStateStore desire
                         ? response : new(request.Id, false, "审计记录过大，请联系管理员。");
                 default: return new(request.Id, false, "不支持的指令");
             }
-            return new(request.Id, true, Snapshot: facade.Snapshot);
+            return new(request.Id, true, Snapshot: Snapshot());
         }
         catch (Exception ex) when (ex is IOException or InvalidDataException or UnauthorizedAccessException or InvalidOperationException or ArgumentException or JsonException or CryptographicException)
         {
