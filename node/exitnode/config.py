@@ -58,6 +58,21 @@ class Updater:
 
 
 @dataclass
+class Watchdog:
+    enabled: bool = True
+    restart_limit_per_hour: int = 3
+    rollback_min_interval_hours: int = 6
+    reboot_enabled: bool = True
+    reboot_after_minutes: int = 30
+    reboot_min_interval_hours: int = 6
+    hardware: bool = True
+    weekly_reboot: bool = False
+    restart_after_failures: int = 4
+    retry_interval_seconds: int = 60
+    max_backoff_seconds: int = 300
+
+
+@dataclass
 class Config:
     node: Node
     network: Network
@@ -65,6 +80,7 @@ class Config:
     admin: Admin
     publisher: Publisher
     updater: Updater
+    watchdog: Watchdog = field(default_factory=Watchdog)
 
     def sanitized(self):
         return asdict(self)
@@ -82,12 +98,15 @@ def load(path: str, runner: Runner | None = None) -> Config:
         # 不转印原文：TOML 错误附近可能包含操作者误填的凭据。
         raise ConfigError(f"配置 {path}：文件无法读取或格式不正确") from exc
     models = {"node": Node, "network": Network, "proxy": Proxy, "admin": Admin,
-              "publisher": Publisher, "updater": Updater}
+              "publisher": Publisher, "updater": Updater, "watchdog": Watchdog}
     for name in raw.keys() - models.keys():
         invalid(name, "未知配置项")
     values = {}
     for name, model in models.items():
         if name not in raw:
+            if name == "watchdog":
+                values[name] = Watchdog()
+                continue
             invalid(name, "缺少配置段")
         section = raw[name]
         if not isinstance(section, dict):
@@ -112,6 +131,16 @@ def load(path: str, runner: Runner | None = None) -> Config:
                 invalid(f"{name}.{key}", "不能为空或含控制字符")
         values[name] = model(**section)
     config = Config(**values)
+    for key in ("restart_limit_per_hour", "rollback_min_interval_hours",
+                "reboot_min_interval_hours", "retry_interval_seconds", "max_backoff_seconds"):
+        if getattr(config.watchdog, key) <= 0:
+            invalid("watchdog." + key, "须为正整数")
+    if config.watchdog.reboot_after_minutes < 5:
+        invalid("watchdog.reboot_after_minutes", "不得少于 5 分钟")
+    if config.watchdog.restart_after_failures < 4:
+        invalid("watchdog.restart_after_failures", "不得少于 4 次")
+    if config.watchdog.max_backoff_seconds < config.watchdog.retry_interval_seconds:
+        invalid("watchdog.max_backoff_seconds", "不得小于重试间隔")
     for name in ("sni", "handshake_server", "hy2_server_name"):
         hostname = getattr(config.proxy, name)
         if len(hostname) > 253 or not re.fullmatch(

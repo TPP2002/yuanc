@@ -14,6 +14,10 @@ from .manifest import UNITS, Manifest
 from .netinfo import check, public_ipv4
 from .runner import RealRunner, RunnerError
 from .status import State, evaluate
+from .watchdog import check as watchdog_check
+from .watchdog import state as watchdog_state
+from .watchdog import summary as watchdog_summary
+from .watchdog import tick as watchdog_tick
 
 
 class ChineseParser(argparse.ArgumentParser):
@@ -71,6 +75,12 @@ def parser():
         if name == "add":
             action.add_argument("--platform", choices=["windows", "android"], default="windows",
                                 help="设备平台（默认 windows）")
+    watcher = sub.add_parser("watchdog", help="运行或查看看门狗", description="运行或查看看门狗")
+    watcher.add_argument("--config", default=argparse.SUPPRESS, help="配置文件路径")
+    actions = watcher.add_subparsers(dest="watchdog_action", required=True, title="看门狗操作")
+    for name, description in (("tick", "执行一轮检查与恢复"), ("status", "读取最近检查记录")):
+        action = actions.add_parser(name, help=description, description=description)
+        action.add_argument("--config", default=argparse.SUPPRESS, help="配置文件路径")
     return root
 
 
@@ -138,6 +148,28 @@ def _install(config, config_path, runner, manifest):
         apply("启用隧道服务",
               lambda: runner.run(["systemctl", "enable", "--now", service.UNIT]),
               {"kind": "systemctl", "unit": service.UNIT})
+        if config.watchdog.enabled:
+            apply("启用看门狗定时器",
+                  lambda: runner.run(["systemctl", "enable", "--now", "exitnode-watchdog.timer"]),
+                  {"kind": "systemctl", "unit": "exitnode-watchdog.timer"})
+        if config.watchdog.hardware:
+            if runner.exists("/dev/watchdog"):
+                hardware_path = "/etc/systemd/system.conf.d/exitnode-watchdog.conf"
+                if (runner.exists(hardware_path)
+                        and not any(s["step"] == "硬件看门狗" for s in manifest.steps)):
+                    raise ValueError("已有硬件看门狗文件未在本安装清单中，请联系维护人员")
+
+                def hardware():
+                    runner.mkdir("/etc/systemd/system.conf.d", 0o755)
+                    runner.write_file(hardware_path,
+                                      "[Manager]\nRuntimeWatchdogSec=60\nRebootWatchdogSec=10min\n",
+                                      0o644)
+                    runner.run(["systemctl", "daemon-reexec"])
+
+                apply("硬件看门狗", hardware,
+                      {"kind": "remove_file", "path": hardware_path, "daemon_reexec": True})
+            else:
+                successful.append("硬件看门狗：设备不存在，跳过")
         if not device.registry(config, runner).all():
             device.add(config, runner, name="第一台电脑")
             print("请把这个文件拷到 U 盘带去电脑")
@@ -180,6 +212,11 @@ def main(argv=None, runner=None):
     try:
         runner = runner if runner is not None else RealRunner()
         config = load(args.config, runner)
+        if args.command == "watchdog":
+            if args.watchdog_action == "tick":
+                return watchdog_tick(config, runner)
+            print(redact(json.dumps(watchdog_state.read(config, runner), ensure_ascii=False)))
+            return 0
         if args.command == "device":
             if args.device_action == "add":
                 device.add(config, runner, name=args.name, platform=args.platform, host=args.host)
@@ -199,8 +236,16 @@ def main(argv=None, runner=None):
             return 0
         if args.command in {"check", "status", "diagnose"}:
             result = check(runner, config)
+            if args.command == "check":
+                result["layers"].insert(-1, watchdog_check(config, runner))
             if args.command == "status":
                 result["public_ipv4"] = public_ipv4(runner)
+                try:
+                    result["watchdog"] = watchdog_summary(config, runner)
+                except ValueError:
+                    result["watchdog"] = {"state": "manual", "last_ok_at": None,
+                                          "consecutive_failures": 0, "last_action": None,
+                                          "reason": "看门狗记录损坏，请联系维护人员"}
             status = evaluate(result)
             if args.command == "check":
                 if args.json:

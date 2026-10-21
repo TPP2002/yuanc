@@ -69,3 +69,33 @@ def test_proxy_strict_fields(field, value):
     text = "\n".join(lines).replace("[proxy]", f"[proxy]\n{field} = {value}")
     with pytest.raises(ConfigError, match="proxy." + field):
         load("/config", FakeRunner(files={"/config": text}))
+
+
+def test_watchdog_defaults_and_example():
+    from dataclasses import asdict
+
+    from exitnode.config import Watchdog
+    text = EXAMPLE.read_text(encoding="utf-8")
+    for source in (text, text.split("[watchdog]")[0]):
+        value = load("/config", FakeRunner(files={"/config": source})).watchdog
+        assert asdict(value) == asdict(Watchdog())
+        assert value.enabled and value.hardware and value.reboot_enabled
+        assert not value.weekly_reboot
+        assert value.restart_limit_per_hour == 3
+        assert value.rollback_min_interval_hours == value.reboot_min_interval_hours == 6
+        assert value.reboot_after_minutes == 30
+
+
+@pytest.mark.parametrize("key,value", [
+    ("restart_limit_per_hour", "-1"), ("rollback_min_interval_hours", "-1"),
+    ("reboot_min_interval_hours", "-1"), ("reboot_after_minutes", "4"),
+    ("reboot_after_minutes", "-1"), ("enabled", "1"), ("hardware", '"true"'),
+    ("weekly_reboot", "0"), ("reboot_enabled", "1"), ("unknown", "true"),
+    ("restart_after_failures", "3"), ("retry_interval_seconds", "0"),
+    ("max_backoff_seconds", "30"),
+])
+def test_watchdog_rejects_invalid_values(key, value):
+    text = EXAMPLE.read_text(encoding="utf-8").split("[watchdog]")[0]
+    text += f"[watchdog]\n{key} = {value}\n"
+    with pytest.raises(ConfigError, match="watchdog." + key):
+        load("/config", FakeRunner(files={"/config": text}))
