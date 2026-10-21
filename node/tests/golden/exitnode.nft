@@ -1,0 +1,17 @@
+# 仅维护本项目规则；管理入口限配置的监听地址。
+table inet exitnode {
+    chain input {
+        type filter hook input priority 0; policy accept;
+        tcp dport 443 accept
+        udp dport 24443 accept
+        ip daddr 127.0.0.1 tcp dport 8443 accept
+    }
+    chain forward {
+        type filter hook forward priority 0; policy accept;
+        # 出口转发规则由后续代理接入卡提供，当前不扩大转发权限。
+    }
+    chain postrouting {
+        type nat hook postrouting priority 100; policy accept;
+        # 待确定隧道源地址后添加受限 masquerade 规则。
+    }
+}
