@@ -1,0 +1,4 @@
+[
+ {"id":"NODE-DEVICE-PAIR-1024","plainTitle":"自用版:在澳洲小主机上一条命令给一台电脑发钥匙,导出配对文件、链接和二维码,能吊销","model":"codex施工·fable契约","scope":["node/exitnode/cli.py","node/exitnode/device.py","node/exitnode/proxy/**","node/tests/**"],"wave":2,"deps":{"dependsOn":["NODE-CORE-1023","PROXY-CONFIG-1023"]},"title":"exitnode device add/list/revoke 子命令:调 proxy 包的设备登记表生成 UUID 与 Hysteria2 密码,导出 .ycpair 配对文件(节点当前公网 IPv4、端口、Reality 公钥与 short-id、设备凭据、导出时间)+ vless:// 链接 + 二维码(纯文本 ASCII 或 PNG 用标准库之外需确认),revoke 热重载;init 结束自动 add 一台并提示拷走。契约待写。","desc":"客户改判自用版第一优先:不用服务器也能直接用;配对文件字段与鉴权服务器下发的 node 字段完全一致"},
+ {"id":"WINCLIENT-LOCAL-MODE-1024","plainTitle":"自用版:Windows 客户端能导入配对文件直接连澳洲,不联系任何服务器","model":"codex施工·fable契约","scope":["winclient/**"],"wave":2,"deps":{"dependsOn":["WINCLIENT-SKELETON-1023","PROXY-CONFIG-1023"]},"title":"客户端新增「导入配对文件」入口:解析 .ycpair → DPAPI 加密保存 → 用与服务器模式相同的 NodeInfo 渲染 sing-box 配置并连接;地址连不上时提示「出口地址可能已变」;与邀请码模式并存。契约待写。","desc":"客户改判自用版第一优先;两模式共用渲染与连接路径"}
+]
