@@ -1,6 +1,28 @@
 """按路由、网卡、上游顺序探测；未知信息不猜测。"""
 
+import ipaddress
 import json
+import re
+
+from . import service
+
+
+def public_ipv4(runner):
+    for url, trace in (("https://1.1.1.1/cdn-cgi/trace", True),
+                       ("https://api.ipify.org", False)):
+        try:
+            result = runner.run(["curl", "-4", "-s", "--max-time", "5", url], check=False)
+            if result.code:
+                continue
+            candidates = ([line[3:] for line in result.out.splitlines() if line.startswith("ip=")]
+                          if trace else [result.out.strip()])
+            if len(candidates) != 1 or not re.fullmatch(r"(?:[0-9]{1,3}\.){3}[0-9]{1,3}",
+                                                      candidates[0]):
+                continue
+            return str(ipaddress.IPv4Address(candidates[0]))
+        except (OSError, RuntimeError, ValueError):
+            continue
+    return None
 
 
 def read_network(runner, iface="auto"):
@@ -58,4 +80,5 @@ def check(runner, config):
     for key, name in (("entry", "入口可达"), ("proxy", "代理进程"), ("egress", "真实出口")):
         layers.append({"layer": key, "name": name, "result": "未接入",
                        "reason": "本阶段未接入此项检查，不能据此判断出口可用"})
+    layers.append(service.check(runner, config))
     return {"network": network, "layers": layers}

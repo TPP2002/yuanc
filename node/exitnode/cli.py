@@ -7,11 +7,11 @@ import sys
 import zipfile
 from pathlib import PurePosixPath
 
-from . import __version__, nft, systemd
+from . import __version__, nft, service, systemd
 from .config import ConfigError, load
 from .log import redact
 from .manifest import UNITS, Manifest
-from .netinfo import check
+from .netinfo import check, public_ipv4
 from .runner import RealRunner, RunnerError
 from .status import State, evaluate
 
@@ -66,12 +66,15 @@ def _install(config, config_path, runner, manifest):
         successful.append(step + ("：已完成" if changed else "：已完成，跳过"))
 
     try:
+        # 先做无命令的前置核对，缺内核时不得写入任何服务单元。
+        if not runner.exists(config.proxy.binary):
+            raise ValueError("未找到 sing-box，请先安装 sing-box 二进制并确认 proxy.binary 路径；不会自动下载")
         for name, directory in (("数据目录", config.node.data_dir),
                                 ("凭据目录", config.node.secrets_dir)):
             # 数据与凭据在撤回时保留，卸载只清除清单管理的产物。
             apply(name, lambda p=directory: runner.mkdir(p),
                   {"kind": "remove_file", "path": directory, "preserve": True})
-        for unit in sorted(UNITS):
+        for unit in sorted(UNITS - {service.UNIT}):
             path = "/etc/systemd/system/" + unit
             text = systemd.render(unit, {"config_path": config_path})
             step = "写入" + unit
@@ -94,13 +97,39 @@ def _install(config, config_path, runner, manifest):
         context = {"reality_port": config.proxy.reality_port, "hy2_port": config.proxy.hy2_port,
                    "admin_port": config.admin.port, "admin_bind": config.admin.bind}
         apply("安装网络规则", lambda: nft.apply(runner, context), {"kind": "nft"})
+        apply("检查 sing-box 二进制", lambda: None,
+              {"kind": "remove_file", "path": config.proxy.binary, "preserve": True})
+        service.ensure_credentials(config, runner)
+        manifest.steps = Manifest(manifest.path, runner).steps
+        successful.append("生成隧道凭据：已完成")
+        service.publish(config, runner)
+        manifest.steps = Manifest(manifest.path, runner).steps
+        successful.append("渲染隧道配置：已完成")
+        path = "/etc/systemd/system/" + service.UNIT
+        step = "写入" + service.UNIT
+        if runner.exists(path) and not any(s["step"] == step for s in manifest.steps):
+            raise ValueError("已有同名服务文件未在本安装清单中，请联系维护人员")
+        text = systemd.render(service.UNIT, {"config_path": config_path}, binary=config.proxy.binary)
+
+        def write_proxy():
+            if runner.exists(path) and runner.read_file(path) != text:
+                raise ValueError("已有服务文件与安装内容不同，请先由维护人员确认")
+            runner.write_file(path, text, 0o644)
+
+        apply(step, write_proxy, {"kind": "systemctl", "unit": service.UNIT})
+        apply("重载隧道服务定义", lambda: runner.run(["systemctl", "daemon-reload"]),
+              {"kind": "systemctl", "unit": service.UNIT, "reload_only": True})
+        apply("启用隧道服务",
+              lambda: runner.run(["systemctl", "enable", "--now", service.UNIT]),
+              {"kind": "systemctl", "unit": service.UNIT})
     except (OSError, RuntimeError, ValueError) as exc:
         print("成功项：" + ("；".join(successful) or "无"))
         print("失败项：" + redact(str(exc)))
         print("下一步：排除问题后重新安装以续跑，或使用撤回命令。")
         return 1
     print("成功项：" + "；".join(successful))
-    print("失败项：无。下一步：接入管理与代理实现后再验真实出口；当前仅安装基础组件。")
+    print("失败项：无。隧道配置已校验，服务已启用；请用 check 检查当前运行状态。"
+          "设备配对与外网实际连接仍需后续完成。")
     return 0
 
 
@@ -134,6 +163,8 @@ def main(argv=None, runner=None):
         config = load(args.config, runner)
         if args.command in {"check", "status", "diagnose"}:
             result = check(runner, config)
+            if args.command == "status":
+                result["public_ipv4"] = public_ipv4(runner)
             status = evaluate(result)
             if args.command == "check":
                 if args.json:
@@ -148,6 +179,7 @@ def main(argv=None, runner=None):
                     labels = {State.NORMAL: "正常", State.RECONNECTING: "重连中",
                               State.REAUTH: "需重新授权", State.MANUAL: "需人工处理"}
                     print(labels[status.state] + "：" + status.reason)
+                    print("公网 IPv4：" + (status.public_ipv4 or "未取得"))
             else:
                 _diagnose(runner, config, result, args.output)
                 return 0

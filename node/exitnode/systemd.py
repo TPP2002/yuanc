@@ -6,11 +6,14 @@ from string import Template
 from .manifest import UNITS
 
 
-def render(name, ctx):
+def render(name, ctx, binary="/usr/bin/sing-box"):
     if name not in UNITS:
         raise ValueError("未知的本项目服务模板")
     config_path = ctx.get("config_path", "/etc/exitnode/config.toml")
     if any(c in config_path for c in '\n\r\x00"\\%$') or not config_path.startswith("/"):
         raise ValueError("服务配置路径含不支持的字符")
+    if (any(c.isspace() or c in '\x00"\\%$' for c in binary)
+            or not binary.startswith("/") or ".." in binary.split("/")):
+        raise ValueError("服务程序路径含不支持的字符")
     template = files("exitnode").joinpath("templates", name).read_text(encoding="utf-8")
-    return Template(template).substitute(config_path=config_path)
+    return Template(template).substitute(config_path=config_path, binary=binary)
