@@ -14,3 +14,7 @@
    GitHub 私有仓令牌只放在节点 `secrets/github-token`，权限 0600，不放配置、URL 或发布说明。
 
 发布前须复核信任公钥和包内实际程序版本。此脚本不上传、不部署、不创建定时更新任务。
+
+## 当前密钥(2026-10-22)
+
+首个签名密钥已生成:私钥在维护机 `C:/Users/Administrator/.secrets/yuanc-exitnode-signing.pem`(仓库外,0600),对应公钥已写入 `node/exitnode/updater/trust.py`。换密钥 = 重新生成 → 改 trust.py → 发一版由旧密钥签名的新程序(节点装上新公钥)→ 之后的包用新私钥签。
