@@ -1,0 +1,83 @@
+{
+  "schemaVersion": 1,
+  "taskId": "NODE-PROXY-INTEGRATE-1024",
+  "slug": "yc-node-proxy-integrate-1024",
+  "title": "节点接入隧道服务:init 生成 Reality 密钥与 Hysteria2 自签证书、渲染服务端 sing-box 配置、装 exitnode-proxy.service 并启用;check/status 新增隧道层与公网 IPv4;全部幂等可撤回",
+  "goal": "做完后,在装好 sing-box 二进制的 Debian 12 上跑 `exitnode init`,会多出一个真正在跑的隧道服务:①凭据目录里有 reality.json(x25519 密钥对+short_id,0600,已有则复用)、hy2.crt/hy2.key(自签 ECDSA 证书,0600,已有则复用)、devices.json(设备登记表,可为空)、sing-box.json(服务端配置,渲染后先 `sing-box check` 通过才落盘);②/etc/systemd/system/exitnode-proxy.service 已写入、daemon-reload、enable --now;③以上每一步都进安装清单(manifest),重复 init 不重做,rollback/uninstall 按逆序撤回单元与线上配置但保留凭据(--purge 才删);④`exitnode check` 多一层「隧道服务」(systemctl is-active exitnode-proxy 且 sing-box check 通过 = 通过);⑤`exitnode status --json` 多一个 public_ipv4 字段(经 runner 跑 curl 取 https://1.1.1.1/cdn-cgi/trace 的 ip= 行,失败再试 https://api.ipify.org,都失败为 null),100.64.0.0/10 段时 reason 写明「疑似运营商内网地址(CGNAT),外网无法直连」;⑥sing-box 二进制不存在时 init 明确失败并打印安装提示,不自动下载。",
+  "background": "项目:客户自购小主机放在澳大利亚家庭宽带下当出口节点。正本:docs/design/方案v2-中国客户端-澳洲出口.md §3(协议)§5.1(自用模式:节点自己是凭据的家)§7(节点模块);docs/开工须知.md;docs/口径速查表.md。已落地:node/exitnode/{cli,config,manifest,runner,systemd,nft,netinfo,status,log}.py(骨架,PR #1)与 node/exitnode/proxy/**(配置生成器,PR #3:keys.ensure_reality_keys / registry.DeviceRegistry / server_config.render_server / context.ProxyContext / sync.apply_sync / reload.reload,它们走自己的最小协议 proxy/runner_proto.Runner:run(argv)->(code,out,err)、write_file(path,text,mode)、read_file、exists)。本单就是把这两块接起来:骨架的 Runner(runner.py,run 返回 CompletedResult、write_file 有 mode)与 proxy 的 Runner 协议形状不同,写一个薄适配器(建议放 node/exitnode/service.py 里,或 proxy/runner_proto.py 加 `adapt(node_runner)`),不要改动两边已有函数的签名。\n硬规矩:①所有主机副作用只经 Runner,测试全部用 FakeRunner(runner.py 里那个,预设命令响应),一个真实系统调用都不许;②凭据只写 /var/lib/exitnode/secrets(config 已强制)且 0600,日志与异常文本不含私钥/UUID/密码(用 log.redact);③只动本项目自己的 systemd 单元(名字以 exitnode- 开头,加进 manifest.UNITS)与 nftables 表,已有同名文件不是本清单写的就拒绝并提示;④渲染后 `sing-box check -c <临时文件>` 不通过就不覆盖线上配置、不 reload、不启用服务,临时文件内容清空;⑤init 幂等:第二次 init 不重复跑任何命令(现有测试 test_repeated_init_does_not_repeat_commands_and_uninstall_keeps_secrets 要继续通过并扩展到新步骤);⑥服务单元 Restart=always、RestartSec=3、ExecReload 用 SIGHUP(sing-box 支持)或 systemctl restart 兜底,与 proxy/reload.py 的口径一致;⑦Hysteria2 自签证书用 runner 跑 openssl(`openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -keyout <key> -out <crt> -days 3650 -subj /CN=<hy2_server_name>`),已有就复用,不许在 Python 里自己实现证书;⑧公网 IPv4 探测用 runner 跑 curl(`curl -4 -s --max-time 5 <url>`),输出严格按 IPv4 正则解析,解析不出就当 null,绝不把非地址文本写进状态;⑨config.proxy 新增字段都要有默认值(sni/handshake_server 默认 www.microsoft.com 并注明可改为澳洲本地大站;hy2_server_name 默认 exitnode;binary 默认 /usr/bin/sing-box),config.py 的严格校验(未知键拒绝、类型检查、主机名正则)要覆盖新字段,node/examples/config.example.toml 同步。\n遇到要改施工面外文件、缺依赖、sing-box 字段拿不准、要放宽断言的情况,停下交 blocked + forks,不要猜。搜索用 rg 或 git grep。",
+  "nonGoals": [
+    "不做设备 add/list/revoke 命令行与配对文件导出(下一单 NODE-DEVICE-PAIR-1024)",
+    "不做 UPnP 开门、看门狗、更新器、救援单元",
+    "不下载 sing-box 二进制(更新器单负责)",
+    "不改鉴权服务器与 Windows 客户端",
+    "不改 docs/ 正本;可新增或修订 docs/node/ 下的说明"
+  ],
+  "allowedPaths": [
+    "node/exitnode/cli.py",
+    "node/exitnode/config.py",
+    "node/exitnode/manifest.py",
+    "node/exitnode/netinfo.py",
+    "node/exitnode/status.py",
+    "node/exitnode/service.py",
+    "node/exitnode/templates/exitnode-proxy.service",
+    "node/exitnode/proxy/runner_proto.py",
+    "node/examples/config.example.toml",
+    "node/tests/**",
+    "docs/node/**"
+  ],
+  "forbiddenPaths": [
+    "node/exitnode/proxy/keys.py",
+    "node/exitnode/proxy/registry.py",
+    "node/exitnode/proxy/server_config.py",
+    "node/exitnode/proxy/client_config.py",
+    "node/exitnode/proxy/subscription.py",
+    "node/exitnode/proxy/sync.py",
+    "node/exitnode/proxy/reload.py",
+    "node/exitnode/runner.py",
+    "node/exitnode/log.py",
+    "node/exitnode/nft.py",
+    "authserver/**",
+    "winclient/**",
+    "docs/开工须知.md",
+    "docs/口径速查表.md",
+    "docs/design/**",
+    "docs/交接/**",
+    "pyproject.toml",
+    "requirements-dev.txt",
+    ".github/**",
+    ".codex/**"
+  ],
+  "expectArtifacts": [
+    "node/exitnode/service.py",
+    "node/exitnode/templates/exitnode-proxy.service",
+    "node/tests/test_service.py",
+    "node/tests/test_netinfo_public.py"
+  ],
+  "acceptance": [
+    { "id": "SERVICE", "kind": "test:targeted", "target": "node/tests/test_service.py", "required": true, "failsOnBase": true, "note": "FakeRunner 下:sing-box 缺失 → init 返回 1 且输出含安装提示、不写任何单元;存在 → 凭据/证书/配置/单元/enable 各一步进清单;第二次 init 零新命令;证书与密钥已存在时复用不重生成;sing-box check 失败 → 线上配置不变、不 enable、返回 1;rollback 删单元与线上配置、保留 secrets;uninstall --purge 才删凭据" },
+    { "id": "PUBLICIP", "kind": "test:targeted", "target": "node/tests/test_netinfo_public.py", "required": true, "failsOnBase": true, "note": "trace 输出含 ip=203.0.113.9 → 取到;trace 失败 ipify 成功 → 取到;两者都失败 → null;输出是乱文本/IPv6 → null;100.64.1.2 → status reason 含 CGNAT 提示" },
+    { "id": "CLI", "kind": "test:targeted", "target": "node/tests/test_cli.py", "required": true, "note": "既有用例全部保持通过;check 的层列表多一层「隧道服务」;status --json 字段集合多 public_ipv4" },
+    { "id": "CONFIG", "kind": "test:targeted", "target": "node/tests/test_config.py", "required": true, "note": "新字段有默认值;未知键仍拒绝;sni 非法主机名拒绝;示例文件能被 load" },
+    { "id": "PROXYSUITE", "kind": "command", "argv": ["python", "-m", "pytest", "-q", "node/tests"], "required": true, "timeoutSec": 600, "note": "node 全部测试绿(含黄金文件)" },
+    { "id": "RUFF", "kind": "command", "argv": ["python", "-m", "ruff", "check", "node"], "required": true, "timeoutSec": 300 },
+    { "id": "SECRETS", "kind": "command", "argv": ["python", "-c", "import pathlib,re,sys;bad=[str(p) for p in pathlib.Path('node/exitnode').rglob('*.py') if re.search(r'(BEGIN (EC )?PRIVATE KEY|[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})', p.read_text(encoding='utf-8'))];print(bad);sys.exit(1 if bad else 0)"], "required": true, "timeoutSec": 60, "note": "源码里没有写死的私钥或 UUID" }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "model": null,
+  "timeoutSec": 7200,
+  "repoRoot": "E:/yuanc",
+  "engine": "codex",
+  "reasoningEffort": "medium",
+  "steps": [
+    "读方案 §3 §5.1 §7、开工须知、口径速查表;通读 node/exitnode/cli.py、manifest.py、runner.py 与 proxy/ 全部文件,搞清两套 Runner 的差别与 manifest.apply(step, action, undo) 的用法。",
+    "config.py:Proxy 增加 sni / handshake_server / hy2_server_name / binary 四个带默认值的字段并校验;examples/config.example.toml 同步;test_config.py 补用例。",
+    "service.py:①适配器把骨架 Runner 包成 proxy 协议;②ensure_credentials(config, runner):调 proxy.keys.ensure_reality_keys、生成/复用 hy2 证书(openssl 经 runner)、确保 devices.json 存在(空表);③build_context(config, keys) -> ProxyContext;④publish(config, runner):render_server(ctx, registry.all()) → 临时文件 → sing-box check → 原子落盘到 secrets/sing-box.json;⑤每步都包成 manifest.apply 的 (step, action, undo),undo 种类复用 manifest 已有的 remove_file / systemctl / restore_file,凭据步骤 undo 用 preserve。",
+    "templates/exitnode-proxy.service:ExecStart=<binary> run -c /var/lib/exitnode/secrets/sing-box.json;Restart=always;RestartSec=3;ExecReload=/bin/kill -HUP $MAINPID;After=network-online.target;加入 manifest.UNITS;systemd.render 的模板变量按现有 Template 机制扩展(binary 路径)。",
+    "cli.py:init 在现有步骤之后追加「检查 sing-box 二进制」「生成隧道凭据」「渲染隧道配置」「写入 exitnode-proxy.service」「启用隧道服务」;check 增加「隧道服务」层(systemctl is-active + sing-box check);status 输出 public_ipv4;init 成功时的收尾提示改为真实状态(不再写「仅安装基础组件」)。",
+    "netinfo.py:public_ipv4(runner) 按 goal 第⑤条实现;status.py:Status 增加 public_ipv4 字段,evaluate 对 CGNAT 段加 reason。",
+    "测试:test_service.py、test_netinfo_public.py 新建;test_cli.py / test_config.py / 黄金文件按需扩展,不放宽任何既有断言;跑 python -m pytest -q node/tests 与 ruff。",
+    "docs/node/隧道配置说明.md 补一节「init 之后机器上多了什么、怎么看隧道服务活着没、公网地址在哪看」,给不懂编程的人看;交活总结不含术语。"
+  ]
+}
