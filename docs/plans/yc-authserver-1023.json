@@ -1,0 +1,74 @@
+{
+  "schemaVersion": 1,
+  "taskId": "AUTHSERVER-1023",
+  "slug": "yc-authserver-1023",
+  "title": "鉴权服务器(FastAPI+SQLite):邀请码(带期限/次数)、兑换建号、刷新令牌换短期会话并下发节点凭据、设备数上限、吊销、到期拒绝、节点放行名单同步接口、审计、管理员命令行",
+  "goal": "做完后:authserver 包能用 uvicorn 起一个 HTTPS 后面的 API(TLS 由反向代理或 uvicorn 参数负责,本单只做应用层),实现:管理员用 X-Admin-Key 生成邀请码(days、max_uses、note),列账号/设备/审计,延期、停用账号,吊销设备;客户端用邀请码 + 设备信息兑换 → 建账号(到期 = 兑换时刻 + days)并领刷新令牌(只存哈希);客户端用刷新令牌换 6 小时会话并拿到节点连接凭据(节点地址、端口、Reality 公钥、short-id、本设备 UUID、Hysteria2 密码、现成的 sing-box 客户端配置 JSON);到期、停用、设备被吊销、设备数超上限分别返回明确的 4xx 错误码与中文 detail,客户端据此提示而不是无限重试;续期 = 已有账号再兑一个码,叠加期限;节点用 X-Node-Key 拉放行名单(与 node/exitnode/proxy/sync.py 约定的形状)并上报心跳;每个写操作进审计表;兑换与会话接口有简单的按 IP 限速;管理员命令行 authserver-admin 能离线建邀请码与看账号;配置 TOML 示例全占位符。",
+  "background": "项目:客户自购小主机放在澳大利亚家庭宽带下当出口节点,国内 Windows 薄客户端经加密隧道从澳洲出口。账户体系 2026-10-22 已拍板(看板 PLAN-SCOPE-1022 d3):邀请码制,邀请码带期限(一天/一周/一月等),过期不能用;分发出去的客户端本身无功能、安装包不含节点地址与凭据,一切由鉴权服务器放行;服务器首期与节点同机、以后可搬;不做支付/商城/多节点/流量计费。正本 docs/design/方案v2-中国客户端-澳洲出口.md §5(结构图、邀请码规则、薄客户端、设备凭据、数据模型)与 §6(客户端四档状态),请先读。\n与本单并行的两单:yc-node-core-1023(node/exitnode 骨架)、yc-proxy-config-1023(node/exitnode/proxy,含放行名单同步纯函数,接口形状:allowed = [{uuid, hy2_password, account_id, device_id}]);本单不 import 它们,只按同一形状输出。客户端配置 JSON 的生成本单先用一个最小渲染函数 authserver/clientconfig.py(字段与方案 §6 一致:TUN、主备两条 outbound、无 direct 兜底、IPv6 block、DNS 走隧道),等 proxy 单落地后由后续卡统一到一处(本单不负责统一,文件头写 TODO 指向卡 PROXY-CONFIG-1023)。\n依赖已装在本机解释器:fastapi、uvicorn、httpx(测试用 TestClient)、pydantic 2、sqlalchemy 2 可用;也可只用标准库 sqlite3。工位里不许 pip install。\n硬规矩:①令牌与密钥只存哈希(sha256 加服务器盐),数据库里不出现明文刷新令牌、会话令牌、邀请码兑换后的原文可以保留(它本来就是要发给人的);②X-Admin-Key 与 X-Node-Key 从配置文件读取,配置示例写占位符,代码里没有默认密钥,缺配置启动即报错退出;③所有时间 UTC、ISO 8601,到期判断用服务器时间;④错误码约定(客户端依赖它们分档):401 令牌无效或过期会话、403 账号停用、410 账号到期、409 设备数超上限、423 设备已吊销、429 限速、404 邀请码不存在、422 参数;detail 中文;⑤审计表记 who(admin/account:id/device:id/node)、what、at、ip;⑥不记录请求体里的令牌到日志;⑦后台进程、子进程一律静默(本单基本不起子进程)。\n遇到要改施工面外文件、缺依赖、要放宽断言的情况,停下交 blocked + forks。搜索用 rg 或 git grep。",
+  "nonGoals": [
+    "不做网页管理后台(后续卡);本单只做 API 与命令行",
+    "不做支付、商城、多节点、流量统计、邀请码分级",
+    "不做 TLS 终止(由 uvicorn 参数或反向代理负责,文档里写清)",
+    "不改 node/、winclient/ 下任何文件",
+    "不改 docs/ 正本;可新增 docs/authserver/接口说明.md 一篇"
+  ],
+  "allowedPaths": [
+    "authserver/**",
+    "docs/authserver/接口说明.md"
+  ],
+  "forbiddenPaths": [
+    "node/**",
+    "winclient/**",
+    "docs/开工须知.md",
+    "docs/口径速查表.md",
+    "docs/design/**",
+    "docs/交接/**",
+    "pyproject.toml",
+    "requirements-dev.txt",
+    ".github/**"
+  ],
+  "expectArtifacts": [
+    "authserver/authserver/__init__.py",
+    "authserver/authserver/app.py",
+    "authserver/authserver/db.py",
+    "authserver/authserver/models.py",
+    "authserver/authserver/security.py",
+    "authserver/authserver/clientconfig.py",
+    "authserver/authserver/admin_cli.py",
+    "authserver/examples/config.example.toml",
+    "authserver/tests/test_invites.py",
+    "authserver/tests/test_sessions.py",
+    "authserver/tests/test_devices.py",
+    "authserver/tests/test_node_sync.py",
+    "authserver/tests/test_security.py",
+    "docs/authserver/接口说明.md"
+  ],
+  "acceptance": [
+    { "id": "INV", "kind": "test:targeted", "target": "authserver/tests/test_invites.py", "required": true, "failsOnBase": true, "note": "管理员建码(days=1/7/30 与任意值)成功;无 X-Admin-Key 401;兑换建号且到期=兑换时刻+days;超 max_uses 后兑换 404/409 之一且稿里固定;续期叠加到现有到期时间之后;不存在的码 404" },
+    { "id": "SESS", "kind": "test:targeted", "target": "authserver/tests/test_sessions.py", "required": true, "failsOnBase": true, "note": "刷新令牌换会话成功且含节点凭据与客户端配置 JSON(配置里无 direct outbound、IPv6 block);到期账号 410;停用账号 403;伪造令牌 401;会话 6 小时后失效(可注入时钟)" },
+    { "id": "DEV", "kind": "test:targeted", "target": "authserver/tests/test_devices.py", "required": true, "note": "设备数超上限 409;吊销后换会话 423;吊销写 revoked_at 不删行;同一设备指纹重复兑换幂等" },
+    { "id": "NODE", "kind": "test:targeted", "target": "authserver/tests/test_node_sync.py", "required": true, "note": "X-Node-Key 正确才 200;放行名单只含未到期、未停用、未吊销的设备,形状 [{uuid, hy2_password, account_id, device_id}];心跳落库" },
+    { "id": "SEC", "kind": "test:targeted", "target": "authserver/tests/test_security.py", "required": true, "note": "数据库里查不到任何明文刷新令牌/会话令牌;缺管理员密钥配置时启动报错;兑换接口超过限速阈值 429;日志里不出现令牌原文" },
+    { "id": "RUFF", "kind": "command", "argv": ["python", "-m", "ruff", "check", "authserver"], "required": true, "timeoutSec": 300 },
+    { "id": "ALL", "kind": "command", "argv": ["python", "-m", "pytest", "-q", "authserver/tests"], "required": true, "timeoutSec": 600 }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "model": null,
+  "timeoutSec": 7200,
+  "repoRoot": "E:/yuanc",
+  "engine": "codex",
+  "reasoningEffort": "medium",
+  "steps": [
+    "读方案 §5 §6、pyproject.toml(pytest pythonpath 已含 authserver,测试里 import authserver 即可;包放 authserver/authserver/)。确认 python -c 'import fastapi, httpx' 可用。",
+    "authserver/authserver/config.py:TOML 配置(server{bind, port}, security{admin_key, node_key, token_salt}, node{host, reality_port, hy2_port, reality_public_key, short_id, sni}, limits{session_hours=6, default_device_limit=2, redeem_per_ip_per_hour=10});缺 security 三项任一启动抛错。examples/config.example.toml 全占位符。",
+    "db.py + models.py:sqlite3 标准库或 SQLAlchemy 任选其一;四张表 invites / accounts / devices / audit 按方案 §5 数据模型,加 sessions(token_hash, device_id, expires_at)与 node_heartbeat;建表幂等;所有写操作在事务里。",
+    "security.py:hash_token(raw) 用 sha256(salt+raw);new_token() 用 secrets.token_urlsafe(32);new_invite_code() 形如 XXXX-XXXX-XXXX(去掉易混字符);clock 可注入(now() 函数参数或依赖注入)便于测过期。",
+    "app.py:FastAPI 应用,路由:POST /admin/invites;GET /admin/accounts;GET /admin/accounts/{id};POST /admin/accounts/{id}/extend {days};POST /admin/accounts/{id}/disable;POST /admin/accounts/{id}/enable;GET /admin/devices;POST /admin/devices/{id}/revoke;GET /admin/audit;POST /client/redeem {code, device{platform, name, fingerprint}, refresh_token 可选用于续期} → {account_id, expires_at, refresh_token, device_id};POST /client/session {refresh_token} → {session_token, session_expires_at, account_expires_at, node{host, reality_port, hy2_port, sni, reality_public_key, short_id, uuid, hy2_password}, singbox_config};POST /client/logout;GET /node/allowed(X-Node-Key)→ {version, allowed[]};POST /node/heartbeat。错误码照 background ④。限速:内存计数器按 IP 每小时,超出 429。",
+    "clientconfig.py:render(node_ctx, device) -> dict,字段与方案 §6 一致(TUN、main/backup/urltest、block、dns、无 direct、IPv6 block、DNS 全部 detour 隧道),文件头 TODO 指向 PROXY-CONFIG-1023 统一。",
+    "admin_cli.py:python -m authserver.admin_cli invite --days 30 --uses 1 --note 文本;accounts;devices;revoke <device_id>;extend <account_id> --days N;直接操作数据库文件,不经 HTTP。",
+    "五个测试文件用 fastapi.testclient.TestClient + 临时 sqlite 文件 + 注入时钟;跑 python -m pytest -q authserver/tests 与 ruff 全绿。",
+    "docs/authserver/接口说明.md:接口表(路径、谁调、错误码含义)+ 给不懂编程的人的一段「邀请码怎么发、怎么停人」;交活总结一段不含术语。"
+  ]
+}

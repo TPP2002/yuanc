@@ -1,0 +1,7 @@
+[tool.pytest.ini_options]
+testpaths = ["node/tests", "authserver/tests"]
+pythonpath = ["node", "authserver"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
