@@ -3,3 +3,4 @@ ruff>=0.6
 fastapi>=0.115
 uvicorn>=0.30
 httpx>=0.27
+cryptography>=42  # 节点 Reality 密钥对生成(node/exitnode/proxy/keys.py);Debian 12 用 apt 包 python3-cryptography
