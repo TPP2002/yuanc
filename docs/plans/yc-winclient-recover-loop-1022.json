@@ -102,7 +102,14 @@
     {
       "id": "BUILD",
       "kind": "command",
-      "argv": ["dotnet", "build", "winclient/WinClient.sln", "-c", "Release", "--nologo"],
+      "argv": [
+        "dotnet",
+        "build",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--nologo"
+      ],
       "required": true,
       "timeoutSec": 1200,
       "note": "首轮会生成 third_party/bin 让指纹漂一次,正常"
@@ -110,23 +117,51 @@
     {
       "id": "TEST",
       "kind": "command",
-      "argv": ["dotnet", "test", "winclient/WinClient.sln", "-c", "Release", "--no-build", "--nologo"],
+      "argv": [
+        "dotnet",
+        "test",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--no-build",
+        "--nologo"
+      ],
       "required": true,
       "timeoutSec": 900,
       "note": "既有测试全过且断言未改(替身签名适配除外);新增 KillSwitchRecoveryTests 见 goal ⑥"
     },
     {
-      "id": "SHAPE",
+      "id": "SHAPE-FW",
       "kind": "command",
-      "argv": ["python", "-c", "import pathlib,sys;r=lambda p:pathlib.Path(p).read_text(encoding='utf-8');pl=r('winclient/WinClient.Core/Firewall/KillSwitchPlanner.cs');ap=r('winclient/WinClient.Core/Firewall/KillSwitchApplier.cs');rt=r('winclient/WinClient.Core/Client/ClientRuntime.cs');ct=r('winclient/WinClient.Core/Client/ClientController.cs');cs=r('winclient/WinClient.App/Hosting/ControlService.cs');bad=[k for k,ok in (('planner.RecoverFallback','RecoverFallback' in pl),('planner.archive','killswitch-state.failed-' in pl),('planner.evidence','killswitch-recovery.json' in pl),('planner.Move-Item','Move-Item' in pl),('planner.windows_default','windows_default' in pl),('applier.signature','Task<string?> RecoverAsync' in ap),('applier.warning','LastRecoveryWarning' in ap),('applier.log','killswitch-recovery.log' in ap),('runtime.guard','catch (InvalidOperationException' in rt and 'RecoveryWarning' in rt),('controller.manual','恢复记录已保留' in ct),('service.log','RecoveryWarning' in cs and 'Environment.Exit(1)' in cs)) if not ok];print(bad);sys.exit(1 if bad else 0)"],
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda p:pathlib.Path(p).read_text(encoding='utf-8');pl=r('winclient/WinClient.Core/Firewall/KillSwitchPlanner.cs');ap=r('winclient/WinClient.Core/Firewall/KillSwitchApplier.cs');bad=[k for k in ('RecoverFallback','killswitch-state.failed-','killswitch-recovery.json','windows_default','Move-Item') if k not in pl]+[k for k in ('Task<string?> RecoverAsync','LastRecoveryWarning','killswitch-recovery.log') if k not in ap];print(bad);sys.exit(1 if bad else 0)"
+      ],
       "required": true,
       "timeoutSec": 60,
-      "note": "两层恢复、归档、证据、守卫、提示、服务日志都在;Fatal 语义仍在"
+      "note": "规划器新动作、归档、证据、系统默认分支;执行器新签名、提示属性、失败日志"
+    },
+    {
+      "id": "SHAPE-WIRE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda p:pathlib.Path(p).read_text(encoding='utf-8');rt=r('winclient/WinClient.Core/Client/ClientRuntime.cs');ct=r('winclient/WinClient.Core/Client/ClientController.cs');cs=r('winclient/WinClient.App/Hosting/ControlService.cs');bad=[k for k,ok in (('runtime.guard','catch (InvalidOperationException' in rt),('runtime.warning','RecoveryWarning' in rt),('controller.manual','恢复记录已保留' in ct),('service.log','RecoveryWarning' in cs),('service.fatal','Environment.Exit(1)' in cs)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60,
+      "note": "运行时守卫与提示透出、控制器需人工处理文案、服务日志;Fatal 语义仍在"
     },
     {
       "id": "NOWINDOW",
       "kind": "command",
-      "argv": ["python", "-c", "import pathlib,sys;norm=lambda p:str(p).replace(chr(92),'/');files=[p for root in ('winclient/WinClient.Core','winclient/WinClient.App') for p in pathlib.Path(root).rglob('*.cs') if '/obj/' not in norm(p) and '/bin/' not in norm(p)];bad=[norm(p) for p in files if 'ProcessStartInfo' in p.read_text(encoding='utf-8') and p.parent.name!='Process' and 'CreateNoWindow = true' not in p.read_text(encoding='utf-8')];print(bad);sys.exit(1 if bad else 0)"],
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;norm=lambda p:str(p).replace(chr(92),'/');files=[p for root in ('winclient/WinClient.Core','winclient/WinClient.App') for p in pathlib.Path(root).rglob('*.cs') if '/obj/' not in norm(p) and '/bin/' not in norm(p)];bad=[norm(p) for p in files if 'ProcessStartInfo' in p.read_text(encoding='utf-8') and p.parent.name!='Process' and 'CreateNoWindow = true' not in p.read_text(encoding='utf-8')];print(bad);sys.exit(1 if bad else 0)"
+      ],
       "required": true,
       "timeoutSec": 60,
       "note": "起子进程的文件显式 CreateNoWindow=true"
@@ -134,7 +169,11 @@
     {
       "id": "DOCS",
       "kind": "command",
-      "argv": ["python", "-c", "import pathlib,sys;a=pathlib.Path('docs/winclient/断网保护加固说明.md').read_text(encoding='utf-8');b=pathlib.Path('docs/winclient/架构说明.md').read_text(encoding='utf-8');miss=[k for k in ('降级','killswitch-state.failed-','killswitch-recovery.json','系统默认','重启','需人工处理','真机') if k not in a]+([] if '降级' in b else ['架构说明缺降级一句']);print(miss);sys.exit(1 if miss else 0)"],
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;a=pathlib.Path('docs/winclient/断网保护加固说明.md').read_text(encoding='utf-8');b=pathlib.Path('docs/winclient/架构说明.md').read_text(encoding='utf-8');miss=[k for k in ('降级','killswitch-state.failed-','killswitch-recovery.json','系统默认','重启','需人工处理','真机') if k not in a]+([] if '降级' in b else ['架构说明缺降级一句']);print(miss);sys.exit(1 if miss else 0)"
+      ],
       "required": true,
       "timeoutSec": 60,
       "note": "加固说明新节齐全,架构说明补了指向"
@@ -142,7 +181,11 @@
     {
       "id": "NOBIN",
       "kind": "command",
-      "argv": ["python", "-c", "import subprocess,sys;out=subprocess.run(['git','ls-files','winclient','build'],capture_output=True,text=True).stdout.split();bad=[f for f in out if f.endswith(('.exe','.dll','.zip','.pdb'))];print(bad);sys.exit(1 if bad else 0)"],
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess,sys;out=subprocess.run(['git','ls-files','winclient','build'],capture_output=True,text=True).stdout.split();bad=[f for f in out if f.endswith(('.exe','.dll','.zip','.pdb'))];print(bad);sys.exit(1 if bad else 0)"
+      ],
       "required": true,
       "timeoutSec": 60,
       "note": "二进制不入库"
