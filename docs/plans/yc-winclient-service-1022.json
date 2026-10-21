@@ -62,7 +62,14 @@
     {
       "id": "BUILD",
       "kind": "command",
-      "argv": ["dotnet", "build", "winclient/WinClient.sln", "-c", "Release", "--nologo"],
+      "argv": [
+        "dotnet",
+        "build",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--nologo"
+      ],
       "required": true,
       "timeoutSec": 1200,
       "note": "只用 NuGet 缓存里已有的包;构建期第三方件走已校验缓存"
@@ -70,7 +77,15 @@
     {
       "id": "TEST",
       "kind": "command",
-      "argv": ["dotnet", "test", "winclient/WinClient.sln", "-c", "Release", "--no-build", "--nologo"],
+      "argv": [
+        "dotnet",
+        "test",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--no-build",
+        "--nologo"
+      ],
       "required": true,
       "timeoutSec": 900,
       "note": "既有测试全过且断言未改;新增 IpcTests / HostingTests 见 goal ⑧"
@@ -78,7 +93,15 @@
     {
       "id": "PUBLISH",
       "kind": "command",
-      "argv": ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", "scripts/release/build-winclient.ps1"],
+      "argv": [
+        "powershell",
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "scripts/release/build-winclient.ps1"
+      ],
       "required": true,
       "timeoutSec": 1800,
       "note": "服务化后单文件出包仍成立(WinForms 托盘与 ServiceController 都进单文件)"
@@ -86,7 +109,11 @@
     {
       "id": "ASINVOKER",
       "kind": "command",
-      "argv": ["python", "-c", "import pathlib,sys;t=pathlib.Path('winclient/WinClient.App/app.manifest').read_text(encoding='utf-8');print('asInvoker' in t, 'requireAdministrator' in t);sys.exit(0 if 'level=\"asInvoker\"' in t and 'requireAdministrator' not in t else 1)"],
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;t=pathlib.Path('winclient/WinClient.App/app.manifest').read_text(encoding='utf-8');print('asInvoker' in t, 'requireAdministrator' in t);sys.exit(0 if 'level=\"asInvoker\"' in t and 'requireAdministrator' not in t else 1)"
+      ],
       "required": true,
       "timeoutSec": 60,
       "note": "界面不再要求管理员"
@@ -94,7 +121,11 @@
     {
       "id": "COREPURE",
       "kind": "command",
-      "argv": ["python", "-c", "import pathlib,sys;t=pathlib.Path('winclient/WinClient.Core/WinClient.Core.csproj').read_text(encoding='utf-8');bad=[k for k in ('UseWPF','UseWindowsForms','PresentationFramework','System.Windows.Forms') if k in t];src=[str(p) for p in pathlib.Path('winclient/WinClient.Core').rglob('*.cs') if 'System.Windows' in p.read_text(encoding='utf-8') or 'System.IO.Pipes.NamedPipe' in p.read_text(encoding='utf-8')];print(bad,src);sys.exit(1 if bad or src else 0)"],
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;t=pathlib.Path('winclient/WinClient.Core/WinClient.Core.csproj').read_text(encoding='utf-8');bad=[k for k in ('UseWPF','UseWindowsForms','PresentationFramework','System.Windows.Forms') if k in t];src=[str(p) for p in pathlib.Path('winclient/WinClient.Core').rglob('*.cs') if 'System.Windows' in p.read_text(encoding='utf-8') or 'System.IO.Pipes.NamedPipe' in p.read_text(encoding='utf-8')];print(bad,src);sys.exit(1 if bad or src else 0)"
+      ],
       "required": true,
       "timeoutSec": 60,
       "note": "Core 不引用 WPF/WinForms,也不直接依赖命名管道类型(管道在 App 宿主里创建,Core 只认 Stream)"
@@ -102,7 +133,11 @@
     {
       "id": "NOWINDOW",
       "kind": "command",
-      "argv": ["python", "-c", "import pathlib,re,sys;bad=[];\nfor p in list(pathlib.Path('winclient/WinClient.Core').rglob('*.cs'))+list(pathlib.Path('winclient/WinClient.App').rglob('*.cs')):\n  if any(s in str(p) for s in ('/obj/','\\\\obj\\\\','/bin/','\\\\bin\\\\')): continue\n  t=p.read_text(encoding='utf-8')\n  if 'ProcessStartInfo' in t and 'Firewall' not in str(p) and 'Process' not in p.parent.name and 'CreateNoWindow = true' not in t: bad.append(str(p))\nprint(bad);sys.exit(1 if bad else 0)"],
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;skip=('/obj/','\\obj\\','/bin/','\\bin\\');files=[p for p in list(pathlib.Path('winclient/WinClient.Core').rglob('*.cs'))+list(pathlib.Path('winclient/WinClient.App').rglob('*.cs')) if not any(s in str(p) for s in skip)];bad=[str(p) for p in files if 'ProcessStartInfo' in p.read_text(encoding='utf-8') and 'Firewall' not in str(p) and p.parent.name!='Process' and 'CreateNoWindow = true' not in p.read_text(encoding='utf-8')];print(bad);sys.exit(1 if bad else 0)"
+      ],
       "required": true,
       "timeoutSec": 60,
       "note": "新写的任何起子进程的文件都显式 CreateNoWindow=true(runas 拉起自己那一处也要写,虽然目标无控制台)"
@@ -110,7 +145,11 @@
     {
       "id": "DOCS",
       "kind": "command",
-      "argv": ["python", "-c", "import pathlib,sys;a=pathlib.Path('docs/winclient/服务化与自启说明.md');b=pathlib.Path('docs/winclient/架构说明.md').read_text(encoding='utf-8');ok=a.exists() and all(k in a.read_text(encoding='utf-8') for k in ('YuanCService','--service','--install','--uninstall','desired.json','YuanC-Control','secure','真机')) and '本单不做服务化' not in b and '不实施 Windows 服务' not in b;print(ok);sys.exit(0 if ok else 1)"],
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;a=pathlib.Path('docs/winclient/服务化与自启说明.md');b=pathlib.Path('docs/winclient/架构说明.md').read_text(encoding='utf-8');ok=a.exists() and all(k in a.read_text(encoding='utf-8') for k in ('YuanCService','--service','--install','--uninstall','desired.json','YuanC-Control','secure','真机')) and '本单不做服务化' not in b and '不实施 Windows 服务' not in b;print(ok);sys.exit(0 if ok else 1)"
+      ],
       "required": true,
       "timeoutSec": 60,
       "note": "新文档齐全;架构说明里的过时口径已改"
@@ -118,7 +157,11 @@
     {
       "id": "NOBIN",
       "kind": "command",
-      "argv": ["python", "-c", "import subprocess,sys;out=subprocess.run(['git','ls-files','winclient','build'],capture_output=True,text=True).stdout.split();bad=[f for f in out if f.endswith(('.exe','.dll','.zip','.pdb'))];print(bad);sys.exit(1 if bad else 0)"],
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess,sys;out=subprocess.run(['git','ls-files','winclient','build'],capture_output=True,text=True).stdout.split();bad=[f for f in out if f.endswith(('.exe','.dll','.zip','.pdb'))];print(bad);sys.exit(1 if bad else 0)"
+      ],
       "required": true,
       "timeoutSec": 60,
       "note": "二进制不入库(只查已跟踪文件,不要求工人做 git 操作)"
