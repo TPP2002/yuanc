@@ -1,0 +1,13 @@
+拍板:选「成功后才移除活动记录」。修正契约 goal ②a 与 ⑥a 如下(其余不变):
+
+RecoverFallback 脚本顺序改为:
+a) 状态文件存在时,先 Copy-Item(不是 Move-Item)复制一份归档 killswitch-state.failed-<UTC yyyyMMddTHHmmssZ>.json 到同目录;复制失败就 throw,什么都不改。复制前把同目录已有的 killswitch-state.failed-*.json 按名字排序,只保留最新 4 份、多的删掉(加上这次最多 5 份),防止连续失败每次开机堆一份。
+b)~e) 照原契约:宽松解析活动记录;按记录或系统默认恢复三个 profile 的默认出站;尽力 Enable disabledRules 并收集失败名;只删 YuanC-KS-* 规则。
+f) 写 killswitch-recovery.json(字段照原契约,archived 填归档文件名)。
+g) 最后一步才 Remove-Item 活动状态文件 killswitch-state.json;然后以 0 退出。
+这样恢复配置或写证据任何一步失败,活动记录仍在:Applier 抛错 → CreateAsync 吞掉 → InitializeAsync 再跑两层 → 仍失败 → 进需人工处理,服务保持运行;下次开机还会再试。不加进程内标记。
+
+Applier 规则相应补一句:第一段失败后状态文件仍存在才跑降级;降级退出 0 后状态文件应已不存在(脚本删的),LastRecoveryWarning 设为提示;降级退出非 0 → 抛 InvalidOperationException,LastRecoveryWarning 不设。
+
+测试 ⑥(a) 改为:Copy-Item 归档出现在第一处 Set-NetFirewallProfile 之前;Remove-Item 活动状态文件出现在写 killswitch-recovery.json 之后且是脚本最后一个操作;含保留最新归档的清理逻辑(文本含 'killswitch-state.failed-*');其余 (a) 断言不变。⑥(b) 假 runner 在第二段成功时删掉状态文件以模拟脚本收尾,不变。新增 (g):第二段退出 1 时状态文件仍存在(假 runner 不删)、抛错、LastRecoveryWarning 为 null。
+文档 ⑦ 同步写清「归档是复制、活动记录恢复成功才删、失败下次开机重试、归档最多 5 份」。
