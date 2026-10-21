@@ -231,7 +231,7 @@ public sealed class PairingTests
         public Task ApplyAsync(IReadOnlyList<IPAddress> ips, string program, int hy2Port) { order.Add("apply"); return Task.CompletedTask; }
         public Task UpdateNodeAsync(IReadOnlyList<IPAddress> ips, string program, int hy2Port) { order.Add("update"); return Task.CompletedTask; }
         public Task RemoveAsync() { order.Add("remove"); return Task.CompletedTask; }
-        public Task RecoverAsync() { order.Add("recover"); return Task.CompletedTask; }
+        public Task<string?> RecoverAsync() { order.Add("recover"); return Task.FromResult<string?>(null); }
     }
     internal sealed class FakeTunnel(List<string> order, bool fail = false) : ITunnelTransport
     {

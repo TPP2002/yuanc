@@ -49,6 +49,7 @@ public sealed class ControlService : ServiceBase
                 var secure = Path.Combine(ClientSettings.DataDirectory, "secure");
                 PrepareSecureDirectory(secure);
                 runtime = await ClientRuntime.CreateAsync(new KernelInstaller(new EmbeddedKernelSource()), secure, DataProtectionScope.LocalMachine).ConfigureAwait(false);
+                if (runtime.RecoveryWarning is { } warning) Log.Write("启动时断网保护降级恢复：" + warning);
                 if (lifetime.IsCancellationRequested) return;
                 var desired = new DesiredStateStore();
                 // Expose status while connecting: network delay must not look like a dead new service.
