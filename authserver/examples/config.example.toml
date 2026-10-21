@@ -15,6 +15,8 @@ hy2_port = "<备用通道端口>"
 reality_public_key = "<Reality公钥>"
 short_id = "<十六进制短标识>"
 sni = "<服务端证书与Reality使用的域名>"
+hy2_server_name = "exitnode"
+hy2_certificate_path = "<节点备用通道证书的本地文件路径，不是私钥>"
 
 [limits]
 session_hours = "<会话小时数，默认6>"

@@ -31,7 +31,7 @@ public sealed class PairingTests
         var input = JsonNode.Parse(File.ReadAllText(Path.Combine(GoldenDirectory, "inputs.json")))!;
         return new JsonObject
         {
-            ["format"] = "ycpair/1", ["exported_at"] = "2026-10-22T00:00:00+00:00",
+            ["format"] = "ycpair/2", ["exported_at"] = "2026-10-22T00:00:00+00:00",
             ["node"] = new JsonObject
             {
                 ["host"] = input["context"]!["server_host"]!.DeepClone(),
@@ -39,7 +39,9 @@ public sealed class PairingTests
                 ["reality_public_key"] = input["context"]!["reality"]!["public_key"]!.DeepClone(),
                 ["short_id"] = input["context"]!["reality"]!["short_id"]!.DeepClone(),
                 ["uuid"] = input["device"]!["uuid"]!.DeepClone(),
-                ["hy2_password"] = input["device"]!["hy2_password"]!.DeepClone()
+                ["hy2_password"] = input["device"]!["hy2_password"]!.DeepClone(),
+                ["hy2_server_name"] = input["context"]!["hy2_server_name"]!.DeepClone(),
+                ["hy2_certificate"] = input["context"]!["hy2_certificate"]!.DeepClone()
             }
         };
     }
@@ -47,7 +49,7 @@ public sealed class PairingTests
     internal static PairingFile ValidPairing() => PairingFile.Parse(ValidDocument().ToJsonString());
 
     [Theory]
-    [InlineData("format", "\"ycpair/2\"")]
+    [InlineData("format", "\"ycpair/3\"")]
     [InlineData("host", "\"node.invalid\"")]
     [InlineData("host", "\"::1\"")]
     [InlineData("host", "\"127.1\"")]

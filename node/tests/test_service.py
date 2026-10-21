@@ -92,6 +92,7 @@ def test_install_manifest_order_permissions_and_repeat(monkeypatch, capsys):
         "openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt",
         "ec_paramgen_curve:prime256v1", "-nodes", "-keyout", SECRETS + "/hy2.key.new.tmp",
         "-out", SECRETS + "/hy2.crt.new.tmp", "-days", "3650", "-subj", "/CN=exitnode",
+        "-addext", "subjectAltName=DNS:exitnode",
     )
     assert "ExecReload=/bin/kill -HUP $MAINPID" in runner.files[UNIT_PATH]
     assert runner.files[LIVE + ".check.tmp"] == ""
@@ -109,7 +110,9 @@ def test_existing_credentials_reused_without_regeneration():
     boundary = len(runner.calls)
     assert main(["init"], runner) == 0
     assert all(runner.files[p] == text for p, text in original.items())
-    assert not any(cmd[0] == "openssl" for cmd in commands(runner))
+    assert [cmd for cmd in commands(runner) if cmd[0] == "openssl"] == [
+        ("openssl", "x509", "-in", SECRETS + "/hy2.crt", "-noout", "-ext", "subjectAltName")]
+    assert not any(cmd[:2] == ("openssl", "req") for cmd in commands(runner))
     assert not any(c[0] == "write_file" and c[1] in original for c in runner.calls[boundary:])
 
 
@@ -204,7 +207,7 @@ def test_context_and_custom_binary_reach_service_and_check():
     assert main(["init"], runner) == 0
     config = load(CONFIG, runner)
     keys = ensure_reality_keys(SECRETS, ProxyRunner(runner))
-    ctx = build_context(config, keys)
+    ctx = build_context(config, keys, runner)
     assert ctx.reality == keys and ctx.sni == config.proxy.sni
     assert ctx.handshake_server == config.proxy.handshake_server
     assert ctx.hy2_server_name == config.proxy.hy2_server_name

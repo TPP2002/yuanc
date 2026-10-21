@@ -59,8 +59,11 @@ public sealed class ClientRuntime : IDisposable
             pairingStore.Save(pairing);
             http?.Dispose(); http = null;
             return new PairingSessionSource(pairing, log);
-        }, $"已导入配对文件：{pairing.DisplayName}，点击连接");
+        }, PairingImportMessage(pairing));
     }
+
+    public static string PairingImportMessage(PairingFile pairing) =>
+        $"已导入配对文件：{pairing.DisplayName}，点击连接" + (pairing.Warning is null ? "" : "。" + pairing.Warning);
 
     public Task ClearPairingAsync() => Controller.ChangeSessionSourceAsync(() =>
     {

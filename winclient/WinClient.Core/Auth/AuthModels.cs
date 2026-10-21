@@ -59,4 +59,6 @@ public sealed class NodeInfo
     public required string ShortId { get; init; }
     public required string Uuid { get; init; }
     public required string Hy2Password { get; init; }
+    public string Hy2ServerName { get; init; } = "exitnode";
+    public string[] Hy2Certificate { get; init; } = [];
 }

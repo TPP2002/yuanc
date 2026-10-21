@@ -23,6 +23,6 @@ def vless_link(ctx: ProxyContext, device: Device) -> str:
         "pbk": ctx.reality.public_key, "sid": ctx.reality.short_id,
     })
     return (
-        f"vless://{device.uuid}@{main['server']}:443?{params}"
+        f"vless://{device.uuid}@{main['server']}:{ctx.reality_port}?{params}"
         f"#{quote(device.name, safe='')}"
     )

@@ -3,7 +3,16 @@
 import tomllib
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    SecretStr,
+    computed_field,
+    field_validator,
+    model_validator,
+)
 
 
 class Section(BaseModel):
@@ -36,6 +45,25 @@ class Node(Section):
     reality_public_key: str = Field(min_length=1)
     short_id: str = Field(pattern=r"^(?:[0-9a-fA-F]{2}){1,8}$")
     sni: str = Field(min_length=1)
+    hy2_server_name: str = Field(default="exitnode", min_length=1)
+    hy2_certificate_path: str = Field(min_length=1, exclude=True, repr=False)
+    _certificate: list[str] = PrivateAttr(default_factory=list)
+
+    @model_validator(mode="after")
+    def read_certificate(self):
+        try:
+            self._certificate = [line for line in Path(self.hy2_certificate_path)
+                                 .read_text(encoding="utf-8").splitlines() if line.strip()]
+        except (OSError, UnicodeError):
+            raise ValueError("无法读取备用通道证书：" + self.hy2_certificate_path) from None
+        if not self._certificate:
+            raise ValueError("备用通道证书为空：" + self.hy2_certificate_path)
+        return self
+
+    @computed_field
+    @property
+    def hy2_certificate(self) -> list[str]:
+        return list(self._certificate)
 
 
 class Limits(Section):
@@ -58,4 +86,5 @@ def load_config(path: str | Path) -> Settings:
     try:
         return Settings.model_validate(data)
     except ValueError:
-        raise ValueError("鉴权服务器配置无效：请检查安全密钥、节点参数及限制") from None
+        raise ValueError("鉴权服务器配置无效：请检查安全密钥、节点参数及限制，"
+                         "备用通道证书路径必填且文件必须可读取") from None

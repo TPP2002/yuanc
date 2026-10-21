@@ -13,9 +13,10 @@ public sealed class PairingFile
     public string RawJson { get; }
     public NodeInfo Node { get; }
     public string DisplayName { get; }
+    public string? Warning { get; }
 
-    private PairingFile(string rawJson, NodeInfo node, string displayName)
-    { RawJson = rawJson; Node = node; DisplayName = displayName; }
+    private PairingFile(string rawJson, NodeInfo node, string displayName, string? warning)
+    { RawJson = rawJson; Node = node; DisplayName = displayName; Warning = warning; }
 
     public static PairingFile Parse(string json)
     {
@@ -24,11 +25,14 @@ public sealed class PairingFile
             using var document = JsonDocument.Parse(json);
             var root = document.RootElement;
             if (root.ValueKind != JsonValueKind.Object || !root.TryGetProperty("format", out var format) ||
-                format.ValueKind != JsonValueKind.String || format.GetString() != "ycpair/1")
+                format.ValueKind != JsonValueKind.String || format.GetString() is not ("ycpair/1" or "ycpair/2"))
                 throw new InvalidDataException("配对文件版本不正确，请重新导出。");
             if (!root.TryGetProperty("node", out var nodeElement) || nodeElement.ValueKind != JsonValueKind.Object)
                 throw new InvalidDataException("配对文件缺少出口信息。");
             var node = nodeElement.Deserialize<NodeInfo>(Json) ?? throw new InvalidDataException("配对文件缺少出口信息。");
+            bool isV2 = format.GetString() == "ycpair/2";
+            if (isV2 || nodeElement.TryGetProperty("hy2_server_name", out _) || nodeElement.TryGetProperty("hy2_certificate", out _))
+                ValidateBackup(nodeElement, node);
             if (node.Host is null || !Regex.IsMatch(node.Host, @"\A[0-9]{1,3}(\.[0-9]{1,3}){3}\z") ||
                 !IPAddress.TryParse(node.Host, out var ip) || ip.AddressFamily != AddressFamily.InterNetwork || ip.ToString() != node.Host)
                 throw new InvalidDataException("出口地址必须是四段数字地址。");
@@ -43,7 +47,7 @@ public sealed class PairingFile
             if (string.IsNullOrEmpty(node.Hy2Password)) throw new InvalidDataException("配对密码不能为空。");
             if (string.IsNullOrWhiteSpace(node.Sni)) throw new InvalidDataException("配对文件缺少连接校验名称。");
             var label = Text(root, "device_name") ?? Text(root, "exported_at") ?? "未注明导出时间";
-            return new(json, node, label);
+            return new(json, node, label, isV2 ? null : "配对文件是旧版,备用线路可能不可用,建议在小主机上重新导出");
         }
         catch (JsonException) { throw new InvalidDataException("配对文件格式不正确或缺少必填字段，请重新导出。"); }
     }
@@ -52,6 +56,19 @@ public sealed class PairingFile
     {
         log.RegisterSecret(Node.Uuid);
         log.RegisterSecret(Node.Hy2Password);
+    }
+
+    private static void ValidateBackup(JsonElement element, NodeInfo node)
+    {
+        if (!element.TryGetProperty("hy2_server_name", out var name) || name.ValueKind != JsonValueKind.String ||
+            node.Hy2ServerName is null || node.Hy2ServerName.Length > 253 ||
+            !Regex.IsMatch(node.Hy2ServerName, @"\A[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\z"))
+            throw new InvalidDataException("备用线路证书名称必须是合法主机名。");
+        if (!element.TryGetProperty("hy2_certificate", out var certificate) || certificate.ValueKind != JsonValueKind.Array ||
+            node.Hy2Certificate is null || node.Hy2Certificate.Length < 3 || node.Hy2Certificate.Any(string.IsNullOrWhiteSpace) ||
+            node.Hy2Certificate.Any(line => line.Contains('\n') || line.Contains('\r')) ||
+            node.Hy2Certificate[0] != "-----BEGIN CERTIFICATE-----" || node.Hy2Certificate[^1] != "-----END CERTIFICATE-----")
+            throw new InvalidDataException("备用线路证书必须为非空的逐行文本，并含正确的证书起止标记。");
     }
 
     private static string? Text(JsonElement root, string key) =>

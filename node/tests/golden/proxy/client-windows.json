@@ -64,7 +64,18 @@
       "password": "TEST-ONLY-hy2-password",
       "tls": {
         "enabled": true,
-        "server_name": "exitnode"
+        "server_name": "exitnode",
+        "certificate": [
+          "-----BEGIN CERTIFICATE-----",
+          "MIIBPTCB5aADAgECAhQRYEwMH9VCQQKIwf9+LXhlxXgxmzAKBggqhkjOPQQDAjAT",
+          "MREwDwYDVQQDDAhleGl0bm9kZTAeFw0yNjAxMDEwMDAwMDBaFw0zNjAxMDEwMDAw",
+          "MDBaMBMxETAPBgNVBAMMCGV4aXRub2RlMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcD",
+          "QgAE1hUrQJdGRuMCTRZ8PCNYJgNw3F8HXk+cm6RAs3CYt1ooSMmqspm0vsBQRPd2",
+          "WdITTrYDOdZdh4bPqjIJWmZIyaMXMBUwEwYDVR0RBAwwCoIIZXhpdG5vZGUwCgYI",
+          "KoZIzj0EAwIDRwAwRAIgRL42tQXA8zgMGx6YWuDVZbT4h5kS23KjkiQhLgaMVUkC",
+          "ID5gxni4Gm3yC8aOV4dNxXpPitBAEMAkiMPIgcYVpZyi",
+          "-----END CERTIFICATE-----"
+        ]
       }
     },
     {

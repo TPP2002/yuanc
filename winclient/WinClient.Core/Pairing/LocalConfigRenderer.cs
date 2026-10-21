@@ -5,6 +5,13 @@ namespace WinClient.Core.Pairing;
 
 public static class LocalConfigRenderer
 {
+    private static Dictionary<string, object> BackupTls(NodeInfo node)
+    {
+        var tls = new Dictionary<string, object> { ["enabled"] = true, ["server_name"] = node.Hy2ServerName };
+        if (node.Hy2Certificate.Length > 0) tls["certificate"] = node.Hy2Certificate;
+        return tls;
+    }
+
     public static JsonElement Render(NodeInfo node) => JsonSerializer.SerializeToElement(new
     {
         log = new { disabled = true },
@@ -23,7 +30,7 @@ public static class LocalConfigRenderer
                     utls = new { enabled = true, fingerprint = "chrome" },
                     reality = new { enabled = true, public_key = node.RealityPublicKey, short_id = node.ShortId } } },
             new { type = "hysteria2", tag = "backup", server = node.Host, server_port = node.Hy2Port,
-                password = node.Hy2Password, tls = new { enabled = true, server_name = "exitnode" } },
+                password = node.Hy2Password, tls = BackupTls(node) },
             new { type = "urltest", tag = "proxy", outbounds = new[] { "main", "backup" },
                 url = "https://www.gstatic.com/generate_204", interval = "1m" },
             new { type = "block", tag = "block" }, new { type = "dns", tag = "dns-out" }
