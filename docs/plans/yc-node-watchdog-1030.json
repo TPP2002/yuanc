@@ -55,14 +55,84 @@
     "docs/node/看门狗说明.md"
   ],
   "acceptance": [
-    { "id": "WATCHDOG", "kind": "test:targeted", "target": "node/tests/test_watchdog.py", "required": true, "failsOnBase": true, "note": "FakeRunner + 注入时钟:全过 → normal 且 last-good 更新且退出 0;第 1 次失败同 tick 重探一次;连续 2~3 次只记录;第 4 次 restart exitnode-proxy;1 小时内第 4 次 restart 被拒;restart 满额后回滚且先 check、check 失败 LIVE 不变;6 小时内第二次回滚被拒;无 last-good 跳过回滚进 manual;manual 29 分钟不重启、30 分钟 reboot 且先写 last_reboot_at;6 小时内第二次 reboot 被拒;reboot_enabled=false 永不 reboot;L-public 失败只 degraded 不 restart;ss 缺失当未知;状态文件 0600 且不含 uuid/密码;只对 exitnode- 前缀单元 restart" },
-    { "id": "CLI", "kind": "test:targeted", "target": "node/tests/test_cli.py", "required": true, "note": "既有用例保持通过;init 多「启用看门狗定时器」与(有 /dev/watchdog 时)「硬件看门狗」两步且第二次 init 零命令;rollback 撤回 timer 与 drop-in;status --json 多 watchdog 字段;check 多「看门狗」层;help 列出 watchdog" },
-    { "id": "CONFIG", "kind": "test:targeted", "target": "node/tests/test_config.py", "required": true, "note": "watchdog 段全部默认值;非法值(负数、reboot_after_minutes<5)拒绝;示例文件能 load" },
-    { "id": "SYSTEMD", "kind": "test:targeted", "target": "node/tests/test_systemd_render.py", "required": true, "note": "watchdog.service ExecStart 为 watchdog tick、Type=oneshot;timer OnUnitActiveSec=60、Persistent=false;模板注入仍被拒" },
-    { "id": "SUITE", "kind": "command", "argv": ["python", "-m", "pytest", "-q", "node/tests"], "required": true, "timeoutSec": 600 },
-    { "id": "RUFF", "kind": "command", "argv": ["python", "-m", "ruff", "check", "node"], "required": true, "timeoutSec": 300 },
-    { "id": "ONLYOURUNITS", "kind": "command", "argv": ["python", "-c", "import pathlib,re,sys;bad=[];\nfor p in pathlib.Path('node/exitnode/watchdog').rglob('*.py'):\n    t=p.read_text(encoding='utf-8')\n    for m in re.finditer(r'\"systemctl\",\\s*\"(restart|stop|start|disable|enable)\",\\s*\"([^\"]+)\"',t):\n        if not m.group(2).startswith('exitnode-'): bad.append(str(p)+':'+m.group(0))\n    if re.search(r'\"(shutdown|poweroff|halt)\"',t): bad.append(str(p)+':shutdown')\nprint(bad);sys.exit(1 if bad else 0)"], "required": true, "timeoutSec": 60, "note": "看门狗源码里 systemctl 只操作 exitnode- 前缀单元,不出现 shutdown/poweroff/halt" },
-    { "id": "SECRETS", "kind": "command", "argv": ["python", "-c", "import pathlib,re,sys;bad=[str(p) for p in pathlib.Path('node/exitnode').rglob('*.py') if re.search(r'(BEGIN (EC )?PRIVATE KEY|[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})', p.read_text(encoding='utf-8'))];print(bad);sys.exit(1 if bad else 0)"], "required": true, "timeoutSec": 60 }
+    {
+      "id": "WATCHDOG",
+      "kind": "test:targeted",
+      "target": "node/tests/test_watchdog.py",
+      "required": true,
+      "failsOnBase": true,
+      "note": "FakeRunner + 注入时钟:全过 → normal 且 last-good 更新且退出 0;第 1 次失败同 tick 重探一次;连续 2~3 次只记录;第 4 次 restart exitnode-proxy;1 小时内第 4 次 restart 被拒;restart 满额后回滚且先 check、check 失败 LIVE 不变;6 小时内第二次回滚被拒;无 last-good 跳过回滚进 manual;manual 29 分钟不重启、30 分钟 reboot 且先写 last_reboot_at;6 小时内第二次 reboot 被拒;reboot_enabled=false 永不 reboot;L-public 失败只 degraded 不 restart;ss 缺失当未知;状态文件 0600 且不含 uuid/密码;只对 exitnode- 前缀单元 restart"
+    },
+    {
+      "id": "CLI",
+      "kind": "test:targeted",
+      "target": "node/tests/test_cli.py",
+      "required": true,
+      "note": "既有用例保持通过;init 多「启用看门狗定时器」与(有 /dev/watchdog 时)「硬件看门狗」两步且第二次 init 零命令;rollback 撤回 timer 与 drop-in;status --json 多 watchdog 字段;check 多「看门狗」层;help 列出 watchdog"
+    },
+    {
+      "id": "CONFIG",
+      "kind": "test:targeted",
+      "target": "node/tests/test_config.py",
+      "required": true,
+      "note": "watchdog 段全部默认值;非法值(负数、reboot_after_minutes<5)拒绝;示例文件能 load"
+    },
+    {
+      "id": "SYSTEMD",
+      "kind": "test:targeted",
+      "target": "node/tests/test_systemd_render.py",
+      "required": true,
+      "note": "watchdog.service ExecStart 为 watchdog tick、Type=oneshot;timer OnUnitActiveSec=60、Persistent=false;模板注入仍被拒"
+    },
+    {
+      "id": "SUITE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+        "node/tests"
+      ],
+      "required": true,
+      "timeoutSec": 600
+    },
+    {
+      "id": "RUFF",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "ruff",
+        "check",
+        "node"
+      ],
+      "required": true,
+      "timeoutSec": 300
+    },
+    {
+      "id": "ONLYOURUNITS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,re,sys;files=list(pathlib.Path('node/exitnode/watchdog').rglob('*.py'));bad=[str(p)+':'+m.group(0) for p in files for m in re.finditer(r'\"systemctl\",\\s*\"(restart|stop|start|disable|enable)\",\\s*\"([^\"]+)\"',p.read_text(encoding='utf-8')) if not m.group(2).startswith('exitnode-')]+[str(p)+':shutdown' for p in files if re.search(r'\"(shutdown|poweroff|halt)\"',p.read_text(encoding='utf-8'))];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60,
+      "note": "看门狗源码里 systemctl 只操作 exitnode- 前缀单元,不出现 shutdown/poweroff/halt"
+    },
+    {
+      "id": "SECRETS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,re,sys;bad=[str(p) for p in pathlib.Path('node/exitnode').rglob('*.py') if re.search(r'(BEGIN (EC )?PRIVATE KEY|[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})', p.read_text(encoding='utf-8'))];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    }
   ],
   "sandbox": "workspace-write",
   "cwd": null,
