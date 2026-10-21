@@ -32,7 +32,17 @@ public sealed class FirewallTests
         Assert.Contains("Set-NetFirewallProfile -DefaultOutboundAction Block", script);
         Assert.Contains("$_.Name -notlike 'YuanC-KS-*'", script);
         Assert.Contains("Get-NetFirewallApplicationFilter", script);
-        Assert.DoesNotContain("Disable-NetFirewallRule", script);
+        Assert.DoesNotContain("Set-NetFirewallRule", script);
+        Assert.All(script.Split('\n').Where(line => line.Contains("Remove-NetFirewallRule", StringComparison.Ordinal)),
+            line => Assert.Matches("^Get-NetFirewallRule -Name 'YuanC-KS-[^']+' -ErrorAction SilentlyContinue \\| Remove-NetFirewallRule\\r?$", line));
+        var disabledRulesRecord = script.IndexOf("$state.disabledRules = @(", StringComparison.Ordinal);
+        Assert.True(disabledRulesRecord >= 0);
+        var disabledRulesWrite = script.IndexOf("Write-State $state", disabledRulesRecord, StringComparison.Ordinal);
+        Assert.True(disabledRulesWrite > disabledRulesRecord);
+        Assert.True(script.IndexOf("Disable-NetFirewallRule", StringComparison.Ordinal) > disabledRulesWrite);
+        Assert.DoesNotContain("Enable-NetFirewallRule", script);
+        var restoreScript = KillSwitchPlanner.ToPowerShellScript([new RestoreProfileDefault()], "state.json", "audit.json");
+        Assert.Contains("Enable-NetFirewallRule", restoreScript);
         Assert.True(script.IndexOf("Write-State $state", StringComparison.Ordinal) < script.IndexOf("Set-NetFirewallProfile", StringComparison.Ordinal));
         Assert.True(script.LastIndexOf("$state.applied = $true", StringComparison.Ordinal) > script.IndexOf("New-NetFirewallRule", StringComparison.Ordinal));
     }

@@ -7,6 +7,7 @@ namespace WinClient.Core.Firewall;
 public enum KillSwitchMode { Apply, Remove, Audit }
 public abstract record FirewallAction;
 public sealed record SetProfileDefault(string Profile, string Action) : FirewallAction;
+public sealed record DisableForeignAllowRules : FirewallAction;
 public sealed record AddRule(string Name, string Direction, string Action, string? Program = null,
     string[]? RemoteAddress = null, string? Protocol = null, string? LocalPort = null,
     string? RemotePort = null, string? InterfaceAlias = null) : FirewallAction;
@@ -30,7 +31,8 @@ public static class KillSwitchPlanner
         {
             new SetProfileDefault("Domain", "Block"),
             new SetProfileDefault("Private", "Block"),
-            new SetProfileDefault("Public", "Block")
+            new SetProfileDefault("Public", "Block"),
+            new DisableForeignAllowRules()
         };
         actions.AddRange(NodeRules(nodeIps, programPath, hy2Port, realityPort));
         actions.Add(new AddRule(Prefix + "Tun", "Outbound", "Allow", InterfaceAlias: tunInterfaceName));
@@ -62,13 +64,21 @@ public static class KillSwitchPlanner
         script.AppendLine("$statePath = " + Quote(Path.GetFullPath(statePath)));
         script.AppendLine("$auditPath = " + Quote(Path.GetFullPath(auditPath)));
         script.AppendLine("function Write-State($value) { $temp = $statePath + '.tmp'; $value | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $temp -Encoding UTF8; Move-Item -LiteralPath $temp -Destination $statePath -Force }");
+        if (actions.Any(action => action is DisableForeignAllowRules or Audit))
+        {
+            script.AppendLine("function Read-UnmanagedRules {");
+            // Include disabled local rules too: ActiveStore may still contain a rule with the same name.
+            script.AppendLine("  $persistentNames = @(Get-NetFirewallRule -PolicyStore PersistentStore | Select-Object -ExpandProperty Name)");
+            script.AppendLine("  Get-NetFirewallRule -PolicyStore ActiveStore -Enabled True -Direction Outbound -Action Allow | Where-Object { $_.Name -notlike 'YuanC-KS-*' -and $persistentNames -notcontains $_.Name } | ForEach-Object { $r = $_; $app = $r | Get-NetFirewallApplicationFilter; [pscustomobject]@{ Name = $r.Name; Program = $app.Program } }");
+            script.AppendLine("}");
+        }
         if (actions.OfType<SetProfileDefault>().Any())
         {
             script.AppendLine("[IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($statePath)) | Out-Null");
             script.AppendLine("if (Test-Path -LiteralPath $statePath) { $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json } else {");
             script.AppendLine("  $profiles = @(Get-NetFirewallProfile | Select-Object Name,DefaultOutboundAction)");
             script.AppendLine("  if ($profiles.Count -ne 3) { throw '无法读取全部防火墙配置，未更改系统。' }");
-            script.AppendLine("  $state = @{ applied = $false; profiles = @($profiles | ForEach-Object { @{ Name = [string]$_.Name; DefaultOutboundAction = [string]$_.DefaultOutboundAction } }) }; Write-State $state\n}");
+            script.AppendLine("  $state = [pscustomobject]@{ applied = $false; profiles = @($profiles | ForEach-Object { @{ Name = [string]$_.Name; DefaultOutboundAction = [string]$_.DefaultOutboundAction } }) }; Write-State $state\n}");
         }
         foreach (var action in actions)
         {
@@ -78,6 +88,24 @@ public static class KillSwitchPlanner
                     if (setting.Profile is not ("Domain" or "Private" or "Public") || setting.Action != "Block")
                         throw new ArgumentException("无效的防火墙默认策略。");
                     script.AppendLine("Set-NetFirewallProfile -DefaultOutboundAction Block -Profile " + Quote(setting.Profile));
+                    break;
+                case DisableForeignAllowRules:
+                    script.AppendLine("$foreignRules = @(Get-NetFirewallRule -PolicyStore PersistentStore -Enabled True -Direction Outbound -Action Allow | Where-Object { $_.Name -notlike 'YuanC-KS-*' })");
+                    // ConvertFrom-Json returns a PSCustomObject; add fields for legacy snapshots before assigning.
+                    script.AppendLine("if ($null -eq $state.PSObject.Properties['disabledRules']) { $state | Add-Member -NotePropertyName disabledRules -NotePropertyValue @() }");
+                    script.AppendLine("if ($null -eq $state.PSObject.Properties['disableFailed']) { $state | Add-Member -NotePropertyName disableFailed -NotePropertyValue @() }");
+                    script.AppendLine("if ($null -eq $state.PSObject.Properties['unmanagedRules']) { $state | Add-Member -NotePropertyName unmanagedRules -NotePropertyValue @() }");
+                    script.AppendLine("$state.disabledRules = @(@($state.disabledRules) + @($foreignRules.Name) | Where-Object { $null -ne $_ } | Sort-Object -Unique)");
+                    script.AppendLine("$state.unmanagedRules = @(Read-UnmanagedRules)");
+                    script.AppendLine("Write-State $state");
+                    script.AppendLine("$disableFailed = @($state.disableFailed)");
+                    script.AppendLine("foreach ($rule in $foreignRules) {");
+                    script.AppendLine("  $disableError = @()");
+                    script.AppendLine("  try { $rule | Disable-NetFirewallRule -ErrorAction SilentlyContinue -ErrorVariable disableError } catch { $disableError = @($_) }");
+                    script.AppendLine("  if ($disableError) { $disableFailed += $rule.Name }");
+                    script.AppendLine("}");
+                    script.AppendLine("$state.disableFailed = @($disableFailed | Where-Object { $null -ne $_ } | Sort-Object -Unique)");
+                    script.AppendLine("Write-State $state");
                     break;
                 case AddRule rule:
                     if (!rule.Name.StartsWith(Prefix, StringComparison.Ordinal) || rule.Direction != "Outbound" || rule.Action != "Allow")
@@ -103,12 +131,24 @@ public static class KillSwitchPlanner
                     script.AppendLine("  $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json");
                     script.AppendLine("  if (@($state.profiles).Count -ne 3) { throw '防火墙恢复记录不完整，需人工处理。' }");
                     script.AppendLine("  foreach ($p in $state.profiles) { if ($p.Name -notin @('Domain','Private','Public') -or $p.DefaultOutboundAction -notin @('Allow','Block','NotConfigured')) { throw '防火墙恢复记录无效。' } }");
+                    script.AppendLine("  $restoreFailed = @()");
+                    script.AppendLine("  if ($null -ne $state.disabledRules) {");
+                    script.AppendLine("    foreach ($name in @($state.disabledRules)) {");
+                    script.AppendLine("      $enableError = @()");
+                    script.AppendLine("      try { Get-NetFirewallRule -PolicyStore PersistentStore -Name $name -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq $name } | Enable-NetFirewallRule -ErrorAction SilentlyContinue -ErrorVariable enableError } catch { $enableError = @($_) }");
+                    script.AppendLine("      if ($enableError) { $restoreFailed += $name }");
+                    script.AppendLine("    }\n  }");
                     script.AppendLine("  foreach ($p in $state.profiles) { Set-NetFirewallProfile -Profile $p.Name -DefaultOutboundAction $p.DefaultOutboundAction }");
+                    script.AppendLine("  if ($restoreFailed.Count -gt 0) { throw '部分防火墙规则恢复失败，恢复记录已保留，请联系管理员。' }");
                     script.AppendLine("  Remove-Item -LiteralPath $statePath\n} else { Set-NetFirewallProfile -Profile Domain,Private,Public -DefaultOutboundAction Allow }");
                     break;
                 case Audit:
                     script.AppendLine("[IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($auditPath)) | Out-Null");
-                    script.AppendLine("$audit = @(Get-NetFirewallRule -PolicyStore ActiveStore -Enabled True -Direction Outbound -Action Allow | Where-Object { $_.Name -notlike 'YuanC-KS-*' } | ForEach-Object { $r = $_; $app = $r | Get-NetFirewallApplicationFilter; [pscustomobject]@{ Name = $r.Name; Program = $app.Program } })");
+                    script.AppendLine("$foreignAllowRules = @(Get-NetFirewallRule -PolicyStore ActiveStore -Enabled True -Direction Outbound -Action Allow | Where-Object { $_.Name -notlike 'YuanC-KS-*' } | ForEach-Object { $r = $_; $app = $r | Get-NetFirewallApplicationFilter; [pscustomobject]@{ Name = $r.Name; Program = $app.Program } })");
+                    script.AppendLine("$auditState = $null");
+                    script.AppendLine("if (Test-Path -LiteralPath $statePath) { $auditState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json }");
+                    script.AppendLine("if ($null -ne $auditState -and $null -ne $auditState.PSObject.Properties['unmanagedRules']) { $unmanagedRules = @($auditState.unmanagedRules) } else { $unmanagedRules = @(Read-UnmanagedRules) }");
+                    script.AppendLine("$audit = [pscustomobject]@{ foreign_allow_rules = @($foreignAllowRules); unmanaged_rules = @($unmanagedRules); generated_at = [DateTime]::UtcNow.ToString('o') }");
                     script.AppendLine("ConvertTo-Json -InputObject $audit -Depth 5 | Set-Content -LiteralPath $auditPath -Encoding UTF8");
                     break;
                 default: throw new ArgumentException("未知的防火墙操作。");
