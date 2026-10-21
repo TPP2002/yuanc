@@ -113,6 +113,11 @@ def bootstrap(config, runner):
     binary = current + "/bin/sing-box"
     if not runner.exists(binary):
         binary = config.proxy.binary
+    if not runner.exists(binary):
+        binary = next((path for path in ("/usr/bin/sing-box", "/usr/local/bin/sing-box")
+                       if runner.exists(path)), None)
+    if binary is None:
+        raise ValueError("未找到 sing-box，请先安装 sing-box 内核；不会自动下载")
     # 在写入前完整读取源文件，避免半套源程序被误认为可安装。
     expected = {"exitnode/" + name: digest for name, digest in hashes(runner, source).items()}
     expected["bin/sing-box"] = hashlib.sha256(runner.read_bytes(binary)).hexdigest()

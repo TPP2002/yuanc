@@ -1,0 +1,12 @@
+[Unit]
+Description=出口节点独立本地程序救援
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
+Environment=PYTHONPATH=/opt/exitnode-rescue
+ExecStart=/usr/bin/python3 -m exitnode_rescue tick
+Restart=no
+NoNewPrivileges=true
+UMask=0077

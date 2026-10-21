@@ -429,3 +429,33 @@ def test_cli_file_and_check(signing):
     assert runner.readlink(CURRENT) == OLD
     assert main(["upgrade", "--file", "/push/update.tar.gz"], runner) == 0
     assert runner.readlink(CURRENT) == NEW
+
+
+@pytest.mark.parametrize("available", ["/usr/bin/sing-box", "/usr/local/bin/sing-box", None])
+def test_bootstrap_default_binary_fallback(signing, monkeypatch, available):
+    config, runner = prepared(signing)
+    runner.files[CONFIG] = runner.files[CONFIG].replace('binary = "/usr/bin/sing-box"', "")
+    config = load(CONFIG, runner)
+    source = "/running/exitnode"
+    monkeypatch.setattr(layout, "running_package", lambda: source)
+    runner.files[source + "/__init__.py"] = b"original"
+    runner.remove_tree(OLD)
+    runner.remove(CURRENT)
+    if available:
+        runner.files[available] = b"fallback-kernel"
+        layout.bootstrap(config, runner)
+        assert runner.read_bytes(CURRENT + "/bin/sing-box") == b"fallback-kernel"
+    else:
+        before = dict(runner.files)
+        with pytest.raises(ValueError, match="未找到 sing-box"):
+            layout.bootstrap(config, runner)
+        assert runner.files == before
+
+
+def test_upgrade_never_changes_independent_rescue(signing):
+    config, runner = prepared(signing)
+    runner.files["/opt/exitnode-rescue/exitnode_rescue/runner.py"] = b"independent-code"
+    runner.files["/opt/exitnode-rescue/factory/manifest.json"] = b"independent-factory"
+    before = {p: v for p, v in runner.files.items() if p.startswith("/opt/exitnode-rescue/")}
+    assert run(config, runner) == 0
+    assert {p: v for p, v in runner.files.items() if p.startswith("/opt/exitnode-rescue/")} == before

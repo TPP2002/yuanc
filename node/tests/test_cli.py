@@ -34,6 +34,9 @@ def fake(*, pairing=False):
         ("nft", "-f"): CompletedResult(),
         ("/usr/bin/sing-box", "check"): CompletedResult(),
     }, connections={("8.8.8.8", 443): True})
+    source = (Path(__file__).parents[1] / "exitnode" / "rescue").as_posix()
+    for name in ("__init__.py", "__main__.py", "runner.py", "state.py", "probes.py", "actions.py"):
+        runner.files[source + "/" + name] = "# simulated rescue source\n"
     if pairing:
         runner.responses[("curl",)] = CompletedResult(out="ip=203.0.113.9\n")
     return runner
@@ -79,10 +82,16 @@ def test_check_unintegrated_layers_are_not_passed(capsys):
     config = load(CONFIG, runner)
     state.save(config, runner, state.fresh(), datetime.now(UTC))
     runner.responses[("systemctl", "is-active", "exitnode-watchdog.timer")] = CompletedResult(out="active")
+    from exitnode.rescue import state as rescue_state
+
+    runner.files[rescue_state.STATE] = json.dumps({"state": "normal", "reason": "正常",
+                                                "updated_at": rescue_state.iso(runner.now())})
+    runner.responses[("systemctl", "is-active", "exitnode-rescue.timer")] = CompletedResult(out="active")
     assert main(["check", "--json"], runner) == 0
     layers = json.loads(capsys.readouterr().out)["layers"]
-    assert [layer["result"] for layer in layers] == ["通过", "通过", "未接入", "未接入", "未接入", "通过", "通过"]
-    assert layers[-2]["name"] == "看门狗"
+    assert [layer["result"] for layer in layers] == ["通过", "通过", "未接入", "未接入", "未接入", "通过", "通过", "通过"]
+    assert layers[-3]["name"] == "看门狗"
+    assert layers[-2]["name"] == "救援单元"
     assert layers[-1]["name"] == "隧道服务"
 
 
@@ -165,6 +174,12 @@ def test_repeated_init_does_not_repeat_commands_and_uninstall_keeps_secrets():
     steps = json.loads(runner.files["/var/lib/exitnode/manifest.json"])["steps"]
     program = next(s for s in steps if s["step"] == "安装程序目录")
     assert program["undo"] == {"kind": "remove_file", "path": "/opt/exitnode/releases", "preserve": True}
+    names = [s["step"] for s in steps]
+    assert names.index("启用看门狗定时器") < names.index("安装救援单元") < names.index("启用救援定时器")
+    rescue = next(s for s in steps if s["step"] == "安装救援单元")
+    assert rescue["undo"] == {"kind": "remove_file", "path": "/opt/exitnode-rescue", "preserve": True}
+    saved_rescue = {p: v for p, v in runner.files.items() if p.startswith("/opt/exitnode-rescue/")}
+    assert saved_rescue
     before = [c for c in runner.calls if c[0] == "run"]
     assert main(["init"], runner) == 0
     assert [c for c in runner.calls if c[0] == "run"] == before
@@ -175,6 +190,7 @@ def test_repeated_init_does_not_repeat_commands_and_uninstall_keeps_secrets():
     assert main(["uninstall", "--purge"], runner) == 0
     assert "/var/lib/exitnode/secrets/identity" not in runner.files
     assert runner.read_bytes("/opt/exitnode/current/exitnode/__init__.py") == saved_program
+    assert {p: v for p, v in runner.files.items() if p.startswith("/opt/exitnode-rescue/")} == saved_rescue
 
 
 def test_upgrade_none_source_is_chinese_and_has_no_mutations(capsys):
@@ -341,3 +357,132 @@ def test_watchdog_tick_dispatch(monkeypatch):
     runner = fake()
     assert main(["watchdog", "tick"], runner) == 2
     assert calls[0][1] is runner and calls[0][0].watchdog.enabled
+
+
+@pytest.mark.parametrize("binary", ["/usr/bin/sing-box", "/usr/local/bin/sing-box", None])
+def test_default_binary_first_install_fallback(binary, capsys):
+    runner = fake(pairing=True)
+    runner.files[CONFIG] = runner.files[CONFIG].replace('binary = "/usr/bin/sing-box"', "")
+    del runner.files["/usr/bin/sing-box"]
+    if binary:
+        runner.files[binary] = b"prepared-kernel"
+    runner.responses[("/opt/exitnode/current/bin/sing-box", "check")] = CompletedResult()
+    assert main(["init"], runner) == (0 if binary else 1)
+    if binary:
+        assert runner.read_bytes("/opt/exitnode/current/bin/sing-box") == b"prepared-kernel"
+        unit = runner.files["/etc/systemd/system/exitnode-proxy.service"]
+        assert "ExecStart=/opt/exitnode/current/bin/sing-box run" in unit
+    else:
+        assert "未找到 sing-box" in capsys.readouterr().out
+        assert not any(p.startswith("/etc/systemd/system/") for p in runner.files)
+        assert not any(c[0] == "run" for c in runner.calls)
+
+
+@pytest.mark.parametrize("command", [["rollback"], ["uninstall"], ["uninstall", "--purge"]])
+def test_all_removal_paths_preserve_rescue(command):
+    runner = fake(pairing=True)
+    assert main(["init"], runner) == 0
+    before = {p: v for p, v in runner.files.items() if p.startswith("/opt/exitnode-rescue/")}
+    assert main(command, runner) == 0
+    assert before == {p: v for p, v in runner.files.items() if p.startswith("/opt/exitnode-rescue/")}
+    assert not any(p.startswith("/etc/systemd/system/exitnode-rescue") for p in runner.files)
+
+
+def test_rescue_status_chinese_and_missing(capsys):
+    from exitnode.rescue import state
+
+    runner = fake()
+    assert main(["rescue", "status"], runner) == 0
+    assert "尚无救援记录" in capsys.readouterr().out
+    runner.files[state.STATE] = json.dumps({"state": "manual", "reason": "重装频率超限",
+                                          "updated_at": state.iso(runner.now())})
+    assert main(["rescue", "status"], runner) == 0
+    text = capsys.readouterr().out
+    assert "需人工处理" in text and "重装频率超限" in text
+    assert not any(c[0] == "run" for c in runner.calls)
+
+
+@pytest.mark.parametrize("age,active,expected", [(0, True, "通过"), (86401, True, "失败"),
+                                               (0, False, "失败"), (-1, True, "失败")])
+def test_rescue_check_timer_and_freshness(age, active, expected, capsys):
+    from exitnode.rescue import state
+
+    runner = fake()
+    runner.files[state.STATE] = json.dumps({"state": "normal", "reason": "正常",
+                                          "updated_at": state.iso(runner.now() - age)})
+    runner.responses[("systemctl", "is-active", "exitnode-rescue.timer")] = CompletedResult(
+        0 if active else 3, "active" if active else "inactive")
+    main(["check", "--json"], runner)
+    layers = json.loads(capsys.readouterr().out)["layers"]
+    assert next(v for v in layers if v["name"] == "救援单元")["result"] == expected
+
+
+@pytest.mark.parametrize("import_ok", [True, False])
+def test_rescue_refresh_uses_independent_runner_checks_before_replace(import_ok, monkeypatch):
+    from exitnode.rescue.runner import FakeRunner as RescueFakeRunner
+    from exitnode.rescue.runner import Result
+    from exitnode.updater import layout
+
+    source = "/running/exitnode/rescue"
+    target = "/opt/exitnode-rescue/exitnode_rescue"
+    files = {source + "/" + name: b"# new\n" for name in (
+        "__init__.py", "__main__.py", "runner.py", "state.py", "probes.py", "actions.py")}
+    files[target + "/old-file.py"] = b"old"
+    rescue = RescueFakeRunner(files=files, responses={("python3",): Result(0 if import_ok else 1)})
+    monkeypatch.setattr(layout, "running_package", lambda: "/running/exitnode")
+    runner = fake()
+    assert main(["rescue", "refresh"], runner, rescue_runner=rescue) == (0 if import_ok else 1)
+    assert not any(c[0] in {"run", "replace", "write_file", "copy_tree"} for c in runner.calls)
+    if import_ok:
+        check = next(i for i, c in enumerate(rescue.calls) if c[0] == "run")
+        assert check < rescue.calls.index(("replace", target + ".staging", target))
+        assert not rescue.exists(target + "/old-file.py")
+        assert rescue.read(target + "/runner.py") == b"# new\n"
+    else:
+        assert rescue.read(target + "/old-file.py") == b"old"
+        assert not any(c == ("replace", target + ".staging", target) for c in rescue.calls)
+
+
+def test_rescue_refresh_rejects_copy_hash_mismatch():
+    from exitnode.cli import refresh
+    from exitnode.rescue.runner import FakeRunner as RescueFakeRunner
+
+    class DamagedCopy(RescueFakeRunner):
+        def copy_tree(self, source, target):
+            super().copy_tree(source, target)
+            self.files[target + "/runner.py"] = b"damaged"
+
+    files = {"/source/" + name: b"# source" for name in (
+        "__init__.py", "__main__.py", "runner.py", "state.py", "probes.py", "actions.py")}
+    files["/target/old"] = b"old"
+    runner = DamagedCopy(files=files)
+    with pytest.raises(ValueError, match="副本校验失败"):
+        refresh("/source", "/target", runner)
+    assert runner.files["/target/old"] == b"old"
+    assert not any(c[0] == "run" for c in runner.calls)
+
+
+def test_refresh_directory_exchange_error_records_manual_and_preserves_old():
+    from exitnode.cli import refresh
+    from exitnode.rescue import state
+    from exitnode.rescue.runner import FakeRunner as RescueFakeRunner
+    from exitnode.rescue.runner import Result
+
+    error = OSError("simulated disk error")
+
+    class FailingExchange(RescueFakeRunner):
+        def replace(self, source, target):
+            if target == "/target":
+                raise error
+            super().replace(source, target)
+
+    files = {"/source/" + name: b"# source" for name in (
+        "__init__.py", "__main__.py", "runner.py", "state.py", "probes.py", "actions.py")}
+    files["/target/old"] = b"old"
+    runner = FailingExchange(files=files, responses={("python3",): Result()})
+    with pytest.raises(OSError) as exc:
+        refresh("/source", "/target", runner)
+    assert exc.value is error
+    assert runner.files["/target/old"] == b"old"
+    assert state.read(runner)["state"] == "manual"
+    assert json.loads(runner.files[state.HISTORY].splitlines()[-1])["status"] == "failed"
