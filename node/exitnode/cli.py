@@ -3,6 +3,7 @@
 import argparse
 import io
 import json
+import subprocess
 import sys
 import zipfile
 from pathlib import PurePosixPath
@@ -12,6 +13,9 @@ from .config import ConfigError, load
 from .log import redact
 from .manifest import UNITS, Manifest
 from .netinfo import check, public_ipv4
+from .rescue import probes as rescue_probes
+from .rescue import state as rescue_state
+from .rescue.runner import RealRunner as RescueRealRunner
 from .runner import RealRunner, RunnerError
 from .status import State, evaluate
 from .watchdog import check as watchdog_check
@@ -84,7 +88,76 @@ def parser():
     for name, description in (("tick", "执行一轮检查与恢复"), ("status", "读取最近检查记录")):
         action = actions.add_parser(name, help=description, description=description)
         action.add_argument("--config", default=argparse.SUPPRESS, help="配置文件路径")
+    rescue = sub.add_parser("rescue", help="查看或维护独立救援程序")
+    rescue.add_argument("--config", default=argparse.SUPPRESS, help="配置文件路径")
+    actions = rescue.add_subparsers(dest="rescue_action", required=True, title="救援操作")
+    for name, description in (("status", "查看最近救援记录"), ("refresh", "手动更新救援程序")):
+        action = actions.add_parser(name, help=description)
+        action.add_argument("--config", default=argparse.SUPPRESS, help="配置文件路径")
     return root
+
+
+def refresh(source_dir, target_dir, rescue_runner=None):
+    """显式更新独立副本；主程序 Runner 不参与目录交换。"""
+    runner = rescue_runner if rescue_runner is not None else RescueRealRunner()
+    expected = rescue_probes.hashes(runner, source_dir)
+    if not {"__init__.py", "__main__.py", "runner.py", "state.py", "probes.py", "actions.py"} <= expected.keys():
+        raise ValueError("救援源码不完整，未更新")
+    staging = target_dir + ".staging"
+    runner.remove_tree(staging)
+    runner.copy_tree(source_dir, staging)
+    if rescue_probes.hashes(runner, staging) != expected:
+        raise ValueError("救援副本校验失败，未更新")
+    # 暂存目录尚未改名，用显式包搜索路径导入，不能误查已安装的旧副本。
+    code = ("import importlib.util,sys; "
+            "p=sys.argv[1]; "
+            "s=importlib.util.spec_from_file_location('exitnode_rescue',p+'/__init__.py',"
+            "submodule_search_locations=[p]); "
+            "m=importlib.util.module_from_spec(s); sys.modules['exitnode_rescue']=m; "
+            "s.loader.exec_module(m); import exitnode_rescue.__main__")
+    try:
+        import_result = runner.run(["python3", "-c", code, staging], timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        raise ValueError("救援副本导入失败或超时，未更新") from None
+    if import_result.code:
+        raise ValueError("救援副本不能导入，未更新")
+    if rescue_probes.hashes(runner, staging) != expected:
+        raise ValueError("救援副本导入后内容变化，未更新")
+    try:
+        runner.replace(staging, target_dir)
+    except OSError:
+        value = rescue_state.read(runner)
+        value.update(state="manual", reason="救援代码替换失败，请人工检查残留目录")
+        try:
+            rescue_state.save(runner, value)
+            rescue_state.history(runner, "refresh", "failed")
+        except OSError:
+            pass  # 磁盘不可写时不能保证记录成功，仍将原异常交给调用方。
+        raise
+
+
+def _rescue_record(runner):
+    if not runner.exists(rescue_state.STATE):
+        return {"state": "manual", "reason": "尚无救援记录", "updated_at": None}
+    try:
+        value = json.loads(runner.read_file(rescue_state.STATE))
+        if value["state"] not in {"normal", "processing", "manual"}:
+            raise ValueError
+        rescue_state.timestamp(value["updated_at"])
+        return {"state": value["state"], "reason": str(value["reason"]),
+                "updated_at": value["updated_at"]}
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return {"state": "manual", "reason": "救援记录损坏", "updated_at": None}
+
+
+def _rescue_check(runner):
+    value = _rescue_record(runner)
+    active = runner.run(["systemctl", "is-active", "exitnode-rescue.timer"], check=False)
+    recent = (value["updated_at"] is not None
+              and 0 <= runner.now() - rescue_state.timestamp(value["updated_at"]) <= 86400)
+    ok = active.code == 0 and active.out.strip() == "active" and recent
+    return {"layer": "rescue", "name": "救援单元", "result": "通过" if ok else "失败",
+            "reason": "定时器运行且最近一天有检查记录" if ok else "救援定时器未运行或记录已过期"}
 
 
 def _install(config, config_path, runner, manifest):
@@ -101,8 +174,9 @@ def _install(config, config_path, runner, manifest):
         layout.repair(config, runner)
         program_path = layout.root(config) + "/current"
         # 先做无命令的前置核对，缺内核时不得写入任何服务单元。
-        if not runner.exists(program_path + "/bin/sing-box") and not runner.exists(config.proxy.binary):
-            raise ValueError("未找到 sing-box，请先安装 sing-box 二进制并确认 proxy.binary 路径；不会自动下载")
+        if not any(runner.exists(path) for path in (program_path + "/bin/sing-box",
+                   config.proxy.binary, "/usr/bin/sing-box", "/usr/local/bin/sing-box")):
+            raise ValueError("未找到 sing-box，请先安装 sing-box 内核；不会自动下载")
         for name, directory in (("数据目录", config.node.data_dir),
                                 ("凭据目录", config.node.secrets_dir)):
             # 数据与凭据在撤回时保留，卸载只清除清单管理的产物。
@@ -111,7 +185,8 @@ def _install(config, config_path, runner, manifest):
         if not apply("安装程序目录", lambda: layout.bootstrap(config, runner),
                      {"kind": "remove_file", "path": layout.releases(config), "preserve": True}):
             layout.bootstrap(config, runner)
-        for unit in sorted(UNITS - {service.UNIT}):
+        rescue_units = {"exitnode-rescue.service", "exitnode-rescue.timer"}
+        for unit in sorted(UNITS - {service.UNIT} - rescue_units):
             path = "/etc/systemd/system/" + unit
             text = systemd.render(unit, {"config_path": config_path, "program_path": program_path})
             step = "写入" + unit
@@ -165,6 +240,41 @@ def _install(config, config_path, runner, manifest):
             apply("启用看门狗定时器",
                   lambda: runner.run(["systemctl", "enable", "--now", "exitnode-watchdog.timer"]),
                   {"kind": "systemctl", "unit": "exitnode-watchdog.timer"})
+
+        def install_rescue():
+            current = layout.current_target(config, runner)
+            if not layout.valid_release(runner, current):
+                raise ValueError("当前程序校验失败，未安装救援包")
+            source = current + "/exitnode/rescue"
+            if not runner.exists(source + "/__main__.py"):
+                raise ValueError("救援源码不完整")
+            runner.mkdir(rescue_probes.RESCUE, 0o755)
+            for src, dst in ((source, rescue_probes.RESCUE + "/exitnode_rescue"),
+                             (current, rescue_probes.FACTORY)):
+                if runner.exists(dst):
+                    if layout.hashes(runner, src) != layout.hashes(runner, dst):
+                        raise ValueError("已有救援包内容不同，请维护人员确认；更新代码请用 rescue refresh")
+                else:
+                    runner.copy_tree(src, dst)
+            for unit in sorted(rescue_units):
+                path = "/etc/systemd/system/" + unit
+                text = systemd.render(unit, {"config_path": config_path, "program_path": program_path})
+
+                def write_rescue_unit(p=path, content=text):
+                    if runner.exists(p):
+                        if runner.read_file(p) != content:
+                            raise ValueError("已有救援服务文件内容不同，请维护人员确认")
+                        return
+                    runner.write_file(p, content, 0o644)
+
+                apply("写入" + unit, write_rescue_unit, {"kind": "systemctl", "unit": unit})
+            runner.run(["systemctl", "daemon-reload"])
+
+        apply("安装救援单元", install_rescue,
+              {"kind": "remove_file", "path": rescue_probes.RESCUE, "preserve": True})
+        apply("启用救援定时器",
+              lambda: runner.run(["systemctl", "enable", "--now", "exitnode-rescue.timer"]),
+              {"kind": "systemctl", "unit": "exitnode-rescue.timer"})
         if config.watchdog.hardware:
             if runner.exists("/dev/watchdog"):
                 hardware_path = "/etc/systemd/system.conf.d/exitnode-watchdog.conf"
@@ -211,7 +321,7 @@ def _diagnose(runner, config, result, output):
     print("诊断包已保存，凭据已打码；分享前请再次检查其中的网络和设备信息。")
 
 
-def main(argv=None, runner=None):
+def main(argv=None, runner=None, rescue_runner=None):
     args = parser().parse_args(argv)
     if args.placeholder:
         print("服务尚未接入，此入口仅为安装占位。", file=sys.stderr)
@@ -225,6 +335,16 @@ def main(argv=None, runner=None):
     try:
         runner = runner if runner is not None else RealRunner()
         config = load(args.config, runner)
+        if args.command == "rescue":
+            if args.rescue_action == "status":
+                print(redact(rescue_state.summary(_rescue_record(runner))))
+            else:
+                from .updater.layout import running_package
+
+                refresh(running_package() + "/rescue",
+                        rescue_probes.RESCUE + "/exitnode_rescue", rescue_runner)
+                print("独立救援程序已更新。")
+            return 0
         if args.command == "upgrade":
             try:
                 from .updater.upgrade import upgrade
@@ -263,6 +383,7 @@ def main(argv=None, runner=None):
             result = check(runner, config)
             if args.command == "check":
                 result["layers"].insert(-1, watchdog_check(config, runner))
+                result["layers"].insert(-1, _rescue_check(runner))
             if args.command == "status":
                 result["public_ipv4"] = public_ipv4(runner)
                 try:

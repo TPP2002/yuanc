@@ -54,3 +54,19 @@ def test_watchdog_service_timer_and_context():
     for unsafe in ('/a\nExecStart=/bin/other', '/a"', '/%n', '/$HOME', '/a\\b'):
         with pytest.raises(ValueError):
             render("exitnode-watchdog.service", {"config_path": unsafe})
+
+
+@pytest.mark.parametrize("name", ["exitnode-rescue.service", "exitnode-rescue.timer"])
+def test_rescue_unit_matches_golden(name):
+    text = render(name, {})
+    assert text == (Path(__file__).parent / "golden" / name).read_text(encoding="utf-8")
+    if name.endswith(".service"):
+        assert "Type=oneshot\n" in text
+        assert "Environment=PYTHONPATH=/opt/exitnode-rescue\n" in text
+        assert "ExecStart=/usr/bin/python3 -m exitnode_rescue tick\n" in text
+        assert "NoNewPrivileges=true\n" in text and "UMask=0077\n" in text
+        assert "/opt/exitnode/current" not in text
+    else:
+        assert "OnBootSec=180\n" in text
+        assert "OnUnitActiveSec=300\n" in text
+        assert "Persistent=false\n" in text
