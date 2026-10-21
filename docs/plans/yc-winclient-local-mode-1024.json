@@ -1,0 +1,60 @@
+{
+  "schemaVersion": 1,
+  "taskId": "WINCLIENT-LOCAL-MODE-1024",
+  "slug": "yc-winclient-local-mode-1024",
+  "title": "Windows 客户端自用模式:导入 .ycpair 配对文件(DPAPI 加密保存)→ 本地渲染 sing-box 配置(与节点黄金文件逐字一致)→ 不联系任何服务器直接连接;与邀请码模式并存;出口地址疑似变化时给人话提示",
+  "goal": "做完后,Windows 客户端在没有鉴权服务器(server.json 不存在)时也能用:①主界面多一个「导入配对文件」按钮(文件选择框,过滤 *.ycpair),导入后校验格式(format 必须是 ycpair/1;node.host 是 IPv4 数字地址;端口 1~65535;reality_public_key 是 43 位 base64url;short_id 2~16 位十六进制;uuid 是 UUIDv4;hy2_password 非空),通过则把整份配对文件用 DPAPI(当前用户)加密存到 %LOCALAPPDATA%\\YuanC\\pairing.bin,界面显示「已导入配对文件:<设备名或导出时间>,点击连接」;②连接时不发任何 HTTP 请求:由本地的 PairingSessionSource 用配对文件里的 node 八字段造出与服务器模式同形状的会话(SessionResponse:SessionExpiresAt / AccountExpiresAt 取远期固定值如 9999-12-31,SessionToken 为空串,Node 为 NodeInfo,SingboxConfig 由 C# 本地渲染),之后 ClientController 走与服务器模式完全相同的状态机、断网保护、隧道启动路径;③本地渲染的 sing-box 配置必须与节点仓黄金文件 node/tests/golden/proxy/client-windows.json 逐字段相等(测试把该文件读进来比对,两边字段顺序无关、值必须一致;TunnelTransport.RenderConfiguration 再加 interface_name 的行为不变);④自用模式下隧道连续失败进入 NeedsManual 时,界面消息写「连不上澳洲出口,出口地址可能已变,请在小主机上重新导出配对文件再导入」;⑤两种模式并存:server.json 存在就照旧用邀请码/鉴权服务器;两者都有时以配对文件优先并在界面显示当前模式;「清除配对文件」入口(删 pairing.bin)放在界面次要位置;⑥不改既有测试断言,既有 53 个用例继续通过。",
+  "background": "项目:客户自购小主机放在澳大利亚家庭宽带下当出口节点,客户自用版第一优先,要求不用任何服务器。正本:docs/design/方案v2-中国客户端-澳洲出口.md §5.1(自用模式;配对文件字段与鉴权服务器 /client/session 下发的 node{...} 完全相同,客户端拿到后走同一条渲染与连接路径)、§6(Windows 客户端、断网保护拍板);docs/winclient/架构说明.md(骨架单写的);docs/口径速查表.md。已落地(PR 已合并):winclient/WinClient.Core(Auth/AuthApiClient、AuthModels 里的 SessionResponse 与 NodeInfo、State/ConnectionStateMachine、Client/ClientController(现在直接依赖 AuthApiClient? 并在 null 时提示未配置服务器)、Client/ClientRuntime、Client/TunnelTransport.RenderConfiguration、Storage/DpapiCredentialStore、Firewall/*)与 WinClient.App(MainWindow/MainViewModel)。配对文件格式(与节点单 NODE-DEVICE-PAIR-1024 对齐,两边都按这个写):{\"format\":\"ycpair/1\",\"exported_at\":\"<ISO 时间>\",\"node\":{\"host\":\"<IPv4>\",\"reality_port\":443,\"hy2_port\":24443,\"sni\":\"www.microsoft.com\",\"reality_public_key\":\"<43 位 base64url>\",\"short_id\":\"<十六进制>\",\"uuid\":\"<UUIDv4>\",\"hy2_password\":\"<字符串>\"}}。本地渲染的 sing-box 配置口径以 node/tests/golden/proxy/client-windows.json 为准(主 vless+reality 443 / 备 hysteria2 / urltest 只在主备间切 / 无 direct / IPv6 block / DNS 全走隧道 / tun auto_route+strict_route),把那份黄金文件读进测试比对,不要手抄一份新的。\n硬规矩:①自用模式下零网络请求到任何服务器(用测试里的 HttpMessageHandler 桩断言 0 次调用,或 ClientController 在 auth 为 null 时也能连);②配对文件只以 DPAPI 密文落盘,明文只在内存,日志打码沿用 RedactingLog(RegisterSecret 配对文件里的 uuid/hy2_password);③不改 ConnectionStateMachine 的迁移表与退避常数;④NuGet 只用现有白名单包(Microsoft.NET.Test.Sdk 17.12.0、xunit 2.9.2、xunit.runner.visualstudio 2.8.2、System.Security.Cryptography.ProtectedData 10.0.11),不加新包;⑤所有子进程 CreateNoWindow=true(既有不变);⑥界面文案全部中文人话,不出现「TUN」「Reality」等术语;⑦不要跑 dotnet build/test 之外的任何命令改系统状态;自测的编译产物落在 bin/obj 会被派单器判「内容在变」——这是派单器的已知问题,自测作废就直接交活写明「由派单方复核」,不要反复重试。\n遇到要改施工面外文件、缺依赖、要放宽断言,停下交 blocked + forks。搜索用 rg 或 git grep。",
+  "nonGoals": [
+    "不做自动更新、诊断导出完善、出口 IP 显示(后续卡)",
+    "不做安卓",
+    "不改节点程序与鉴权服务器",
+    "不改 docs/ 正本;可修订 docs/winclient/架构说明.md 加一节自用模式"
+  ],
+  "allowedPaths": [
+    "winclient/**",
+    "docs/winclient/**"
+  ],
+  "forbiddenPaths": [
+    "node/**",
+    "authserver/**",
+    "docs/开工须知.md",
+    "docs/口径速查表.md",
+    "docs/design/**",
+    "docs/交接/**",
+    "pyproject.toml",
+    "requirements-dev.txt",
+    ".github/**",
+    ".codex/**"
+  ],
+  "expectArtifacts": [
+    "winclient/WinClient.Core/Pairing/PairingFile.cs",
+    "winclient/WinClient.Core/Pairing/PairingStore.cs",
+    "winclient/WinClient.Core/Pairing/LocalConfigRenderer.cs",
+    "winclient/WinClient.Core/Client/ISessionSource.cs",
+    "winclient/WinClient.Tests/PairingTests.cs"
+  ],
+  "acceptance": [
+    { "id": "BUILD", "kind": "command", "argv": ["dotnet", "build", "winclient/WinClient.sln", "--nologo", "-v", "q"], "required": true, "timeoutSec": 900 },
+    { "id": "TEST", "kind": "command", "argv": ["dotnet", "test", "winclient/WinClient.sln", "--nologo", "-v", "q"], "required": true, "timeoutSec": 900, "note": "新增用例覆盖:配对文件每条校验规则各一个失败样本;本地渲染配置与节点黄金文件逐字段相等;自用模式连接期间 HTTP 桩零调用;状态机在自用模式进入 NeedsManual 时消息含「出口地址可能已变」;配对文件优先于 server.json;清除后回到未配置;既有 53 个用例保持通过" },
+    { "id": "NOSECRET", "kind": "command", "argv": ["python", "-c", "import pathlib,re,sys;pat=re.compile(r'(vless://|hysteria2://|[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})');bad=[str(p) for p in pathlib.Path('winclient').rglob('*') if p.is_file() and 'obj' not in p.parts and 'bin' not in p.parts and p.suffix in {'.cs','.xaml','.json','.resx','.config'} and 'Tests' not in str(p) and pat.search(p.read_text(encoding='utf-8',errors='ignore'))];print(bad);sys.exit(1 if bad else 0)"], "required": true, "timeoutSec": 60, "note": "非测试源码里没有写死的 UUID 或隧道链接(排除 bin/obj)" },
+    { "id": "NOWINDOW", "kind": "command", "argv": ["python", "-c", "import pathlib,sys;files=[p for p in pathlib.Path('winclient').rglob('*.cs') if 'obj' not in p.parts and 'bin' not in p.parts and 'ProcessStartInfo' in p.read_text(encoding='utf-8',errors='ignore')];bad=[str(p) for p in files if 'CreateNoWindow = true' not in p.read_text(encoding='utf-8',errors='ignore')];print(bad);sys.exit(1 if bad else 0)"], "required": true, "timeoutSec": 60 },
+    { "id": "NOHTTP", "kind": "command", "argv": ["python", "-c", "import pathlib,sys;bad=[str(p) for p in pathlib.Path('winclient/WinClient.Core/Pairing').rglob('*.cs') if 'HttpClient' in p.read_text(encoding='utf-8',errors='ignore')];print(bad);sys.exit(1 if bad else 0)"], "required": true, "timeoutSec": 60, "note": "配对模块里没有任何 HTTP 客户端引用" }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "model": null,
+  "timeoutSec": 7200,
+  "repoRoot": "E:/yuanc",
+  "engine": "codex",
+  "reasoningEffort": "medium",
+  "steps": [
+    "读方案 §5.1 §6、docs/winclient/架构说明.md、口径速查表;通读 WinClient.Core 全部源码与测试;读 node/tests/golden/proxy/client-windows.json 与 node/exitnode/proxy/client_config.py 理解渲染口径。",
+    "Pairing/PairingFile.cs:解析与校验(System.Text.Json,snake_case),失败抛带中文原因的 InvalidDataException;Pairing/PairingStore.cs:DPAPI 读写 pairing.bin(复用 DpapiCredentialStore 的写法或抽公共基类),Clear();Pairing/LocalConfigRenderer.cs:NodeInfo → sing-box 配置 JsonElement,口径按黄金文件。",
+    "Client/ISessionSource.cs:接口 Task<AuthResponse<SessionResponse>> GetSessionAsync(ct) + Mode 名;AuthServerSessionSource(包现有 AuthApiClient+凭据存储)与 PairingSessionSource(本地);ClientController 改为依赖 ISessionSource(保留现有构造签名的兼容重载,既有测试不改);ClientRuntime.CreateAsync 按「有 pairing.bin → 配对模式;否则有 server.json → 服务器模式;否则未配置」装配;NeedsManual 消息在配对模式下换成出口地址提示。",
+    "App:MainWindow 加「导入配对文件」按钮(OpenFileDialog *.ycpair)、当前模式文字、次要位置「清除配对文件」;MainViewModel 加 ImportPairingCommand / ClearPairingCommand;导入后不自动连接,提示点连接。",
+    "测试 PairingTests.cs(校验失败样本、黄金文件比对、HTTP 桩零调用、模式优先级、清除);ControllerTests 补配对模式一条;架构说明补一节。",
+    "交活:changedFiles 列全;自测被判「内容在变」作废就直接交活写明「由派单方复核」。"
+  ]
+}

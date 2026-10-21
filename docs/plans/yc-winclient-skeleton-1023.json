@@ -5,13 +5,6 @@
   "title": "Windows 薄客户端骨架(.NET 9 WPF):解决方案与三项目(Core 类库 / App 界面 / Tests);登录与会话状态机、鉴权服务器 API 客户端、sing-box 内核进程管理器、防火墙断网保护规则规划器、四档状态模型;可测逻辑全部在 Core,界面只做最小一页",
   "goal": "做完后:winclient/WinClient.sln 含 WinClient.Core(net9.0 类库,无 WPF 依赖)、WinClient.App(net9.0-windows WPF,单文件发布配置)、WinClient.Tests(xunit);dotnet build 与 dotnet test 在本机离线通过;Core 里有①AuthApiClient(HttpClient 可注入 HttpMessageHandler;redeem/session/logout 三个接口,按状态码映射到枚举:Ok/InvalidToken(401)/Disabled(403)/Expired(410)/DeviceLimit(409)/Revoked(423)/RateLimited(429)/InviteNotFound(404)/Network);②ConnectionStateMachine(Disconnected/Connecting/Connected/Reconnecting/NeedsLogin/NeedsManual 六态,事件驱动,带指数退避与上限,到上限转 NeedsManual;会话到期转 NeedsLogin;用户主动断开才允许回到 Disconnected 并撤防火墙规则);③SingBoxProcessManager(把服务器下发的配置 JSON 写到 %ProgramData%\\<产品名>\\run\\config.json,起 sing-box.exe 子进程,CreateNoWindow、重定向日志、崩溃上报事件;进程启动器可注入便于测试);④KillSwitchPlanner(纯函数:给定节点地址与 TUN 网卡名,产出 Windows 防火墙规则的增删计划——只放行到节点地址的出站、放行 TUN 网卡、放行本地回环与 DHCP,其余出站阻断;产出 netsh advfirewall 命令行数组,不执行;另有 Apply/Remove 经可注入 CommandRunner 执行,CreateNoWindow);⑤本地凭据存储(刷新令牌用 DPAPI 加密落在 %LOCALAPPDATA%,接口可注入内存实现);⑥App 界面一页:邀请码/登录区、一个大按钮(连接/断开)、状态文字四档中文、当前出口 IP 占位、「导出诊断」按钮占位;App 不包含任何节点地址或隧道凭据常量。",
   "background": "项目:客户自购小主机放在澳大利亚家庭宽带下当出口节点,国内 Windows 薄客户端经加密隧道从澳洲出口。2026-10-22 拍板:客户端是「薄客户端」——安装包不含节点地址、不含任何隧道凭据,每次启动用本地刷新令牌向鉴权服务器换 6 小时会话并领取节点凭据与 sing-box 客户端配置;服务器拒绝则什么都连不上(防破解)。正本 docs/design/方案v2-中国客户端-澳洲出口.md §5(薄客户端、错误码分档)与 §6(技术栈、服务化、断网保护、兼容 Win10 1809+/Win11、已知风险),客户交接文档「出口转发与客户端」(隧道失败不得静默回落;用户主动断开按明确规则恢复)。请先读。\n鉴权服务器由并行单 yc-authserver-1023 实现,接口与错误码约定(两边都按这个写,不要改):POST /client/redeem {code, device{platform, name, fingerprint}, refresh_token?} → {account_id, expires_at, refresh_token, device_id};POST /client/session {refresh_token} → {session_token, session_expires_at, account_expires_at, node{host, reality_port, hy2_port, sni, reality_public_key, short_id, uuid, hy2_password}, singbox_config};POST /client/logout;错误码 401 令牌无效或会话过期、403 停用、410 到期、409 设备数超上限、423 设备吊销、429 限速、404 邀请码不存在、422 参数。\n环境:本机 .NET SDK 9.0.102;NuGet 缓存里已有且**只允许用**这几个包与版本:Microsoft.NET.Test.Sdk 17.12.0、xunit 2.9.2、xunit.runner.visualstudio 2.8.2、System.Text.Json 9.0.0(框架自带也行)。沙箱可能没有网络,dotnet restore 必须离线成功;需要别的包就停下交 blocked + forks,不要自己加。sing-box.exe 与 wintun.dll 本单不下载、不内嵌,SingBoxProcessManager 只按可配置路径启动,找不到给出中文错误。\n硬规矩(开工须知 §4 第 3、6 条):①隧道断了不许静默回落:状态机在 Reconnecting 期间防火墙规则保持,流量被挡不是漏;只有用户主动点断开才撤规则;②任何子进程(sing-box、netsh、以后的服务安装)一律 CreateNoWindow = true、UseShellExecute = false,不许弹黑窗;③不写任何节点地址、密钥、UUID 的常量或默认值到代码或资源里;④日志里令牌打码;⑤界面文字中文。\nTUN 需要管理员权限与 Windows 服务化,本单不做服务,App 先以「需要管理员」清单(app.manifest requireAdministrator)运行;服务化是后续卡 WINCLIENT-SERVICE。遇到要改施工面外文件、缺依赖、要放宽断言的情况,停下交 blocked + forks。搜索用 rg 或 git grep。",
-  "nonGoals": [
-    "不做 Windows 服务化、自动更新、诊断导出的实际实现(界面只留按钮占位)",
-    "不下载、不内嵌 sing-box.exe / wintun.dll",
-    "不做安装包(MSI/Inno)与代码签名",
-    "不实现真正的 TUN 创建(由 sing-box 内核负责,本单只负责起进程与写配置)",
-    "不改 node/、authserver/、docs/ 正本;可新增 docs/winclient/架构说明.md 一篇"
-  ],
   "allowedPaths": [
     "winclient/**",
     "docs/winclient/架构说明.md"
@@ -25,7 +18,71 @@
     "docs/交接/**",
     "pyproject.toml",
     "requirements-dev.txt",
-    ".github/**"
+    ".github/**",
+    ".codex/jobs/**"
+  ],
+  "nonGoals": [
+    "不做 Windows 服务化、自动更新、诊断导出的实际实现(界面只留按钮占位)",
+    "不下载、不内嵌 sing-box.exe / wintun.dll",
+    "不做安装包(MSI/Inno)与代码签名",
+    "不实现真正的 TUN 创建(由 sing-box 内核负责,本单只负责起进程与写配置)",
+    "不改 node/、authserver/、docs/ 正本;可新增 docs/winclient/架构说明.md 一篇"
+  ],
+  "acceptance": [
+    {
+      "id": "BUILD",
+      "kind": "command",
+      "required": true,
+      "note": "离线还原并编译通过,零警告不强求但零错误",
+      "argv": [
+        "dotnet",
+        "build",
+        "winclient/WinClient.sln",
+        "--nologo",
+        "-v",
+        "q"
+      ],
+      "timeoutSec": 900
+    },
+    {
+      "id": "TEST",
+      "kind": "command",
+      "required": true,
+      "note": "xunit 用例覆盖:错误码→枚举映射全表;状态机每条迁移与退避上限→NeedsManual;会话到期→NeedsLogin;Reconnecting 期间 KillSwitch 规则计划不含删除;只有 UserDisconnect 产生删除计划;KillSwitchPlanner 计划里放行项只有节点地址/TUN/回环/DHCP;SingBoxProcessManager 启动参数 CreateNoWindow 为 true 且 UseShellExecute 为 false;凭据存储接口的内存实现往返一致;日志令牌打码",
+      "argv": [
+        "dotnet",
+        "test",
+        "winclient/WinClient.sln",
+        "--nologo",
+        "-v",
+        "q"
+      ],
+      "timeoutSec": 900
+    },
+    {
+      "id": "NOSECRET",
+      "kind": "command",
+      "required": true,
+      "note": "非测试源码里没有写死的 UUID 或隧道链接(排除 bin/obj 编译产物;2026-10-22 派单方修正:生成的 *.g.cs 含 GUID 被误报)",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,re,sys;pat=re.compile(r\"(vless://|hysteria2://|[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\");bad=[str(p) for p in pathlib.Path(\"winclient\").rglob(\"*\") if p.is_file() and \"obj\" not in p.parts and \"bin\" not in p.parts and p.suffix in {\".cs\",\".xaml\",\".json\",\".resx\",\".config\"} and \"Tests\" not in str(p) and pat.search(p.read_text(encoding=\"utf-8\",errors=\"ignore\"))];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "timeoutSec": 60
+    },
+    {
+      "id": "NOWINDOW",
+      "kind": "command",
+      "required": true,
+      "note": "每个用 ProcessStartInfo 的文件都设了 CreateNoWindow = true",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,re,sys;files=[p for p in pathlib.Path('winclient').rglob('*.cs') if 'ProcessStartInfo' in p.read_text(encoding='utf-8',errors='ignore')];bad=[str(p) for p in files if 'CreateNoWindow = true' not in p.read_text(encoding='utf-8',errors='ignore')];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "timeoutSec": 60
+    }
   ],
   "expectArtifacts": [
     "winclient/WinClient.sln",
@@ -39,18 +96,12 @@
     "winclient/WinClient.Tests/WinClient.Tests.csproj",
     "docs/winclient/架构说明.md"
   ],
-  "acceptance": [
-    { "id": "BUILD", "kind": "command", "argv": ["dotnet", "build", "winclient/WinClient.sln", "--nologo", "-v", "q"], "required": true, "timeoutSec": 900, "note": "离线还原并编译通过,零警告不强求但零错误" },
-    { "id": "TEST", "kind": "command", "argv": ["dotnet", "test", "winclient/WinClient.sln", "--nologo", "-v", "q"], "required": true, "timeoutSec": 900, "note": "xunit 用例覆盖:错误码→枚举映射全表;状态机每条迁移与退避上限→NeedsManual;会话到期→NeedsLogin;Reconnecting 期间 KillSwitch 规则计划不含删除;只有 UserDisconnect 产生删除计划;KillSwitchPlanner 计划里放行项只有节点地址/TUN/回环/DHCP;SingBoxProcessManager 启动参数 CreateNoWindow 为 true 且 UseShellExecute 为 false;凭据存储接口的内存实现往返一致;日志令牌打码" },
-    { "id": "NOSECRET", "kind": "command", "argv": ["python", "-c", "import pathlib,re,sys;pat=re.compile(r'(vless://|hysteria2://|[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})');bad=[str(p) for p in pathlib.Path('winclient').rglob('*') if p.is_file() and p.suffix in {'.cs','.xaml','.json','.resx','.config'} and 'Tests' not in str(p) and pat.search(p.read_text(encoding='utf-8',errors='ignore'))];print(bad);sys.exit(1 if bad else 0)"], "required": true, "timeoutSec": 60, "note": "非测试源码里没有写死的 UUID 或隧道链接" },
-    { "id": "NOWINDOW", "kind": "command", "argv": ["python", "-c", "import pathlib,re,sys;files=[p for p in pathlib.Path('winclient').rglob('*.cs') if 'ProcessStartInfo' in p.read_text(encoding='utf-8',errors='ignore')];bad=[str(p) for p in files if 'CreateNoWindow = true' not in p.read_text(encoding='utf-8',errors='ignore')];print(bad);sys.exit(1 if bad else 0)"], "required": true, "timeoutSec": 60, "note": "每个用 ProcessStartInfo 的文件都设了 CreateNoWindow = true" }
-  ],
   "sandbox": "workspace-write",
   "cwd": null,
   "worktree": true,
   "model": null,
   "timeoutSec": 7200,
-  "repoRoot": "E:/yuanc",
+  "repoRoot": "E:\\yuanc",
   "engine": "codex",
   "reasoningEffort": "medium",
   "steps": [

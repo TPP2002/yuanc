@@ -1,0 +1,73 @@
+{
+  "schemaVersion": 1,
+  "taskId": "NODE-DEVICE-PAIR-1024",
+  "slug": "yc-node-device-pair-1024",
+  "title": "自用模式设备配对:exitnode device add/list/revoke/export 子命令,生成设备凭据、导出 .ycpair 配对文件 + vless:// 链接 + 终端二维码,吊销即重渲染并热重载;init 结束自动发第一台",
+  "goal": "做完后,在装好的节点上:①`exitnode device add --name 老板的电脑 [--platform windows|android] [--host <IPv4>]` 在设备登记表(secrets/devices.json,PROXY 单的 DeviceRegistry)里登记一台设备,重渲染服务端配置(sing-box check 过才落盘)并热重载,然后把配对文件写到 <data_dir>/export/<名字>.ycpair(0600),终端打印文件路径、一条 vless:// 链接和一张 UTF-8 字符二维码(经 runner 跑 `qrencode -t UTF8`,没装就提示 apt 安装、只打印链接);②配对文件是 JSON:{\"format\":\"ycpair/1\",\"exported_at\":ISO 时间,\"node\":{host, reality_port, hy2_port, sni, reality_public_key, short_id, uuid, hy2_password}},node 里的八个字段名与鉴权服务器 /client/session 下发的 node 对象完全一致(authserver/authserver/service.py session() 里 node.update(...) 之后的键);host 取 `--host`,没给就取 status 的 public_ipv4,取不到就明确失败并提示手填;③`device list [--json]` 列出名字/平台/登记时间/是否吊销(不打印 uuid 与密码);④`device revoke --name X` 标 revoked_at、重渲染、热重载,再 export 同名会被拒;同名重复 add 幂等返回原设备不重生成凭据;⑤`device export --name X [--host]` 对已有设备重新导出(公网地址变了用);⑥`exitnode init` 成功结束时若登记表为空,自动 add 一台名为「第一台电脑」的设备并打印配对文件路径与「请把这个文件拷到 U 盘带去电脑」;⑦所有命令全经 Runner,测试用 FakeRunner,不碰真实系统。",
+  "background": "项目:客户自购小主机放在澳大利亚家庭宽带下当出口节点,客户自用版第一优先,要求不用任何服务器。正本:docs/design/方案v2-中国客户端-澳洲出口.md §5.1(自用模式:节点自己就是凭据的家,客户端靠配对文件接入;配对文件字段与鉴权服务器 node{...} 完全相同,客户端走同一条渲染与连接路径;公网 IP 变了要重导出)、§3、§7;docs/口径速查表.md(不用域名,一切 IPv4 数字地址)。已落地:node/exitnode/proxy/**(registry.DeviceRegistry.add(device_id, account_id, platform, name) / revoke / all / active;subscription.vless_link(ctx, device);client_config.render_client_windows;sync.apply_sync;reload.reload)、node/exitnode/service.py(上一单 NODE-PROXY-INTEGRATE-1024:build_context / publish / 适配器,先读它,复用不重写)、cli.py 的 ChineseParser 与 main。自用模式下 account_id 统一填 \"local\",device_id 用名字的安全化形式(只留字母数字中划线下划线和汉字,长度 1~64)。\n硬规矩:①凭据(uuid、hy2_password、私钥)只出现在 secrets 目录与配对文件里,配对文件 0600,日志与异常文本一律 log.redact 打码;list 不打印凭据;②配对文件 node 字段集合必须与 authserver 的 session().node 键集合逐字相同,写一个测试把两边的键集合比一遍(直接 import authserver.service 不方便就把八个键名写死在测试里并注明来源);③重渲染后先 sing-box check,失败不落盘不 reload、登记表也不动(复用 sync.apply_sync 的保护口径或 service.publish);④二维码只经 runner 跑外部 qrencode,不在 Python 里自己实现编码,qrencode 缺失时命令仍成功、只少二维码并提示安装命令;⑤名字做文件名用前要安全化,拒绝含路径分隔符或 .. 的名字;⑥不改既有命令的行为与既有测试断言;init 自动 add 只在登记表为空时发生,重复 init 不再加。\n遇到要改施工面外文件、缺依赖、要放宽断言,停下交 blocked + forks。搜索用 rg 或 git grep。",
+  "nonGoals": [
+    "不做鉴权服务器放行名单同步的定时任务(分发模式,后续卡)",
+    "不做 UPnP 开门、DDNS、看门狗、更新器",
+    "不改 Windows 客户端(导入配对文件归 WINCLIENT-LOCAL-MODE-1024)",
+    "不生成 PNG 二维码,只要终端字符二维码",
+    "不改 docs/ 正本;可新增 docs/node/自用配对说明.md"
+  ],
+  "allowedPaths": [
+    "node/exitnode/cli.py",
+    "node/exitnode/device.py",
+    "node/exitnode/service.py",
+    "node/tests/**",
+    "docs/node/自用配对说明.md",
+    "docs/node/隧道配置说明.md"
+  ],
+  "forbiddenPaths": [
+    "node/exitnode/proxy/**",
+    "node/exitnode/config.py",
+    "node/exitnode/runner.py",
+    "node/exitnode/manifest.py",
+    "node/exitnode/systemd.py",
+    "node/exitnode/nft.py",
+    "node/exitnode/netinfo.py",
+    "node/exitnode/status.py",
+    "node/exitnode/log.py",
+    "node/exitnode/templates/**",
+    "authserver/**",
+    "winclient/**",
+    "docs/开工须知.md",
+    "docs/口径速查表.md",
+    "docs/design/**",
+    "docs/交接/**",
+    "pyproject.toml",
+    "requirements-dev.txt",
+    ".github/**",
+    ".codex/**"
+  ],
+  "expectArtifacts": [
+    "node/exitnode/device.py",
+    "node/tests/test_device.py",
+    "node/tests/golden/device/pair.ycpair.json",
+    "docs/node/自用配对说明.md"
+  ],
+  "acceptance": [
+    { "id": "DEVICE", "kind": "test:targeted", "target": "node/tests/test_device.py", "required": true, "failsOnBase": true, "note": "add 生成合法 UUIDv4 与密码并写配对文件 0600;配对文件与黄金文件逐字一致(测试向量);node 八个键与鉴权服务器口径一致;同名 add 幂等;list 不含凭据;revoke 后 export 被拒且服务端配置 users 不含该设备;sing-box check 失败时登记表与线上配置都不变;qrencode 缺失时只少二维码仍成功;名字含 / 或 .. 被拒;init 空表自动 add 一台、第二次 init 不再加" },
+    { "id": "CLI", "kind": "test:targeted", "target": "node/tests/test_cli.py", "required": true, "note": "既有用例全部保持通过;help 列出 device 命令" },
+    { "id": "SUITE", "kind": "command", "argv": ["python", "-m", "pytest", "-q", "node/tests"], "required": true, "timeoutSec": 600 },
+    { "id": "RUFF", "kind": "command", "argv": ["python", "-m", "ruff", "check", "node"], "required": true, "timeoutSec": 300 },
+    { "id": "SECRETS", "kind": "command", "argv": ["python", "-c", "import pathlib,re,sys;bad=[str(p) for p in pathlib.Path('node/exitnode').rglob('*.py') if re.search(r'(BEGIN (EC )?PRIVATE KEY|[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})', p.read_text(encoding='utf-8'))];print(bad);sys.exit(1 if bad else 0)"], "required": true, "timeoutSec": 60 }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "model": null,
+  "timeoutSec": 7200,
+  "repoRoot": "E:/yuanc",
+  "engine": "codex",
+  "reasoningEffort": "medium",
+  "steps": [
+    "读方案 §5.1、口径速查表、node/exitnode/service.py、proxy/registry.py、proxy/subscription.py、proxy/sync.py、cli.py,以及 authserver/authserver/service.py 的 session() 看 node 字段名。",
+    "device.py:safe_name(name);PairFile 数据结构与 render_pair(ctx, device, host, exported_at) -> dict;add/list/revoke/export 四个函数,全部接收 (config, runner) 并复用 service.build_context / service.publish(或 sync.apply_sync)做重渲染+校验+热重载;qr(runner, text) 经 qrencode。",
+    "cli.py:挂 device 子命令组(add/list/revoke/export 与各自参数,中文帮助);init 成功收尾时登记表为空则自动 add「第一台电脑」。",
+    "测试 test_device.py(FakeRunner;黄金文件 node/tests/golden/device/pair.ycpair.json 头部 _comment 注明测试向量;时间与 uuid 用可注入的 clock / 固定种子);test_cli.py 补 help 断言。",
+    "docs/node/自用配对说明.md:给客户看的三步说明(在小主机上敲一条命令 → 拿到文件 → 拷到电脑导入),以及公网地址变了怎么重导出;交活总结不含术语。"
+  ]
+}
