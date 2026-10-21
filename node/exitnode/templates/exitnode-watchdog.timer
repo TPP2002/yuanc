@@ -1,11 +1,12 @@
 [Unit]
-Description=出口节点定时检查占位（尚未启用）
+Description=出口节点每分钟检查
 StartLimitIntervalSec=300
 StartLimitBurst=3
 
 [Timer]
-OnBootSec=60
+OnBootSec=90
 OnUnitActiveSec=60
+Persistent=false
 Unit=exitnode-watchdog.service
 
 [Install]

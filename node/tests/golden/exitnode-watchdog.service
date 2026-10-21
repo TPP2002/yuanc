@@ -1,12 +1,12 @@
 [Unit]
-Description=出口节点状态检查（守护恢复待接入）
+Description=出口节点分层检查与有界恢复
 After=network-online.target
 StartLimitIntervalSec=300
 StartLimitBurst=3
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/python3 -m exitnode --config "/etc/exitnode/config.toml" check
+ExecStart=/usr/bin/python3 -m exitnode --config "/etc/exitnode/config.toml" watchdog tick
 Restart=no
 NoNewPrivileges=true
 UMask=0077

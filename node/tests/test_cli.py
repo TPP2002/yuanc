@@ -56,7 +56,8 @@ def test_status_json_fields_and_four_states(capsys):
     assert main(["status", "--json"], runner) == 0
     result = json.loads(capsys.readouterr().out)
     assert set(result) == {"state", "version", "network", "path", "last_ok_at", "reason",
-                           "public_ipv4"}
+                           "public_ipv4", "watchdog"}
+    assert result["watchdog"] is None
     assert result["public_ipv4"] is None
     assert result["state"] == "normal"
     assert set(result["network"]) == {"iface", "gateway", "dhcp", "addr"}
@@ -67,9 +68,18 @@ def test_status_json_fields_and_four_states(capsys):
 
 
 def test_check_unintegrated_layers_are_not_passed(capsys):
-    assert main(["check", "--json"], fake()) == 0
+    from datetime import UTC, datetime
+
+    from exitnode.watchdog import state
+
+    runner = fake()
+    config = load(CONFIG, runner)
+    state.save(config, runner, state.fresh(), datetime.now(UTC))
+    runner.responses[("systemctl", "is-active", "exitnode-watchdog.timer")] = CompletedResult(out="active")
+    assert main(["check", "--json"], runner) == 0
     layers = json.loads(capsys.readouterr().out)["layers"]
-    assert [layer["result"] for layer in layers] == ["通过", "通过", "未接入", "未接入", "未接入", "通过"]
+    assert [layer["result"] for layer in layers] == ["通过", "通过", "未接入", "未接入", "未接入", "通过", "通过"]
+    assert layers[-2]["name"] == "看门狗"
     assert layers[-1]["name"] == "隧道服务"
 
 
@@ -197,3 +207,115 @@ def test_device_help_and_subcommands(capsys):
     assert all(name in text for name in ("add", "list", "revoke", "export"))
     args = parser().parse_args(["device", "add", "--name", "电脑"])
     assert args.platform == "windows" and args.host is None
+
+
+def test_watchdog_help_and_status_without_state(capsys):
+    with pytest.raises(SystemExit):
+        main(["--help"], FakeRunner())
+    assert "watchdog" in capsys.readouterr().out
+    assert main(["watchdog", "status"], fake()) == 0
+    assert json.loads(capsys.readouterr().out) is None
+
+
+@pytest.mark.parametrize("value,expected", [("manual", "manual"), ("degraded", "reconnecting")])
+def test_status_uses_watchdog_reason(value, expected, capsys):
+    from datetime import UTC, datetime
+
+    from exitnode.watchdog import state
+
+    runner = fake()
+    config = load(CONFIG, runner)
+    saved = state.fresh()
+    saved.update(state=value, consecutive_failures=12, reason="隧道未恢复，请检查配置")
+    state.record(saved, "wait", datetime.now(UTC), saved["reason"])
+    state.save(config, runner, saved, datetime.now(UTC))
+    assert main(["status", "--json"], runner) == 1
+    result = json.loads(capsys.readouterr().out)
+    assert result["state"] == expected
+    assert result["reason"] == saved["reason"]
+    assert result["watchdog"]["state"] == value
+    assert result["watchdog"]["consecutive_failures"] == 12
+    assert result["watchdog"]["last_action"]["action"] == "wait"
+
+
+def test_check_missing_watchdog_fails(capsys):
+    assert main(["check", "--json"], fake()) == 1
+    layers = json.loads(capsys.readouterr().out)["layers"]
+    assert next(layer for layer in layers if layer["name"] == "看门狗")["result"] == "失败"
+
+
+@pytest.mark.parametrize("command", ["rollback", "uninstall"])
+def test_timer_hardware_init_is_idempotent_and_undo_is_reverse(command, capsys):
+    from exitnode.manifest import Manifest
+
+    runner = fake(pairing=True)
+    runner.files["/dev/watchdog"] = "device"
+    hardware_path = "/etc/systemd/system.conf.d/exitnode-watchdog.conf"
+    timer = "exitnode-watchdog.timer"
+    assert main(["init"], runner) == 0
+    assert runner.files[hardware_path] == "[Manager]\nRuntimeWatchdogSec=60\nRebootWatchdogSec=10min\n"
+    steps = Manifest("/var/lib/exitnode/manifest.json", runner).steps
+    names = [step["step"] for step in steps]
+    assert names.index("启用隧道服务") < names.index("启用看门狗定时器") < names.index("硬件看门狗")
+    timer_step = next(s for s in steps if s["step"] == "启用看门狗定时器")
+    assert timer_step["undo"] == {"kind": "systemctl", "unit": timer}
+    calls = [c for c in runner.calls if c[0] == "run"]
+    assert any(c[1] == ("systemctl", "enable", "--now", timer) for c in calls)
+    timer_index = next(i for i, c in enumerate(calls) if c[1] == ("systemctl", "enable", "--now", timer))
+    first_device = next(i for i, c in enumerate(calls) if c[1] == ("systemctl", "reload", "exitnode-proxy.service"))
+    assert timer_index < first_device
+    assert main(["init"], runner) == 0
+    assert [c for c in runner.calls if c[0] == "run"] == calls
+    boundary = len(runner.calls)
+    assert main([command], runner) == 0
+    undo = runner.calls[boundary:]
+    removed = [c[1] for c in undo if c[0] == "remove"]
+    assert removed.index(hardware_path) < removed.index("/etc/systemd/system/" + timer)
+    assert hardware_path not in runner.files
+    removal_index = undo.index(("remove", hardware_path))
+    assert undo[removal_index + 1][1] == ("systemctl", "daemon-reexec")
+    assert ("run", ("systemctl", "disable", "--now", timer), True, None) in undo
+
+
+def test_foreign_hardware_file_is_neither_overwritten_nor_removed():
+    runner = fake(pairing=True)
+    runner.files["/dev/watchdog"] = "device"
+    path = "/etc/systemd/system.conf.d/exitnode-watchdog.conf"
+    runner.files[path] = "FOREIGN"
+    assert main(["init"], runner) == 1
+    assert main(["rollback"], runner) == 0
+    assert runner.files[path] == "FOREIGN"
+
+
+def test_absent_hardware_is_reported_as_skipped(capsys):
+    runner = fake(pairing=True)
+    assert main(["init"], runner) == 0
+    assert "硬件看门狗：设备不存在，跳过" in capsys.readouterr().out
+    assert not any(c[0] == "run" and c[1] == ("systemctl", "daemon-reexec") for c in runner.calls)
+
+
+def test_disabled_watchdog_does_not_enable_timer_or_hardware():
+    runner = fake(pairing=True)
+    runner.files["/dev/watchdog"] = "device"
+    runner.files[CONFIG] = runner.files[CONFIG].replace("enabled = true", "enabled = false").replace(
+        "hardware = true", "hardware = false")
+    assert main(["init"], runner) == 0
+    assert not any(c[0] == "run" and c[1] == ("systemctl", "enable", "--now", "exitnode-watchdog.timer")
+                   for c in runner.calls)
+    assert "/etc/systemd/system.conf.d/exitnode-watchdog.conf" not in runner.files
+    assert not any("weekly-reboot" in p for p in runner.files)
+
+
+def test_watchdog_tick_dispatch(monkeypatch):
+    from exitnode import cli
+
+    calls = []
+
+    def tick(config, runner):
+        calls.append((config, runner))
+        return 2
+
+    monkeypatch.setattr(cli, "watchdog_tick", tick)
+    runner = fake()
+    assert main(["watchdog", "tick"], runner) == 2
+    assert calls[0][1] is runner and calls[0][0].watchdog.enabled

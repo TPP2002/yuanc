@@ -40,3 +40,16 @@ def test_proxy_binary_override():
     assert "ExecStart=/opt/sing-box run -c /var/lib/exitnode/secrets/sing-box.json\n" in text
     with pytest.raises(ValueError):
         render("exitnode-proxy.service", {}, binary="/a\nExecStart=/bin/other")
+
+
+def test_watchdog_service_timer_and_context():
+    text = render("exitnode-watchdog.service", {"config_path": "/etc/custom config.toml"})
+    assert 'ExecStart=/usr/bin/python3 -m exitnode --config "/etc/custom config.toml" watchdog tick\n' in text
+    assert "Type=oneshot\n" in text
+    timer = render("exitnode-watchdog.timer", {})
+    assert "OnBootSec=90\n" in timer
+    assert "OnUnitActiveSec=60\n" in timer
+    assert "Persistent=false\n" in timer
+    for unsafe in ('/a\nExecStart=/bin/other', '/a"', '/%n', '/$HOME', '/a\\b'):
+        with pytest.raises(ValueError):
+            render("exitnode-watchdog.service", {"config_path": unsafe})

@@ -30,3 +30,17 @@ domain = "请填写域名"
 [updater]
 channel = "stable"
 check_interval = 3600
+
+[watchdog]
+enabled = true
+restart_limit_per_hour = 3
+rollback_min_interval_hours = 6
+reboot_enabled = true
+reboot_after_minutes = 30
+reboot_min_interval_hours = 6
+hardware = true
+# 仅保留配置项；本版本不会安装每周重启任务。
+weekly_reboot = false
+restart_after_failures = 4
+retry_interval_seconds = 60
+max_backoff_seconds = 300

@@ -56,6 +56,9 @@ class Manifest:
             raise ValueError("只允许撤回本项目的服务")
         if kind == "nft" and spec.get("table", "exitnode") != "exitnode":
             raise ValueError("只允许撤回本项目的规则表")
+        if spec.get("daemon_reexec") and (kind != "remove_file" or spec.get("path") !=
+                                         "/etc/systemd/system.conf.d/exitnode-watchdog.conf"):
+            raise ValueError("仅本项目硬件看门狗文件允许重新加载管理进程")
 
     def apply(self, step_id, do, undo_spec):
         self._validate_undo(undo_spec)
@@ -81,6 +84,8 @@ class Manifest:
         if kind == "remove_file":
             if not spec.get("preserve", False):
                 self.runner.remove(spec["path"])
+                if spec.get("daemon_reexec"):
+                    self.runner.run(["systemctl", "daemon-reexec"])
         elif kind == "restore_file":
             self.runner.write_file(spec["path"], self.runner.read_file(spec["backup"]),
                                    spec.get("mode", 0o600))
