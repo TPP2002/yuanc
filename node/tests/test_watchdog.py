@@ -355,3 +355,12 @@ def test_decision_rejects_second_rollback_and_plain_restart_respects_window():
     assert decide(value, probes.probe(config, runner), NOW, config).name == "manual"
     value["last_rollback_at"] = (NOW - timedelta(hours=6)).isoformat()
     assert decide(value, probes.probe(config, runner), NOW, config).name == "rollback_config"
+
+
+def test_listener_uses_configured_reality_port():
+    from dataclasses import replace
+    config, runner = setup()
+    config = replace(config, proxy=replace(config.proxy, reality_port=14443))
+    assert next(p for p in probes.probe(config, runner) if p["layer"] == "L-listen")["result"] == "失败"
+    runner.responses[("ss", "-ltnH")] = CompletedResult(out="LISTEN 0 128 *:14443 *:*\n")
+    assert next(p for p in probes.probe(config, runner) if p["layer"] == "L-listen")["result"] == "通过"
