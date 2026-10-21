@@ -1,4 +1,6 @@
+import json
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 from authserver.app import create_app
@@ -18,13 +20,17 @@ class Clock:
 
 
 @pytest.fixture
-def settings():
+def settings(tmp_path):
+    vector = json.loads((Path(__file__).parents[2] / "node/tests/golden/proxy/inputs.json")
+                        .read_text(encoding="utf-8"))
+    certificate = tmp_path / "hy2.crt"
+    certificate.write_text("\n".join(vector["context"]["hy2_certificate"]), encoding="utf-8")
     return Settings.model_validate({
         "security": {"admin_key": "test-admin-only", "node_key": "test-node-only",
                      "token_salt": "test-salt-only"},
         "node": {"host": "192.0.2.23", "reality_port": 443, "hy2_port": 24443,
                  "reality_public_key": "test-public-key", "short_id": "abcd1234",
-                 "sni": "example.test"},
+                 "sni": "example.test", "hy2_certificate_path": str(certificate)},
     })
 
 

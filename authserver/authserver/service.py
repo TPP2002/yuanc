@@ -218,6 +218,7 @@ class Service:
             conn.execute("UPDATE devices SET last_seen = ? WHERE id = ?", (at, device["id"]))
             audit(conn, "device:" + device["id"], "session.create", at, ip)
             node = self.settings.node.model_dump()
+            # Node excludes the local certificate path and exports the loaded PEM lines.
             node.update(uuid=device["uuid"], hy2_password=hy2_password(device["uuid"], self.salt))
             return {"session_token": raw, "session_expires_at": expires,
                     "account_expires_at": account["expires_at"], "node": node}

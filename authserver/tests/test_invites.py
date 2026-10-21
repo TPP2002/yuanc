@@ -105,7 +105,7 @@ def test_admin_extend_disable_enable_and_audit(client, admin, enrolled, app):
     assert client.get("/admin/audit", headers=admin).json() == entries
 
 
-def test_offline_cli(tmp_path, app, enrolled, capsys):
+def test_offline_cli(tmp_path, app, enrolled, capsys, settings):
     config = tmp_path / "config.toml"
     config.write_text('''[security]
 admin_key = "test-admin-only"
@@ -118,7 +118,8 @@ hy2_port = 24443
 reality_public_key = "test-public-key"
 short_id = "abcd1234"
 sni = "example.test"
-''', encoding="utf-8")
+''' + 'hy2_certificate_path = ' + json.dumps(settings.node.hy2_certificate_path) + '\n',
+                      encoding="utf-8")
     args = ["--config", str(config), "--db", app.state.service.db.path]
     assert main(args + ["invite", "--days", "30", "--uses", "2", "--note", "离线"]) == 0
     output = json.loads(capsys.readouterr().out)

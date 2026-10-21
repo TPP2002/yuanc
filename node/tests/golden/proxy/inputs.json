@@ -1,7 +1,19 @@
 {
-  "_comment": "测试向量,不是真凭据",
+  "_comment": "测试向量,不是真凭据；自签 ECDSA 证书仅用于测试，不是真机证书",
   "context": {
     "server_host": "203.0.113.10",
+    "hy2_server_name": "exitnode",
+    "hy2_certificate": [
+      "-----BEGIN CERTIFICATE-----",
+      "MIIBPTCB5aADAgECAhQRYEwMH9VCQQKIwf9+LXhlxXgxmzAKBggqhkjOPQQDAjAT",
+      "MREwDwYDVQQDDAhleGl0bm9kZTAeFw0yNjAxMDEwMDAwMDBaFw0zNjAxMDEwMDAw",
+      "MDBaMBMxETAPBgNVBAMMCGV4aXRub2RlMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcD",
+      "QgAE1hUrQJdGRuMCTRZ8PCNYJgNw3F8HXk+cm6RAs3CYt1ooSMmqspm0vsBQRPd2",
+      "WdITTrYDOdZdh4bPqjIJWmZIyaMXMBUwEwYDVR0RBAwwCoIIZXhpdG5vZGUwCgYI",
+      "KoZIzj0EAwIDRwAwRAIgRL42tQXA8zgMGx6YWuDVZbT4h5kS23KjkiQhLgaMVUkC",
+      "ID5gxni4Gm3yC8aOV4dNxXpPitBAEMAkiMPIgcYVpZyi",
+      "-----END CERTIFICATE-----"
+    ],
     "reality": {
       "private_key": "dwdtCnMYpX08FsFyUbJmRd9ML4frwJkqsXf7pR25LCo",
       "public_key": "hSDwCYkwp1R0i33ctD73Wg2_Og0mOBr066SpjqqbTmo",

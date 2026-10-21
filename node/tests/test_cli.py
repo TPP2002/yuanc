@@ -22,6 +22,7 @@ def fake(*, pairing=False):
         "/var/lib/exitnode/secrets/hy2.crt": "测试证书",
         "/var/lib/exitnode/secrets/hy2.key": "测试私钥占位",
     }, responses={
+        ("openssl", "x509"): CompletedResult(out="X509v3 Subject Alternative Name:\n    DNS:exitnode\n"),
         ("ip", "-j", "route"): CompletedResult(out='[{"dst":"default","dev":"eth0","gateway":"192.0.2.1"}]'),
         ("ip", "-j", "addr"): CompletedResult(out=json.dumps([
             {"ifname": "eth0", "ifindex": 2, "flags": ["UP"],

@@ -62,6 +62,7 @@ def test_exact_pair_golden_and_session_node_keys(installed, monkeypatch):
     config, runner = installed
     vector = json.loads((GOLDEN / "proxy" / "inputs.json").read_text(encoding="utf-8"))
     runner.files[service.SECRETS + "/reality.json"] = json.dumps(vector["context"]["reality"])
+    runner.files[service.SECRETS + "/hy2.crt"] = "\n".join(vector["context"]["hy2_certificate"])
     monkeypatch.setattr(registry_module, "uuid4", lambda: UUID(vector["device"]["uuid"]))
     monkeypatch.setattr(registry_module.secrets, "token_urlsafe", lambda _: "TEST-ONLY-hy2-password")
     monkeypatch.setattr(registry_module, "now", lambda: AT)
@@ -74,10 +75,10 @@ def test_exact_pair_golden_and_session_node_keys(installed, monkeypatch):
         GOLDEN / "device" / "pair.ycpair.json"
     ).read_text(encoding="utf-8")
     # authserver/authserver/service.py Service.session(): Node.model_dump()
-    # (authserver/authserver/config.py Node 的六个字段) + node.update 的两个凭据字段。
+    # Node 导出的八个字段 + node.update 的两个凭据字段。
     assert set(pair["node"]) == {
         "host", "reality_port", "hy2_port", "sni", "reality_public_key", "short_id",
-        "uuid", "hy2_password",
+        "uuid", "hy2_password", "hy2_server_name", "hy2_certificate",
     }
     assert set(pair) == {"format", "exported_at", "node"}
     assert "private_key" not in runner.files[path]

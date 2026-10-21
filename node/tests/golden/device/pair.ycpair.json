@@ -1,6 +1,6 @@
 {
   "_comment": "测试向量,不是真凭据",
-  "format": "ycpair/1",
+  "format": "ycpair/2",
   "exported_at": "2026-10-22T00:00:00+00:00",
   "node": {
     "host": "203.0.113.10",
@@ -10,6 +10,18 @@
     "reality_public_key": "hSDwCYkwp1R0i33ctD73Wg2_Og0mOBr066SpjqqbTmo",
     "short_id": "01234567",
     "uuid": "00000000-0000-4000-8000-000000000001",
-    "hy2_password": "TEST-ONLY-hy2-password"
+    "hy2_password": "TEST-ONLY-hy2-password",
+    "hy2_server_name": "exitnode",
+    "hy2_certificate": [
+      "-----BEGIN CERTIFICATE-----",
+      "MIIBPTCB5aADAgECAhQRYEwMH9VCQQKIwf9+LXhlxXgxmzAKBggqhkjOPQQDAjAT",
+      "MREwDwYDVQQDDAhleGl0bm9kZTAeFw0yNjAxMDEwMDAwMDBaFw0zNjAxMDEwMDAw",
+      "MDBaMBMxETAPBgNVBAMMCGV4aXRub2RlMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcD",
+      "QgAE1hUrQJdGRuMCTRZ8PCNYJgNw3F8HXk+cm6RAs3CYt1ooSMmqspm0vsBQRPd2",
+      "WdITTrYDOdZdh4bPqjIJWmZIyaMXMBUwEwYDVR0RBAwwCoIIZXhpdG5vZGUwCgYI",
+      "KoZIzj0EAwIDRwAwRAIgRL42tQXA8zgMGx6YWuDVZbT4h5kS23KjkiQhLgaMVUkC",
+      "ID5gxni4Gm3yC8aOV4dNxXpPitBAEMAkiMPIgcYVpZyi",
+      "-----END CERTIFICATE-----"
+    ]
   }
 }

@@ -25,7 +25,8 @@ def render_server(ctx: ProxyContext, devices: list[Device]) -> dict:
         "dns": {"servers": [{"tag": "upstream", "address": "1.1.1.1"}], "final": "upstream"},
         "inbounds": [
             {
-                "type": "vless", "tag": "in-reality", "listen": "::", "listen_port": 443,
+                "type": "vless", "tag": "in-reality", "listen": "::",
+                "listen_port": ctx.reality_port,
                 "users": [{"uuid": d.uuid, "flow": "xtls-rprx-vision"} for d in active],
                 "tls": {
                     "enabled": True, "server_name": ctx.sni,

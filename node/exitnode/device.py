@@ -22,6 +22,8 @@ class PairNode(TypedDict):
     short_id: str
     uuid: str
     hy2_password: str
+    hy2_server_name: str
+    hy2_certificate: list[str]
 
 
 class PairFile(TypedDict):
@@ -44,10 +46,11 @@ def render_pair(ctx, device, host, exported_at) -> PairFile:
         raise ValueError("设备已吊销，不能导出配对文件")
     validate_devices([device])
     host = ipv4_host(replace(ctx, server_host=host))
-    return PairFile(format="ycpair/1", exported_at=exported_at, node=PairNode(
-        host=host, reality_port=443, hy2_port=ctx.hy2_port, sni=ctx.sni,
+    return PairFile(format="ycpair/2", exported_at=exported_at, node=PairNode(
+        host=host, reality_port=ctx.reality_port, hy2_port=ctx.hy2_port, sni=ctx.sni,
         reality_public_key=ctx.reality.public_key, short_id=ctx.reality.short_id,
         uuid=device.uuid, hy2_password=device.hy2_password,
+        hy2_server_name=ctx.hy2_server_name, hy2_certificate=list(ctx.hy2_certificate),
     ))
 
 
@@ -75,7 +78,7 @@ def _context(config, runner, host):
     if not adapter.exists(config.node.secrets_dir.rstrip("/") + "/reality.json"):
         raise ValueError("节点尚未准备好凭据，请先完成 init")
     keys = ensure_reality_keys(config.node.secrets_dir, adapter)
-    ctx = service.build_context(config, keys)
+    ctx = service.build_context(config, keys, runner)
     address = host if host is not None else public_ipv4(runner)
     if address is None:
         raise ValueError("未取得公网 IPv4，请用 --host 手填节点公网 IPv4 地址")

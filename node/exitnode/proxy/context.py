@@ -10,6 +10,7 @@ from .keys import RealityKeys
 class ProxyContext:
     reality: RealityKeys = field(repr=False)
     server_host: str = ""
+    reality_port: int = 443
     # Configurable camouflage target; operator may select an Australian local site.
     sni: str = "www.microsoft.com"
     handshake_server: str = "www.microsoft.com"

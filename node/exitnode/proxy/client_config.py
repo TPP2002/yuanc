@@ -30,7 +30,7 @@ def render_client_windows(ctx: ProxyContext, device: Device) -> dict:
         }],
         "outbounds": [
             {
-                "type": "vless", "tag": "main", "server": host, "server_port": 443,
+                "type": "vless", "tag": "main", "server": host, "server_port": ctx.reality_port,
                 "uuid": device.uuid, "flow": "xtls-rprx-vision",
                 "tls": {
                     "enabled": True, "server_name": ctx.sni,

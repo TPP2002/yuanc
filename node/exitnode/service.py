@@ -76,9 +76,22 @@ def ensure_credentials(config, runner):
 
     def certificate():
         have_crt, have_key = runner.exists(crt), runner.exists(key)
+        regenerated = False
         if have_crt and have_key:
-            return
-        if have_crt or have_key:
+            result = runner.run([
+                "openssl", "x509", "-in", crt, "-noout", "-ext", "subjectAltName",
+            ], check=False)
+            if result.code:
+                raise ValueError("备用通道证书检查失败；命令输出已隐藏，已有文件未覆盖")
+            names = re.findall(r"DNS:([^,\s]+)", result.out)
+            if config.proxy.hy2_server_name in names:
+                return
+            for path in (crt, key):
+                runner.write_file(path, "", 0o600)
+            for path in (crt, key):
+                runner.remove(path)
+            regenerated = True
+        elif have_crt or have_key:
             raise ValueError("备用通道证书与私钥不成对，请联系维护人员；已有文件未覆盖")
         # 命令已完成但完成标记未落盘时，复用完整暂存对，不重新生成。
         if all(runner.exists(path) and runner.read_file(path) for path in (crt_tmp, key_tmp)):
@@ -91,11 +104,14 @@ def ensure_credentials(config, runner):
                 "ec_paramgen_curve:prime256v1", "-nodes", "-keyout", key_tmp,
                 "-out", crt_tmp, "-days", "3650", "-subj",
                 "/CN=" + config.proxy.hy2_server_name,
+                "-addext", "subjectAltName=DNS:" + config.proxy.hy2_server_name,
             ], check=False)
             if result.code:
                 raise ValueError("备用通道证书生成失败，请检查 openssl；命令输出已隐藏")
             if not runner.read_file(crt_tmp) or not runner.read_file(key_tmp):
                 raise ValueError("备用通道证书生成未产生完整文件")
+            if regenerated:
+                print("备用通道证书已重新生成,旧配对文件需重新导出")
         except (OSError, RuntimeError, ValueError):
             for path in (crt_tmp, key_tmp):
                 if runner.exists(path):
@@ -127,11 +143,15 @@ def ensure_credentials(config, runner):
     return ensure_reality_keys(config.node.secrets_dir, adapter)
 
 
-def build_context(config, keys):
+def build_context(config, keys, runner):
     return ProxyContext(
         reality=keys, sni=config.proxy.sni, handshake_server=config.proxy.handshake_server,
+        reality_port=config.proxy.reality_port,
         hy2_port=config.proxy.hy2_port, hy2_server_name=config.proxy.hy2_server_name,
         hy2_certificate_path=SECRETS + "/hy2.crt", hy2_key_path=SECRETS + "/hy2.key",
+        hy2_certificate=tuple(line for line in
+                              runner.read_file(SECRETS + "/hy2.crt").splitlines()
+                              if line.strip()),
     )
 
 
@@ -147,7 +167,7 @@ class ReloadRunner(ProxyRunner):
 def _publish_checked(config, runner, devices, registry=None):
     adapter = ProxyRunner(runner)
     keys = ensure_reality_keys(config.node.secrets_dir, adapter)
-    text = json.dumps(render_server(build_context(config, keys), devices),
+    text = json.dumps(render_server(build_context(config, keys, runner), devices),
                       ensure_ascii=False, indent=2) + "\n"
     temporary = LIVE + ".check.tmp"
     try:
