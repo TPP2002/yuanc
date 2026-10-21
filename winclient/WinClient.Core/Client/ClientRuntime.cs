@@ -21,6 +21,7 @@ public sealed class ClientRuntime : IClientFacade, IDisposable
     private readonly DataProtectionScope scope;
     public ClientController Controller { get; }
     public ClientSnapshot Snapshot => Controller.Snapshot;
+    public string? RecoveryWarning => firewall.LastRecoveryWarning;
     public event Action<ClientSnapshot>? Changed { add => Controller.Changed += value; remove => Controller.Changed -= value; }
     public Task ConnectAsync() => Controller.ConnectAsync();
     public Task DisconnectAsync() => Controller.DisconnectAsync();
@@ -34,7 +35,11 @@ public sealed class ClientRuntime : IClientFacade, IDisposable
         DataProtectionScope scope = DataProtectionScope.CurrentUser)
     {
         var firewall = new KillSwitchApplier(Path.Combine(ClientSettings.DataDirectory, "run"));
-        await firewall.RecoverAsync(); // Recovery precedes even reading server.json.
+        try { await firewall.RecoverAsync(); } // 恢复先于读取服务器配置。
+        catch (InvalidOperationException)
+        {
+            // 启动恢复失败由 Controller.InitializeAsync 再试并进入需人工处理，服务不得因此退出。
+        }
         var pairingStore = new PairingStore(root: storeRoot, scope: scope);
         var log = new RedactingLog(new RollingFileLog(Path.Combine(ClientSettings.DataDirectory, "run", "sing-box.log")));
         var settings = ClientSettings.Load();

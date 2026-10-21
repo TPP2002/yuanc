@@ -12,6 +12,51 @@ namespace WinClient.Tests;
 public sealed class ControllerTests
 {
     [Fact]
+    public async Task RecoveryWarningRemainsVisibleAfterAutomaticConnect()
+    {
+        var order = new List<string>();
+        using var http = SessionHttp(() => TestData.Session());
+        var store = new InMemoryCredentialStore(); store.Save("refresh");
+        const string warning = "上次断网保护已降级恢复，请管理员检查记录。";
+        using var controller = new ClientController(new AuthApiClient(http), store,
+            new Firewall(order) { RecoveryWarning = warning }, new Tunnel(order), Path.GetFullPath("fake.exe"), TestData.Device);
+        await controller.InitializeAsync();
+        Assert.Contains(warning, controller.Snapshot.Message);
+        Assert.NotEqual(ConnectionState.NeedsManual, controller.Snapshot.State);
+        Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
+        Assert.True(order.IndexOf("recover") >= 0 && order.IndexOf("apply") > order.IndexOf("recover"));
+        Assert.Contains("start", order);
+    }
+
+    [Fact]
+    public async Task RecoveryWarningAlsoExplainsMissingServer()
+    {
+        var order = new List<string>();
+        const string warning = "上次断网保护已降级恢复。";
+        using var controller = new ClientController(null, new InMemoryCredentialStore(),
+            new Firewall(order) { RecoveryWarning = warning }, new Tunnel(order), Path.GetFullPath("fake.exe"), TestData.Device);
+        await controller.InitializeAsync();
+        Assert.Equal(warning + " 未配置服务器。", controller.Snapshot.Message);
+        Assert.NotEqual(ConnectionState.NeedsManual, controller.Snapshot.State);
+        Assert.DoesNotContain("apply", order);
+    }
+
+    [Fact]
+    public async Task FailedRecoveryNeedsManualAndExplainsPreservedRecord()
+    {
+        var order = new List<string>();
+        using var http = SessionHttp(() => TestData.Session());
+        var store = new InMemoryCredentialStore(); store.Save("refresh");
+        using var controller = new ClientController(new AuthApiClient(http), store,
+            new Firewall(order) { FailRecovery = true }, new Tunnel(order), Path.GetFullPath("fake.exe"), TestData.Device);
+        await controller.InitializeAsync();
+        Assert.Equal(ConnectionState.NeedsManual, controller.Snapshot.State);
+        Assert.Contains("恢复记录已保留", controller.Snapshot.Message);
+        Assert.DoesNotContain("apply", order);
+        Assert.DoesNotContain("start", order);
+    }
+
+    [Fact]
     public async Task PairingRetriesReachManualWithAddressHintAndKeepProtection()
     {
         var pending = System.Threading.Channels.Channel.CreateUnbounded<(TimeSpan Delay, TaskCompletionSource Completion)>();
@@ -104,13 +149,16 @@ public sealed class ControllerTests
     { BaseAddress = new("https://unit.invalid") };
     private sealed class Firewall(List<string> order) : IKillSwitch
     {
+        public string? RecoveryWarning { get; init; }
+        public bool FailRecovery { get; init; }
         public bool FailApply { get; init; }
         public Task ApplyAsync(IReadOnlyList<IPAddress> ips, string program, int hy2Port)
         { order.Add("apply"); if (FailApply) throw new InvalidOperationException(); return Task.CompletedTask; }
         public Task UpdateNodeAsync(IReadOnlyList<IPAddress> ips, string program, int hy2Port)
         { order.Add("update:" + ips[0]); return Task.CompletedTask; }
         public Task RemoveAsync() { order.Add("remove"); return Task.CompletedTask; }
-        public Task RecoverAsync() { order.Add("recover"); return Task.CompletedTask; }
+        public Task<string?> RecoverAsync()
+        { order.Add("recover"); if (FailRecovery) throw new InvalidOperationException(); return Task.FromResult(RecoveryWarning); }
     }
     private sealed class Tunnel(List<string> order) : ITunnelTransport
     {

@@ -50,18 +50,30 @@ public sealed class ClientController : IDisposable
 
     public async Task InitializeAsync(bool autoConnect = true)
     {
+        string? warning = null;
         await gate.WaitAsync();
         try
         {
-            await firewall.RecoverAsync();
-            if (sessionSource is null) message = "未配置服务器";
+            warning = await firewall.RecoverAsync();
+            if (warning is not null) message = warning + (sessionSource is null ? " 未配置服务器。" : "");
+            else if (sessionSource is null) message = "未配置服务器";
         }
-        catch (Exception ex) when (IsOperational(ex)) { await FailAsync(); }
+        catch (Exception ex) when (IsOperational(ex))
+        {
+            await FailAsync();
+            message = "启动时未能恢复上次的断网保护设置，恢复记录已保留；请联系管理员处理后重新启动后台服务。";
+        }
         finally { Publish(); gate.Release(); }
         if (autoConnect && sessionSource is not null && machine.State != ConnectionState.NeedsManual)
         {
             try { if (sessionSource is PairingSessionSource || sessionSource is AuthServerSessionSource { HasCredentials: true }) await ConnectAsync(); }
             catch (Exception ex) when (IsOperational(ex)) { message = "无法读取本地登录凭据，请重新兑换邀请码。"; Publish(); }
+        }
+        // 自动连接会更新消息；保留降级提示，同时保留连接过程自身的结果。
+        if (warning is not null && !message.Contains(warning, StringComparison.Ordinal))
+        {
+            message = warning + " " + message;
+            Publish();
         }
     }
 

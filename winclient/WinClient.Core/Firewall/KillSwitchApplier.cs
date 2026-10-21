@@ -8,7 +8,7 @@ public interface IKillSwitch
     Task ApplyAsync(IReadOnlyList<IPAddress> ips, string program, int hy2Port);
     Task UpdateNodeAsync(IReadOnlyList<IPAddress> ips, string program, int hy2Port);
     Task RemoveAsync();
-    Task RecoverAsync();
+    Task<string?> RecoverAsync();
     Task ApplyAsync(IReadOnlyList<IPAddress> ips, string program, int hy2Port, int realityPort) =>
         realityPort == 443 ? ApplyAsync(ips, program, hy2Port) : throw new InvalidOperationException("当前断网保护不支持此出口端口。");
     Task UpdateNodeAsync(IReadOnlyList<IPAddress> ips, string program, int hy2Port, int realityPort) =>
@@ -21,6 +21,7 @@ public sealed class KillSwitchApplier : IKillSwitch
     private readonly SemaphoreSlim gate = new(1, 1);
     public string StatePath { get; }
     public string AuditPath { get; }
+    public string? LastRecoveryWarning { get; private set; }
     public KillSwitchApplier(string runDirectory, ICommandRunner? runner = null)
     {
         this.runner = runner ?? new CommandRunner();
@@ -38,7 +39,43 @@ public sealed class KillSwitchApplier : IKillSwitch
         ExecuteAsync(KillSwitchPlanner.UpdateNode(ips, program, hy2Port, realityPort));
     public Task RemoveAsync() => ExecuteAsync([new RemoveRulesByPrefix(KillSwitchPlanner.Prefix), new RestoreProfileDefault()]);
     // A snapshot with applied=false also needs recovery: the process may have died partway through Apply.
-    public Task RecoverAsync() => File.Exists(StatePath) ? RemoveAsync() : Task.CompletedTask;
+    public async Task<string?> RecoverAsync()
+    {
+        await gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            if (!File.Exists(StatePath)) return LastRecoveryWarning;
+            if (await RunRecoveryStageAsync([new RemoveRulesByPrefix(KillSwitchPlanner.Prefix), new RestoreProfileDefault()], "restore").ConfigureAwait(false) == 0)
+            {
+                LastRecoveryWarning = null;
+                return null;
+            }
+            if (File.Exists(StatePath) && await RunRecoveryStageAsync([new RecoverFallback()], "fallback").ConfigureAwait(false) == 0)
+            {
+                LastRecoveryWarning = "启动时未能按原记录完整恢复断网保护，已降级恢复网络设置并归档记录；请联系管理员检查恢复记录。";
+                return LastRecoveryWarning;
+            }
+            throw new InvalidOperationException("防火墙操作失败，恢复记录已保留，请联系管理员。");
+        }
+        finally { gate.Release(); }
+    }
+
+    private async Task<int> RunRecoveryStageAsync(IReadOnlyList<FirewallAction> actions, string stage)
+    {
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(180));
+        var result = await runner.RunAsync(CreateStartInfo(KillSwitchPlanner.ToPowerShellScript(actions, StatePath, AuditPath)), timeout.Token).ConfigureAwait(false);
+        if (result.ExitCode != 0)
+        {
+            try
+            {
+                // CommandResult 不携带 stderr，不把标准输出中的私有内容写入日志。
+                var path = Path.Combine(Path.GetDirectoryName(StatePath)!, "killswitch-recovery.log");
+                await File.AppendAllTextAsync(path, $"{DateTime.UtcNow:O} {stage} {result.ExitCode}{Environment.NewLine}").ConfigureAwait(false);
+            }
+            catch (Exception) { /* 追加证据失败不能阻断恢复。 */ }
+        }
+        return result.ExitCode;
+    }
 
     public static ProcessStartInfo CreateStartInfo(string script)
     {

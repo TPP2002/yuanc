@@ -13,6 +13,7 @@ public sealed record AddRule(string Name, string Direction, string Action, strin
     string? RemotePort = null, string? InterfaceAlias = null) : FirewallAction;
 public sealed record RemoveRulesByPrefix(string Prefix) : FirewallAction;
 public sealed record RestoreProfileDefault : FirewallAction;
+public sealed record RecoverFallback : FirewallAction;
 public sealed record Audit : FirewallAction;
 
 public static class KillSwitchPlanner
@@ -141,6 +142,45 @@ public static class KillSwitchPlanner
                     script.AppendLine("  foreach ($p in $state.profiles) { Set-NetFirewallProfile -Profile $p.Name -DefaultOutboundAction $p.DefaultOutboundAction }");
                     script.AppendLine("  if ($restoreFailed.Count -gt 0) { throw '部分防火墙规则恢复失败，恢复记录已保留，请联系管理员。' }");
                     script.AppendLine("  Remove-Item -LiteralPath $statePath\n} else { Set-NetFirewallProfile -Profile Domain,Private,Public -DefaultOutboundAction Allow }");
+                    break;
+                case RecoverFallback:
+                    script.AppendLine("$archived = $null; $state = $null");
+                    script.AppendLine("$runDirectory = [IO.Path]::GetDirectoryName($statePath)");
+                    script.AppendLine("if (Test-Path -LiteralPath $statePath) {");
+                    script.AppendLine("  Get-ChildItem -LiteralPath $runDirectory -Filter 'killswitch-state.failed-*.json' -File | Sort-Object Name -Descending | Select-Object -Skip 4 | ForEach-Object { Remove-Item -LiteralPath $_.FullName -ErrorAction Stop }");
+                    script.AppendLine("  $archived = 'killswitch-state.failed-' + [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssZ') + '.json'");
+                    script.AppendLine("  $archivePath = Join-Path $runDirectory $archived");
+                    script.AppendLine("  Copy-Item -LiteralPath $statePath -Destination $archivePath -ErrorAction Stop");
+                    script.AppendLine("  try { $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json -ErrorAction Stop } catch { $state = $null }");
+                    script.AppendLine("}");
+                    script.AppendLine("$recordValid = $null -ne $state -and @($state.profiles).Count -eq 3");
+                    script.AppendLine("if ($recordValid) {");
+                    script.AppendLine("  foreach ($p in $state.profiles) { if ($p.Name -notin @('Domain','Private','Public') -or $p.DefaultOutboundAction -notin @('Allow','Block','NotConfigured')) { $recordValid = $false } }");
+                    script.AppendLine("  if (@($state.profiles.Name | Sort-Object -Unique).Count -ne 3) { $recordValid = $false }");
+                    script.AppendLine("}");
+                    script.AppendLine("if ($recordValid) {");
+                    script.AppendLine("  foreach ($p in $state.profiles) { Set-NetFirewallProfile -Profile $p.Name -DefaultOutboundAction $p.DefaultOutboundAction }");
+                    script.AppendLine("  $profilesApplied = 'recorded'");
+                    script.AppendLine("} else {");
+                    script.AppendLine("  Set-NetFirewallProfile -Profile Domain,Private,Public -DefaultOutboundAction Allow");
+                    script.AppendLine("  $profilesApplied = 'windows_default'");
+                    script.AppendLine("}");
+                    script.AppendLine("$notEnabled = @()");
+                    script.AppendLine("if ($null -ne $state.disabledRules) {");
+                    script.AppendLine("  foreach ($name in @($state.disabledRules)) {");
+                    script.AppendLine("    $enableError = @()");
+                    script.AppendLine("    try { Get-NetFirewallRule -PolicyStore PersistentStore -Name $name -ErrorAction SilentlyContinue -ErrorVariable enableError | Where-Object { $_.Name -eq $name -and $_.Direction -eq 'Outbound' } | Enable-NetFirewallRule -ErrorAction SilentlyContinue -ErrorVariable +enableError } catch { $enableError = @($_) }");
+                    script.AppendLine("    if ($enableError) { $notEnabled += $name }");
+                    script.AppendLine("  }");
+                    script.AppendLine("}");
+                    script.AppendLine("Get-NetFirewallRule -Name " + Quote(Prefix + "*") + " -ErrorAction SilentlyContinue | Remove-NetFirewallRule");
+                    script.AppendLine("$recoveryPath = Join-Path $runDirectory 'killswitch-recovery.json'");
+                    script.AppendLine("$recovery = [pscustomobject]@{ at = [DateTime]::UtcNow.ToString('o'); archived = $archived; record_valid = $recordValid; profiles_applied = $profilesApplied; rules_not_enabled = @($notEnabled) }");
+                    script.AppendLine("$recoveryTemp = $recoveryPath + '.tmp'");
+                    script.AppendLine("$recovery | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $recoveryTemp -Encoding UTF8");
+                    script.AppendLine("Move-Item -LiteralPath $recoveryTemp -Destination $recoveryPath -Force");
+                    script.AppendLine("if (Test-Path -LiteralPath $statePath) { Remove-Item -LiteralPath $statePath -ErrorAction Stop }");
+                    script.AppendLine("exit 0");
                     break;
                 case Audit:
                     script.AppendLine("[IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($auditPath)) | Out-Null");
