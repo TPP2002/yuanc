@@ -1,0 +1,60 @@
+using System.Diagnostics;
+using System.Net;
+
+namespace WinClient.Core.Firewall;
+
+public interface IKillSwitch
+{
+    Task ApplyAsync(IReadOnlyList<IPAddress> ips, string program, int hy2Port);
+    Task UpdateNodeAsync(IReadOnlyList<IPAddress> ips, string program, int hy2Port);
+    Task RemoveAsync();
+    Task RecoverAsync();
+}
+
+public sealed class KillSwitchApplier : IKillSwitch
+{
+    private readonly ICommandRunner runner;
+    private readonly SemaphoreSlim gate = new(1, 1);
+    public string StatePath { get; }
+    public string AuditPath { get; }
+    public KillSwitchApplier(string runDirectory, ICommandRunner? runner = null)
+    {
+        this.runner = runner ?? new CommandRunner();
+        StatePath = Path.Combine(runDirectory, "killswitch-state.json");
+        AuditPath = Path.Combine(runDirectory, "firewall-audit.json");
+    }
+
+    public Task ApplyAsync(IReadOnlyList<IPAddress> ips, string program, int hy2Port) =>
+        ExecuteAsync(KillSwitchPlanner.Plan(ips, KillSwitchPlanner.TunAlias, program, hy2Port, KillSwitchMode.Apply));
+    public Task UpdateNodeAsync(IReadOnlyList<IPAddress> ips, string program, int hy2Port) =>
+        ExecuteAsync(KillSwitchPlanner.UpdateNode(ips, program, hy2Port));
+    public Task RemoveAsync() => ExecuteAsync([new RemoveRulesByPrefix(KillSwitchPlanner.Prefix), new RestoreProfileDefault()]);
+    // A snapshot with applied=false also needs recovery: the process may have died partway through Apply.
+    public Task RecoverAsync() => File.Exists(StatePath) ? RemoveAsync() : Task.CompletedTask;
+
+    public static ProcessStartInfo CreateStartInfo(string script)
+    {
+        var start = new ProcessStartInfo
+        {
+            FileName = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "WindowsPowerShell", "v1.0", "powershell.exe"),
+            CreateNoWindow = true,
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true
+        };
+        foreach (var arg in new[] { "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script }) start.ArgumentList.Add(arg);
+        return start;
+    }
+
+    private async Task ExecuteAsync(IReadOnlyList<FirewallAction> actions)
+    {
+        await gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(45));
+            var result = await runner.RunAsync(CreateStartInfo(KillSwitchPlanner.ToPowerShellScript(actions, StatePath, AuditPath)), timeout.Token).ConfigureAwait(false);
+            if (result.ExitCode != 0) throw new InvalidOperationException("防火墙操作失败，恢复记录已保留，请联系管理员。");
+        }
+        finally { gate.Release(); }
+    }
+}
