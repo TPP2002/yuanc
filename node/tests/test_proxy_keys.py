@@ -1,14 +1,13 @@
 import base64
 import json
 import os
-from pathlib import Path
 import re
+from pathlib import Path
 from unittest.mock import patch
 
-from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
-from cryptography.hazmat.primitives import serialization
 import pytest
-
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 from exitnode.proxy.keys import ensure_reality_keys
 from exitnode.proxy.runner_proto import FakeRunner, LocalRunner
 
@@ -80,8 +79,10 @@ def test_atomic_write_failure_preserves_original(tmp_path):
     runner = LocalRunner()
     path = tmp_path / "secrets" / "test.json"
     runner.write_file(str(path), "original", 0o600)
-    with patch("exitnode.proxy.runner_proto.os.replace", side_effect=OSError("disk error")):
-        with pytest.raises(OSError):
-            runner.write_file(str(path), "new", 0o600)
+    with (
+        patch("exitnode.proxy.runner_proto.os.replace", side_effect=OSError("disk error")),
+        pytest.raises(OSError),
+    ):
+        runner.write_file(str(path), "new", 0o600)
     assert path.read_text() == "original"
     assert list(path.parent.iterdir()) == [path]

@@ -2,7 +2,6 @@ import json
 from uuid import UUID
 
 import pytest
-
 from exitnode.proxy.registry import DeviceRegistry
 from exitnode.proxy.runner_proto import FakeRunner
 

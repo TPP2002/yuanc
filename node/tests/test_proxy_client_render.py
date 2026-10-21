@@ -1,11 +1,10 @@
-from dataclasses import replace
 import ipaddress
 import json
+from dataclasses import replace
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
 import pytest
-
 from exitnode.proxy.client_config import render_client_windows
 from exitnode.proxy.context import ProxyContext
 from exitnode.proxy.keys import RealityKeys

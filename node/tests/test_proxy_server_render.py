@@ -1,9 +1,8 @@
-from dataclasses import replace
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
-
 from exitnode.proxy.context import ProxyContext
 from exitnode.proxy.keys import RealityKeys
 from exitnode.proxy.registry import Device

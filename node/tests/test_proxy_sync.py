@@ -1,10 +1,9 @@
-from dataclasses import asdict
 import json
+from dataclasses import asdict
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-
 from exitnode.proxy.context import ProxyContext
 from exitnode.proxy.keys import RealityKeys
 from exitnode.proxy.registry import Device, DeviceRegistry
@@ -127,8 +126,10 @@ def test_bad_allowlist_rejected_without_mutation(state):
 def test_registry_write_failure_rolls_back_live_without_reload(state):
     runner, registry, ctx, _, live = state
     before = runner.files[live], runner.files[registry.path]
-    with patch.object(registry, "save", side_effect=OSError("disk full")):
-        with pytest.raises(RuntimeError, match="回退"):
-            apply_sync(registry, ctx, [], runner, live)
+    with (
+        patch.object(registry, "save", side_effect=OSError("disk full")),
+        pytest.raises(RuntimeError, match="回退"),
+    ):
+        apply_sync(registry, ctx, [], runner, live)
     assert (runner.files[live], runner.files[registry.path]) == before
     assert runner.commands == [["sing-box", "check", "-c", live + ".check.tmp"]]
