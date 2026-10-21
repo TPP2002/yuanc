@@ -9,3 +9,5 @@ target-version = "py311"
 [tool.ruff.lint]
 # 规则集写死,免得 ruff 换版本默认规则又变(0.17 起默认含 I/SIM)。
 select = ["E4", "E7", "E9", "F", "I", "B", "SIM", "UP"]
+# UP042(str+Enum 改 StrEnum)只是风格,现有 State(str, Enum) 口径保留。
+ignore = ["UP042"]
