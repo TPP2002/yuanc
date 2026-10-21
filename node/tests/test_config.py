@@ -53,7 +53,7 @@ def test_proxy_defaults():
     proxy = load("/config", FakeRunner(files={"/config": text})).proxy
     assert proxy.sni == proxy.handshake_server == "www.microsoft.com"
     assert proxy.hy2_server_name == "exitnode"
-    assert proxy.binary == "/usr/bin/sing-box"
+    assert proxy.binary == "/opt/exitnode/current/bin/sing-box"
 
 
 @pytest.mark.parametrize("field,value", [
@@ -98,4 +98,43 @@ def test_watchdog_rejects_invalid_values(key, value):
     text = EXAMPLE.read_text(encoding="utf-8").split("[watchdog]")[0]
     text += f"[watchdog]\n{key} = {value}\n"
     with pytest.raises(ConfigError, match="watchdog." + key):
+        load("/config", FakeRunner(files={"/config": text}))
+
+
+def test_updater_defaults_and_legacy_config_version():
+    text = EXAMPLE.read_text(encoding="utf-8")
+    for line in ('config_version = 1\n', 'source = "none"\n', 'github_repo = ""\n',
+                 'health_timeout_sec = 120\n', 'releases_dir = "/opt/exitnode"\n'):
+        text = text.replace(line, "")
+    config = load("/config", FakeRunner(files={"/config": text}))
+    assert config.node.config_version == 1
+    assert config.updater.source == "none" and config.updater.github_repo == ""
+    assert config.updater.health_timeout_sec == 120
+    assert config.updater.releases_dir == "/opt/exitnode"
+
+
+@pytest.mark.parametrize("value", ["0", "-1", '"1"', "true", "1.5"])
+def test_config_version_must_be_positive_integer(value):
+    text = EXAMPLE.read_text(encoding="utf-8").replace("config_version = 1", "config_version = " + value)
+    with pytest.raises(ConfigError, match="node.config_version.*须为正整数"):
+        load("/config", FakeRunner(files={"/config": text}))
+
+
+@pytest.mark.parametrize("key,value", [("source", '"other"'), ("source", "1"),
+                                      ("github_repo", '"https://bad/repo"'),
+                                      ("health_timeout_sec", "0"),
+                                      ("health_timeout_sec", "true"),
+                                      ("releases_dir", '"/"'),
+                                      ("releases_dir", '"/opt/../etc"')])
+def test_updater_invalid_values(key, value):
+    text = EXAMPLE.read_text(encoding="utf-8")
+    text = "\n".join(line for line in text.splitlines() if not line.startswith(key + " ="))
+    text = text.replace("[updater]", f"[updater]\n{key} = {value}")
+    with pytest.raises(ConfigError, match="updater." + key):
+        load("/config", FakeRunner(files={"/config": text}))
+
+
+def test_github_source_requires_repository():
+    text = EXAMPLE.read_text(encoding="utf-8").replace('source = "none"', 'source = "github"')
+    with pytest.raises(ConfigError, match="github_repo"):
         load("/config", FakeRunner(files={"/config": text}))

@@ -6,6 +6,7 @@ StartLimitIntervalSec=300
 StartLimitBurst=3
 
 [Service]
+Environment=PYTHONPATH=$program_path
 Type=simple
 ExecStart=/usr/bin/python3 -m exitnode --placeholder admin --config "$config_path"
 Restart=on-failure

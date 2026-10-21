@@ -6,6 +6,7 @@ StartLimitIntervalSec=300
 StartLimitBurst=3
 
 [Service]
+Environment=PYTHONPATH=$program_path
 Type=simple
 ExecStart=$binary run -c /var/lib/exitnode/secrets/sing-box.json
 ExecReload=/bin/kill -HUP $$MAINPID

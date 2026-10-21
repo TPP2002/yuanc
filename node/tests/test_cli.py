@@ -19,6 +19,8 @@ TEXT = (Path(__file__).parents[1] / "examples" / "config.example.toml").read_tex
 def fake(*, pairing=False):
     runner = FakeRunner(files={
         CONFIG: TEXT, "/usr/bin/sing-box": "测试内核",
+        (Path(__file__).parents[1] / "exitnode" / "__init__.py").as_posix():
+            '__version__ = "0.1.0"\n',
         "/var/lib/exitnode/secrets/hy2.crt": "测试证书",
         "/var/lib/exitnode/secrets/hy2.key": "测试私钥占位",
     }, responses={
@@ -158,6 +160,11 @@ def test_repeated_init_does_not_repeat_commands_and_uninstall_keeps_secrets():
     runner = fake(pairing=True)
     runner.files["/var/lib/exitnode/secrets/identity"] = "保留"
     assert main(["init"], runner) == 0
+    assert runner.readlink("/opt/exitnode/current") == "/opt/exitnode/releases/0.1.0"
+    saved_program = runner.read_bytes("/opt/exitnode/current/exitnode/__init__.py")
+    steps = json.loads(runner.files["/var/lib/exitnode/manifest.json"])["steps"]
+    program = next(s for s in steps if s["step"] == "安装程序目录")
+    assert program["undo"] == {"kind": "remove_file", "path": "/opt/exitnode/releases", "preserve": True}
     before = [c for c in runner.calls if c[0] == "run"]
     assert main(["init"], runner) == 0
     assert [c for c in runner.calls if c[0] == "run"] == before
@@ -167,6 +174,20 @@ def test_repeated_init_does_not_repeat_commands_and_uninstall_keeps_secrets():
     assert main(["uninstall"], runner) == 0
     assert main(["uninstall", "--purge"], runner) == 0
     assert "/var/lib/exitnode/secrets/identity" not in runner.files
+    assert runner.read_bytes("/opt/exitnode/current/exitnode/__init__.py") == saved_program
+
+
+def test_upgrade_none_source_is_chinese_and_has_no_mutations(capsys):
+    runner = fake()
+    before = dict(runner.files)
+    assert main(["upgrade"], runner) == 1
+    assert "只能使用 --file" in capsys.readouterr().out
+    assert runner.files == before
+
+
+def test_upgrade_new_flags_parse():
+    args = parser().parse_args(["upgrade", "--check", "--file", "/pack", "--signature", "/sig"])
+    assert args.check and args.file == "/pack" and args.signature == "/sig"
 
 
 def test_init_failure_can_resume_without_rewriting_completed_units():

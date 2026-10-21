@@ -6,7 +6,7 @@ from string import Template
 from .manifest import UNITS
 
 
-def render(name, ctx, binary="/usr/bin/sing-box"):
+def render(name, ctx, binary="/opt/exitnode/current/bin/sing-box"):
     if name not in UNITS:
         raise ValueError("未知的本项目服务模板")
     config_path = ctx.get("config_path", "/etc/exitnode/config.toml")
@@ -16,4 +16,9 @@ def render(name, ctx, binary="/usr/bin/sing-box"):
             or not binary.startswith("/") or ".." in binary.split("/")):
         raise ValueError("服务程序路径含不支持的字符")
     template = files("exitnode").joinpath("templates", name).read_text(encoding="utf-8")
-    return Template(template).substitute(config_path=config_path, binary=binary)
+    program_path = ctx.get("program_path", "/opt/exitnode/current")
+    if (any(c.isspace() or c in '\x00"\\%$' for c in program_path)
+            or not program_path.startswith("/") or ".." in program_path.split("/")):
+        raise ValueError("服务程序目录含不支持的字符")
+    return Template(template).substitute(config_path=config_path, binary=binary,
+                                         program_path=program_path)

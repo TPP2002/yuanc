@@ -1,5 +1,7 @@
 # 此文件不保存密码、令牌或密钥；凭据文件由后续授权模块管理。
 [node]
+# 配置格式版本,升级包要求的最低版本高于它时拒绝升级
+config_version = 1
 name = "请填写节点名称"
 data_dir = "/var/lib/exitnode"
 secrets_dir = "/var/lib/exitnode/secrets"
@@ -28,6 +30,10 @@ ddns_provider = "请填写服务商"
 domain = "请填写域名"
 
 [updater]
+source = "none"
+github_repo = ""
+health_timeout_sec = 120
+releases_dir = "/opt/exitnode"
 channel = "stable"
 check_interval = 3600
 

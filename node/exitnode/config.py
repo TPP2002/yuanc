@@ -16,6 +16,7 @@ class ConfigError(ValueError):
 @dataclass
 class Node:
     name: str
+    config_version: int = 1
     data_dir: str = "/var/lib/exitnode"
     secrets_dir: str = "/var/lib/exitnode/secrets"
     log_level: str = "INFO"
@@ -35,7 +36,7 @@ class Proxy:
     sni: str = "www.microsoft.com"
     handshake_server: str = "www.microsoft.com"
     hy2_server_name: str = "exitnode"
-    binary: str = "/usr/bin/sing-box"
+    binary: str = "/opt/exitnode/current/bin/sing-box"
 
 
 @dataclass
@@ -55,6 +56,10 @@ class Publisher:
 class Updater:
     channel: str
     check_interval: int
+    source: str = "none"
+    github_repo: str = ""
+    health_timeout_sec: int = 120
+    releases_dir: str = "/opt/exitnode"
 
 
 @dataclass
@@ -120,6 +125,9 @@ def load(path: str, runner: Runner | None = None) -> Config:
                     invalid(f"{name}.{key}", "缺少必填字段")
                 continue
             value = section[key]
+            if (name == "node" and key == "config_version"
+                    and (type(value) is not int or value <= 0)):
+                invalid("node.config_version", "须为正整数")
             if spec.type == list[str]:
                 valid = (type(value) is list and bool(value)
                          and all(type(v) is str and v.strip() for v in value))
@@ -127,7 +135,8 @@ def load(path: str, runner: Runner | None = None) -> Config:
                 valid = type(value) is spec.type
             if not valid:
                 invalid(f"{name}.{key}", "字段类型不正确")
-            if isinstance(value, str) and (not value or any(ord(c) < 32 for c in value)):
+            if (isinstance(value, str) and (not value or any(ord(c) < 32 for c in value))
+                    and not (name == "updater" and key == "github_repo" and value == "")):
                 invalid(f"{name}.{key}", "不能为空或含控制字符")
         values[name] = model(**section)
     config = Config(**values)
@@ -179,4 +188,16 @@ def load(path: str, runner: Runner | None = None) -> Config:
         invalid("publisher.mode", "只支持 upnp 或 relay")
     if config.updater.check_interval <= 0:
         invalid("updater.check_interval", "检查间隔须为正整数秒数")
+    if config.updater.source not in {"none", "github"}:
+        invalid("updater.source", "只支持 none 或 github")
+    if config.updater.health_timeout_sec <= 0:
+        invalid("updater.health_timeout_sec", "须为正整数秒数")
+    repo = config.updater.github_repo
+    if ((repo or config.updater.source == "github")
+            and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_][A-Za-z0-9_.-]*", repo)):
+        invalid("updater.github_repo", "须为 owner/repo 格式")
+    directory = config.updater.releases_dir
+    if (not re.fullmatch(r"/[A-Za-z0-9_./-]+", directory)
+            or ".." in PurePosixPath(directory).parts or str(PurePosixPath(directory)) == "/"):
+        invalid("updater.releases_dir", "须为安全的非根目录绝对路径")
     return config
