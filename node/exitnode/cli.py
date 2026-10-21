@@ -7,7 +7,7 @@ import sys
 import zipfile
 from pathlib import PurePosixPath
 
-from . import __version__, nft, service, systemd
+from . import __version__, device, nft, service, systemd
 from .config import ConfigError, load
 from .log import redact
 from .manifest import UNITS, Manifest
@@ -55,6 +55,22 @@ def parser():
             command.add_argument("--to-step", help="保留该步骤及之前的步骤")
         if name == "uninstall":
             command.add_argument("--purge", action="store_true", help="同时永久删除凭据目录")
+    devices = sub.add_parser("device", help="管理自用设备与配对文件", description="管理自用设备与配对文件")
+    devices.add_argument("--config", default=argparse.SUPPRESS, help="配置文件路径")
+    actions = devices.add_subparsers(dest="device_action", title="设备操作", required=True)
+    for name, description in {"add": "添加设备并导出配对文件", "list": "列出设备（不含凭据）",
+                              "revoke": "停用设备", "export": "重新导出配对文件"}.items():
+        action = actions.add_parser(name, help=description, description=description)
+        action.add_argument("--config", default=argparse.SUPPRESS, help="配置文件路径")
+        if name == "list":
+            action.add_argument("--json", action="store_true", help="输出机器可读结果")
+        else:
+            action.add_argument("--name", required=True, help="设备名字")
+        if name in {"add", "export"}:
+            action.add_argument("--host", help="节点公网 IPv4 地址；不填则自动获取")
+        if name == "add":
+            action.add_argument("--platform", choices=["windows", "android"], default="windows",
+                                help="设备平台（默认 windows）")
     return root
 
 
@@ -122,6 +138,9 @@ def _install(config, config_path, runner, manifest):
         apply("启用隧道服务",
               lambda: runner.run(["systemctl", "enable", "--now", service.UNIT]),
               {"kind": "systemctl", "unit": service.UNIT})
+        if not device.registry(config, runner).all():
+            device.add(config, runner, name="第一台电脑")
+            print("请把这个文件拷到 U 盘带去电脑")
     except (OSError, RuntimeError, ValueError) as exc:
         print("成功项：" + ("；".join(successful) or "无"))
         print("失败项：" + redact(str(exc)))
@@ -129,7 +148,7 @@ def _install(config, config_path, runner, manifest):
         return 1
     print("成功项：" + "；".join(successful))
     print("失败项：无。隧道配置已校验，服务已启用；请用 check 检查当前运行状态。"
-          "设备配对与外网实际连接仍需后续完成。")
+          "请导入配对文件后检查外网实际连接。")
     return 0
 
 
@@ -161,6 +180,23 @@ def main(argv=None, runner=None):
     try:
         runner = runner if runner is not None else RealRunner()
         config = load(args.config, runner)
+        if args.command == "device":
+            if args.device_action == "add":
+                device.add(config, runner, name=args.name, platform=args.platform, host=args.host)
+            elif args.device_action == "export":
+                device.export(config, runner, name=args.name, host=args.host)
+            elif args.device_action == "revoke":
+                device.revoke(config, runner, name=args.name)
+                print("设备已停用，服务配置已更新。")
+            else:
+                rows = device.list_devices(config, runner)
+                if args.json:
+                    print(redact(json.dumps(rows, ensure_ascii=False)))
+                else:
+                    for row in rows:
+                        print(redact(f"{row['name']} | {row['platform']} | {row['created_at']} | "
+                                     + ("已吊销" if row["revoked_at"] else "未吊销")))
+            return 0
         if args.command in {"check", "status", "diagnose"}:
             result = check(runner, config)
             if args.command == "status":
