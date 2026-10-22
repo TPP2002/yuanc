@@ -22,19 +22,19 @@ class Action:
 CLOCK_SKEW_TOLERANCE_SEC = 300
 
 
-def is_future(at, now):
-    return (storage.timestamp(at) - now).total_seconds() > CLOCK_SKEW_TOLERANCE_SEC
+def is_future(at, now, tolerance_seconds=CLOCK_SKEW_TOLERANCE_SEC):
+    return (storage.timestamp(at) - now).total_seconds() > tolerance_seconds
 
 
-def elapsed(at, now, seconds):
+def elapsed(at, now, seconds, tolerance_seconds=CLOCK_SKEW_TOLERANCE_SEC):
     if at is None:
         return True
-    if is_future(at, now):
+    if is_future(at, now, tolerance_seconds):
         return True  # 未来时间戳视为失效，不能把自动恢复永久锁死。
     return (now - storage.timestamp(at)).total_seconds() >= seconds
 
 
-def sanitize_clock(state, now):
+def sanitize_clock(state, now, max_backoff_seconds=0):
     """丢弃晚于当前时间超过容差的频率记录，返回改动条数。"""
     changed = 0
     kept = [at for at in state["restart_times"] if not is_future(at, now)]
@@ -44,7 +44,9 @@ def sanitize_clock(state, now):
         state["restart_count_window"] = len(kept)
     for key in ("first_failure_at", "last_ok_at", "last_rollback_at", "last_reboot_at",
                 "updated_at", "last_failure_tick_at", "next_action_at"):
-        if state[key] is not None and is_future(state[key], now):
+        tolerance_seconds = (CLOCK_SKEW_TOLERANCE_SEC + max_backoff_seconds
+                             if key == "next_action_at" else CLOCK_SKEW_TOLERANCE_SEC)
+        if state[key] is not None and is_future(state[key], now, tolerance_seconds):
             # 连续失联时长从现在重新计，回拨不能立刻满足整机重启条件。
             state[key] = now.isoformat() if key == "first_failure_at" else None
             changed += 1
@@ -87,7 +89,8 @@ def decide(state, probes, now, config):
         return Action("reboot" if reboot_allowed(state, now, config) else "manual",
                       state, now, reason + "；请检查网线、路由器或宽带")
     if state["restart_count_window"] < settings.restart_limit_per_hour:
-        if not elapsed(state["next_action_at"], now, 0):
+        if not elapsed(state["next_action_at"], now, 0,
+                       tolerance_seconds=CLOCK_SKEW_TOLERANCE_SEC + settings.max_backoff_seconds):
             return Action("wait", state, now, reason + "；恢复动作冷却中")
         return Action("restart_service", state, now, reason + "；尝试重新启动隧道服务")
     if elapsed(state["last_rollback_at"], now, settings.rollback_min_interval_hours * 3600):
