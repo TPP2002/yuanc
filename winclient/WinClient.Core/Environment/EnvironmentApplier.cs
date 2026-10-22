@@ -12,6 +12,7 @@ public interface IEnvironmentEnforcer
     Task ApplyAsync(EnvironmentTarget target);
     Task RestoreAsync();
     Task<EnvironmentInspection?> InspectAsync() => Task.FromResult<EnvironmentInspection?>(null);
+    Task<EnvironmentInspection?> InspectAsync(CancellationToken token) => InspectAsync();
 }
 
 public sealed class EnvironmentVerifyException(string message) : InvalidOperationException(message);
@@ -25,12 +26,15 @@ public sealed class EnvironmentApplier(string runDirectory, ICommandRunner? runn
     public Task ApplyAsync(EnvironmentTarget target) => ExecuteAsync(EnvironmentPlanner.ApplyScript(target, StatePath), restoring: false);
     public Task RestoreAsync() => ExecuteAsync(EnvironmentPlanner.RestoreScript(StatePath), restoring: true);
 
-    public async Task<EnvironmentInspection?> InspectAsync()
+    public Task<EnvironmentInspection?> InspectAsync() => InspectAsync(CancellationToken.None);
+
+    public async Task<EnvironmentInspection?> InspectAsync(CancellationToken token)
     {
         await gate.WaitAsync().ConfigureAwait(false);
         try
         {
-            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
+            timeout.CancelAfter(TimeSpan.FromSeconds(60));
             var result = await runner.RunAsync(KillSwitchApplier.CreateStartInfo(EnvironmentPlanner.InspectScript()), timeout.Token).ConfigureAwait(false);
             if (result.ExitCode != 0) return null;
             var lastLine = result.Output.Split('\n').LastOrDefault(line => !string.IsNullOrWhiteSpace(line));
