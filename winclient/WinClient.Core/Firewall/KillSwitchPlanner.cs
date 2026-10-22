@@ -106,6 +106,8 @@ public static class KillSwitchPlanner
     public static string ToPowerShellScript(IReadOnlyList<FirewallAction> actions, string statePath, string auditPath)
     {
         var record = actions.OfType<RecordState>().SingleOrDefault();
+        var hasAllowRules = actions.OfType<AddRule>().Any();
+        var updateExistingState = hasAllowRules && !actions.OfType<SetProfileDefault>().Any() && record is null;
         // 仅指定程序模式的审计仍查询允许规则，使用只读过滤；不生成任何 Allow 操作参数。
         var allowQuery = record is null
             ? "Get-NetFirewallRule -PolicyStore ActiveStore -Enabled True -Direction Outbound -Action Allow | Where-Object { "
@@ -133,6 +135,10 @@ public static class KillSwitchPlanner
             else
                 script.AppendLine("  $state = [pscustomobject]@{ applied = $false; mode = " + Quote(record.Mode) + "; profiles = @($profiles | ForEach-Object { @{ Name = [string]$_.Name; DefaultOutboundAction = [string]$_.DefaultOutboundAction; Enabled = [string]$_.Enabled } }) }; Write-State $state\n}");
         }
+        if (updateExistingState)
+            script.AppendLine("if (Test-Path -LiteralPath $statePath) { $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json } else { $state = $null }");
+        if (hasAllowRules)
+            script.AppendLine("if ($null -ne $state -and $null -eq $state.PSObject.Properties['rules']) { $state | Add-Member -NotePropertyName rules -NotePropertyValue @() }");
         foreach (var action in actions)
         {
             switch (action)
@@ -171,7 +177,7 @@ public static class KillSwitchPlanner
                     script.AppendLine("  $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json");
                     script.AppendLine("  if ($null -eq $state.PSObject.Properties['disabledRules']) { $state | Add-Member -NotePropertyName disabledRules -NotePropertyValue @() }");
                     script.AppendLine("  if ($null -eq $state.PSObject.Properties['disableFailed']) { $state | Add-Member -NotePropertyName disableFailed -NotePropertyValue @() }");
-                    script.AppendLine("  $foreignRules = @(Get-NetFirewallRule -PolicyStore PersistentStore -Enabled True -Direction Outbound -Action Allow -ErrorAction SilentlyContinue -ErrorVariable +patrolErrors | Where-Object { $_.Name -notlike 'YuanC-KS-*' -and $state.disabledRules -notcontains $_.Name })");
+                    script.AppendLine("  $foreignRules = @(Get-NetFirewallRule -PolicyStore PersistentStore -Enabled True -Direction Outbound -Action Allow -ErrorAction SilentlyContinue -ErrorVariable +patrolErrors | Where-Object { $_.Name -notlike 'YuanC-KS-*' })");
                     script.AppendLine("  $state.disabledRules = @(@($state.disabledRules) + @($foreignRules.Name) | Where-Object { $null -ne $_ } | Sort-Object -Unique)");
                     // 必须先落恢复名单；停用中途失败也能在主动断开时恢复。
                     script.AppendLine("  Write-State $state");
@@ -183,7 +189,29 @@ public static class KillSwitchPlanner
                     script.AppendLine("  }");
                     script.AppendLine("  $state.disableFailed = @($disableFailed | Where-Object { $null -ne $_ } | Sort-Object -Unique)");
                     script.AppendLine("  Write-State $state\n}");
-                    script.AppendLine("$missing = @(@(" + string.Join(",", patrol.ExpectedRules.Select(Quote)) + ") | Where-Object { -not (Get-NetFirewallRule -Name $_ -ErrorAction SilentlyContinue) })");
+                    script.AppendLine("$missing = @(@(" + string.Join(",", patrol.ExpectedRules.Select(Quote)) + ") | Where-Object {");
+                    script.AppendLine("  $name = $_; $rules = @(Get-NetFirewallRule -PolicyStore ActiveStore -Name $name -ErrorAction SilentlyContinue)");
+                    script.AppendLine("  if ($rules.Count -ne 1) { return $true }");
+                    script.AppendLine("  $r = $rules[0]");
+                    script.AppendLine("  if ([string]$r.Enabled -ne 'True' -or [string]$r.Action -ne 'Allow' -or [string]$r.Direction -ne 'Outbound') { return $true }");
+                    // 旧版记录没有期望时仍核基本属性，下次套用后再核内容。
+                    script.AppendLine("  $expected = @($state.rules | Where-Object { $_.Name -eq $name })");
+                    script.AppendLine("  if ($expected.Count -eq 0) { return $false }");
+                    script.AppendLine("  $expected = $expected[0]");
+                    script.AppendLine("  $app = $r | Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue -ErrorVariable +patrolErrors");
+                    script.AppendLine("  $service = $r | Get-NetFirewallServiceFilter -ErrorAction SilentlyContinue -ErrorVariable +patrolErrors");
+                    script.AppendLine("  $address = $r | Get-NetFirewallAddressFilter -ErrorAction SilentlyContinue -ErrorVariable +patrolErrors");
+                    script.AppendLine("  $port = $r | Get-NetFirewallPortFilter -ErrorAction SilentlyContinue -ErrorVariable +patrolErrors");
+                    script.AppendLine("  foreach ($field in @(@{ Actual = $app.Program; Expected = $expected.Program }, @{ Actual = $service.Service; Expected = $expected.Service }, @{ Actual = $port.Protocol; Expected = $expected.Protocol }, @{ Actual = $port.LocalPort; Expected = $expected.LocalPort }, @{ Actual = $port.RemotePort; Expected = $expected.RemotePort })) {");
+                    script.AppendLine("    if ($null -ne $field.Expected) { if ([string]$field.Actual -ine [string]$field.Expected) { return $true } } elseif ([string]$field.Actual -notin @('Any','')) { return $true }");
+                    script.AppendLine("  }");
+                    script.AppendLine("  foreach ($field in @('LocalAddress','RemoteAddress')) {");
+                    script.AppendLine("    $actualAddresses = @($address.$field | ForEach-Object { ([string]$_).Trim().ToLowerInvariant() } | Where-Object { $_ -ne '' } | Sort-Object -Unique)");
+                    script.AppendLine("    $expectedAddresses = @('any')");
+                    script.AppendLine("    if ($null -ne $expected.$field) { $expectedAddresses = @($expected.$field | ForEach-Object { ([string]$_).Trim().ToLowerInvariant() } | Where-Object { $_ -ne '' } | Sort-Object -Unique) }");
+                    script.AppendLine("    if ($actualAddresses.Count -ne $expectedAddresses.Count -or ($actualAddresses -join \"`n\") -cne ($expectedAddresses -join \"`n\")) { return $true }");
+                    script.AppendLine("  }");
+                    script.AppendLine("  return $false\n})");
                     script.AppendLine("if ((Get-Service MpsSvc).Status -ne 'Running') { exit 3 }");
                     script.AppendLine("$effective = @(Get-NetFirewallProfile -PolicyStore ActiveStore -ErrorAction SilentlyContinue -ErrorVariable +patrolErrors)");
                     script.AppendLine("$bad = @($effective | Where-Object { [string]$_.Enabled -ne 'True' -or [string]$_.DefaultOutboundAction -ne 'Block' } | Select-Object -ExpandProperty Name)");
@@ -237,6 +265,13 @@ public static class KillSwitchPlanner
                     AddArgument(script, "RemotePort", rule.RemotePort);
                     AddArgument(script, "InterfaceAlias", rule.InterfaceAlias);
                     script.AppendLine(" | Out-Null");
+                    script.AppendLine("if ($null -ne $state) {");
+                    script.AppendLine("  $state.rules = @($state.rules | Where-Object { $_.Name -ne " + Quote(rule.Name) + " }) + @([pscustomobject]@{ Name = " + Quote(rule.Name)
+                        + "; Program = " + QuoteNullable(rule.Program) + "; Service = " + QuoteNullable(rule.Service)
+                        + "; LocalAddress = " + QuoteAddresses(rule.LocalAddress) + "; RemoteAddress = " + QuoteAddresses(rule.RemoteAddress)
+                        + "; Protocol = " + QuoteNullable(rule.Protocol) + "; LocalPort = " + QuoteNullable(rule.LocalPort)
+                        + "; RemotePort = " + QuoteNullable(rule.RemotePort) + " })");
+                    script.AppendLine("}");
                     break;
                 case RemoveRulesByPrefix remove:
                     if (remove.Prefix is not (Prefix or NodePrefix)) throw new ArgumentException("禁止删除非本项目规则。");
@@ -320,6 +355,7 @@ public static class KillSwitchPlanner
             }
         }
         if (actions.OfType<SetProfileDefault>().Any() || record is not null) script.AppendLine("$state.applied = $true; Write-State $state");
+        if (updateExistingState) script.AppendLine("if ($null -ne $state) { Write-State $state }");
         return script.ToString();
     }
 
@@ -373,4 +409,6 @@ public static class KillSwitchPlanner
         if (value is not null) script.Append(" -").Append(name).Append(' ').Append(Quote(value));
     }
     private static string Quote(string value) => "'" + value.Replace("'", "''", StringComparison.Ordinal) + "'";
+    private static string QuoteNullable(string? value) => value is null ? "$null" : Quote(value);
+    private static string QuoteAddresses(string[]? values) => values is null ? "$null" : "@(" + string.Join(",", values.Select(Quote)) + ")";
 }
