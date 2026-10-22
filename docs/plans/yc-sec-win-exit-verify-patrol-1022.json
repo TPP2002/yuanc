@@ -1,0 +1,202 @@
+{
+  "schemaVersion": 1,
+  "taskId": "SEC-WIN-EXIT-IP-VERIFY-1022",
+  "slug": "yc-sec-win-exit-verify-patrol-1022",
+  "title": "Windows 客户端:连上后经隧道核验真实出口 IP 并显示;连接期间每 60 秒巡检断网保护(配置档、第三方新规则、本项目规则、防火墙服务),任何结果都不自动断开",
+  "goal": "以主干 main(含 PR #38/#39)为基点。背景红线:客户以「任何情况下出口都是澳洲家宽、绝不漏国内 IP」为验收口径,不稳不付尾款。本单做两件事,全部在后台服务进程里完成,一次都不许自动撤销断网保护、一次都不许因核验或巡检结果自动断开隧道(断开=撤保护=真泄漏)。\n\n① 出口 IP 核验(卡 SEC-WIN-EXIT-IP-VERIFY-1022)\n(a) 新文件 winclient/WinClient.Core/Client/ExitProbe.cs:`public interface IExitProbe { Task<System.Net.IPAddress?> ProbeAsync(CancellationToken token); }` 与 `public sealed class HttpExitProbe : IExitProbe`:用自己的 HttpClient(AllowAutoRedirect=false,Timeout 5 秒)GET `https://1.1.1.1/cdn-cgi/trace`(IP 字面量,不走域名解析),逐行找 `ip=` 取值 IPAddress.TryParse 成功才返回,任何异常、超时、非 200、解析失败一律返回 null,不抛;不记录响应正文到日志。\n(b) winclient/WinClient.Core/Client/ClientController.cs:ClientController 两个构造函数都加可选参数 `IExitProbe? exitProbe = null`(null = 不核验,既有测试一个不改);新增 internal 常量 `ExitCheckDelay = 3 秒`、`ExitCheckRetry = 5 秒`、`ExitCheckAttempts = 5`、`ExitRecheckInterval = 5 分钟`。进入 Connected(TunnelUp 处理完、machine.State == Connected)后用既有 Schedule 机制在 ExitCheckDelay 后首探;期间 ExitStatus=「核验中」。探到地址:与 `session.Node.Host`(节点公网 IPv4)相同 → ExitStatus=「已核验」、ExitIp=该地址;不同 → ExitStatus=「不一致」、ExitIp=该地址、message=「出口地址与澳洲节点不一致,请联系管理员;断网保护保持,未自动断开。」,状态机不动、隧道不停、不撤保护。探不到(null):每 ExitCheckRetry 重试,累计 ExitCheckAttempts 次仍 null → ExitStatus=「无法核验」、ExitIp 空。任一终局后每 ExitRecheckInterval 再探一次并按同规则更新。只在 machine.State == Connected 且 session 不为 null 时探;TunnelDown / UserDisconnect / SessionExpired / AuthRejected / OperationFailed 任何离开 Connected 的迁移把 ExitStatus 清回「未检测」、ExitIp 清空(放在 ExecuteAsync 处理完迁移后统一判定:State != Connected 就清)。旧回调靠既有 generation/lifetime 作废,不另起线程、不加锁以外的并发。\n(c) ClientSnapshot 加 `public string ExitStatus { get; init; } = \"未检测\";`、`public string ExitIp { get; init; } = \"\";`、`public string GuardStatus { get; init; } = \"\";`(第三个给②用);Snapshot 属性与 Publish 带上。winclient/WinClient.Core/Ipc/ControlProtocol.cs 的 ControlSnapshot 同加三个同名同默认值属性,两个 implicit operator 都要原样搬运(JSON 名自然为 exit_status / exit_ip / guard_status,不手写 JsonPropertyName)。\n(d) winclient/WinClient.Core/Client/ClientRuntime.cs:CreateAsync 构造 ClientController 时传 `exitProbe: new HttpExitProbe()`。\n(e) winclient/WinClient.App/MainViewModel.cs:新增只读属性 `ExitLine`:ExitStatus 为「未检测」→「当前出口 IP:待检测」;「核验中」→「当前出口 IP:核验中…」;「已核验」→「当前出口 IP:{ExitIp}(与澳洲节点一致)」;「不一致」→「⚠ 当前出口 IP:{ExitIp},与澳洲节点不一致,请联系管理员」;「无法核验」→「当前出口 IP:无法核验(隧道内暂无回应)」。新增 `GuardLine`:GuardStatus 为空 → 空串,否则「断网保护巡检:」+GuardStatus。Refresh 里 Notify 这两个。winclient/WinClient.App/MainWindow.xaml 第 25 行固定文字「当前出口 IP:待检测」改为 `Text=\"{Binding ExitLine}\"`,其下新加一行 `<TextBlock Text=\"{Binding GuardLine}\" TextWrapping=\"Wrap\" HorizontalAlignment=\"Center\" Margin=\"0,8,0,0\" Foreground=\"#8A2E2E\" AutomationProperties.LiveSetting=\"Polite\"/>`;第 31 行的既有提示保留。\n\n② 连接期断网保护巡检(卡 SEC-WIN-KS-PATROL-1022,与①合单)\n(a) winclient/WinClient.Core/Firewall/KillSwitchPlanner.cs:新增 `public sealed record Patrol(string[] ExpectedRules) : FirewallAction;` 与 `public static string[] ExpectedRuleNames(bool withAuth)` → [NodePrefix+\"Tcp\", NodePrefix+\"Udp\", (withAuth 时 Prefix+\"Auth\"), Prefix+\"Tun\", Prefix+\"Loopback\", Prefix+\"Dhcp\"]。ToPowerShellScript 对 Patrol 生成(次序必须如此):1) `$reenforced=@()`;读 `Get-NetFirewallProfile -PolicyStore ActiveStore`,每个 Enabled 不是 True 或 DefaultOutboundAction 不是 Block 的配置档 `Set-NetFirewallProfile -Profile <名> -Enabled True -DefaultOutboundAction Block` 并记名;2) 只在 `Test-Path $statePath` 为真时:读 state,找 PersistentStore 里 Enabled True、Outbound、Allow、名字不以 YuanC-KS- 开头、且不在 state.disabledRules 里的规则,**先**把名字并进 state.disabledRules 并 Write-State,**再**逐条 Disable-NetFirewallRule(失败记进 disableFailed 后再 Write-State),新停用名单 `$newlyDisabled`;state 文件不存在时不碰任何规则、不创建 state;3) `$missing` = ExpectedRules 里 `Get-NetFirewallRule -Name <名> -ErrorAction SilentlyContinue` 取不到的;4) `(Get-Service MpsSvc).Status -ne 'Running'` → `exit 3`;5) 再读一次 ActiveStore 配置档,仍有不达标 → 把名单写进 state.verifyFailed(state 存在时)并 `exit 3`;6) 标准输出最后一行打印 `ConvertTo-Json -Compress @{ reenforced=@($reenforced); newly_disabled=@($newlyDisabled); missing_rules=@($missing) }`,`exit 0`。脚本只用 Set-NetFirewallProfile / Disable-NetFirewallRule / Write-State,不新建规则、不删规则、不启用规则、不改入站。\n(b) winclient/WinClient.Core/Firewall/KillSwitchApplier.cs:`public sealed record PatrolReport(IReadOnlyList<string> Reenforced, IReadOnlyList<string> NewlyDisabled, IReadOnlyList<string> MissingRules) { public static PatrolReport Empty => new([], [], []); public bool Clean => Reenforced.Count == 0 && NewlyDisabled.Count == 0 && MissingRules.Count == 0; }`;IKillSwitch 加默认接口成员 `Task<PatrolReport> PatrolAsync(IReadOnlyList<string> expectedRules) => Task.FromResult(PatrolReport.Empty);`(既有假件不改);KillSwitchApplier 实现:在同一 gate 内跑 Patrol 脚本(180 秒超时),退出码 3 → 抛 FirewallIneffectiveException(文案同既有),其他非 0 → InvalidOperationException(「断网保护巡检失败,请联系管理员。」),0 → 取标准输出最后一个非空行 JSON 解析成 PatrolReport(解析失败按 InvalidOperationException)。\n(c) winclient/WinClient.Core/Client/ClientController.cs:新增 internal 常量 `PatrolInterval = 60 秒`。protection 为真且 machine.State 为 Connected 或 Reconnecting 时,用 Schedule 每 PatrolInterval 跑一次 `firewall.PatrolAsync(KillSwitchPlanner.ExpectedRuleNames(sessionSource is AuthServerSessionSource))`(第一次在进入这两个状态之后 PatrolInterval 时;重复进入不重复排,用一个 bool 标记「巡检已在排」,离开两个状态或 protection 变假时不再续排)。结果处理:MissingRules 非空 → 走既有 `firewall.ApplyAsync(NodeIps(session!), program, Hy2Port, RealityPort, auth)` 幂等重建(session 为 null 则跳过),GuardStatus=「已重建 n 条本项目规则」;否则 Reenforced 或 NewlyDisabled 非空 → GuardStatus=「已重新收紧 n 条规则」(n=两者之和);全空 → GuardStatus=「正常」。抛 FirewallIneffectiveException → GuardStatus=「系统防火墙已被关闭或被策略覆盖,断网保护可能失效,请立即在 Windows 安全中心开启防火墙或联系管理员」,message 同文,**状态机不动、隧道不停、不撤保护、下一轮照常巡**;其他 IsOperational 异常 → GuardStatus=「巡检失败,下一轮重试」,同样不动状态。UserDisconnect 后 GuardStatus 清空。每次结果 Publish。\n(d) 文档 docs/winclient/断网保护加固说明.md 新增小节「连接期间巡检」(巡检项、频率、三种结果与界面文字、退出码 3 的含义、「不自动断开」的理由、真机待验证:连接后新建一条任意程序的出站允许规则 60 秒内应被停用并记入 disabledRules;手动把某配置档默认出站改回 Allow 60 秒内应被改回 Block 且界面显示「已重新收紧」;停掉 MpsSvc 服务界面应红字提示而隧道不断);docs/winclient/架构说明.md:「已知局限」段补一句巡检把「连接那一刻」的承诺延伸到「连接期间每 60 秒」,组策略与第三方接管仍是局限;「验证与交付边界」段加「出口 IP 核验:连上后经隧道取真实出口与节点地址比对,结果显示在界面;真机待验证」。\n\n③ 测试(先写红):winclient/WinClient.Tests/ControllerTests.cs 加假件 `ScriptedProbe : IExitProbe`(队列返回 IPAddress?)并用既有 Timers 假 delayAsync 驱动:连上后 3 秒探、地址等于 TestData.Node().Host(192.0.2.5)→ ExitStatus 已核验/ExitIp 正确;探到 198.51.100.9 → 不一致、message 含「不一致」、State 仍 Connected、order 里没有 RemoveKillSwitch 与 StopTunnel;连续 5 次 null → 无法核验;Disconnect 后 ExitStatus 回「未检测」且 ExitIp 空;exitProbe 为 null 时从不探。巡检:既有 Firewall 假件加记录 PatrolAsync 调用与可脚本化返回/抛出;邀请码模式 60 秒后 PatrolAsync 的 expectedRules 含 YuanC-KS-Auth、自用模式不含;返回 MissingRules 非空 → order 再出现一次 ApplyKillSwitch(或 Apply 调用记录)且 GuardStatus 含「已重建」;返回 Reenforced=[Public] → GuardStatus 含「已重新收紧 1 条」;抛 FirewallIneffectiveException → GuardStatus 含「防火墙」、State 仍 Connected、无 StopTunnel/RemoveKillSwitch;Disconnected 状态下推进 10 分钟也不巡。winclient/WinClient.Tests/KillSwitchPatrolTests.cs(新):Patrol 脚本文本断言——含 `-PolicyStore ActiveStore`、`Set-NetFirewallProfile`、`Disable-NetFirewallRule`、`Get-Service MpsSvc`、`exit 3`、`ConvertTo-Json`;`Write-State` 首次出现位置早于 `Disable-NetFirewallRule`;不含 `New-NetFirewallRule`、`Remove-NetFirewallRule`、`Enable-NetFirewallRule`;ExpectedRuleNames(true) 恰好 6 个且含 Auth,ExpectedRuleNames(false) 5 个不含 Auth。winclient/WinClient.Tests/IpcTests.cs:Encode 含 exit_status / exit_ip / guard_status,解码回 ControlSnapshot 三值保持。winclient/WinClient.Tests/TestData.cs 只许加辅助构造,不改既有方法签名。\n\n④ 边界:全程中文注释与文案;不新增 NuGet 依赖;不起新进程(巡检仍走既有 PowerShell 执行器,CreateNoWindow 已有);不改 ConnectionStateMachine、ControlServer、ControlService、Pairing、Update、Process、Hosting;不改既有断言(只许新增;既有 Firewall/Tunnel 假件只许加成员);不放宽任何闸门;HttpExitProbe 的请求不带任何本机信息、不记 IP 到日志(只记「一致/不一致/无法核验」)。",
+  "background": "项目:外包,中国 Windows 客户端(.NET 9 WPF,后台服务 + 托盘界面,sing-box TUN,strict_route)+ 澳洲出口节点。客户最看重最终出口 IP 必须是澳洲家宽、任何情况不漏国内 IP,不稳不付尾款。现状:断网保护(默认出站 Block + 停用第三方允许规则 + 强制配置档 + 服务重启保持保护)只在连接那一刻套用并核验一次;界面「当前出口 IP:待检测」是死文字,从不核验真实出口。详见 docs/winclient/架构说明.md、docs/winclient/断网保护加固说明.md、docs/design/方案v2-中国客户端-澳洲出口.md §A03/A04/W02。ClientController 用 Schedule(generation+lifetime)管定时回调、gate 串行化;KillSwitchPlanner 把动作渲染成 PowerShell 脚本由 KillSwitchApplier 执行(退出码 3 = 防火墙失效);ControlSnapshot 与 ClientSnapshot 靠 implicit operator 互转,JSON snake_case。本单两张卡文件完全重叠,合成一单,taskId 记 SEC-WIN-EXIT-IP-VERIFY-1022。",
+  "nonGoals": [
+    "不做 WFP 子层(另卡 SEC-WIN-WFP-KILLSWITCH-1022)",
+    "不改状态机迁移表、退避常数、既有防火墙规则内容",
+    "不因核验或巡检结果自动断开或撤保护",
+    "不在真机实测;真机项写进文档待验证清单"
+  ],
+  "allowedPaths": [
+    "winclient/WinClient.Core/Client/ClientController.cs",
+    "winclient/WinClient.Core/Client/ClientRuntime.cs",
+    "winclient/WinClient.Core/Client/ExitProbe.cs",
+    "winclient/WinClient.Core/Firewall/KillSwitchApplier.cs",
+    "winclient/WinClient.Core/Firewall/KillSwitchPlanner.cs",
+    "winclient/WinClient.Core/Ipc/ControlProtocol.cs",
+    "winclient/WinClient.App/MainViewModel.cs",
+    "winclient/WinClient.App/MainWindow.xaml",
+    "winclient/WinClient.Tests/ControllerTests.cs",
+    "winclient/WinClient.Tests/IpcTests.cs",
+    "winclient/WinClient.Tests/KillSwitchPatrolTests.cs",
+    "winclient/WinClient.Tests/TestData.cs",
+    "docs/winclient/断网保护加固说明.md",
+    "docs/winclient/架构说明.md"
+  ],
+  "forbiddenPaths": [
+    "docs/开工须知.md",
+    "docs/口径速查表.md",
+    "docs/design/**",
+    "docs/交接/**",
+    "docs/plans/**",
+    "docs/acceptance/**",
+    "docs/node/**",
+    "docs/authserver/**",
+    "docs/winclient/服务化与自启说明.md",
+    "docs/winclient/自动更新说明.md",
+    "docs/winclient/打包与发布说明.md",
+    ".github/**",
+    ".codex/**",
+    ".gitignore",
+    "pyproject.toml",
+    "scripts/**",
+    "node/**",
+    "authserver/**",
+    "winclient/third_party/**",
+    "winclient/*.sln",
+    "winclient/*/*.csproj",
+    "winclient/WinClient.Core/Auth/**",
+    "winclient/WinClient.Core/Hosting/**",
+    "winclient/WinClient.Core/Kernel/**",
+    "winclient/WinClient.Core/Logging/**",
+    "winclient/WinClient.Core/Pairing/**",
+    "winclient/WinClient.Core/Process/**",
+    "winclient/WinClient.Core/State/**",
+    "winclient/WinClient.Core/Storage/**",
+    "winclient/WinClient.Core/Update/**",
+    "winclient/WinClient.Core/Firewall/CommandRunner.cs",
+    "winclient/WinClient.Core/Client/ClientSettings.cs",
+    "winclient/WinClient.Core/Client/DesiredStateStore.cs",
+    "winclient/WinClient.Core/Client/IClientFacade.cs",
+    "winclient/WinClient.Core/Client/ISessionSource.cs",
+    "winclient/WinClient.Core/Client/TunnelTransport.cs",
+    "winclient/WinClient.Core/Ipc/CallerIdentity.cs",
+    "winclient/WinClient.Core/Ipc/ConnectionBudget.cs",
+    "winclient/WinClient.Core/Ipc/ControlClient.cs",
+    "winclient/WinClient.Core/Ipc/ControlServer.cs",
+    "winclient/WinClient.Core/Ipc/ServerIdentity.cs",
+    "winclient/WinClient.App/App.xaml*",
+    "winclient/WinClient.App/Hosting/**",
+    "winclient/WinClient.App/MainWindow.xaml.cs",
+    "winclient/WinClient.App/Program.cs",
+    "winclient/WinClient.App/Views/**",
+    "winclient/WinClient.Tests/AuthTests.cs",
+    "winclient/WinClient.Tests/DataDirectorySecurityTests.cs",
+    "winclient/WinClient.Tests/FirewallTests.cs",
+    "winclient/WinClient.Tests/HostingTests.cs",
+    "winclient/WinClient.Tests/KernelInstallerTests.cs",
+    "winclient/WinClient.Tests/KillSwitchAuthRuleTests.cs",
+    "winclient/WinClient.Tests/KillSwitchHardenTests.cs",
+    "winclient/WinClient.Tests/KillSwitchNarrowRuleTests.cs",
+    "winclient/WinClient.Tests/KillSwitchProfileTests.cs",
+    "winclient/WinClient.Tests/KillSwitchRecoveryTests.cs",
+    "winclient/WinClient.Tests/PairingCertificateTests.cs",
+    "winclient/WinClient.Tests/PairingTests.cs",
+    "winclient/WinClient.Tests/ProcessStorageTests.cs",
+    "winclient/WinClient.Tests/StateTests.cs",
+    "winclient/WinClient.Tests/Update*.cs",
+    "winclient/WinClient.Tests/Fixtures/**"
+  ],
+  "expectArtifacts": [
+    "winclient/WinClient.Core/Client/ExitProbe.cs",
+    "winclient/WinClient.Core/Client/ClientController.cs",
+    "winclient/WinClient.Core/Firewall/KillSwitchApplier.cs",
+    "winclient/WinClient.Core/Firewall/KillSwitchPlanner.cs",
+    "winclient/WinClient.Core/Ipc/ControlProtocol.cs",
+    "winclient/WinClient.App/MainViewModel.cs",
+    "winclient/WinClient.App/MainWindow.xaml",
+    "winclient/WinClient.Tests/ControllerTests.cs",
+    "winclient/WinClient.Tests/KillSwitchPatrolTests.cs",
+    "docs/winclient/断网保护加固说明.md"
+  ],
+  "acceptance": [
+    {
+      "id": "BUILD",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "build",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 900
+    },
+    {
+      "id": "TEST",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "test",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--no-build",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 900
+    },
+    {
+      "id": "SHAPE-A",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda p:pathlib.Path(p).read_text(encoding='utf-8');ep=r('winclient/WinClient.Core/Client/ExitProbe.cs');cc=r('winclient/WinClient.Core/Client/ClientController.cs');cp=r('winclient/WinClient.Core/Ipc/ControlProtocol.cs');rt=r('winclient/WinClient.Core/Client/ClientRuntime.cs');bad=[k for k,ok in (('probe.iface','interface IExitProbe' in ep and 'class HttpExitProbe' in ep and '1.1.1.1/cdn-cgi/trace' in ep),('ctrl.consts','ExitCheckDelay' in cc and 'ExitCheckAttempts' in cc and 'PatrolInterval' in cc),('ctrl.probe','IExitProbe? exitProbe = null' in cc and 'PatrolAsync(' in cc and 'ExpectedRuleNames(' in cc),('snap.fields','ExitStatus' in cc and 'ExitIp' in cc and 'GuardStatus' in cc and 'ExitStatus' in cp and 'ExitIp' in cp and 'GuardStatus' in cp),('ctrl.texts','不一致' in cc and '已核验' in cc and '无法核验' in cc and '核验中' in cc and '已重新收紧' in cc and '已重建' in cc),('rt.wire','new HttpExitProbe()' in rt)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "SHAPE-B",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda p:pathlib.Path(p).read_text(encoding='utf-8');kp=r('winclient/WinClient.Core/Firewall/KillSwitchPlanner.cs');ka=r('winclient/WinClient.Core/Firewall/KillSwitchApplier.cs');vm=r('winclient/WinClient.App/MainViewModel.cs');x=r('winclient/WinClient.App/MainWindow.xaml');bad=[k for k,ok in (('plan.patrol','record Patrol(' in kp and 'ExpectedRuleNames(' in kp and 'MpsSvc' in kp and 'ConvertTo-Json' in kp),('plan.order',kp.find('Get-Service MpsSvc')>0),('app.patrol','record PatrolReport(' in ka and 'PatrolAsync(' in ka and 'PatrolReport.Empty' in ka),('vm.lines','ExitLine' in vm and 'GuardLine' in vm and '与澳洲节点一致' in vm and '与澳洲节点不一致' in vm),('xaml','{Binding ExitLine}' in x and '{Binding GuardLine}' in x and '当前出口 IP：待检测' not in x and '当前出口 IP:待检测' not in x)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "NOWINDOW",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;norm=lambda p:str(p).replace(chr(92),'/');files=[p for root in ('winclient/WinClient.Core','winclient/WinClient.App') for p in pathlib.Path(root).rglob('*.cs') if '/obj/' not in norm(p) and '/bin/' not in norm(p)];bad=[norm(p) for p in files if 'ProcessStartInfo' in p.read_text(encoding='utf-8') and p.parent.name!='Process' and 'CreateNoWindow = true' not in p.read_text(encoding='utf-8')];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;a=pathlib.Path('docs/winclient/断网保护加固说明.md').read_text(encoding='utf-8');b=pathlib.Path('docs/winclient/架构说明.md').read_text(encoding='utf-8');bad=[k for k in ('连接期间巡检','60 秒','MpsSvc','不自动断开','disabledRules','已重新收紧') if k not in a]+['arch:'+k for k in ('出口 IP 核验','每 60 秒') if k not in b];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "NOBIN",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess,sys;out=subprocess.run(['git','ls-files','winclient','build'],capture_output=True,text=True).stdout.split();bad=[f for f in out if f.endswith(('.exe','.dll','.zip','.pdb'))];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    }
+  ],
+  "steps": [
+    "读 ClientController.cs / ClientRuntime.cs / KillSwitchPlanner.cs / KillSwitchApplier.cs / ControlProtocol.cs / MainViewModel.cs / MainWindow.xaml / ControllerTests.cs(含 Timers、Firewall、Tunnel 假件)/ IpcTests.cs / TestData.cs 与两份文档;先写 ③ 的红测试。",
+    "实现 ①(ExitProbe、控制器核验调度、快照字段、界面两行)与 ②(Patrol 动作与脚本、PatrolReport、PatrolAsync、控制器巡检调度);跑 BUILD / TEST / 形状断言。",
+    "改两份文档;交活说明列真机待验证项(出口核验一致/不一致/无法核验三种界面;新建允许规则 60 秒内被停用;配置档被改回 60 秒内被收紧;停 MpsSvc 红字提示隧道不断)。不许自己跑 dotnet build/test/publish/restore 以外的命令改环境;第三方件缓存由派单方放进 winclient/third_party/cache/。"
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "timeoutSec": 7200,
+  "repoRoot": "E:/yuanc"
+}
