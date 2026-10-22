@@ -51,6 +51,11 @@ class Runner(Protocol):
     def release_lock(self, path: str) -> None: ...
     def now(self) -> float: ...
     def sleep(self, seconds: float) -> None: ...
+    def uptime_seconds(self) -> float: ...
+
+
+def _read_proc_uptime():
+    return Path("/proc/uptime").read_text(encoding="ascii")
 
 
 class RealRunner:
@@ -99,6 +104,13 @@ class RealRunner:
     def sleep(self, seconds):
         time.sleep(seconds)
 
+    def uptime_seconds(self):
+        # 读不到时返回无穷大：永不按开机规则判陈旧，宁可保守。
+        try:
+            return float(_read_proc_uptime().split()[0])
+        except (OSError, ValueError, IndexError):
+            return float("inf")
+
     def acquire_lock(self, path):
         import fcntl
 
@@ -121,16 +133,18 @@ class RealRunner:
                     pid, at = lock["pid"], lock["at"]
                     if type(pid) is not int or pid <= 0 or type(at) not in (int, float):
                         return False
-                    if self.now() - at <= 7200:
-                        return False
-                    try:
-                        os.kill(pid, 0)
-                    except ProcessLookupError:
-                        pass
-                    except PermissionError:
-                        return False
-                    else:
-                        return False
+                    # 锁写于本次开机之前：持有者必然已不在，直接接管。
+                    if not at < self.now() - self.uptime_seconds():
+                        if self.now() - at <= 7200:
+                            return False
+                        try:
+                            os.kill(pid, 0)
+                        except ProcessLookupError:
+                            pass
+                        except PermissionError:
+                            return False
+                        else:
+                            return False
                 except (ValueError, KeyError, TypeError):
                     return False
             os.fchmod(fd, 0o600)
@@ -165,8 +179,12 @@ class RealRunner:
             try:
                 value = json.loads(content)
                 if (type(value["pid"]) is not int or value["pid"] <= 0
-                        or type(value["at"]) not in (int, float)
-                        or self.now() - value["at"] <= 7200):
+                        or type(value["at"]) not in (int, float)):
+                    return True
+                # 锁写于本次开机之前视为陈旧。
+                if value["at"] < self.now() - self.uptime_seconds():
+                    return False
+                if self.now() - value["at"] <= 7200:
                     return True
                 os.kill(value["pid"], 0)
             except ProcessLookupError:
@@ -264,6 +282,8 @@ class FakeRunner:
         self.clock = 1800000000.0
         self.pid = 100
         self.live_pids = {self.pid}
+        # 默认开机时刻远早于所有测试时钟，既有锁测试不受开机规则影响。
+        self.uptime = 10 ** 9
         self._locks = set()
 
     def _resolve(self, path):
@@ -363,6 +383,9 @@ class FakeRunner:
         self.calls.append(("sleep", seconds))
         self.clock += seconds
 
+    def uptime_seconds(self):
+        return self.uptime
+
     def acquire_lock(self, path):
         self.calls.append(("acquire_lock", path))
         if self.lock_busy(path):
@@ -379,9 +402,12 @@ class FakeRunner:
             try:
                 value = json.loads(self.files[path])
                 if (type(value["pid"]) is not int or value["pid"] <= 0
-                        or type(value["at"]) not in (int, float)
-                        or self.now() - value["at"] <= 7200
-                        or value["pid"] in self.live_pids):
+                        or type(value["at"]) not in (int, float)):
+                    return True
+                # 锁写于本次开机之前视为陈旧。
+                if value["at"] < self.now() - self.uptime_seconds():
+                    return False
+                if self.now() - value["at"] <= 7200 or value["pid"] in self.live_pids:
                     return True
             except (ValueError, TypeError, KeyError):
                 return True

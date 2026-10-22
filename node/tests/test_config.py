@@ -134,6 +134,21 @@ def test_updater_invalid_values(key, value):
         load("/config", FakeRunner(files={"/config": text}))
 
 
+def test_health_stable_sec_default_and_zero():
+    text = EXAMPLE.read_text(encoding="utf-8")
+    assert load("/config", FakeRunner(files={"/config": text})).updater.health_stable_sec == 30
+    text = text.replace("[updater]", "[updater]\nhealth_stable_sec = 0")
+    assert load("/config", FakeRunner(files={"/config": text})).updater.health_stable_sec == 0
+
+
+@pytest.mark.parametrize("value", ["-1", "true", '"30"', "1.5"])
+def test_health_stable_sec_must_be_non_negative_integer(value):
+    text = EXAMPLE.read_text(encoding="utf-8").replace(
+        "[updater]", f"[updater]\nhealth_stable_sec = {value}")
+    with pytest.raises(ConfigError, match="updater.health_stable_sec.*须为非负整数秒数"):
+        load("/config", FakeRunner(files={"/config": text}))
+
+
 def test_github_source_requires_repository():
     text = EXAMPLE.read_text(encoding="utf-8").replace('source = "none"', 'source = "github"')
     with pytest.raises(ConfigError, match="github_repo"):

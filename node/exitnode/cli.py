@@ -68,6 +68,8 @@ def parser():
                                  help="允许安装比当前版本或已安装过的最高版本更低的版本")
             command.add_argument("--switch", metavar="版本",
                                  help="切换到已安装且未标记失败的版本，不下载升级包")
+            command.add_argument("--recover", action="store_true",
+                                 help="只收尾上次未完成的更新，不检查网络、不下载")
         if name == "rollback":
             command.add_argument("--to-step", help="保留该步骤及之前的步骤")
         if name == "uninstall":
@@ -207,7 +209,9 @@ def _install(config, config_path, runner, manifest):
                      {"kind": "remove_file", "path": layout.releases(config), "preserve": True}):
             layout.bootstrap(config, runner)
         rescue_units = {"exitnode-rescue.service", "exitnode-rescue.timer"}
-        for unit in sorted(UNITS - {service.UNIT} - rescue_units):
+        recover_unit = "exitnode-recover.service"
+        # 收尾单元排在隧道服务单元之后单独写入。
+        for unit in sorted(UNITS - {service.UNIT, recover_unit} - rescue_units):
             path = "/etc/systemd/system/" + unit
             text = systemd.render(unit, {"config_path": config_path, "program_path": program_path})
             step = "写入" + unit
@@ -252,11 +256,29 @@ def _install(config, config_path, runner, manifest):
             runner.write_file(path, text, 0o644)
 
         apply(step, write_proxy, {"kind": "systemctl", "unit": service.UNIT})
+        recover_path = "/etc/systemd/system/" + recover_unit
+        recover_step = "写入exitnode-recover.service"
+        if runner.exists(recover_path) and not any(s["step"] == recover_step
+                                                   for s in manifest.steps):
+            raise ValueError("已有同名服务文件未在本安装清单中，请联系维护人员")
+        recover_text = systemd.render(recover_unit,
+                                      {"config_path": config_path, "program_path": program_path})
+
+        def write_recover():
+            if runner.exists(recover_path) and runner.read_file(recover_path) != recover_text:
+                raise ValueError("已有服务文件与安装内容不同，请先由维护人员确认")
+            runner.write_file(recover_path, recover_text, 0o644)
+
+        apply(recover_step, write_recover, {"kind": "systemctl", "unit": recover_unit})
         apply("重载隧道服务定义", lambda: runner.run(["systemctl", "daemon-reload"]),
               {"kind": "systemctl", "unit": service.UNIT, "reload_only": True})
         apply("启用隧道服务",
               lambda: runner.run(["systemctl", "enable", "--now", service.UNIT]),
               {"kind": "systemctl", "unit": service.UNIT})
+        # 只在开机时运行收尾，不加 --now。
+        apply("启用更新收尾服务",
+              lambda: runner.run(["systemctl", "enable", recover_unit]),
+              {"kind": "systemctl", "unit": recover_unit})
         if config.watchdog.enabled:
             apply("启用看门狗定时器",
                   lambda: runner.run(["systemctl", "enable", "--now", "exitnode-watchdog.timer"]),
@@ -358,6 +380,11 @@ def main(argv=None, runner=None, rescue_runner=None):
     if args.command == "upgrade" and args.switch is not None and (args.file or args.signature):
         print("--switch 不能与 --file 或 --signature 同时使用", file=sys.stderr)
         return 2
+    if args.command == "upgrade" and args.recover and (
+            args.file or args.signature or args.switch is not None
+            or args.check or args.allow_downgrade):
+        print("--recover 不能与其他升级参数同时使用", file=sys.stderr)
+        return 2
     try:
         runner = runner if runner is not None else RealRunner()
         config = load(args.config, runner)
@@ -398,8 +425,10 @@ def main(argv=None, runner=None, rescue_runner=None):
             return 0
         if args.command == "upgrade":
             try:
-                from .updater.upgrade import upgrade
+                from .updater.upgrade import recover, upgrade
 
+                if args.recover:
+                    return recover(config, runner, config_path=args.config)
                 if args.signature and not args.file:
                     print("签名路径须与本地升级包一起指定。", file=sys.stderr)
                     return 2

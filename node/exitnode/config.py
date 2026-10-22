@@ -60,6 +60,8 @@ class Updater:
     source: str = "none"
     github_repo: str = ""
     health_timeout_sec: int = 120
+    # 首次通过后继续观察的稳定窗秒数；0 表示关闭稳定窗。
+    health_stable_sec: int = 30
     releases_dir: str = "/opt/exitnode"
 
 
@@ -129,6 +131,9 @@ def load(path: str, runner: Runner | None = None) -> Config:
             if (name == "node" and key == "config_version"
                     and (type(value) is not int or value <= 0)):
                 invalid("node.config_version", "须为正整数")
+            if (name == "updater" and key == "health_stable_sec"
+                    and (type(value) is not int or value < 0)):
+                invalid("updater.health_stable_sec", "须为非负整数秒数")
             if spec.type == list[str]:
                 allow_empty = name == "proxy" and key == "maintenance_device_ids"
                 valid = (type(value) is list and (allow_empty or bool(value))

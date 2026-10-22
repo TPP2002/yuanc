@@ -513,6 +513,57 @@ def test_winclient_publish_status_and_parser(capsys):
     assert "/var/lib" not in output and "/input" not in output
 
 
+@pytest.mark.parametrize("extra", [["--file", "x"], ["--signature", "x"], ["--switch", "0.2.0"],
+                                   ["--check"], ["--allow-downgrade"]])
+def test_upgrade_recover_rejects_other_options_without_system_calls(extra, capsys):
+    runner = FakeRunner()
+    assert main(["upgrade", "--recover", *extra], runner) == 2
+    assert "--recover 不能与其他升级参数同时使用" in capsys.readouterr().err
+    assert runner.calls == []
+
+
+def test_upgrade_recover_runs_recover_offline(capsys):
+    runner = fake()
+    runner.connections.clear()
+    assert main(["upgrade", "--recover"], runner) == 0
+    assert "没有未完成的更新。" in capsys.readouterr().out
+    assert not any(c[0] == "tcp_connect" for c in runner.calls)
+    assert "/var/lib/exitnode/updater.lock" not in runner.files
+
+
+def test_install_writes_and_enables_recover_unit_and_rollback_removes_it():
+    from exitnode.manifest import Manifest
+    from exitnode.systemd import render
+
+    runner = fake(pairing=True)
+    unit = "exitnode-recover.service"
+    path = "/etc/systemd/system/" + unit
+    assert main(["init"], runner) == 0
+    names = [s["step"] for s in Manifest("/var/lib/exitnode/manifest.json", runner).steps]
+    assert (names.index("写入exitnode-proxy.service") < names.index("写入exitnode-recover.service")
+            < names.index("重载隧道服务定义"))
+    assert (names.index("启用隧道服务") < names.index("启用更新收尾服务")
+            < names.index("启用看门狗定时器"))
+    calls = [c[1] for c in runner.calls if c[0] == "run"]
+    assert ("systemctl", "enable", unit) in calls
+    assert not any(c[:2] == ("systemctl", "enable") and unit in c and "--now" in c for c in calls)
+    assert runner.files[path] == render(unit, {"config_path": CONFIG,
+                                               "program_path": "/opt/exitnode/current"})
+    boundary = len(runner.calls)
+    assert main(["rollback"], runner) == 0
+    assert path not in runner.files
+    assert ("run", ("systemctl", "disable", "--now", unit), True, None) in runner.calls[boundary:]
+
+
+def test_existing_unowned_recover_unit_is_not_overwritten():
+    runner = fake(pairing=True)
+    path = "/etc/systemd/system/exitnode-recover.service"
+    runner.files[path] = "已有服务定义"
+    assert main(["init"], runner) == 1
+    assert main(["rollback"], runner) == 0
+    assert runner.files[path] == "已有服务定义"
+
+
 @pytest.mark.parametrize("argv", [["admin", "serve"], ["--placeholder", "admin"]])
 def test_admin_entrypoints_are_equivalent(argv, monkeypatch):
     calls = []
