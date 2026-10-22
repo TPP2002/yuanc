@@ -1,0 +1,148 @@
+{
+  "schemaVersion": 1,
+  "taskId": "SEC-NODE-WATCHDOG-STARTLIMIT-1022",
+  "slug": "yc-sec-node-watchdog-startlimit-1022",
+  "title": "节点看门狗:去掉每分钟 oneshot 单元与定时器上的 systemd 启动频率限制(5 分钟 3 次,实际每分钟触发必撞限进 failed),检查层改为「最近 10 分钟有记录且单元没被频率限制拦下」",
+  "goal": "做完后:①node/exitnode/templates/exitnode-watchdog.service 与 exitnode-watchdog.timer 的 [Unit] 段都删掉 StartLimitIntervalSec 与 StartLimitBurst 两行(其余行一字不改:Description、After、Type=oneshot、ExecStart、Restart=no、NoNewPrivileges、UMask、OnBootSec=90、OnUnitActiveSec=60、Persistent=false、Unit、WantedBy 不动);黄金 node/tests/golden/exitnode-watchdog.service 与 exitnode-watchdog.timer 同步。②node/exitnode/watchdog/__init__.py 的 check(config, runner, clock) 改判定:a) 定时器 systemctl is-active exitnode-watchdog.timer 仍须 active;b) 状态记录 updated_at 距 clock() 须在 [0, 600) 秒内(原来是 86400);c) 新增 runner.run([\"systemctl\", \"show\", \"exitnode-watchdog.service\", \"-p\", \"Result\", \"--value\"], check=False),输出去空白后等于 \"start-limit-hit\" 判失败;三者任一不满足 result=\"失败\",reason 按原因分别为「定时检查未运行」「十分钟内没有检查记录」「检查任务被 systemd 启动频率限制拦下,请执行 systemctl reset-failed exitnode-watchdog.service 并核对单元文件」,全通过 reason=「定时检查已启动且记录新鲜」;异常捕获范围与返回结构(layer/name/result/reason)不变。FakeRunner 对未配置的命令默认返回退出值 127、空输出,所以 systemctl show 没配响应时按「没有 start-limit-hit」处理(输出不等于 start-limit-hit 即可),既有测试不用都补这条响应。③测试:node/tests/test_systemd_render.py 的 test_watchdog_service_timer_and_context 加断言 \"StartLimit\" not in text 且 not in timer;test_unit_matches_golden 随黄金通过;node/tests/test_watchdog.py 的 test_check_requires_timer_and_record_younger_than_one_day 改名为 test_check_requires_timer_fresh_record_and_no_start_limit 并改断言:9 分 59 秒通过、10 分钟失败且 reason 含「十分钟」;再加:systemctl show 响应为 \"start-limit-hit\\n\" 时记录新鲜也失败、reason 含「启动频率限制」;定时器 inactive 失败不变。这是本卡明确要改的既有断言,其他既有测试只加不改。④docs/node/看门狗说明.md:「查看状态」里「最近 24 小时内有状态更新」改为「最近 10 分钟内有状态更新,且检查任务没有被 systemd 启动频率限制拦下」;新加一小段「为什么单元文件不设启动频率限制」(每分钟触发一次的 oneshot 单元,5 分钟 3 次的限制必然撞上,撞上后单元进 failed、journal 报 start request repeated too quickly、定时器照常走但任务不跑;本次去掉限制,改由 check 的十分钟新鲜度与 Result 核查兜底);「本单不包含」或末尾加真机待验证项:安装后运行 15 分钟,systemctl status exitnode-watchdog.service 与 journalctl -u exitnode-watchdog 不出现 start-limit-hit / repeated too quickly,exitnode check 看门狗层通过。",
+  "background": "项目:外包,澳洲出口节点程序 Python 在 node/exitnode;systemd 单元模板在 exitnode/templates(string.Template 渲染,systemd.py render,黄金在 node/tests/golden/);看门狗每分钟一轮 tick 写 watchdog/state.json(updated_at 每轮更新,成功失败都写),check() 给 exitnode check 用。对抗审查(看板 yuanc 卡 SECURITY-REDTEAM-1022 A7)按 systemd 语义推断:exitnode-watchdog.service 与 .timer 都写 StartLimitIntervalSec=300/StartLimitBurst=3,而定时器 OnUnitActiveSec=60,5 分钟内启动 5 次必然超过 3 次,systemd 会拒绝后续启动(start request repeated too quickly)、单元进 failed;现有 check 只看定时器 active 与 24 小时内有记录,撞限后几小时都报「通过」,看门狗名存实亡(需真机确认,本卡把真机验证写进文档)。Restart=no 的 oneshot 单元本来就不需要启动频率限制;定时器单元上的 StartLimit 也没有意义。exitnode-rescue.service/.timer 是每 5 分钟一次,不撞限,本卡不动;exitnode-admin/proxy 两个常驻服务的 StartLimit 配 Restart 是另一回事,本卡不动。先读:node/exitnode/templates/exitnode-watchdog.{service,timer}、node/tests/golden/exitnode-watchdog.*、node/exitnode/systemd.py、node/exitnode/watchdog/__init__.py(check 与 summary)、watchdog/state.py(timestamp/read)、node/tests/test_systemd_render.py、node/tests/test_watchdog.py(setup、NOW、FakeRunner.responses 用法,第 339 行既有 check 测试)、node/exitnode/runner.py FakeRunner.run(未配置命令返回 127)、docs/node/看门狗说明.md。环境:工位无外网;跑法 python -m ruff check node scripts authserver 与 python -m pytest -q node/tests;搜索用 rg 或 git grep。同仓同时还有两张节点卡在别的工位施工(yc-sec-node-route-private-1022 动 proxy/server_config.py、proxy/context.py、config.py、service.py;yc-sec-node-token-argv-1022 动 updater/upgrade.py、test_updater.py),本卡不得碰这些文件。硬规矩:①只动 watchdog 两个单元,rescue/admin/proxy 单元不动;②tick 的决策逻辑(重启/回滚/重启整机的阶梯)一行不改,只改 check;③中文文案;④拿不准停下交 blocked + forks,不猜;真机项写进文档,不模拟成通过。",
+  "nonGoals": [
+    "不改 exitnode-rescue.*、exitnode-admin.service、exitnode-proxy.service 的 StartLimit",
+    "不改 tick 的失败阶梯与重启/回滚/重启整机决策",
+    "不改 status 总状态的汇总口径(status.py 不动)",
+    "不在真机实测:15 分钟观察与 journal 核查写进文档真机清单"
+  ],
+  "allowedPaths": [
+    "node/exitnode/templates/exitnode-watchdog.service",
+    "node/exitnode/templates/exitnode-watchdog.timer",
+    "node/exitnode/watchdog/__init__.py",
+    "node/tests/golden/exitnode-watchdog.service",
+    "node/tests/golden/exitnode-watchdog.timer",
+    "node/tests/test_systemd_render.py",
+    "node/tests/test_watchdog.py",
+    "docs/node/看门狗说明.md"
+  ],
+  "forbiddenPaths": [
+    "winclient/**",
+    "authserver/**",
+    "scripts/**",
+    "docs/开工须知.md",
+    "docs/口径速查表.md",
+    "docs/design/**",
+    "docs/交接/**",
+    "docs/plans/**",
+    "docs/acceptance/**",
+    "docs/authserver/**",
+    "docs/winclient/**",
+    "docs/node/配置说明.md",
+    "docs/node/隧道配置说明.md",
+    "docs/node/救援单元说明.md",
+    "docs/node/更新与回退说明.md",
+    "docs/node/客户端包托管说明.md",
+    "docs/node/自用配对说明.md",
+    ".github/**",
+    ".codex/**",
+    ".gitignore",
+    "pyproject.toml",
+    "node/exitnode/templates/exitnode-admin.service",
+    "node/exitnode/templates/exitnode-proxy.service",
+    "node/exitnode/templates/exitnode-rescue.service",
+    "node/exitnode/templates/exitnode-rescue.timer",
+    "node/exitnode/watchdog/ladder.py",
+    "node/exitnode/watchdog/probes.py",
+    "node/exitnode/watchdog/state.py",
+    "node/exitnode/proxy/**",
+    "node/exitnode/updater/**",
+    "node/exitnode/admin/**",
+    "node/exitnode/rescue/**",
+    "node/exitnode/config.py",
+    "node/exitnode/service.py",
+    "node/exitnode/status.py",
+    "node/exitnode/systemd.py",
+    "node/exitnode/runner.py",
+    "node/exitnode/cli.py",
+    "node/tests/golden/exitnode-admin.service",
+    "node/tests/golden/exitnode-proxy.service",
+    "node/tests/golden/exitnode-rescue.*",
+    "node/tests/golden/proxy/**",
+    "node/tests/golden/device/**",
+    "node/tests/test_updater.py",
+    "node/tests/test_proxy_*.py",
+    "node/tests/test_config.py",
+    "node/tests/test_service.py",
+    "node/tests/test_renderer_parity.py",
+    "node/tests/test_rescue.py"
+  ],
+  "expectArtifacts": [
+    "node/exitnode/templates/exitnode-watchdog.service",
+    "node/exitnode/templates/exitnode-watchdog.timer",
+    "node/exitnode/watchdog/__init__.py",
+    "node/tests/golden/exitnode-watchdog.service",
+    "node/tests/golden/exitnode-watchdog.timer",
+    "node/tests/test_watchdog.py",
+    "docs/node/看门狗说明.md"
+  ],
+  "acceptance": [
+    {
+      "id": "RUFF",
+      "kind": "command",
+      "argv": ["python", "-m", "ruff", "check", "node", "scripts", "authserver"],
+      "required": true,
+      "timeoutSec": 300
+    },
+    {
+      "id": "PYTEST",
+      "kind": "command",
+      "argv": ["python", "-m", "pytest", "-q", "node/tests"],
+      "required": true,
+      "timeoutSec": 900,
+      "note": "除 goal ③ 点名的那一条,既有断言只加不改"
+    },
+    {
+      "id": "UNITS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda p:pathlib.Path(p).read_text(encoding='utf-8');files=['node/exitnode/templates/exitnode-watchdog.service','node/exitnode/templates/exitnode-watchdog.timer','node/tests/golden/exitnode-watchdog.service','node/tests/golden/exitnode-watchdog.timer'];bad=[f for f in files if 'StartLimit' in r(f)];t=r('node/exitnode/templates/exitnode-watchdog.timer');s=r('node/exitnode/templates/exitnode-watchdog.service');bad+=[k for k in ('OnBootSec=90','OnUnitActiveSec=60','Persistent=false') if k not in t]+[k for k in ('Type=oneshot','Restart=no','NoNewPrivileges=true','UMask=0077') if k not in s];a=r('node/exitnode/templates/exitnode-admin.service');bad+=[] if 'StartLimitBurst=3' in a else ['admin_touched'];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60,
+      "note": "看门狗两单元与黄金无 StartLimit,其余行在;admin 单元没被顺手改"
+    },
+    {
+      "id": "CHECK",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;w=pathlib.Path('node/exitnode/watchdog/__init__.py').read_text(encoding='utf-8');t=pathlib.Path('node/tests/test_watchdog.py').read_text(encoding='utf-8');bad=[k for k,ok in (('result_probe','start-limit-hit' in w),('ten_min','600' in w),('old_day','86400' not in w),('test_limit','start-limit-hit' in t),('test_ten','十分钟' in t or 'minutes=10' in t)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;d=pathlib.Path('docs/node/看门狗说明.md').read_text(encoding='utf-8');bad=[k for k in ('10 分钟','启动频率限制','start-limit-hit','真机') if k not in d]+(['仍写24小时'] if '最近 24 小时内有状态更新' in d else []);print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "model": null,
+  "timeoutSec": 3600,
+  "repoRoot": "E:/yuanc",
+  "engine": "codex",
+  "reasoningEffort": "medium",
+  "steps": [
+    "读两份单元模板与黄金、watchdog/__init__.py 的 check、两份测试与说明文档。",
+    "先改测试(goal ③)跑红,再删 StartLimit 两行、更新黄金、改 check 判定;跑 RUFF/PYTEST 与断言。",
+    "改文档三处;交活说明写明「按 systemd 语义推断,真机 15 分钟观察待验证」。"
+  ]
+}

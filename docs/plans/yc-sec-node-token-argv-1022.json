@@ -1,0 +1,120 @@
+{
+  "schemaVersion": 1,
+  "taskId": "SEC-NODE-TOKEN-ARGV-1022",
+  "slug": "yc-sec-node-token-argv-1022",
+  "title": "节点更新器:发布源令牌不再拼进 curl 命令行参数(本机任何用户 ps/proc 可见),改经标准输入喂请求头",
+  "goal": "做完后:①node/exitnode/updater/upgrade.py 的 _request 不再把 Authorization 头放进 argv;有令牌文件时 argv 追加 [\"-H\", \"@-\"](curl 从标准输入读请求头),并把 \"Authorization: Bearer <令牌>\\n\" 作为 runner.run(argv, check=False, input=<该字符串>) 的 input 参数传入;没有令牌文件时 input 为 None、argv 不含 -H @-;既有的控制字符校验(令牌含 ord<32 的字符报「发布源令牌格式不正确,请检查令牌」)、既有的 Accept 头、--proto/--max-time 等参数、finally 里 argv.clear()、401/403 与非 200 的中文报错一律保持;请求头字符串在 finally 里同样清掉引用(局部变量置 None),不缓存令牌。②node/tests/test_updater.py 新增用例:(a) 有令牌时,FakeRunner 记录的 run 调用里 argv 任一元素都不含 \"Bearer\" 与令牌明文,argv 含 \"-H\" 紧跟 \"@-\",input 等于 \"Authorization: Bearer <令牌>\\n\";(b) 没有令牌文件时 argv 不含 \"@-\" 且 input 为 None;(c) 既有 test_github_token_never_in_output_logs_exceptions_or_state 保持通过且断言不改。③docs/node/更新与回退说明.md 第 29 行附近(令牌保存位置那段)补一句:令牌只经标准输入交给下载程序,不出现在命令行参数里,节点本机的进程列表看不到它。",
+  "background": "项目:外包,澳洲出口节点程序 Python 在 node/exitnode,更新事务在 updater/upgrade.py,所有主机命令经 runner.Runner.run(argv, check, input, timeout)(真实实现是 subprocess.run(argv, input=input, capture_output=True, text=True),FakeRunner 把 (\"run\", tuple(argv), check, input) 记进 calls,响应按 argv 前缀匹配 responses,现有测试用 (\"curl\",) 做键,加了 -H @- 不影响前缀匹配)。对抗审查(看板 yuanc 卡 SECURITY-REDTEAM-1022 A3)查实:upgrade.py 第 30 行 argv.extend([\"-H\", \"Authorization: Bearer \" + 令牌]),curl 运行期间 /proc/<pid>/cmdline 与 ps 对本机任何用户可见(Debian 12 默认没有 hidepid),节点上存在非 root 账户或被攻破的低权进程时,维护人员执行一次 exitnode upgrade 令牌就泄漏。修法:curl 的 -H 参数支持 @文件 读请求头,@- 表示标准输入(curl 7.55 起支持;Debian 12 自带 7.88),Runner.run 已有 input 参数,直接喂。先读:node/exitnode/updater/upgrade.py 全文、node/exitnode/runner.py 的 run 两处实现、node/tests/test_updater.py(prepared、FakeRunner 用法、第 345 行起的令牌泄漏测试)、docs/node/更新与回退说明.md。环境:工位无外网;跑法 python -m ruff check node scripts authserver 与 python -m pytest -q node/tests;搜索用 rg 或 git grep。同仓同时还有两张节点卡在别的工位施工(yc-sec-node-route-private-1022 动 proxy/server_config.py、proxy/context.py、config.py、service.py 与对应测试;yc-sec-node-watchdog-startlimit-1022 动 templates/exitnode-watchdog.*、watchdog/__init__.py 与对应测试),本卡不得碰这些文件。硬规矩:①令牌不得出现在 argv、URL、异常文本、日志、状态文件;②不改下载/校验/替换流程的其他行为;③中文文案;④拿不准停下交 blocked + forks,不猜。",
+  "nonGoals": [
+    "不改令牌文件位置与权限(仍 /var/lib/exitnode/secrets/github-token,0600)",
+    "不改用临时头文件方案(标准输入够用且无落盘)",
+    "不改升级事务其他步骤、不改 CLI 入口"
+  ],
+  "allowedPaths": [
+    "node/exitnode/updater/upgrade.py",
+    "node/tests/test_updater.py",
+    "docs/node/更新与回退说明.md"
+  ],
+  "forbiddenPaths": [
+    "winclient/**",
+    "authserver/**",
+    "scripts/**",
+    "docs/开工须知.md",
+    "docs/口径速查表.md",
+    "docs/design/**",
+    "docs/交接/**",
+    "docs/plans/**",
+    "docs/acceptance/**",
+    "docs/authserver/**",
+    "docs/winclient/**",
+    "docs/node/看门狗说明.md",
+    "docs/node/配置说明.md",
+    "docs/node/隧道配置说明.md",
+    "docs/node/救援单元说明.md",
+    "docs/node/客户端包托管说明.md",
+    "docs/node/自用配对说明.md",
+    ".github/**",
+    ".codex/**",
+    ".gitignore",
+    "pyproject.toml",
+    "node/exitnode/updater/layout.py",
+    "node/exitnode/updater/package.py",
+    "node/exitnode/updater/version.py",
+    "node/exitnode/updater/__init__.py",
+    "node/exitnode/proxy/**",
+    "node/exitnode/watchdog/**",
+    "node/exitnode/templates/**",
+    "node/exitnode/admin/**",
+    "node/exitnode/rescue/**",
+    "node/exitnode/config.py",
+    "node/exitnode/service.py",
+    "node/exitnode/runner.py",
+    "node/exitnode/log.py",
+    "node/exitnode/cli.py",
+    "node/tests/golden/**",
+    "node/tests/test_proxy_*.py",
+    "node/tests/test_config.py",
+    "node/tests/test_service.py",
+    "node/tests/test_watchdog.py",
+    "node/tests/test_systemd_render.py",
+    "node/tests/test_renderer_parity.py"
+  ],
+  "expectArtifacts": [
+    "node/exitnode/updater/upgrade.py",
+    "node/tests/test_updater.py",
+    "docs/node/更新与回退说明.md"
+  ],
+  "acceptance": [
+    {
+      "id": "RUFF",
+      "kind": "command",
+      "argv": ["python", "-m", "ruff", "check", "node", "scripts", "authserver"],
+      "required": true,
+      "timeoutSec": 300
+    },
+    {
+      "id": "PYTEST",
+      "kind": "command",
+      "argv": ["python", "-m", "pytest", "-q", "node/tests"],
+      "required": true,
+      "timeoutSec": 900,
+      "note": "既有断言不改;新增用例见 goal ②"
+    },
+    {
+      "id": "SHAPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,re,sys;s=pathlib.Path('node/exitnode/updater/upgrade.py').read_text(encoding='utf-8');t=pathlib.Path('node/tests/test_updater.py').read_text(encoding='utf-8');bad=[k for k,ok in (('stdin_header','\"@-\"' in s),('no_bearer_in_argv',not re.search(r'argv\\.(extend|append)\\([^\\n]*Bearer',s)),('input_passed',re.search(r'runner\\.run\\(argv[^\\n]*input=',s) is not None),('test_asserts_argv','Bearer' in t and '@-' in t)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60,
+      "note": "源码:-H @- 在、Bearer 不再进 argv、run 带 input;测试断言了 argv 与 @-"
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;d=pathlib.Path('docs/node/更新与回退说明.md').read_text(encoding='utf-8');bad=[k for k in ('标准输入','命令行') if k not in d];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "model": null,
+  "timeoutSec": 3600,
+  "repoRoot": "E:/yuanc",
+  "engine": "codex",
+  "reasoningEffort": "medium",
+  "steps": [
+    "读 upgrade.py、runner.py 的 run、test_updater.py 既有令牌测试。",
+    "先写 goal ② 的红测试,再改 _request;跑 RUFF/PYTEST 与断言。",
+    "补文档一句;交活说明写明 curl -H @- 的版本前提(7.55+,Debian 12 为 7.88)。"
+  ]
+}

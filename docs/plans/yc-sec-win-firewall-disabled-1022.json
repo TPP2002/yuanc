@@ -1,0 +1,177 @@
+{
+  "schemaVersion": 1,
+  "taskId": "SEC-WIN-FIREWALL-DISABLED-1022",
+  "slug": "yc-sec-win-firewall-disabled-1022",
+  "title": "Windows 客户端断网保护:连接时记录并强制开启三个防火墙配置档(Enabled=True),末尾读实际生效值(ActiveStore)核三档都是 Enabled=True 且默认出站 Block,核不过就拒绝连接并明示「系统防火墙被关闭或被策略覆盖」;断开/恢复时还原 Enabled 原值;审计记录实际生效值",
+  "goal": "做完后:①KillSwitchPlanner.ToPowerShellScript 的状态快照(首次 Apply 写 $state.profiles 那段)改为 Select-Object Name,DefaultOutboundAction,Enabled,每条 profile 记录多存 Enabled = [string]$_.Enabled('True'/'False');SetProfileDefault 生成的那行改为 Set-NetFirewallProfile -Enabled True -DefaultOutboundAction Block -Profile '<档名>'(仍只允许 Domain/Private/Public 与 Block)。②新增 FirewallAction 子类 VerifyProfiles(record,无参数),Plan(...Apply) 顺序改为:SetProfileDefault×3 → DisableForeignAllowRules → AddRule×5 → VerifyProfiles → Audit;UpdateNode/Remove/Audit 模式的动作列表不变。VerifyProfiles 的脚本:$effective = @(Get-NetFirewallProfile -PolicyStore ActiveStore | Select-Object Name,Enabled,DefaultOutboundAction);$bad = 其中 Enabled 不为 True 或 DefaultOutboundAction 不为 'Block' 的 Name 列表(数量不是 3 条也算失败);有 $bad 时:给 $state 加/写 verifyFailed = @($bad) 与 verifiedAt(UTC ISO8601)并 Write-State,然后 exit 3(不 throw,用固定退出码 3 让执行器认出来);全过时写 $state.verifyFailed = @() 并 Write-State,继续后面的 Audit。③RestoreProfileDefault 脚本:恢复三档时若记录里该 profile 有 Enabled 字段且属 'True'/'False',用 Set-NetFirewallProfile -Profile <名> -Enabled <记录值> -DefaultOutboundAction <记录值>;旧记录没有 Enabled 字段则只恢复 DefaultOutboundAction(不碰 Enabled);记录校验加一条:有 Enabled 字段但不属 'True'/'False' 视为「防火墙恢复记录无效」。RecoverFallback 脚本:$recordValid 分支同样按记录恢复 Enabled(有字段才恢复,无字段不碰);windows_default 分支只设 -DefaultOutboundAction Allow,不碰 Enabled(原值不明时不替用户开关防火墙);Enabled 字段不合法只让该条记录判无效,不中止。既有 Remove/Fallback 的其他行一字不改。④Audit 脚本的输出对象加 profiles_effective = @(Get-NetFirewallProfile -PolicyStore ActiveStore | Select-Object Name,Enabled,DefaultOutboundAction);其他字段不变。⑤KillSwitchApplier:新增 public sealed class FirewallIneffectiveException : InvalidOperationException(放在 KillSwitchApplier.cs);ExecuteAsync 在 result.ExitCode == 3 时抛 FirewallIneffectiveException(\"系统防火墙已被关闭或被策略覆盖，断网保护无法生效，已拒绝连接。请点击断开，在 Windows 安全中心开启防火墙（或联系管理员解除策略）后重新连接。\"),其他非 0 退出码照旧抛原 InvalidOperationException 文案;常量 public const int VerifyFailedExitCode = 3。⑥ClientController:FailAsync 改为 FailAsync(Exception? cause = null),在 ExecuteAsync(transition) 之后(含它的 catch 之后)若 cause is FirewallIneffectiveException 则 message = cause.Message;ConnectAsync/重连等调用 FailAsync 的 catch 分支把捕获的异常传进去(只传参,其他逻辑不改);状态仍进 NeedsManual、protection 仍为 true(ApplyKillSwitch 的部分执行照旧要人工断开)。⑦测试:新建 winclient/WinClient.Tests/KillSwitchProfileTests.cs 至少覆盖:(a) Apply 脚本:快照 Select-Object 含 Enabled;三行 Set-NetFirewallProfile 都含 -Enabled True 与 -DefaultOutboundAction Block;VerifyProfiles 段读 -PolicyStore ActiveStore、含 'exit 3'、位于最后一条 New-NetFirewallRule 之后且在 Audit 的 ConvertTo-Json 之前;Audit 含 profiles_effective;(b) Remove 脚本:含按记录 -Enabled 恢复的分支与旧记录无 Enabled 字段的兼容分支,仍含既有「防火墙恢复记录无效」文案;(c) Fallback 脚本:windows_default 分支那行只含 -DefaultOutboundAction Allow 不含 -Enabled;(d) 假 ICommandRunner 退出 3 → ApplyAsync 抛 FirewallIneffectiveException 且 Message 含「防火墙」「策略」;退出 1 → 仍是普通 InvalidOperationException(不是子类);(e) 动作顺序:Plan(Apply) 的类型名序列 = SetProfileDefault×3, DisableForeignAllowRules, AddRule×5, VerifyProfiles, Audit。KillSwitchHardenTests.ApplyActionOrderIsExact 的序列断言按新顺序更新(这是本卡明确要改的一条既有断言);FirewallTests/KillSwitchRecoveryTests 其他断言只加不改,若有「Set-NetFirewallProfile -DefaultOutboundAction Block -Profile」整行匹配的既有断言,改为匹配新行形状属本卡允许的最小适配(交活说明里列出改了哪几行)。ControllerTests.cs 加一条:假防火墙 ApplyAsync 抛 FirewallIneffectiveException(自定文案) → ConnectAsync 后 State=NeedsManual、ProtectionActive=true、Message 等于该文案、order 不含 start/remove。⑧文档:docs/winclient/断网保护加固说明.md 新增一节「## 防火墙配置档被关闭或被策略覆盖」:原缺口(只设默认出站 Block、配置档 Enabled=False 时整套规则不生效,负责人本机 2026-10-22 实测三档均为 False)、现在的做法(记录原 Enabled→强制开启→连接前核 ActiveStore 实际值→不过就拒连并提示→断开按记录还原 Enabled;组策略覆盖时本机改不了所以只能拒连)、状态文件与审计多了哪些字段(profiles[].Enabled、verifyFailed、verifiedAt、profiles_effective)、真机待验证项(三档关闭的机器上连接应被拒并出现该提示,点断开后 Enabled 应还原为关闭;正常机器连接后 Get-NetFirewallProfile -PolicyStore ActiveStore 三档 Enabled True 且 Block);docs/winclient/架构说明.md 断网保护那段补一句指向该节。",
+  "background": "项目:外包,中国客户端经加密隧道到澳洲家宽出口;Windows 客户端 .NET 9 在 winclient/,断网保护在 WinClient.Core/Firewall:KillSwitchPlanner 把动作列表翻成 PowerShell,KillSwitchApplier 用 powershell.exe 执行(CreateNoWindow,180 秒超时,只拿退出码与标准输出,不拿 stderr),状态文件 run/killswitch-state.json(profiles 原始默认出站、disabledRules、disableFailed、unmanagedRules、applied),审计 run/firewall-audit.json;ClientController(Core/Client)在 ApplyKillSwitch 效果里先置 protection=true 再 await firewall.ApplyAsync,失败走 FailAsync → 状态机 OperationFailed → NeedsManual,文案被状态机 ShowMessage「连接操作失败,断网保护未主动撤销,请联系管理员。」覆盖。对抗审查(看板 yuanc 卡 SECURITY-REDTEAM-1022 C-H2)查实:Apply 只执行 Set-NetFirewallProfile -DefaultOutboundAction Block,从不检查/设置配置档 Enabled,也不核 ActiveStore 实际生效值(域组策略 Allow 会覆盖本机设置);负责人本机(Win10 专业版)2026-10-22 实测三个配置档 Enabled=False——国内装安全软件或手工关闭很常见。后果:连接后杀掉内核,流量直接走物理网卡,真实 IP 与 DNS 泄漏,而界面 ProtectionActive 为真,客户毫不知情。修法要点:a) 强制开启而不是只检查——客户要「常年自动运行」,能自动修好的就自动修,但原值要记下、断开时还原;b) 组策略覆盖本机改不了,只能拒连并明说;c) 核的是 ActiveStore(实际生效值),不是 PersistentStore;d) 用固定退出码 3 让执行器区分「核不过」与「脚本出错」,因为 CommandResult 不带 stderr、不能靠文本;e) 拒连之后状态仍是 NeedsManual + protection=true,由用户点断开走既有 RemoveAsync 还原——与「部分 Apply 也要显式恢复」的既有口径一致。先读:winclient/WinClient.Core/Firewall/{KillSwitchPlanner,KillSwitchApplier,CommandRunner}.cs 全文、winclient/WinClient.Core/Client/ClientController.cs(ExecuteAsync 的 ApplyKillSwitch 分支、FailAsync、各处 catch IsOperational)、winclient/WinClient.Core/State 下状态机的 OperationFailed 分支、winclient/WinClient.Tests/{FirewallTests,KillSwitchHardenTests,KillSwitchRecoveryTests,ControllerTests}.cs(RecordingRunner/RecoveryRunner/Firewall 替身写法)、docs/winclient/断网保护加固说明.md。环境:工位无外网,只用框架自带与 NuGet 缓存已有的包(不新增包);CI 是本机自托管 Windows runner 跑 dotnet test winclient;首轮 dotnet build 会生成 winclient/third_party/bin 让自测指纹漂一次属正常;构建报 Access denied 先 dotnet build-server shutdown;Windows 子进程一律 CreateNoWindow=true(既有 CreateStartInfo 已满足,不要另起新的进程启动方式)。硬规矩:①既有 Remove/Fallback 脚本除 goal ③ 点名的 Enabled 相关行外一字不改;②不删、不改任何非 YuanC-KS- 规则,不碰入站规则;③核不过必须拒连(exit 3 → 异常 → NeedsManual),不许降级成「只记审计继续连」;④原值不明时(旧记录、损坏记录)不替用户开关防火墙;⑤ControlService 的 Fatal/Exit 语义不动;⑥既有测试只加不改断言(goal ⑦ 点名的除外);⑦所有文案中文、不含凭据与路径;⑧拿不准(例如 Get-NetFirewallProfile 的 Enabled 在 Select-Object 后的字面值、-PolicyStore ActiveStore 的支持)停下交 blocked + forks,不猜;真机验证写进文档清单,不模拟成通过。",
+  "nonGoals": [
+    "不做连接期间的持续巡检(定时重核 ActiveStore)——另有巡检卡",
+    "不改 UpdateNode 路径(节点切换只换节点规则,不重核配置档)",
+    "不改界面(MainViewModel/MainWindow):提示走既有 Message 字段",
+    "不处理第三方安全软件接管防火墙的情形(只核 Windows 防火墙配置档)",
+    "不在真机实测:三档关闭机器上的拒连与还原写进真机清单(负责人本机可做)"
+  ],
+  "allowedPaths": [
+    "winclient/WinClient.Core/Firewall/KillSwitchPlanner.cs",
+    "winclient/WinClient.Core/Firewall/KillSwitchApplier.cs",
+    "winclient/WinClient.Core/Client/ClientController.cs",
+    "winclient/WinClient.Tests/KillSwitchProfileTests.cs",
+    "winclient/WinClient.Tests/FirewallTests.cs",
+    "winclient/WinClient.Tests/KillSwitchHardenTests.cs",
+    "winclient/WinClient.Tests/KillSwitchRecoveryTests.cs",
+    "winclient/WinClient.Tests/ControllerTests.cs",
+    "winclient/WinClient.Tests/TestData.cs",
+    "docs/winclient/断网保护加固说明.md",
+    "docs/winclient/架构说明.md"
+  ],
+  "forbiddenPaths": [
+    "node/**",
+    "authserver/**",
+    "scripts/**",
+    "docs/开工须知.md",
+    "docs/口径速查表.md",
+    "docs/design/**",
+    "docs/交接/**",
+    "docs/node/**",
+    "docs/plans/**",
+    "docs/acceptance/**",
+    "docs/authserver/**",
+    "docs/winclient/服务化与自启说明.md",
+    "docs/winclient/打包与发布说明.md",
+    "docs/winclient/自动更新说明.md",
+    ".github/**",
+    ".codex/**",
+    ".gitignore",
+    "pyproject.toml",
+    "winclient/third_party/**",
+    "winclient/Directory.Build.props",
+    "winclient/NuGet.Config",
+    "winclient/WinClient.Core/Firewall/CommandRunner.cs",
+    "winclient/WinClient.Core/Auth/**",
+    "winclient/WinClient.Core/Client/ClientSettings.cs",
+    "winclient/WinClient.Core/Client/ClientRuntime.cs",
+    "winclient/WinClient.Core/Client/IClientFacade.cs",
+    "winclient/WinClient.Core/Client/PairingSessionSource.cs",
+    "winclient/WinClient.Core/Client/AuthServerSessionSource.cs",
+    "winclient/WinClient.Core/Client/ISessionSource.cs",
+    "winclient/WinClient.Core/Client/DesiredStateStore.cs",
+    "winclient/WinClient.Core/Hosting/**",
+    "winclient/WinClient.Core/Ipc/**",
+    "winclient/WinClient.Core/Kernel/**",
+    "winclient/WinClient.Core/Logging/**",
+    "winclient/WinClient.Core/Pairing/**",
+    "winclient/WinClient.Core/Process/**",
+    "winclient/WinClient.Core/State/**",
+    "winclient/WinClient.Core/Storage/**",
+    "winclient/WinClient.Core/Update/**",
+    "winclient/WinClient.Core/WinClient.Core.csproj",
+    "winclient/WinClient.App/**",
+    "winclient/WinClient.Tests/AuthTests.cs",
+    "winclient/WinClient.Tests/HostingTests.cs",
+    "winclient/WinClient.Tests/IpcTests.cs",
+    "winclient/WinClient.Tests/KernelInstallerTests.cs",
+    "winclient/WinClient.Tests/PairingCertificateTests.cs",
+    "winclient/WinClient.Tests/PairingTests.cs",
+    "winclient/WinClient.Tests/ProcessStorageTests.cs",
+    "winclient/WinClient.Tests/StateTests.cs",
+    "winclient/WinClient.Tests/Update*.cs",
+    "winclient/WinClient.Tests/Fixtures/**",
+    "winclient/WinClient.Tests/WinClient.Tests.csproj"
+  ],
+  "expectArtifacts": [
+    "winclient/WinClient.Core/Firewall/KillSwitchPlanner.cs",
+    "winclient/WinClient.Core/Firewall/KillSwitchApplier.cs",
+    "winclient/WinClient.Core/Client/ClientController.cs",
+    "winclient/WinClient.Tests/KillSwitchProfileTests.cs",
+    "docs/winclient/断网保护加固说明.md"
+  ],
+  "acceptance": [
+    {
+      "id": "BUILD",
+      "kind": "command",
+      "argv": ["dotnet", "build", "winclient/WinClient.sln", "-c", "Release", "--nologo"],
+      "required": true,
+      "timeoutSec": 1200,
+      "note": "首轮会生成 third_party/bin 让指纹漂一次,正常"
+    },
+    {
+      "id": "TEST",
+      "kind": "command",
+      "argv": ["dotnet", "test", "winclient/WinClient.sln", "-c", "Release", "--no-build", "--nologo"],
+      "required": true,
+      "timeoutSec": 900,
+      "note": "既有测试全过;点名的两处断言按新形状更新,其余只加不改"
+    },
+    {
+      "id": "SHAPE-FW",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda p:pathlib.Path(p).read_text(encoding='utf-8');pl=r('winclient/WinClient.Core/Firewall/KillSwitchPlanner.cs');ap=r('winclient/WinClient.Core/Firewall/KillSwitchApplier.cs');bad=[k for k in ('VerifyProfiles','-Enabled True -DefaultOutboundAction Block','-PolicyStore ActiveStore','exit 3','verifyFailed','profiles_effective','Name,DefaultOutboundAction,Enabled') if k not in pl]+[k for k in ('FirewallIneffectiveException','VerifyFailedExitCode','ExitCode == 3' ) if k not in ap and k!='ExitCode == 3']+([] if ('== VerifyFailedExitCode' in ap or 'ExitCode == 3' in ap) else ['exit3_mapping']);print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60,
+      "note": "规划器:新动作、强制开启行、ActiveStore 核查、exit 3、状态/审计新字段;执行器:异常类型与退出码映射"
+    },
+    {
+      "id": "SHAPE-WIRE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;ct=pathlib.Path('winclient/WinClient.Core/Client/ClientController.cs').read_text(encoding='utf-8');fb=pathlib.Path('winclient/WinClient.Core/Firewall/KillSwitchPlanner.cs').read_text(encoding='utf-8');bad=[k for k,ok in (('controller.cause','FirewallIneffectiveException' in ct),('controller.failasync','FailAsync(Exception' in ct),('fallback.default_no_enabled','-DefaultOutboundAction Allow' in fb and \"-Enabled True -DefaultOutboundAction Allow\" not in fb)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60,
+      "note": "控制器透出文案;降级的系统默认分支不替用户开防火墙"
+    },
+    {
+      "id": "NOWINDOW",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;norm=lambda p:str(p).replace(chr(92),'/');files=[p for root in ('winclient/WinClient.Core','winclient/WinClient.App') for p in pathlib.Path(root).rglob('*.cs') if '/obj/' not in norm(p) and '/bin/' not in norm(p)];bad=[norm(p) for p in files if 'ProcessStartInfo' in p.read_text(encoding='utf-8') and p.parent.name!='Process' and 'CreateNoWindow = true' not in p.read_text(encoding='utf-8')];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;a=pathlib.Path('docs/winclient/断网保护加固说明.md').read_text(encoding='utf-8');b=pathlib.Path('docs/winclient/架构说明.md').read_text(encoding='utf-8');miss=[k for k in ('Enabled','ActiveStore','策略','拒绝连接','profiles_effective','verifyFailed','真机') if k not in a]+([] if ('配置档' in b or 'Enabled' in b) else ['架构说明缺指向']);print(miss);sys.exit(1 if miss else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "NOBIN",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess,sys;out=subprocess.run(['git','ls-files','winclient','build'],capture_output=True,text=True).stdout.split();bad=[f for f in out if f.endswith(('.exe','.dll','.zip','.pdb'))];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "model": null,
+  "timeoutSec": 7200,
+  "repoRoot": "E:/yuanc",
+  "engine": "codex",
+  "reasoningEffort": "high",
+  "steps": [
+    "读 background 列的源文件与测试;确认 ApplyAsync 失败到 Message 的路径与 FailAsync 的调用点。",
+    "先写 KillSwitchProfileTests.cs 与 ControllerTests 新用例的红测试;再加 VerifyProfiles 动作与脚本、改快照/强制开启/Restore/Fallback/Audit 各段、Applier 退出码映射与异常类、Controller 透出文案;更新点名的两处既有断言。",
+    "本机跑 BUILD/TEST 与各断言;写文档;交活说明列出真机待验证清单与改动的既有断言行。"
+  ]
+}

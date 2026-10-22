@@ -1,0 +1,145 @@
+{
+  "schemaVersion": 1,
+  "taskId": "SEC-NODE-ROUTE-PRIVATE-1022",
+  "slug": "yc-sec-node-route-private-1022",
+  "title": "节点侧 sing-box 路由补私网与回环阻断:隧道用户不能再经节点访问澳洲家里的内网、节点本机服务与 198.18.0.0/15 其余地址;维护人员的 SSH 通道改为按登记的维护设备(auth_user)只放行 22 端口",
+  "goal": "做完后:①node/exitnode/proxy/server_config.py 的 render_server 输出 route.rules 固定为这个顺序:a) 既有 {\"ip_cidr\": [\"198.18.255.1/32\"], \"outbound\": \"admin-local\"} 一字不改仍是第 1 条;b) 只在有维护设备时加 1 条 {\"auth_user\": [<维护设备的 device_id,按 device_id 排序>], \"ip_is_private\": true, \"port\": [22], \"outbound\": \"direct\"};c) {\"ip_is_private\": true, \"outbound\": \"block\"};d) {\"ip_cidr\": [\"198.18.0.0/15\"], \"outbound\": \"block\"};route.final 仍是 \"direct\",outbounds 三个 tag(direct/block/admin-local)不变不增。维护设备 = ctx.maintenance_device_ids 里出现、且在 devices 里是未吊销(revoked_at is None)的 device_id;列表为空或没有一个匹配就不生成 b) 这条(不报错,不留空 auth_user)。②为了让 auth_user 对主通道也生效,in-reality 的 users 每项加 \"name\": d.device_id(保留 uuid 与 flow);in-hy2 的 users 已有 name 不动。③node/exitnode/proxy/context.py 的 ProxyContext 新增字段 maintenance_device_ids: tuple[str, ...] = (),validate_context 校验每项是非空字符串且无重复(否则 ValueError,中文文案);node/exitnode/config.py 的 Proxy 新增 maintenance_device_ids: list[str] = field(default_factory=list),load 时按既有方式校验类型(非字符串列表报 ConfigError,中文);node/exitnode/service.py 的 build_context 把 tuple(config.proxy.maintenance_device_ids) 传进去。④黄金文件 node/tests/golden/proxy/server.json 同步为新输出(黄金用的输入没有维护设备,所以只多 c)、d) 两条规则与 vless users 的 name)。⑤测试(node/tests/test_proxy_server_render.py 只加不改既有断言,除 test_server_exact_golden_and_revoked_exclusion 随黄金自然更新):(a) 规则顺序与上面 a)~d) 完全一致、final 为 direct;(b) 给 ctx 两个维护设备 id,其中一个已吊销、一个不存在、一个有效 → auth_user 只含有效那个,规则在 admin-local 之后、block 之前,port 为 [22];(c) 全部不匹配 → 没有任何含 auth_user 的规则;(d) vless 每个 user 的 name == device_id 且 hy2 users 不变;(e) validate_context 对空字符串、重复 id 抛 ValueError;test_config.py 加:缺省为空列表、填非列表或含非字符串报 ConfigError;test_service.py 若有 build_context 覆盖则加一条断言字段透传(没有就不加)。node/tests/test_renderer_parity.py、test_proxy_sync.py 若比对黄金,随黄金更新,不改断言语义。⑥文档:docs/node/配置说明.md 「每一项怎么填」表格加一行 proxy.maintenance_device_ids(维护设备的设备编号列表,默认空;写了的设备连上隧道后能用 SSH 连节点与局域网内其他机器的 22 端口,其他设备连私网一律被拦);docs/node/隧道配置说明.md 「给接入维护人员的补充」加一小段「隧道里能到哪、不能到哪」:私网地址(10/8、172.16/12、192.168/16、169.254/16、127/8、fc00::/7、fe80::/10 等 sing-box 判定为私网的全部)与 198.18.0.0/15 一律阻断,只有维护设备能走 22 端口,改配置后要重新生成并重载服务才生效,真机待验证项写明「从非维护设备 curl http://192.168.1.1 应失败、维护设备 ssh 节点局域网地址应通」;docs/node/救援单元说明.md 第 82 行那段「维护人员连上隧道后,用 SSH 连接节点的局域网地址」补一句:前提是该设备的 device_id 已写进 proxy.maintenance_device_ids,否则会被节点路由拦下。",
+  "background": "项目:外包,中国客户端经加密隧道到澳洲家宽出口;节点程序 Python 在 node/exitnode,sing-box 1.10.7 配置由 proxy/server_config.py 渲染(官方 JSON 格式),黄金文件在 node/tests/golden/proxy/。对抗审查(看板 yuanc 卡 SECURITY-REDTEAM-1022 A1/C-H1)查实:route 只有 198.18.255.1→admin-local 一条,final=direct,任何持有设备凭据的客户端把目标写成 192.168.x.1、NAS、节点本机 22/8000/8443 就直连澳洲家里的内网;分发版每个邀请码用户都能这样做;鉴权服务按 client.host 限流也因来源都是 127.0.0.1 失效。本卡只改节点路由(sing-box 层),nft 表、鉴权服务、客户端配置都不动。sing-box 1.10 路由规则字段:ip_is_private(布尔,匹配私网、回环、链路本地、ULA 等)、ip_cidr、port(整数数组,目标端口)、auth_user(字符串数组,匹配入站 users 的 name;vless users 支持 name 字段)。规则按顺序匹配,先匹配先生效,所以维护放行必须排在 block 之前,admin-local 必须保持第 1 条(198.18.255.1 是客户端访问节点管理口的假地址,它在 198.18.0.0/15 之内,顺序反了会被 d) 拦掉)。维护设备为什么按 device_id 不按账号:登记表 Device 只有 device_id/account_id/platform/name/uuid/hy2_password,device_id 在未吊销设备中唯一,配置文件里写 device_id 最直白;未来按账号放行另立卡。节点公网 IP 的回环访问(隧道内访问节点自己的公网地址)本卡不封:公网地址是动态的,写进静态配置会让每次换 IP 都重载,放到 nft 层另立卡处理。先读:node/exitnode/proxy/{server_config,context,registry}.py、node/exitnode/config.py(Proxy 数据类与 load 的校验写法)、node/exitnode/service.py 的 build_context、node/tests/{test_proxy_server_render,test_config,test_service,test_renderer_parity,test_proxy_sync}.py、node/tests/golden/proxy/server.json、docs/node/{配置说明,隧道配置说明,救援单元说明}.md。环境:工位无外网;跑法 python -m ruff check node scripts authserver 与 python -m pytest -q node/tests;搜索用 rg 或 git grep。同仓同时还有两张节点卡在别的工位施工(yc-sec-node-token-argv-1022 只动 updater/upgrade.py 与 test_updater.py;yc-sec-node-watchdog-startlimit-1022 只动 templates/exitnode-watchdog.*、watchdog/__init__.py、test_systemd_render.py、test_watchdog.py、docs/node/看门狗说明.md),本卡不得碰这些文件。硬规矩:①admin-local 规则保持第 1 条且一字不改;②不新增 outbound、不改 dns、不改 inbounds 其他字段;③auth_user 规则只在有匹配的未吊销维护设备时出现,绝不输出空数组;④所有报错与文档中文;⑤拿不准(例如 sing-box 1.10 某字段名)停下交 blocked + forks,不猜;真机项写进文档不模拟成通过。",
+  "nonGoals": [
+    "不改 nft 表(input/forward 仍 accept),不封节点自己的公网 IP(动态地址,另立卡走 nft 层)",
+    "不改客户端配置渲染 client_config.py(客户端 route.final=proxy 不动)",
+    "不改鉴权服务、不改设备登记表结构(不给 Device 加角色字段)",
+    "不做按账号放行,不做维护设备的界面/CLI 管理命令(配置文件手填)",
+    "不在真机实测:从非维护设备访问私网应失败、维护设备 ssh 应通写进文档真机清单"
+  ],
+  "allowedPaths": [
+    "node/exitnode/proxy/server_config.py",
+    "node/exitnode/proxy/context.py",
+    "node/exitnode/config.py",
+    "node/exitnode/service.py",
+    "node/tests/golden/proxy/server.json",
+    "node/tests/test_proxy_server_render.py",
+    "node/tests/test_config.py",
+    "node/tests/test_service.py",
+    "node/tests/test_renderer_parity.py",
+    "node/tests/test_proxy_sync.py",
+    "docs/node/配置说明.md",
+    "docs/node/隧道配置说明.md",
+    "docs/node/救援单元说明.md"
+  ],
+  "forbiddenPaths": [
+    "winclient/**",
+    "authserver/**",
+    "scripts/**",
+    "docs/开工须知.md",
+    "docs/口径速查表.md",
+    "docs/design/**",
+    "docs/交接/**",
+    "docs/plans/**",
+    "docs/acceptance/**",
+    "docs/authserver/**",
+    "docs/winclient/**",
+    "docs/node/看门狗说明.md",
+    "docs/node/更新与回退说明.md",
+    "docs/node/客户端包托管说明.md",
+    "docs/node/自用配对说明.md",
+    ".github/**",
+    ".codex/**",
+    ".gitignore",
+    "pyproject.toml",
+    "node/exitnode/updater/**",
+    "node/exitnode/watchdog/**",
+    "node/exitnode/templates/**",
+    "node/exitnode/admin/**",
+    "node/exitnode/rescue/**",
+    "node/exitnode/nft.py",
+    "node/exitnode/netinfo.py",
+    "node/exitnode/cli.py",
+    "node/exitnode/status.py",
+    "node/exitnode/proxy/client_config.py",
+    "node/exitnode/proxy/registry.py",
+    "node/exitnode/proxy/keys.py",
+    "node/exitnode/proxy/sync.py",
+    "node/tests/golden/exitnode-*",
+    "node/tests/golden/device/**",
+    "node/tests/golden/proxy/client*.json",
+    "node/tests/test_updater.py",
+    "node/tests/test_watchdog.py",
+    "node/tests/test_systemd_render.py",
+    "node/tests/test_proxy_client_render.py",
+    "node/tests/test_nft_render.py"
+  ],
+  "expectArtifacts": [
+    "node/exitnode/proxy/server_config.py",
+    "node/exitnode/proxy/context.py",
+    "node/exitnode/config.py",
+    "node/exitnode/service.py",
+    "node/tests/golden/proxy/server.json",
+    "node/tests/test_proxy_server_render.py",
+    "docs/node/隧道配置说明.md"
+  ],
+  "acceptance": [
+    {
+      "id": "RUFF",
+      "kind": "command",
+      "argv": ["python", "-m", "ruff", "check", "node", "scripts", "authserver"],
+      "required": true,
+      "timeoutSec": 300
+    },
+    {
+      "id": "PYTEST",
+      "kind": "command",
+      "argv": ["python", "-m", "pytest", "-q", "node/tests"],
+      "required": true,
+      "timeoutSec": 900,
+      "note": "既有断言只加不改(黄金随输出更新除外);新增用例见 goal ⑤"
+    },
+    {
+      "id": "GOLDEN",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import json,sys;c=json.load(open('node/tests/golden/proxy/server.json',encoding='utf-8'));r=c['route']['rules'];bad=[];bad+=[] if r[0]=={'ip_cidr':['198.18.255.1/32'],'outbound':'admin-local'} else ['first'];bad+=[] if {'ip_is_private':True,'outbound':'block'} in r else ['private'];bad+=[] if {'ip_cidr':['198.18.0.0/15'],'outbound':'block'} in r else ['fakeip'];bad+=[] if not any('auth_user' in x for x in r) else ['auth_user_in_golden'];bad+=[] if c['route']['final']=='direct' else ['final'];bad+=[] if [o['tag'] for o in c['outbounds']]==['direct','block','admin-local'] else ['outbounds'];v=[i for i in c['inbounds'] if i['tag']=='in-reality'][0];bad+=[] if all('name' in u and 'uuid' in u for u in v['users']) else ['vless_name'];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60,
+      "note": "黄金:admin-local 仍第 1 条、私网与 198.18.0.0/15 阻断在、无维护设备不出 auth_user、outbounds 不变、vless users 带 name"
+    },
+    {
+      "id": "SHAPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda p:pathlib.Path(p).read_text(encoding='utf-8');s=r('node/exitnode/proxy/server_config.py');x=r('node/exitnode/proxy/context.py');c=r('node/exitnode/config.py');v=r('node/exitnode/service.py');bad=[k for k,ok in (('render.auth_user','auth_user' in s),('render.port22','22' in s),('render.private','ip_is_private' in s),('ctx.field','maintenance_device_ids' in x),('config.field','maintenance_device_ids' in c),('service.wire','maintenance_device_ids' in v)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda p:pathlib.Path(p).read_text(encoding='utf-8');a=r('docs/node/配置说明.md');b=r('docs/node/隧道配置说明.md');c=r('docs/node/救援单元说明.md');bad=([] if 'maintenance_device_ids' in a else ['配置说明'])+[k for k in ('198.18.0.0/15','22','维护设备','真机') if k not in b]+([] if 'maintenance_device_ids' in c else ['救援说明']);print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "model": null,
+  "timeoutSec": 5400,
+  "repoRoot": "E:/yuanc",
+  "engine": "codex",
+  "reasoningEffort": "high",
+  "steps": [
+    "读 background 列的源文件、黄金与测试;确认 render_server 的调用点与黄金比对点。",
+    "先写 goal ⑤ 的红测试(规则顺序、维护设备过滤、vless name、配置校验),再改 context/config/service/server_config,更新黄金。",
+    "本机跑 RUFF/PYTEST 与各断言;写三份文档;交活说明列出真机待验证清单与未动的既有断言。"
+  ]
+}
