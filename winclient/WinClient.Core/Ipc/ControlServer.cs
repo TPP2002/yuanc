@@ -11,6 +11,10 @@ public sealed class ControlServer(IClientFacade facade, DesiredStateStore desire
     TimeSpan? idleTimeout = null)
 {
     public static readonly TimeSpan DefaultIdleTimeout = TimeSpan.FromSeconds(30);
+    /// <summary>不可信调用者发会改变连接状态的指令时返回的错误文案。</summary>
+    public const string UntrustedCallerError = "只有本产品的界面程序可以执行此操作";
+    // 会改变连接状态或配对的指令：只允许程序位于安装目录之下的调用者执行。其余（status/subscribe/check_update/read_audit）只读，不受限。
+    private static readonly HashSet<string> StateChangingOps = ["connect", "disconnect", "redeem", "import_pairing", "clear_pairing"];
     // One ordering across connections keeps persisted intent consistent with completed commands.
     private readonly SemaphoreSlim commands = new(1, 1);
     // 未订阅连接的空闲上限；零或负数表示不限。已订阅连接靠推送保活，不受此限。
@@ -18,7 +22,9 @@ public sealed class ControlServer(IClientFacade facade, DesiredStateStore desire
     private ControlSnapshot Snapshot() => ((ControlSnapshot)facade.Snapshot) with
     { ServiceVersion = serviceVersion ?? ControlSnapshot.CurrentVersion, Update = updates?.Status ?? new() };
 
-    public async Task ServeAsync(Stream stream, CancellationToken cancellationToken = default)
+    /// <param name="callerTrusted">调用者是否可信（由宿主按调用者程序路径判定）；默认 true 保持既有行为。
+    /// 为 false 时会改变连接状态的指令一律拒绝，只读指令照常。</param>
+    public async Task ServeAsync(Stream stream, CancellationToken cancellationToken = default, bool callerTrusted = true)
     {
         using (stream)
         using (var closed = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
@@ -72,7 +78,7 @@ public sealed class ControlServer(IClientFacade facade, DesiredStateStore desire
                             if (!subscribed) { facade.Changed += Changed; if (updates is not null) updates.Changed += UpdateChanged; subscribed = true; }
                             Enqueue(new ControlResponse(request.Id, true, Snapshot: Snapshot()));
                         }
-                        else Enqueue(await ExecuteAsync(request, closed.Token).ConfigureAwait(false));
+                        else Enqueue(await ExecuteAsync(request, callerTrusted, closed.Token).ConfigureAwait(false));
                     }
                     finally { ArmIdle(); }
                 }
@@ -94,8 +100,10 @@ public sealed class ControlServer(IClientFacade facade, DesiredStateStore desire
         }
     }
 
-    private async Task<ControlResponse> ExecuteAsync(ControlRequest request, CancellationToken token)
+    private async Task<ControlResponse> ExecuteAsync(ControlRequest request, bool callerTrusted, CancellationToken token)
     {
+        // 不可信调用者：不进指令信号量、不调门面、不写期望状态，直接拒绝。
+        if (!callerTrusted && StateChangingOps.Contains(request.Op)) return new(request.Id, false, UntrustedCallerError);
         if (request.Op == "check_update")
         {
             if (updates is not null) _ = updates.CheckNowAsync();
