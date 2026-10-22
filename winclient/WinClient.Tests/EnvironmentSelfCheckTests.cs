@@ -71,6 +71,37 @@ public sealed class EnvironmentSelfCheckTests
     }
 
     [Fact]
+    public void 浏览器策略明细只在已核验结果中说明覆盖边界()
+    {
+        const string boundary = ";策略只覆盖 Chrome 与 Edge,360、QQ、搜狗、夸克等浏览器不受约束";
+        var passed = EnvironmentSelfCheck.Evaluate(Good);
+        var inspection = GoodInspection with { TimeZone = "China Standard Time", AutoTimeZoneStart = null,
+            ChromeForcedLanguages = ["en", "en-AU"], Edge = new Dictionary<string, string?>() };
+        var failed = EnvironmentSelfCheck.Evaluate(Good with { Inspection = inspection, EnvironmentApplied = false });
+        var skipped = EnvironmentSelfCheck.Evaluate(Good with { EnvironmentEnabled = false });
+        var unknown = EnvironmentSelfCheck.Evaluate(Good with { Inspection = null });
+
+        foreach (var index in new[] { 4, 5 })
+        {
+            Assert.Equal("通过", passed.Items[index].Result);
+            foreach (var name in new[] { "360", "夸克", "Chrome", "Edge" })
+                Assert.Contains(name, passed.Items[index].Detail);
+            Assert.EndsWith(boundary, passed.Items[index].Detail);
+            Assert.Equal("未通过", failed.Items[index].Result);
+            Assert.StartsWith("不符项:", failed.Items[index].Detail);
+            Assert.EndsWith(boundary, failed.Items[index].Detail);
+            Assert.DoesNotContain("en-AU", failed.Items[index].Detail);
+            Assert.Equal("跳过", skipped.Items[index].Result);
+            Assert.DoesNotContain("360", skipped.Items[index].Detail);
+            Assert.Equal("无法核验", unknown.Items[index].Result);
+            Assert.DoesNotContain("360", unknown.Items[index].Detail);
+        }
+        Assert.Contains("ForcedLanguages", failed.Items[4].Detail);
+        foreach (var name in new[] { "DefinePreferredLanguages", "WebRtcLocalhostIpHandling", "DefaultGeolocationSetting" })
+            Assert.Contains(name, failed.Items[5].Detail);
+    }
+
+    [Fact]
     public void CountryMismatchNamesFailureWithoutAddress()
     {
         var report = EnvironmentSelfCheck.Evaluate(Good with { Exit = new(Good.Exit!.Address, "CN") });

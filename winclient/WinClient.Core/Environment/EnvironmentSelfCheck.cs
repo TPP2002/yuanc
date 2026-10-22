@@ -131,6 +131,9 @@ public static class EnvironmentSelfCheck
     private static CheckItem Policy(string id, string name, params (string Name, bool Matches)[] conditions)
     {
         var missing = conditions.Where(condition => !condition.Matches).Select(condition => condition.Name).ToArray();
-        return new(id, name, missing.Length == 0 ? "通过" : "未通过", missing.Length == 0 ? "符合目标要求" : "不符项:" + string.Join("、", missing));
+        var detail = missing.Length == 0 ? "符合目标要求" : "不符项:" + string.Join("、", missing);
+        if (id is "chrome_policy" or "edge_policy")
+            detail += ";策略只覆盖 Chrome 与 Edge,360、QQ、搜狗、夸克等浏览器不受约束";
+        return new(id, name, missing.Length == 0 ? "通过" : "未通过", detail);
     }
 }
