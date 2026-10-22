@@ -1,0 +1,177 @@
+{
+  "schemaVersion": 1,
+  "taskId": "SEC-WIN-PIPE-DOS-1022",
+  "slug": "yc-sec-win-pipe-harden-1022",
+  "title": "Windows 客户端本机管道三处加固(一单覆盖看板卡 SEC-WIN-PIPE-DOS-1022、SEC-WIN-PIPE-SPOOF-1022、SEC-WIN-STATUS-LOCK-1022):①管道占满——实例 4→16、未订阅连接 30 秒空闲断开、按客户端进程每进程最多 2 条;更新助手 60 秒连不上管道时改查服务进程映像再定是否判坏;卸载连不上管道时停服务后自己撤防;②冒名——服务端首实例独占(FirstPipeInstance),界面/更新助手/卸载连上后核对服务端进程是会话 0 且程序在安装目录下,不符断开;③状态锁——status 不进指令信号量,直接读快照",
+  "goal": "以主干 05dce36 为基点(含 PR #27 的 keepProtection 启动分路)。做完后:\n\n① 【STATUS-LOCK】winclient/WinClient.Core/Ipc/ControlServer.cs:ExecuteAsync 里 `status` 与现有 `check_update` 一样**不进 `commands` 信号量**,直接返回 `new(request.Id, true, Snapshot: Snapshot())`;connect/disconnect/redeem/import_pairing/clear_pairing/read_audit 仍排队,顺序语义不变。\n\n② 【PIPE-DOS·服务端】\n  (a) ControlServer 构造加可选参数 `TimeSpan? idleTimeout = null`(默认 30 秒;TimeSpan.Zero 或负数表示不限),语义:**尚未发送 subscribe 的连接**,自上一条请求(或连接建立)起超过 idleTimeout 没有新请求就由服务端断开(取消 closed、关流);已 subscribe 的连接不受此限(它们靠推送保活,断开仍由对端或服务停止决定)。每收到一条请求重置计时。实现只用 CancellationTokenSource.CancelAfter / 重置,不开线程。\n  (b) 新文件 winclient/WinClient.Core/Ipc/ConnectionBudget.cs:纯逻辑类 `ConnectionBudget(int maxTotal, int maxPerClient)`,方法 `bool TryAdmit(uint clientProcessId)`、`void Release(uint clientProcessId)`、属性 `int Active`;同一进程超过 maxPerClient 或总数超过 maxTotal 返回 false(不计数);线程安全(lock)。服务用 `new ConnectionBudget(16, 2)`。\n  (c) winclient/WinClient.App/Hosting/ControlService.cs:`MaxInstances = 16`,监听任务数与 NamedPipeServerStreamAcl.Create 的 maxNumberOfServerInstances 都用它;WaitForConnectionAsync 返回后先取客户端进程号(新文件 WinClient.App/Hosting/PipePeer.cs 的 `PipePeer.ClientProcessId(NamedPipeServerStream)`,P/Invoke kernel32 GetNamedPipeClientProcessId,失败返回 null),再 `budget.TryAdmit(pid)`:取不到进程号或超额 → 直接 Dispose 该管道、不调用 ServeAsync、Log 一行「同一程序的管道连接数超限，已拒绝（进程 <pid>）」(同一 pid 五分钟内只记一次,防刷日志);被接纳的在 ServeAsync 结束后 `budget.Release(pid)`(finally 里)。\n\n③ 【PIPE-SPOOF·服务端】ControlService:**服务启动创建的第一个管道实例**带 `PipeOptions.FirstPipeInstance`(与 Asynchronous 按位或);创建抛 IOException / UnauthorizedAccessException → Log「管道名已被其他程序占用，后台服务拒绝启动」后 Fatal();之后所有实例(各监听循环的后续迭代、其余监听任务)不带该标志。实现建议:OnStart 里在拉起监听任务之前同步创建首实例并交给第一个监听任务使用,其余任务照旧在循环里创建。\n\n④ 【PIPE-SPOOF·客户端核验】PipePeer.cs 再提供:\n  (a) 纯判定 `public static bool IsTrustedServer(uint sessionId, string? imagePath, string appRoot)`:sessionId == 0,imagePath 非空、Path.IsPathFullyQualified、Path.GetFullPath 后不含 `..` 段且以 Path.GetFullPath(appRoot) + 分隔符 为前缀(OrdinalIgnoreCase)→ true;否则 false。appRoot 调用方传 UpdatePlanner.DefaultAppRoot(= %ProgramFiles%\\YuanC\\app)。\n  (b) `public static bool VerifyServer(NamedPipeClientStream pipe, string appRoot)`:GetNamedPipeServerProcessId → OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION=0x1000) → QueryFullProcessImageNameW(flags 0)→ ProcessIdToSessionId,任一步失败返回 false;成功交 IsTrustedServer 判定;句柄用 SafeHandle/finally 关闭。所有 P/Invoke 用 LibraryImport 或 DllImport 均可,不新增 NuGet 包。\n  (c) 接入三处,连接成功后、发第一条指令前核验,不过就断开:\n    · winclient/WinClient.App/MainViewModel.cs InitializeCoreAsync:ConnectAsync 成功后 `if (!PipePeer.VerifyServer(pipe, UpdatePlanner.DefaultAppRoot))` → pipe.Dispose()、availability = Unavailable、Update(snapshot with { Status = \"后台服务身份核验失败\", Message = \"连接到的不是本产品的后台服务，已断开；请联系管理员。\" })、**直接 return 不再重试**(重试只会再连到同一个冒名者)。\n    · winclient/WinClient.App/Hosting/UpdateWindowsHost.cs ReadStatusAsync:核验不过返回 null(与连不上同样处理,后续由 ⑤ 的服务进程兜底判定)。\n    · winclient/WinClient.App/Hosting/InstallerRunner.cs UninstallAsync:核验不过按「未连上」处理(走 ⑥ 的自行撤防路径),并 Console.Error 打「后台服务身份核验失败，按未联系上处理。」。\n\n⑤ 【PIPE-DOS·更新助手】\n  (a) winclient/WinClient.App/Hosting/UpdateApplier.cs 的 IUpdateHost 新增 `string? RunningServiceExecutable()`:服务当前为 Running 且能取到服务进程的程序完整路径就返回它(Path.GetFullPath 规范化),否则 null。UpdateWindowsHost 实现:ServiceController 状态 Running → P/Invoke advapi32 OpenSCManagerW(GENERIC_READ)/OpenServiceW(SERVICE_QUERY_STATUS)/QueryServiceStatusEx(SC_STATUS_PROCESS_INFO)取 dwProcessId → 复用 PipePeer 的进程映像查询;任一步失败返回 null。\n  (b) RunAsync 的 60 秒探测循环结束 `healthy is null` 时,**先**问 `host.RunningServiceExecutable()`:等于 pending.NewExe(两边 Path.GetFullPath,OrdinalIgnoreCase)→ 新版进程确实在跑、只是管道不通,**不算 badProcess**:抛 InvalidOperationException 走既有回滚,history 用既有非坏文案「更新未完成，已恢复旧版，下次再试。」,不 MarkBad;不等于(null 或别的路径)→ 照旧 badProcess。120 秒等 Connected 的分支里「版本不符 → badProcess」不变。\n  (c) UpdateApplierTests 的假宿主加属性 `string? RunningExe`(默认 null,既有数据行行为不变),新增两行/两条用例:silent + RunningExe == NewExe → 不 MarkBad、history rolled_back 且 reason 含「下次再试」、.bad 不存在;silent + RunningExe == OldExe → 照旧 MarkBad。\n\n⑥ 【PIPE-DOS·卸载】InstallerRunner.UninstallAsync 改成:先按现状尝试连管道(3 秒)并核验(④c);**连上且核验通过** → 发 disconnect,结果不是 {ProtectionActive:false, State:Disconnected} 仍 SafeError「未能撤销断网保护，卸载已停止，请联系管理员。」(不变);**连不上或核验不过** → Console.Error 打「无法联系后台服务，将在停止服务后直接恢复网络。」,然后**先停服务**(既有停服务逻辑提前到这里:Stopped 以外先 Stop、等到 Stopped),再 `await new KillSwitchApplier(Path.Combine(ClientSettings.DataDirectory, \"run\")).RemoveAsync()`;RemoveAsync 抛异常 → SafeError「未能撤销断网保护，卸载已停止，请联系管理员。」并**不删服务、不删自启值**(服务留着下次开机还能按期望状态接管保护,比留一套没人管的阻止规则安全)。随后删服务、删自启值与现状相同。服务不存在(ServiceStatus() 为 null)且连不上管道时同样跑 RemoveAsync(可能残留规则)。\n\n⑦ 测试(既有断言只加不改;替身因接口新增而补方法/属性属接口适配):\n  IpcTests.cs:(a) 两个连接,第一个发 connect 而假门面的 ConnectAsync 卡在 TaskCompletionSource 上,第二个连接发 status 应在 1 秒内收到 Ok 响应;放开 TCS 后 connect 也完成;(b) idleTimeout=200ms:未 subscribe 的连接 600ms 内被服务端关闭(ServeAsync 返回/流被关),已 subscribe 的同样等 600ms 仍能收到 status 响应;(c) 未 subscribe 但每 100ms 发一条 status 的连接在 600ms 内不被关闭(请求重置计时);(d) idleTimeout=TimeSpan.Zero 时未 subscribe 空闲 600ms 也不关。\n  HostingTests.cs:(e) ConnectionBudget:同一 pid 第 3 次 TryAdmit 为 false、Release 后再 TryAdmit 为 true、总数达 maxTotal 后别的 pid 也 false、Active 计数正确;(f) IsTrustedServer:会话 0 + 路径在 appRoot 子目录 → true;会话 1 → false;路径在 appRoot 之外 / 等于 appRoot 本身 / 含 `..` / 相对路径 / null → false;大小写不同的同路径 → true。\n  UpdateApplierTests.cs:见 ⑤(c)。\n  不写需要真实命名管道、真实 SCM 或管理员权限的测试;P/Invoke 封装本身不测,真机项写文档。\n\n⑧ 文档:docs/winclient/服务化与自启说明.md「本机管道协议」段改写:16 个实例、首实例独占、未订阅连接 30 秒空闲断开、每客户端进程最多 2 条(超限直接断开并记日志)、status 不排队;新增一段「客户端核验服务端身份」(会话 0 + 程序在 %ProgramFiles%\\YuanC\\app 之下,界面不过不重试并提示,更新助手与卸载按连不上处理);「卸载」段改成 ⑥ 的新流程;真机待验证清单加:16 条连接并发与第 17 条等待、同一进程第 3 条被拒、冒名管道(服务停止后用别的程序建同名管道)被界面识别并提示、卸载时服务不可达也能恢复网络。docs/winclient/自动更新说明.md 第 3/5 步改写:管道 60 秒不通时查服务进程映像,等于新版则只记「下次再试」不写 .bad,否则写 .bad;真机待验证加「新版在跑但管道被占满时的回退不标坏」。\n\n⑨ 工程纪律:所有新 P/Invoke 与系统调用不弹窗口(没有新进程就天然满足;若有 ProcessStartInfo 必须 CreateNoWindow = true);工人不自己跑 dotnet build/test/publish/restore,统一用派单器的自测通道跑 BUILD/TEST(沙箱里跑过的 MSBuild 节点会让后续构建报拒绝访问);测试与构建产物只落 build/(已配置 UseArtifactsOutput),不往 winclient/ 下写文件;全程中文:注释、文案、文档、交活说明。",
+  "background": "项目:外包,中国侧 Windows 10/11 客户端(.NET 9,WPF 界面 + Windows 服务 + 更新助手 + 安装/卸载角色都在同一个 exe,winclient/WinClient.App;纯逻辑在 WinClient.Core;测试 WinClient.Tests 用 xunit、假流 FakeStream、假门面 Facade、假宿主)。服务端:WinClient.App/Hosting/ControlService.cs 用 NamedPipeServerStreamAcl.Create(\"YuanC-Control\", InOut, 4, Byte, Asynchronous, 4096, 4096, PipeSecurity) 开 4 个监听循环,每个连上后交 Core 的 ControlServer.ServeAsync(stream);PipeSecurity:SYSTEM/Administrators FullControl、Users ReadWrite、Network 拒绝。ControlServer.ServeAsync:每连接一个读循环 + 一个发送队列(Channel 64),subscribe 后挂 facade.Changed 推快照;ExecuteAsync 里 check_update 不排队,其余(含 status)进一把 SemaphoreSlim commands。客户端三处:MainViewModel.InitializeCoreAsync(3 秒连接超时,失败重试 5 次间隔 1 秒,成功后 subscribe)、UpdateWindowsHost.ReadStatusAsync(更新助手每 2 秒探一次 status,UpdateApplier 60 秒内没拿到 ServiceVersion==新版的成功响应就 badProcess → MarkBad 写 .bad 并回滚)、InstallerRunner.UninstallAsync(连 3 秒,连不上就打一句跳过断开,然后停服务、删服务、删自启值)。IUpdateHost 现有成员:Now / DesiredConnection / DelayAsync / WaitServiceAsync / ReadStatusAsync / SetRunValue;UpdateApplierTests 的假宿主 FakeHost 用 mode 字符串控制 ReadStatusAsync 返回(silent=null)。KillSwitchApplier(runDirectory, runner=null) 有 RemoveAsync()(删 YuanC-KS-* 规则并按恢复文件还原三个配置档默认出站;无恢复文件设回 Allow)。服务 exe 安装在 %ProgramFiles%\\YuanC\\app\\<版本>\\YuanC-Client.exe(UpdatePlanner.DefaultAppRoot / Executable(appRoot, version));服务名 ServiceInstaller.ServiceName=\"YuanCService\"。HostingTests.AllSystemCommandsAreHiddenAndUseFullPathsAndArgumentLists 核所有 sc 命令隐藏窗口。文档正本:docs/winclient/服务化与自启说明.md(「本机管道协议」「卸载」「真机待验证」段)、docs/winclient/自动更新说明.md(第 3/5 步与真机待验证)。第三方件 winclient/third_party/cache/{sing-box-1.10.7-windows-amd64.zip,wintun-0.14.1.zip} 由派单方放进工位(沙箱无外网,不要自己下载)。工人不许 git 写操作;验收由派单器在工位跑。",
+  "nonGoals": [
+    "不改管道权限(PipeSecurity)、不改协议消息格式、不改 ControlClient",
+    "不改 ControlServer 对 connect/disconnect/redeem/import_pairing/clear_pairing/read_audit 的排队顺序语义",
+    "不改 UpdateApplier 的 60 秒 / 120 秒时限与回滚命令序列;只改「管道不通时判不判坏」",
+    "不做管道消息签名或共享密钥鉴权(进程身份核验已覆盖冒名场景)",
+    "不在真机实测;真机项写进两份文档的待验证清单"
+  ],
+  "allowedPaths": [
+    "winclient/WinClient.App/Hosting/ControlService.cs",
+    "winclient/WinClient.App/Hosting/PipePeer.cs",
+    "winclient/WinClient.App/Hosting/UpdateWindowsHost.cs",
+    "winclient/WinClient.App/Hosting/UpdateApplier.cs",
+    "winclient/WinClient.App/Hosting/InstallerRunner.cs",
+    "winclient/WinClient.App/MainViewModel.cs",
+    "winclient/WinClient.Core/Ipc/ControlServer.cs",
+    "winclient/WinClient.Core/Ipc/ConnectionBudget.cs",
+    "winclient/WinClient.Tests/IpcTests.cs",
+    "winclient/WinClient.Tests/HostingTests.cs",
+    "winclient/WinClient.Tests/UpdateApplierTests.cs",
+    "winclient/WinClient.Tests/UpdateIpcTests.cs",
+    "docs/winclient/服务化与自启说明.md",
+    "docs/winclient/自动更新说明.md"
+  ],
+  "forbiddenPaths": [
+    "node/**",
+    "authserver/**",
+    "scripts/**",
+    "docs/开工须知.md",
+    "docs/口径速查表.md",
+    "docs/design/**",
+    "docs/交接/**",
+    "docs/plans/**",
+    "docs/acceptance/**",
+    "docs/authserver/**",
+    "docs/node/**",
+    "docs/winclient/断网保护加固说明.md",
+    "docs/winclient/架构说明.md",
+    ".github/**",
+    ".codex/**",
+    ".gitignore",
+    "pyproject.toml",
+    "winclient/WinClient.sln",
+    "winclient/Directory.Build.props",
+    "winclient/third_party/**",
+    "winclient/WinClient.App/WinClient.App.csproj",
+    "winclient/WinClient.Core/WinClient.Core.csproj",
+    "winclient/WinClient.Tests/WinClient.Tests.csproj",
+    "winclient/WinClient.App/App.xaml",
+    "winclient/WinClient.App/App.xaml.cs",
+    "winclient/WinClient.App/MainWindow.xaml",
+    "winclient/WinClient.App/MainWindow.xaml.cs",
+    "winclient/WinClient.App/Program.cs",
+    "winclient/WinClient.App/Hosting/UpdateRecovery.cs",
+    "winclient/WinClient.Core/Ipc/ControlClient.cs",
+    "winclient/WinClient.Core/Ipc/ControlProtocol.cs",
+    "winclient/WinClient.Core/Client/**",
+    "winclient/WinClient.Core/Firewall/**",
+    "winclient/WinClient.Core/State/**",
+    "winclient/WinClient.Core/Update/**",
+    "winclient/WinClient.Core/Hosting/**",
+    "winclient/WinClient.Core/Storage/**",
+    "winclient/WinClient.Core/Kernel/**",
+    "winclient/WinClient.Core/Logging/**",
+    "winclient/WinClient.Core/Process/**",
+    "winclient/WinClient.Tests/ControllerTests.cs",
+    "winclient/WinClient.Tests/KillSwitch*.cs",
+    "winclient/WinClient.Tests/Pairing*.cs",
+    "winclient/WinClient.Tests/Update*Tests.cs",
+    "winclient/WinClient.Tests/DataDirectorySecurityTests.cs",
+    "winclient/WinClient.Tests/Fixtures/**"
+  ],
+  "expectArtifacts": [
+    "winclient/WinClient.App/Hosting/ControlService.cs",
+    "winclient/WinClient.App/Hosting/PipePeer.cs",
+    "winclient/WinClient.App/Hosting/UpdateApplier.cs",
+    "winclient/WinClient.App/Hosting/InstallerRunner.cs",
+    "winclient/WinClient.Core/Ipc/ControlServer.cs",
+    "winclient/WinClient.Core/Ipc/ConnectionBudget.cs",
+    "winclient/WinClient.Tests/IpcTests.cs",
+    "docs/winclient/服务化与自启说明.md"
+  ],
+  "acceptance": [
+    {
+      "id": "BUILD",
+      "kind": "command",
+      "argv": ["dotnet", "build", "winclient/WinClient.sln", "-c", "Release", "--nologo"],
+      "required": true,
+      "timeoutSec": 1200,
+      "note": "首轮会生成 third_party/bin 让指纹漂一次,正常"
+    },
+    {
+      "id": "TEST",
+      "kind": "command",
+      "argv": ["dotnet", "test", "winclient/WinClient.sln", "-c", "Release", "--no-build", "--nologo"],
+      "required": true,
+      "timeoutSec": 900,
+      "note": "既有测试全过;替身补成员属接口适配,断言不改"
+    },
+    {
+      "id": "SHAPE-SERVER",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda p:pathlib.Path(p).read_text(encoding='utf-8');sv=r('winclient/WinClient.Core/Ipc/ControlServer.cs');cs=r('winclient/WinClient.App/Hosting/ControlService.cs');cb=pathlib.Path('winclient/WinClient.Core/Ipc/ConnectionBudget.cs');bad=[k for k,ok in (('server.idle','idleTimeout' in sv),('server.status.nolock','case \"status\": break;' not in sv),('budget.file',cb.exists()),('budget.api',cb.exists() and 'TryAdmit' in cb.read_text(encoding='utf-8') and 'Release' in cb.read_text(encoding='utf-8')),('svc.first','FirstPipeInstance' in cs),('svc.16','16' in cs and ', 4,' not in cs),('svc.budget','ConnectionBudget' in cs),('svc.pid','ClientProcessId' in cs)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60,
+      "note": "空闲超时、status 不排队、连接预算、首实例独占、16 实例、按进程限连"
+    },
+    {
+      "id": "SHAPE-CLIENT",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;A='winclient/WinClient.App/';r=lambda p:pathlib.Path(A+p).read_text(encoding='utf-8') if pathlib.Path(A+p).exists() else '';t=r('Hosting/PipePeer.cs');vm=r('MainViewModel.cs');uh=r('Hosting/UpdateWindowsHost.cs');ir=r('Hosting/InstallerRunner.cs');ua=r('Hosting/UpdateApplier.cs');bad=[k for k,ok in (('peer.api',all(x in t for x in ('IsTrustedServer','VerifyServer','GetNamedPipeServerProcessId','GetNamedPipeClientProcessId','ProcessIdToSessionId'))),('vm.verify','VerifyServer' in vm and '身份核验' in vm),('uh.verify','VerifyServer' in uh),('uh.running','RunningServiceExecutable' in uh and 'QueryServiceStatusEx' in uh),('ir.verify','VerifyServer' in ir),('ir.remove','RemoveAsync' in ir and 'KillSwitchApplier' in ir),('ua.running','RunningServiceExecutable' in ua),('ua.msg','下次再试' in ua)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60,
+      "note": "三处客户端核验、更新助手服务进程兜底、卸载自行撤防"
+    },
+    {
+      "id": "NOWINDOW",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;norm=lambda p:str(p).replace(chr(92),'/');files=[p for root in ('winclient/WinClient.Core','winclient/WinClient.App') for p in pathlib.Path(root).rglob('*.cs') if '/obj/' not in norm(p) and '/bin/' not in norm(p)];bad=[norm(p) for p in files if 'ProcessStartInfo' in p.read_text(encoding='utf-8') and p.parent.name!='Process' and 'CreateNoWindow = true' not in p.read_text(encoding='utf-8')];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda p:pathlib.Path(p).read_text(encoding='utf-8');a=r('docs/winclient/服务化与自启说明.md');b=r('docs/winclient/自动更新说明.md');bad=[k for k in ('16','空闲','每进程','身份','会话 0','独占','不排队','直接恢复网络','冒名') if k not in a]+[k for k in ('服务进程','下次再试','.bad') if k not in b];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "NOBIN",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess,sys;out=subprocess.run(['git','ls-files','winclient','build'],capture_output=True,text=True).stdout.split();bad=[f for f in out if f.endswith(('.exe','.dll','.zip','.pdb'))];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "model": null,
+  "timeoutSec": 7200,
+  "repoRoot": "E:/yuanc",
+  "engine": "codex",
+  "reasoningEffort": "high",
+  "steps": [
+    "读 background 列的源文件与测试;画出今天的三条客户端连接路径与服务端 ServeAsync 的生命周期。",
+    "先写 IpcTests(status 不排队、空闲断开三条)、HostingTests(ConnectionBudget、IsTrustedServer)、UpdateApplierTests(服务进程兜底两条)跑红;再改 ControlServer、ConnectionBudget、PipePeer、ControlService、三处客户端核验、UpdateApplier 兜底、Uninstall 自行撤防。",
+    "经派单器自测通道跑 BUILD/TEST 与断言;改两份文档;交活说明列出:替身补了哪些成员、真机待验证项、P/Invoke 清单。"
+  ]
+}
