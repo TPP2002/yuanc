@@ -8,6 +8,7 @@ using WinClient.Core.Logging;
 using WinClient.Core.Pairing;
 using WinClient.Core.Kernel;
 using WinClient.Core.Hosting;
+using WinClient.Core.EnvironmentSupport;
 
 namespace WinClient.Core.Client;
 
@@ -26,6 +27,7 @@ public sealed class ClientRuntime : IClientFacade, IDisposable
     public event Action<ClientSnapshot>? Changed { add => Controller.Changed += value; remove => Controller.Changed -= value; }
     public Task ConnectAsync() => Controller.ConnectAsync();
     public Task DisconnectAsync() => Controller.DisconnectAsync();
+    public Task SetEnvironmentEnabledAsync(bool enabled) => Controller.SetEnvironmentEnabledAsync(enabled);
     public Task RedeemAsync(string code) => Controller.RedeemAsync(code);
     public string? ReadAudit() => File.Exists(firewall.AuditPath) ? File.ReadAllText(firewall.AuditPath) : null;
     private ClientRuntime(ClientController controller, KillSwitchApplier firewall, HttpClient? http, PairingStore pairingStore, RedactingLog log,
@@ -61,7 +63,9 @@ public sealed class ClientRuntime : IClientFacade, IDisposable
             var transport = new TunnelTransport(new SingBoxProcessManager(program, ClientSettings.ProductName, logger: log));
             var controller = new ClientController(source, firewall,
                 transport, program, new DeviceInfo { Platform = "windows", Name = Environment.MachineName, Fingerprint = ClientSettings.GetDeviceFingerprint(storeRoot, scope) },
-                authEndpoint: settings?.AuthEndpoint, exitProbe: new HttpExitProbe());
+                authEndpoint: settings?.AuthEndpoint, exitProbe: new HttpExitProbe(),
+                environment: new EnvironmentApplier(Path.Combine(ClientSettings.DataDirectory, "run")),
+                environmentSettings: new EnvironmentSettingsStore());
             return new(controller, firewall, http, pairingStore, log, storeRoot, scope);
         }
         catch { http?.Dispose(); throw; }

@@ -4,6 +4,7 @@ using WinClient.Core.Auth;
 using WinClient.Core.Firewall;
 using WinClient.Core.State;
 using WinClient.Core.Storage;
+using WinClient.Core.EnvironmentSupport;
 
 // 测试工程需要直接调用 SameSession，并用实现 IRenewableSessionSource 的假件驱动续期流程。
 [assembly: System.Runtime.CompilerServices.InternalsVisibleTo("WinClient.Tests")]
@@ -22,6 +23,8 @@ public sealed record ClientSnapshot(ConnectionState State, string Status, string
     public string ExitStatus { get; init; } = "未检测";
     public string ExitIp { get; init; } = "";
     public string GuardStatus { get; init; } = "";
+    public bool EnvironmentEnabled { get; init; } = true;
+    public string EnvironmentStatus { get; init; } = "未应用";
 }
 
 /// <summary>Owns the serialized user flow, effects and session lifetime; no UI dependencies.</summary>
@@ -35,6 +38,10 @@ public sealed class ClientController : IDisposable
     // 测试可同时记录所有用途；未注入时仍使用原有 delayAsync，不改变调度行为。
     internal Func<TimeSpan, CancellationToken, string, Task>? DelayWithPurposeAsync { get; set; }
     private readonly IExitProbe? exitProbe;
+    private readonly IEnvironmentEnforcer? environment;
+    private readonly IEnvironmentSettingsStore? environmentSettings;
+    private bool environmentApplied;
+    private string environmentStatus = "未应用";
     private string exitStatus = "未检测";
     private string exitIp = "";
     private string guardStatus = "";
@@ -61,16 +68,20 @@ public sealed class ClientController : IDisposable
     private long generation;
     private string message = "";
     public ClientSnapshot Snapshot => new(machine.State, machine.StatusText, message, protection)
-    { Mode = sessionSource?.Mode ?? "未配置", ExitStatus = exitStatus, ExitIp = exitIp, GuardStatus = guardStatus };
+    { Mode = sessionSource?.Mode ?? "未配置", ExitStatus = exitStatus, ExitIp = exitIp, GuardStatus = guardStatus,
+        EnvironmentEnabled = environmentSettings?.Read().Enabled ?? true, EnvironmentStatus = environmentStatus };
     public event Action<ClientSnapshot>? Changed;
 
     public ClientController(AuthApiClient? auth, ICredentialStore credentials, IKillSwitch firewall,
-        ITunnelTransport tunnel, string program, DeviceInfo device, AuthEndpoint? authEndpoint = null, IExitProbe? exitProbe = null)
-        : this(auth is null ? null : new AuthServerSessionSource(auth, credentials), firewall, tunnel, program, device, authEndpoint: authEndpoint, exitProbe: exitProbe) { }
+        ITunnelTransport tunnel, string program, DeviceInfo device, AuthEndpoint? authEndpoint = null, IExitProbe? exitProbe = null,
+        IEnvironmentEnforcer? environment = null, IEnvironmentSettingsStore? environmentSettings = null)
+        : this(auth is null ? null : new AuthServerSessionSource(auth, credentials), firewall, tunnel, program, device,
+            authEndpoint: authEndpoint, exitProbe: exitProbe, environment: environment, environmentSettings: environmentSettings) { }
 
     public ClientController(ISessionSource? sessionSource, IKillSwitch firewall,
         ITunnelTransport tunnel, string program, DeviceInfo device, Func<TimeSpan, CancellationToken, Task>? delayAsync = null,
-        AuthEndpoint? authEndpoint = null, IExitProbe? exitProbe = null)
+        AuthEndpoint? authEndpoint = null, IExitProbe? exitProbe = null,
+        IEnvironmentEnforcer? environment = null, IEnvironmentSettingsStore? environmentSettings = null)
     {
         this.sessionSource = sessionSource;
         this.delayAsync = delayAsync ?? ((delay, token) => Task.Delay(delay, token));
@@ -80,6 +91,8 @@ public sealed class ClientController : IDisposable
         this.authEndpoint = authEndpoint;
         this.device = device;
         this.exitProbe = exitProbe;
+        this.environment = environment;
+        this.environmentSettings = environmentSettings;
         tunnel.TunnelDown += OnTunnelDown;
     }
 
@@ -97,12 +110,19 @@ public sealed class ClientController : IDisposable
                 protection = true;
                 message = protectionNotice;
                 keptProtection = true;
+                environmentApplied = environment?.HasPendingState ?? false;
             }
             else
             {
                 warning = await firewall.RecoverAsync();
                 if (warning is not null) message = warning + (sessionSource is null ? " 未配置服务器。" : "");
                 else if (sessionSource is null) message = "未配置服务器";
+                if (!await RestoreEnvironmentAsync())
+                {
+                    const string environmentWarning = "启动时未能恢复上次的时区或浏览器设置,请联系管理员。";
+                    warning = warning is null ? environmentWarning : warning + " " + environmentWarning;
+                    message += " " + environmentWarning;
+                }
             }
         }
         catch (Exception ex) when (IsOperational(ex))
@@ -184,7 +204,9 @@ public sealed class ClientController : IDisposable
             // Execution is ordered: a failure to stop the tunnel must not proceed to Remove.
             await ExecuteAsync(machine.Handle(new(ConnectionEventKind.UserDisconnect)));
             session = null;
-            message = "已断开，原网络设置已恢复。";
+            var environmentRestored = await RestoreEnvironmentAsync();
+            message = environmentRestored ? "已断开，原网络设置已恢复。"
+                : "已断开,原网络设置已恢复;但时区或浏览器设置未能恢复,请联系管理员。";
         }
         catch (Exception ex) when (IsOperational(ex)) { await FailAsync(ex); }
         finally { Publish(); gate.Release(); }
@@ -200,6 +222,70 @@ public sealed class ClientController : IDisposable
         catch (OperationCanceledException) when (lifetime.IsCancellationRequested) { }
         catch (Exception ex) when (IsOperational(ex)) { await FailAsync(ex); }
         finally { Publish(); gate.Release(); }
+    }
+
+    public async Task SetEnvironmentEnabledAsync(bool enabled)
+    {
+        await gate.WaitAsync();
+        try
+        {
+            environmentSettings?.WriteEnabled(enabled);
+            if (environment is null) return;
+            if (!enabled && environmentApplied)
+            {
+                if (!await RestoreEnvironmentAsync())
+                    message = "时区与浏览器设置未能恢复,原值记录已保留,请联系管理员。";
+                else environmentStatus = "未启用";
+            }
+            else if (enabled && machine.State == ConnectionState.Connected && !environmentApplied)
+                await ApplyEnvironmentAsync();
+            else environmentStatus = !enabled ? "未启用" : environmentApplied ? "已切换到澳洲时区与浏览器策略" : "未应用";
+        }
+        catch (Exception ex) when (IsOperational(ex))
+        {
+            // 环境总开关的保存失败也不触发连接失败处理。
+            environmentStatus = "设置失败,请联系管理员;连接与断网保护不受影响";
+        }
+        finally { Publish(); gate.Release(); }
+    }
+
+    private async Task ApplyEnvironmentAsync()
+    {
+        if (environment is null) return;
+        try
+        {
+            var policy = environmentSettings?.Read() ?? EnvironmentSettingsStore.Default;
+            if (!policy.Enabled) { environmentStatus = "未启用"; return; }
+            if (machine.State != ConnectionState.Connected || environmentApplied) return;
+            await environment.ApplyAsync(policy.Target);
+            environmentApplied = true;
+            environmentStatus = "已切换到澳洲时区与浏览器策略";
+        }
+        catch (Exception ex) when (ex is EnvironmentVerifyException || IsOperational(ex))
+        {
+            // 不能让环境项异常进入外层隧道故障处理，也不覆盖连接消息。
+            environmentStatus = "设置失败,请联系管理员;连接与断网保护不受影响";
+        }
+    }
+
+    private async Task<bool> RestoreEnvironmentAsync()
+    {
+        if (environment is null) return true;
+        try
+        {
+            if (environmentApplied || environment.HasPendingState)
+            {
+                await environment.RestoreAsync();
+                environmentApplied = false;
+            }
+            environmentStatus = (environmentSettings?.Read().Enabled ?? true) ? "未应用" : "未启用";
+            return true;
+        }
+        catch (Exception ex) when (IsOperational(ex))
+        {
+            environmentStatus = "恢复失败,请联系管理员";
+            return false;
+        }
     }
 
     private async Task FetchSessionAsync()
@@ -339,6 +425,7 @@ public sealed class ClientController : IDisposable
                         lifetime.Token.ThrowIfCancellationRequested();
                         await ExecuteAsync(machine.Handle(new(ConnectionEventKind.TunnelUp)));
                         message = "虚拟网卡已就绪。";
+                        await ApplyEnvironmentAsync();
                     }
                     catch (FileNotFoundException ex)
                     {
