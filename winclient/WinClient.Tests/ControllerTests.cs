@@ -284,6 +284,242 @@ public sealed class ControllerTests
         await controller.InitializeAsync(); Assert.Equal("未配置服务器", controller.Snapshot.Message);
         controller.Dispose(); Assert.DoesNotContain("remove", order);
     }
+    // ===== 会话续期（邀请码模式）=====
+
+    [Fact]
+    public async Task RenewWaitIsScheduledAtEightyPercentAlongsideExpiry()
+    {
+        var (controller, timers, _, _) = await ConnectRenewable(TestData.SessionExpiringIn(TimeSpan.FromHours(6)));
+        using (controller)
+        {
+            Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
+            Assert.Contains(timers.Delays, d => Near(d, TimeSpan.FromHours(6 * 0.8)));
+            Assert.Contains(timers.Delays, d => Near(d, TimeSpan.FromHours(6)));
+        }
+    }
+
+    [Fact]
+    public async Task RenewWithSameContentOnlySwapsSessionWithoutRestartingTunnel()
+    {
+        var (controller, timers, source, order) = await ConnectRenewable(TestData.SessionExpiringIn(TimeSpan.FromHours(6)));
+        using (controller)
+        {
+            source.Enqueue(Ok(TestData.SessionExpiringIn(TimeSpan.FromHours(7), token: "renewed-session")));
+            timers.Fire(d => Near(d, TimeSpan.FromHours(4.8)));
+            await Until(() => timers.Count == 4);
+            Assert.Equal(new[] { "apply", "start" }, order);
+            Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
+            Assert.Equal("虚拟网卡已就绪。", controller.Snapshot.Message);
+            Assert.Equal(2, source.Calls);
+            // 新会话的到期与续期等待已重新安排，说明控制器持有的会话到期时间已更新。
+            Assert.Contains(timers.Delays.Skip(2), d => Near(d, TimeSpan.FromHours(7)));
+            Assert.Contains(timers.Delays.Skip(2), d => Near(d, TimeSpan.FromHours(7 * 0.8)));
+            // 旧会话的到期回调触发时不再生效。
+            await controller.ConnectAsync(); // 已连接时直接返回，用作串行锁屏障。
+            var published = Volatile.Read(ref timers.Published);
+            timers.Fire(d => Near(d, TimeSpan.FromHours(6)));
+            await Until(() => Volatile.Read(ref timers.Published) > published);
+            Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
+            Assert.Equal(new[] { "apply", "start" }, order);
+        }
+    }
+
+    [Fact]
+    public async Task RenewNetworkFailureRetriesEveryFiveMinutesWithoutTouchingTunnel()
+    {
+        var (controller, timers, source, order) = await ConnectRenewable(TestData.SessionExpiringIn(TimeSpan.FromHours(6)));
+        using (controller)
+        {
+            source.Enqueue(new AuthResponse<SessionResponse>(AuthResult.Network));
+            timers.Fire(d => Near(d, TimeSpan.FromHours(4.8)));
+            await Until(() => timers.Count == 3);
+            Assert.Equal(TimeSpan.FromMinutes(5), timers.Delays[2]);
+            Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
+            Assert.Equal(new[] { "apply", "start" }, order);
+            Assert.True(controller.Snapshot.ProtectionActive);
+            // 再次触发：服务器恢复，返回内容相同的新会话，回到只换会话的路径。
+            source.Enqueue(Ok(TestData.SessionExpiringIn(TimeSpan.FromHours(7), token: "renewed-session")));
+            timers.Fire(d => d == TimeSpan.FromMinutes(5));
+            await Until(() => timers.Count == 5);
+            Assert.Equal(3, source.Calls);
+            Assert.Equal(new[] { "apply", "start" }, order);
+            Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
+            Assert.Contains(timers.Delays.Skip(3), d => Near(d, TimeSpan.FromHours(7)));
+            Assert.Contains(timers.Delays.Skip(3), d => Near(d, TimeSpan.FromHours(7 * 0.8)));
+        }
+    }
+
+    [Fact]
+    public async Task RenewRejectedTokenNeedsLoginStopsTunnelAndKeepsProtection()
+    {
+        var (controller, timers, source, order) = await ConnectRenewable(TestData.SessionExpiringIn(TimeSpan.FromHours(6)));
+        using (controller)
+        {
+            source.Enqueue(new AuthResponse<SessionResponse>(AuthResult.InvalidToken));
+            timers.Fire(d => Near(d, TimeSpan.FromHours(4.8)));
+            await Until(() => controller.Snapshot.State == ConnectionState.NeedsLogin);
+            await Until(() => order.Contains("stop"));
+            Assert.Equal(new[] { "apply", "start", "stop" }, order);
+            Assert.True(controller.Snapshot.ProtectionActive);
+            Assert.DoesNotContain("remove", order);
+        }
+    }
+
+    [Fact]
+    public async Task RenewWithChangedNodeRestartsTunnelUnderProtection()
+    {
+        var (controller, timers, source, order) = await ConnectRenewable(TestData.SessionExpiringIn(TimeSpan.FromHours(6)));
+        using (controller)
+        {
+            source.Enqueue(Ok(TestData.SessionExpiringIn(TimeSpan.FromHours(7), token: "renewed-session",
+                node: TestData.Node(host: "192.0.2.6"))));
+            timers.Fire(d => Near(d, TimeSpan.FromHours(4.8)));
+            // 停内核后进入退避，并为新会话安排到期与续期等待。
+            await Until(() => timers.Count == 5);
+            Assert.Equal(new[] { "apply", "start", "update", "stop" }, order);
+            Assert.True(controller.Snapshot.ProtectionActive);
+            timers.Fire(d => d == TimeSpan.FromSeconds(2));
+            await Until(() => controller.Snapshot.State == ConnectionState.Connected);
+            await controller.ConnectAsync(); // 串行锁屏障，等退避回调结束。
+            Assert.Equal(new[] { "apply", "start", "update", "stop", "start" }, order);
+            Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
+            Assert.True(controller.Snapshot.ProtectionActive);
+            Assert.Contains(timers.Delays, d => Near(d, TimeSpan.FromHours(7 * 0.8)));
+        }
+    }
+
+    [Fact]
+    public async Task PairingModeNeverSchedulesRenew()
+    {
+        var timers = new Timers();
+        var order = new List<string>();
+        using var controller = new ClientController(new PairingSessionSource(PairingTests.ValidPairing()),
+            new PairingTests.FakeFirewall(order), new PairingTests.FakeTunnel(order), Path.GetFullPath("fake.exe"), TestData.Device, timers.Delay);
+        await controller.ConnectAsync();
+        Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
+        // 只有到期等待的第一段（一天）；若安排了续期，会再多出一段等待。
+        Assert.Equal(TimeSpan.FromDays(1), Assert.Single(timers.Delays));
+        Assert.DoesNotContain(timers.Delays, d => d < TimeSpan.FromDays(1));
+    }
+
+    [Fact]
+    public async Task NoRenewWhenLessThanOneMinuteRemains()
+    {
+        var (controller, timers, _, _) = await ConnectRenewable(TestData.SessionExpiringIn(TimeSpan.FromSeconds(30)));
+        using (controller)
+        {
+            Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
+            var expiry = Assert.Single(timers.Delays);
+            Assert.True(expiry <= TimeSpan.FromSeconds(30));
+        }
+    }
+
+    [Theory]
+    [InlineData("host")]
+    [InlineData("reality_port")]
+    [InlineData("hy2_port")]
+    [InlineData("sni")]
+    [InlineData("reality_public_key")]
+    [InlineData("short_id")]
+    [InlineData("uuid")]
+    [InlineData("hy2_password")]
+    [InlineData("hy2_server_name")]
+    [InlineData("hy2_certificate")]
+    [InlineData("hy2_obfs_password")]
+    [InlineData("singbox_config")]
+    public void SameSessionDetectsAnyNodeOrConfigDifference(string field)
+    {
+        var baseline = TestData.SessionExpiringIn(TimeSpan.FromHours(6));
+        var node = field switch
+        {
+            "host" => TestData.Node(host: "192.0.2.6"),
+            "reality_port" => TestData.Node(realityPort: 444),
+            "hy2_port" => TestData.Node(hy2Port: 8444),
+            "sni" => TestData.Node(sni: "other.invalid"),
+            "reality_public_key" => TestData.Node(realityPublicKey: "other-key"),
+            "short_id" => TestData.Node(shortId: "other-short"),
+            "uuid" => TestData.Node(uuid: "other-uuid"),
+            "hy2_password" => TestData.Node(hy2Password: "other-password"),
+            "hy2_server_name" => TestData.Node(hy2ServerName: "other-name"),
+            "hy2_certificate" => TestData.Node(hy2Certificate: ["-----BEGIN CERTIFICATE-----", "other-cert", "-----END CERTIFICATE-----"]),
+            "hy2_obfs_password" => TestData.Node(hy2ObfsPassword: "other-obfs-password"),
+            _ => TestData.Node()
+        };
+        var config = field == "singbox_config"
+            ? JsonSerializer.SerializeToElement(new { inbounds = new[] { new { type = "mixed" } } }) : TestData.Config;
+        var changed = TestData.SessionExpiringIn(TimeSpan.FromHours(6), node: node, config: config);
+        Assert.False(ClientController.SameSession(baseline, changed));
+    }
+
+    [Fact]
+    public void SameSessionIgnoresTokenAndExpiry()
+    {
+        var a = TestData.SessionExpiringIn(TimeSpan.FromHours(6), token: "first", accountLifetime: TimeSpan.FromDays(1));
+        var b = TestData.SessionExpiringIn(TimeSpan.FromHours(9), token: "second", accountLifetime: TimeSpan.FromDays(2));
+        Assert.True(ClientController.SameSession(a, b));
+    }
+
+    private static bool Near(TimeSpan actual, TimeSpan expected) => (actual - expected).Duration() <= TimeSpan.FromMinutes(2);
+    private static AuthResponse<SessionResponse> Ok(SessionResponse value) => new(AuthResult.Ok, value);
+    private static async Task Until(Func<bool> condition)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(5);
+        while (!condition())
+        {
+            if (DateTime.UtcNow > deadline) throw new TimeoutException("等待控制器处理超时。");
+            await Task.Delay(10);
+        }
+    }
+    private static async Task<(ClientController Controller, Timers Timers, ScriptedSource Source, List<string> Order)> ConnectRenewable(
+        SessionResponse first)
+    {
+        var order = new List<string>();
+        var timers = new Timers();
+        var source = new ScriptedSource();
+        source.Enqueue(Ok(first));
+        var controller = new ClientController(source, new PairingTests.FakeFirewall(order), new PairingTests.FakeTunnel(order),
+            Path.GetFullPath("fake.exe"), TestData.Device, timers.Delay);
+        controller.Changed += _ => Interlocked.Increment(ref timers.Published);
+        await controller.ConnectAsync();
+        return (controller, timers, source, order);
+    }
+    /// <summary>可脚本化的会话来源：按调用次序返回预设结果；标记为需要续期的来源。</summary>
+    private sealed class ScriptedSource : IRenewableSessionSource
+    {
+        private readonly System.Collections.Concurrent.ConcurrentQueue<AuthResponse<SessionResponse>> script = new();
+        private int calls;
+        public int Calls => Volatile.Read(ref calls);
+        public string Mode => "邀请码模式";
+        public void Enqueue(AuthResponse<SessionResponse> response) => script.Enqueue(response);
+        public Task<AuthResponse<SessionResponse>> GetSessionAsync(CancellationToken cancellationToken = default)
+        {
+            Interlocked.Increment(ref calls);
+            return script.TryDequeue(out var next) ? Task.FromResult(next)
+                : throw new InvalidOperationException("测试脚本没有预设下一次会话结果。");
+        }
+    }
+    /// <summary>记录每次等待并返回可手动完成的任务；测试按需触发某个等待。</summary>
+    private sealed class Timers
+    {
+        private readonly List<(TimeSpan Delay, TaskCompletionSource Completion)> entries = [];
+        public int Published;
+        public TimeSpan[] Delays { get { lock (entries) return entries.Select(e => e.Delay).ToArray(); } }
+        public int Count { get { lock (entries) return entries.Count; } }
+        public Task Delay(TimeSpan delay, CancellationToken token)
+        {
+            var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            token.Register(() => completion.TrySetCanceled(token));
+            lock (entries) entries.Add((delay, completion));
+            return completion.Task;
+        }
+        public void Fire(Func<TimeSpan, bool> match)
+        {
+            TaskCompletionSource target;
+            lock (entries) target = entries.First(e => !e.Completion.Task.IsCompleted && match(e.Delay)).Completion;
+            target.SetResult();
+        }
+    }
+
     private static HttpClient SessionHttp(Func<SessionResponse> response) => new(new AuthTests.Handler(_ => new(HttpStatusCode.OK)
     { Content = new StringContent(JsonSerializer.Serialize(response(), new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower })) }))
     { BaseAddress = new("https://unit.invalid") };
