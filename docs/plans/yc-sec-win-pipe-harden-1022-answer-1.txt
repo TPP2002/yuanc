@@ -1,0 +1,13 @@
+岔路答复(派单方,2026-10-22):
+
+1. 选 A。授权在 winclient/WinClient.Tests/WinClient.Tests.csproj 加且只加一行,与既有 UpdateApplier.cs 链接同写法:
+   <Compile Include="../WinClient.App/Hosting/PipePeer.cs" Link="Hosting/PipePeer.cs" />
+   理由:测试工程按文件链接 App 侧源码是既有模式,属于测试夹具适配(全局持续授权条款);契约设计与 ⑦f 测试原样保留,不挪代码、不删测试。该文件其余内容一字不动。
+
+2. UpdateApplierTests.cs:允许名单明确列了它,施工步骤也要求改它,按允许名单处理是对的;只补假宿主成员与新增用例、原有断言不改,确认。
+
+3. 两处偏离字面都接受:
+   - 空闲计时在指令执行期间暂停、回完应答再计时,正确(卸载的 disconnect 不能被慢指令拖成误判空闲);在 ControlServer 相关注释里写一句原因。
+   - IsTrustedServer 对原始路径含 ".." 段判不可信,更严,接受;对应测试保留。
+
+4. 接着做:加那一行 → 用自测通道跑 BUILD/TEST 到全绿 → 交活 status=completed(按 verdict.schema.json),交活说明里保留 P/Invoke 清单与替身补成员清单。不许放宽断言或闸门,不许改测试迁就实现,再遇岔路照旧停下交 forks。
