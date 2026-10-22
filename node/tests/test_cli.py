@@ -12,6 +12,12 @@ from exitnode.netinfo import check, probe_upstream, read_network
 from exitnode.runner import CompletedResult, FakeRunner
 from exitnode.status import State, evaluate
 
+
+def test_upgrade_parser_accepts_downgrade_and_switch():
+    args = parser().parse_args(["upgrade", "--allow-downgrade", "--switch", "0.1.0"])
+    assert args.allow_downgrade is True
+    assert args.switch == "0.1.0"
+
 CONFIG = "/etc/exitnode/config.toml"
 TEXT = (Path(__file__).parents[1] / "examples" / "config.example.toml").read_text(encoding="utf-8")
 

@@ -75,7 +75,7 @@ def _github(config, runner, destination):
     signature = archive + ".sig"
     _request(config, runner, urls[0], archive)
     _request(config, runner, urls[1], signature)
-    return archive, signature
+    return archive, signature, version
 
 
 def _fetch(config, runner, file, signature):
@@ -89,7 +89,7 @@ def _fetch(config, runner, file, signature):
     archive = destination + "/package.tar.gz"
     runner.write_bytes(archive, data, 0o600)
     runner.write_bytes(archive + ".sig", signed, 0o600)
-    return archive, archive + ".sig"
+    return archive, archive + ".sig", None
 
 
 def _restart(runner):
@@ -131,6 +131,38 @@ def _healthy(config, runner, config_path):
 
 def _state_path(config, name):
     return config.node.data_dir.rstrip("/") + "/updater/" + name
+
+
+def _highest(config, runner):
+    try:
+        return Version(json.loads(runner.read_file(_state_path(config, "highest.json")))["version"])
+    except (FileNotFoundError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _record_highest(config, runner, old, version):
+    highest = _highest(config, runner)
+    value = max(Version(old.rsplit("/", 1)[-1]), Version(version))
+    if highest is not None:
+        value = max(highest, value)
+    path = _state_path(config, "highest.json")
+    runner.write_file(path + ".tmp", json.dumps({"version": str(value)}), 0o600)
+    runner.replace(path + ".tmp", path)
+
+
+def _check_downgrade(config, runner, candidate, current, allow_downgrade):
+    highest = _highest(config, runner)
+    floor = max(current, highest) if highest is not None else current
+    if candidate < floor and not allow_downgrade:
+        raise UpdateError(f"拒绝降级到 {candidate}：当前或已安装过的最高版本为 {floor}；"
+                          "确需回退请加 --allow-downgrade", 1)
+
+
+def _check_release(runner, target):
+    if runner.exists(target + ".bad"):
+        raise UpdateError("此版本已有失败标记，请联系维护人员")
+    if not layout.valid_release(runner, target):
+        raise UpdateError("已安装的同版本目录校验失败，请联系维护人员", 1)
 
 
 def _history(config, runner, version, status):
@@ -204,20 +236,73 @@ def _install(config, runner, info, archive, config_path):
         raise UpdateError("升级包安装失败，当前版本未切换") from None
     finally:
         runner.remove_tree(staging)
+    _record_highest(config, runner, old, info.version)
+
+
+def _switch(config, runner, target, version, config_path):
+    old = layout.current_target(config, runner)
+    pending = _state_path(config, "pending.json")
+    switched = False
+    try:
+        runner.write_file(pending + ".tmp", json.dumps({"old": old, "target": target,
+                                                       "version": version}), 0o600)
+        runner.replace(pending + ".tmp", pending)
+        # 与安装路径一样，切换后的目录同步异常也必须回退。
+        switched = True
+        layout.switch(config, runner, target)
+        _restart(runner)
+        if not _healthy(config, runner, config_path):
+            raise UpdateError("新版健康检查未通过")
+        _history(config, runner, version, "ok")
+        runner.remove(pending)
+    except Exception:
+        if switched:
+            try:
+                _rollback(config, runner, old, target, version)
+                runner.remove(pending)
+            except Exception:
+                raise UpdateError("新版启动失败，自动恢复未全部完成，请联系维护人员") from None
+            raise UpdateError("新版启动失败，已恢复旧版") from None
+        raise UpdateError("程序切换失败，当前版本未切换") from None
+    _record_highest(config, runner, old, version)
+    print("切换完成，健康检查通过。")
+
+
+def _switch_requested(config, runner, switch, current, allow_downgrade, check, config_path):
+    try:
+        candidate = Version(switch)
+    except ValueError:
+        raise UpdateError("版本号格式不正确", 1) from None
+    target = next((path for version, path in layout.versions(config, runner)
+                   if version == candidate), None)
+    if target is None:
+        raise UpdateError("目标版本未安装，无法切换", 1)
+    if candidate == current:
+        raise UpdateError("该版本已是当前版本，无需切换", 1)
+    _check_release(runner, target)
+    _check_downgrade(config, runner, candidate, current, allow_downgrade)
+    # 沿用真实目录名，保证恢复记录与现有目录布局一致。
+    version = target.rsplit("/", 1)[-1]
+    if check:
+        print(f"可以切换到 {version}，未执行。")
+    else:
+        _switch(config, runner, target, version, config_path)
+    return 0
 
 
 def upgrade(config, runner, *, file=None, signature=None, check=False,
-            config_path="/etc/exitnode/config.toml"):
+            config_path="/etc/exitnode/config.toml", allow_downgrade=False, switch=None):
     """返回命令退出码；错误不回显主机命令输出或第三方异常。"""
     locked = False
     lock = config.node.data_dir.rstrip("/") + "/updater.lock"
     try:
-        if file is None and config.updater.source == "none":
+        if not switch and file is None and config.updater.source == "none":
             raise UpdateError("未配置更新来源，只能使用 --file 指定升级包")
         if runner.lock_busy(lock):
             raise UpdateError("已有更新任务正在执行，请稍后重试", 4)
         # 断网必须零文件变更，所以锁、修复和清理均排在探测之后。
-        if not any(runner.tcp_connect(host, 443, 3) for host in config.network.probe_targets):
+        if not switch and not any(runner.tcp_connect(host, 443, 3)
+                                  for host in config.network.probe_targets):
             raise UpdateError("网络不可用，稍后重试", 3)
         runner.mkdir(config.node.data_dir, 0o700)
         if not runner.acquire_lock(lock):
@@ -227,16 +312,36 @@ def upgrade(config, runner, *, file=None, signature=None, check=False,
         _recover(config, runner)
         layout.repair(config, runner)
         layout.cleanup(config, runner)
-        archive, signed = _fetch(config, runner, file, signature)
+        current = Version(layout.current_target(config, runner).rsplit("/", 1)[-1])
+        if switch:
+            return _switch_requested(config, runner, switch, current, allow_downgrade,
+                                     check, config_path)
+        archive, signed, tag_version = _fetch(config, runner, file, signature)
         data, signed_data = runner.read_bytes(archive), runner.read_bytes(signed)
         try:
             info = package.verify(data, signed_data, config.node.config_version)
         except ValueError as exc:
             raise UpdateError(str(exc)) from None
-        if any(version == Version(info.version) for version, _ in layout.versions(config, runner)):
+        candidate = Version(info.version)
+        if tag_version is not None and Version(tag_version) != candidate:
+            raise UpdateError("发布源标签版本与升级包内版本不一致，拒绝安装", 1)
+        if candidate == current:
             raise UpdateError("同版本程序已经安装，拒绝重复升级")
+        _check_downgrade(config, runner, candidate, current, allow_downgrade)
         if runner.exists(layout.releases(config) + "/" + info.version + ".bad"):
             raise UpdateError("此版本已有失败标记，请联系维护人员")
+        target = next((path for version, path in layout.versions(config, runner)
+                       if version == candidate), None)
+        if target is not None:
+            _check_release(runner, target)
+            installed = json.loads(runner.read_file(target + "/manifest.json"))
+            if installed["files"] != info.manifest["files"]:
+                raise UpdateError("同版本程序已安装但内容不同，请联系维护人员；已有版本未覆盖", 1)
+            if check:
+                print("升级包检查通过，未安装。")
+            else:
+                _switch(config, runner, target, target.rsplit("/", 1)[-1], config_path)
+            return 0
         if runner.disk_free(layout.root(config)) < info.size * 2 + 50 * 1024 * 1024:
             raise UpdateError("磁盘空间不足，未安装升级包")
         if check:

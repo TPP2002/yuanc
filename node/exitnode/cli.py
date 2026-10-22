@@ -64,6 +64,10 @@ def parser():
             command.add_argument("--file", help="本地升级包路径")
             command.add_argument("--signature", help="签名路径，默认升级包路径加 .sig")
             command.add_argument("--check", action="store_true", help="只检查升级包，不安装")
+            command.add_argument("--allow-downgrade", action="store_true",
+                                 help="允许安装比当前版本或已安装过的最高版本更低的版本")
+            command.add_argument("--switch", metavar="版本",
+                                 help="切换到已安装且未标记失败的版本，不下载升级包")
         if name == "rollback":
             command.add_argument("--to-step", help="保留该步骤及之前的步骤")
         if name == "uninstall":
@@ -351,6 +355,9 @@ def main(argv=None, runner=None, rescue_runner=None):
     if args.command == "upgrade" and args.version:
         print("按版本号选择未实现，请使用 --file 或配置发布来源。", file=sys.stderr)
         return 2
+    if args.command == "upgrade" and args.switch is not None and (args.file or args.signature):
+        print("--switch 不能与 --file 或 --signature 同时使用", file=sys.stderr)
+        return 2
     try:
         runner = runner if runner is not None else RealRunner()
         config = load(args.config, runner)
@@ -397,7 +404,8 @@ def main(argv=None, runner=None, rescue_runner=None):
                     print("签名路径须与本地升级包一起指定。", file=sys.stderr)
                     return 2
                 return upgrade(config, runner, file=args.file, signature=args.signature,
-                               check=args.check, config_path=args.config)
+                               check=args.check, config_path=args.config,
+                               allow_downgrade=args.allow_downgrade, switch=args.switch)
             except Exception:
                 print("更新失败：更新组件异常，请联系维护人员。", file=sys.stderr)
                 return 1
