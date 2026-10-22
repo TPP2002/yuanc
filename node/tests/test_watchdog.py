@@ -336,13 +336,23 @@ def test_disabled_tick_has_no_side_effects():
     assert runner.calls == before
 
 
-def test_check_requires_timer_and_record_younger_than_one_day():
+def test_check_requires_timer_fresh_record_and_no_start_limit():
     config, runner = setup()
     runner.responses[("systemctl", "is-active", "exitnode-watchdog.timer")] = CompletedResult(out="active")
     assert check(config, runner, lambda: NOW)["result"] == "失败"
     state.save(config, runner, state.fresh(), NOW)
-    assert check(config, runner, lambda: NOW + timedelta(hours=23, minutes=59))["result"] == "通过"
-    assert check(config, runner, lambda: NOW + timedelta(hours=24))["result"] == "失败"
+    assert check(config, runner, lambda: NOW + timedelta(minutes=9, seconds=59))["result"] == "通过"
+    stale = check(config, runner, lambda: NOW + timedelta(minutes=10))
+    assert stale["result"] == "失败"
+    assert "十分钟" in stale["reason"]
+    assert check(config, runner, lambda: NOW - timedelta(seconds=1))["result"] == "失败"
+    result_command = ("systemctl", "show", "exitnode-watchdog.service", "-p", "Result", "--value")
+    runner.responses[result_command] = CompletedResult(out="start-limit-hit\n")
+    limited = check(config, runner, lambda: NOW)
+    assert limited["result"] == "失败"
+    assert "启动频率限制" in limited["reason"]
+    runner.responses[result_command] = CompletedResult(out="success\n")
+    assert check(config, runner, lambda: NOW)["result"] == "通过"
     runner.responses[("systemctl", "is-active", "exitnode-watchdog.timer")] = CompletedResult(3, "inactive")
     assert check(config, runner, lambda: NOW)["result"] == "失败"
 

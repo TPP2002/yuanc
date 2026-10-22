@@ -11,8 +11,11 @@ UNITS = ("exitnode-admin.service", "exitnode-proxy.service",
 def test_unit_matches_golden(name):
     text = render(name, {})
     assert text == (Path(__file__).parent / "golden" / name).read_text(encoding="utf-8")
-    assert "StartLimitIntervalSec=" in text
-    assert "StartLimitBurst=" in text
+    if name.startswith(("exitnode-admin.service", "exitnode-proxy.service")):
+        assert "StartLimitIntervalSec=" in text
+        assert "StartLimitBurst=" in text
+    else:
+        assert "StartLimit" not in text
     if name.endswith(".service"):
         assert "Restart=" in text
         assert "Environment=PYTHONPATH=/opt/exitnode/current\n" in text
@@ -48,6 +51,8 @@ def test_watchdog_service_timer_and_context():
     assert 'ExecStart=/usr/bin/python3 -m exitnode --config "/etc/custom config.toml" watchdog tick\n' in text
     assert "Type=oneshot\n" in text
     timer = render("exitnode-watchdog.timer", {})
+    assert "StartLimit" not in text
+    assert "StartLimit" not in timer
     assert "OnBootSec=90\n" in timer
     assert "OnUnitActiveSec=60\n" in timer
     assert "Persistent=false\n" in timer

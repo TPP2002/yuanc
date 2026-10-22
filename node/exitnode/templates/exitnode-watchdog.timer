@@ -1,7 +1,5 @@
 [Unit]
 Description=出口节点每分钟检查
-StartLimitIntervalSec=300
-StartLimitBurst=3
 
 [Timer]
 OnBootSec=90

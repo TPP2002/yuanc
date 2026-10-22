@@ -52,13 +52,24 @@ def summary(config, runner):
 
 
 def check(config, runner, clock=lambda: datetime.now(UTC)):
+    reason = "定时检查未运行"
     try:
         active = runner.run(["systemctl", "is-active", "exitnode-watchdog.timer"], check=False)
+        timer_active = active.code == 0 and active.out.strip() == "active"
+        if timer_active:
+            reason = "十分钟内没有检查记录"
         value = state.read(config, runner)
         age = ((clock() - state.timestamp(value["updated_at"])).total_seconds()
                if value and value["updated_at"] else None)
-        ok = active.code == 0 and active.out.strip() == "active" and age is not None and 0 <= age < 86400
+        result = runner.run(["systemctl", "show", "exitnode-watchdog.service",
+                             "-p", "Result", "--value"], check=False)
+        limited = result.out.strip() == "start-limit-hit"
+        fresh = age is not None and 0 <= age < 600
+        ok = timer_active and fresh and not limited
+        if timer_active and fresh and limited:
+            reason = ("检查任务被 systemd 启动频率限制拦下,请执行 "
+                      "systemctl reset-failed exitnode-watchdog.service 并核对单元文件")
     except (OSError, RuntimeError, ValueError):
         ok = False
     return {"layer": "watchdog", "name": "看门狗", "result": "通过" if ok else "失败",
-            "reason": "定时检查已启动且记录新鲜" if ok else "定时检查未运行或一天内没有检查记录"}
+            "reason": "定时检查已启动且记录新鲜" if ok else reason}
