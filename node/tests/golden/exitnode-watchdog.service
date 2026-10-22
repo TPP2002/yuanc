@@ -1,8 +1,6 @@
 [Unit]
 Description=出口节点分层检查与有界恢复
 After=network-online.target
-StartLimitIntervalSec=300
-StartLimitBurst=3
 
 [Service]
 Environment=PYTHONPATH=/opt/exitnode/current
