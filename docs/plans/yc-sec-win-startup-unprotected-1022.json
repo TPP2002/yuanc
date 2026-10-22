@@ -1,0 +1,208 @@
+{
+  "schemaVersion": 1,
+  "taskId": "SEC-WIN-STARTUP-UNPROTECTED-1022",
+  "slug": "yc-sec-win-startup-unprotected-1022",
+  "title": "Windows 客户端:期望状态为已连接时,后台服务重启/开机不再先撤销断网保护再连——保持阻止、直接重新鉴权并重新套用保护;只有期望为断开或没有配对/凭据时才恢复网络;分发版加一条只放行服务进程到鉴权服务器地址端口的窄规则;服务器地址按口径只认 IPv4 数字地址",
+  "goal": "做完后:①IKillSwitch 新增只读属性 bool HasPendingState(KillSwitchApplier 实现为 File.Exists(StatePath));ControllerTests/PairingTests 等替身补实现(可设置的属性,默认 false),属接口适配。②KillSwitchPlanner:新增 public sealed record AuthEndpoint(IPAddress Address, int Port, string Program);Plan(...) 增加可选参数 AuthEndpoint? auth = null,非空时在节点两条规则之后、Tun 规则之前追加 AddRule(Prefix + \"Auth\", \"Outbound\", \"Allow\", Program: auth.Program, RemoteAddress: [auth.Address 字符串], Protocol: \"TCP\", RemotePort: auth.Port 字符串);Address 必须是 IPv4、Port 1~65535、Program 绝对路径,否则 ArgumentException(中文);auth 为 null 时动作序列与现在完全一致。IKillSwitch.ApplyAsync 的四参数重载增加可选 AuthEndpoint? auth = null(接口默认实现与 Applier 都透传给 Plan);UpdateNode/Remove/Audit 不变(Remove 的前缀通配自然删掉 Auth 规则)。③ClientSettings.Load:server_url 的主机必须是 IPv4 数字地址(Uri.HostNameType == UriHostNameType.IPv4),否则 InvalidDataException(\"服务器地址必须是 IPv4 数字地址，不使用域名。\");新增属性 AuthEndpoint? AuthEndpoint(从 ServerUrl 的主机与端口构造,Program 用 Environment.ProcessPath 的完整路径;取不到进程路径时为 null)。既有用 \"https://unit.invalid\" 一类域名的测试数据把地址改成 192.0.2.x 文档保留地址(接口适配;断言里直接比对该地址字串的期望值随数据同步改成同一个 IPv4,其余断言不改;涉及 PairingTests 第 195 行、DataDirectorySecurityTests 的 WriteSettings 与 TrustedConfigOwnerCanLoad 的期望值等)。④ClientRuntime.CreateAsync 增加参数 bool keepProtection = false:为 true 时跳过启动时的 firewall.RecoverAsync(不碰防火墙),其余不变;ClientController 构造时把 settings?.AuthEndpoint 交给控制器(新增可选构造参数 AuthEndpoint? authEndpoint = null),ExecuteAsync 的 ApplyKillSwitch 分支调用 firewall.ApplyAsync(ips, program, hy2Port, realityPort, sessionSource is AuthServerSessionSource ? authEndpoint : null)——自用(配对)模式不加 Auth 规则。⑤ClientController.InitializeAsync(bool autoConnect = true, bool keepProtection = false):keepProtection 为 true 且 firewall.HasPendingState 为 true 且 sessionSource 非空且(sessionSource 是 PairingSessionSource 或 AuthServerSessionSource { HasCredentials: true })时——不调用 RecoverAsync,直接 protection = true、message = \"后台服务已重新启动，断网保护保持，正在恢复连接。\"、Publish,然后 await ConnectAsync()(不看 autoConnect,keepProtection 本身就表示期望已连接);其他任何情况(keepProtection 为 false、没有恢复记录、没有配对/凭据、没有服务器配置)走既有流程一字不改(先 RecoverAsync、再按 autoConnect 自动连接、降级提示拼接规则不变)。重新连接时 SessionOk 触发的 ApplyKillSwitch 对已有状态文件是幂等的(既有脚本:快照不覆盖、disabledRules 并集、节点规则先删后建),不需要新脚本。⑥ControlService.OnStart:在 CreateAsync 之前读 var desired = new DesiredStateStore(); var keep = desired.Read() != false;CreateAsync 传 keepProtection: keep;InitializeRuntimeAsync 改为 Controller.InitializeAsync(autoConnect: keep, keepProtection: keep);其余顺序不变(数据目录核验、UpdateStore、UpdateRecovery 仍在前)。⑦测试:ControllerTests.cs 新增:(a) 假防火墙 HasPendingState=true + 配对来源 + InitializeAsync(true, true) → order 里没有 recover、apply 在 start 之前、Initialize 返回后 ProtectionActive 为 true、Message 含「保持」;(b) HasPendingState=true 但 sessionSource 为 null → order 含 recover、ProtectionActive 为 false、Message 含「未配置服务器」;(c) HasPendingState=true + 鉴权来源但无凭据 → order 含 recover;(d) HasPendingState=false + keepProtection=true → 与今天一致(recover 一次后自动连接);(e) 鉴权模式 Apply 时假防火墙收到非空 AuthEndpoint,配对模式收到 null。KillSwitchHardenTests 或新文件 KillSwitchAuthRuleTests.cs:Plan 带 AuthEndpoint 的动作序列 = 既有序列在两条 Node 规则之后插入一条 Name 为 YuanC-KS-Auth 的 AddRule;脚本文本含该规则的 -Program/-RemoteAddress/-Protocol 'TCP'/-RemotePort;IPv6 地址、端口 0、相对路径各抛 ArgumentException;Plan 不带 auth 的序列不变(既有 ApplyActionOrderIsExact 不改)。ClientSettings 测试:域名主机抛 InvalidDataException 且文案含「IPv4」,IPv4 主机通过且 AuthEndpoint 的地址端口正确。IpcTests 既有 DisabledAutoConnectStillRecoversAndPublishesWithCredentials 不改。⑧文档:docs/winclient/断网保护加固说明.md 新增一节「## 服务重启时保持保护」(原缺口:重启/开机先恢复默认出站再连,鉴权不可达时直连窗口无限长,违反「隧道断了不静默回落」;现在:期望已连接且有恢复记录就不恢复、保持阻止直接重连并重新套用,鉴权不可达就一直停在重连中且保护保持——用户要上网必须点断开;只有期望为断开或没有配对/凭据才恢复网络;分发版多了 YuanC-KS-Auth 规则只放行服务进程到鉴权服务器 IPv4:端口,因此服务器地址必须是 IPv4 数字地址;与两层降级恢复的关系:降级恢复只在走恢复路径时发生;真机待验证项:连接中结束后台进程→服务被系统拉起期间另开程序持续 ping 公网应全程无回应直到隧道重新就绪;把鉴权地址改成不可达后重启服务应停在重连中且 ping 无回应;期望为断开时重启应恢复网络);docs/winclient/服务化与自启说明.md 「安全存储与期望状态」里 desired.json 那段改写启动语义(期望不是 false 且有恢复记录 → 保持保护直接重连;false → 恢复网络不自动连;缺失按不是 false 处理),「真机待验证清单」加上述三项;docs/winclient/架构说明.md 第 21 行「后台服务启动先处理上次防火墙恢复记录,再读取服务器配置」改为按期望状态分两路的说法,并写明服务器地址只认 IPv4。",
+  "background": "项目:外包,中国客户端经加密隧道到澳洲家宽出口,客户要求常年自动运行、隧道断了不许静默回落到直连(设计正本 A04、验收 W02)。Windows 客户端 .NET 9 在 winclient/:后台服务 ControlService(WinClient.App/Hosting)→ ClientRuntime.CreateAsync(Core/Client)→ ClientController.InitializeAsync;期望状态 run/desired.json 由管道服务端在用户点连接/断开时写 true/false(Core/Ipc/ControlServer.cs),缺失或损坏读成 null、启动按自动连接处理;断网保护 Core/Firewall(KillSwitchPlanner 动作列表→PowerShell,KillSwitchApplier 执行,状态文件 run/killswitch-state.json 在就表示上次的保护还在系统里)。对抗审查(看板 yuanc 卡 SECURITY-REDTEAM-1022 C-H3)查实:CreateAsync 与 InitializeAsync 都先 RecoverAsync(有状态文件就恢复默认出站 Allow、删掉本项目规则),之后才自动连接;规则要到 SessionOk 才重新 Apply;鉴权网络错误只排队重试、protection=false(状态机 AuthRejected Network 分支)。后果:期望为已连接的客户,服务被结束/崩溃后由 SCM 拉起,或开机——从恢复到重新 Apply 之间真实 IP 直连泄漏,鉴权服务器不可达时这个窗口无限长而界面显示「重连中」。修法(卡内原文):期望状态为已连接且有状态文件时启动不恢复,保持阻止直接重新 Apply(幂等、名单并集);只有期望为断开或无配对/凭据时才恢复;加一条窄规则只放行服务进程到鉴权地址端口(分发版);与 RECOVER-LOOP 已合入的两层恢复逻辑衔接(降级层只在走恢复路径时发生)。为什么分发版需要 Auth 规则:保持阻止时默认出站是 Block,只有 YuanC-KS-* 放行(节点地址上的内核进程、TUN 网卡、回环、DHCP),服务进程自己去鉴权服务器换会话会被挡;Windows 防火墙规则只认 IP 不认域名,而项目口径(docs/口径速查表.md 第 14 行,2026-10-22 负责人转述客户)本来就是「客户端与鉴权服务器一律用 IPv4 数字地址、不使用域名」,所以服务器地址按 IPv4 校验、规则按 IPv4 写;自用(配对)模式不联系任何服务器,不加这条规则。为什么鉴权不可达时宁可一直停在重连中:这是「不静默回落」的本意,用户要上网可以点断开(走既有 RemoveAsync 恢复)。两张前置单均已合并进主干(PR #23、#25):本卡在 yc-sec-win-firewall-disabled-1022(VerifyProfiles、FirewallIneffectiveException、FailAsync(cause))与 yc-sec-win-programdata-acl-1022(DataDirectorySecurity、ClientSettings.Load 的 ownerIsTrusted/kernelRoot 参数)合并之后施工,以工位基点的代码为准,不要回退它们的改动;Load 的新参数照旧透传。先读:winclient/WinClient.Core/Client/{ClientController,ClientRuntime,ClientSettings,DesiredStateStore}.cs、winclient/WinClient.Core/Firewall/{KillSwitchPlanner,KillSwitchApplier}.cs、winclient/WinClient.Core/State/ConnectionStateMachine.cs、winclient/WinClient.Core/Ipc/ControlServer.cs、winclient/WinClient.App/Hosting/ControlService.cs、winclient/WinClient.Tests/{ControllerTests,PairingTests,KillSwitchHardenTests,KillSwitchProfileTests,IpcTests,KernelInstallerTests}.cs、docs/winclient/{断网保护加固说明,服务化与自启说明,架构说明}.md、docs/口径速查表.md。环境:工位无外网,只用框架自带与 NuGet 缓存已有的包(不新增包);CI 是本机自托管 Windows runner 跑 dotnet test winclient;首轮 dotnet build 会生成 winclient/third_party/bin 让自测指纹漂一次属正常;构建报 Access denied 先 dotnet build-server shutdown;Windows 子进程一律 CreateNoWindow=true(既有 CreateStartInfo 已满足)。硬规矩:①状态机 ConnectionStateMachine 一行不改(保持保护是控制器与宿主的决定,不改迁移表);②keepProtection 为 false 的路径与现在完全一致,既有测试只加不改(替身补属性、域名改 IPv4 这类接口适配除外);③保持保护路径绝不调用 RecoverAsync/RemoveAsync;④Auth 规则只在鉴权模式、只放行服务进程、只到配置的 IPv4:端口、只 TCP;⑤所有文案中文、不含凭据;⑥拿不准停下交 blocked + forks,不猜;真机验证写进文档,不模拟成通过。",
+  "nonGoals": [
+    "不改状态机迁移表与退避常数",
+    "不做会话配置的本地缓存(重连仍要向鉴权服务器换会话;自用模式本来就不需要)",
+    "不放行系统 DNS(svchost)——服务器地址是 IPv4 数字地址,不需要解析",
+    "不改界面;提示走既有 Message",
+    "不在真机实测:三项真机验证写进文档清单"
+  ],
+  "allowedPaths": [
+    "winclient/WinClient.Core/Firewall/KillSwitchPlanner.cs",
+    "winclient/WinClient.Core/Firewall/KillSwitchApplier.cs",
+    "winclient/WinClient.Core/Client/ClientController.cs",
+    "winclient/WinClient.Core/Client/ClientRuntime.cs",
+    "winclient/WinClient.Core/Client/ClientSettings.cs",
+    "winclient/WinClient.App/Hosting/ControlService.cs",
+    "winclient/WinClient.Tests/ControllerTests.cs",
+    "winclient/WinClient.Tests/PairingTests.cs",
+    "winclient/WinClient.Tests/KillSwitchHardenTests.cs",
+    "winclient/WinClient.Tests/KillSwitchAuthRuleTests.cs",
+    "winclient/WinClient.Tests/KillSwitchProfileTests.cs",
+    "winclient/WinClient.Tests/KillSwitchRecoveryTests.cs",
+    "winclient/WinClient.Tests/FirewallTests.cs",
+    "winclient/WinClient.Tests/KernelInstallerTests.cs",
+    "winclient/WinClient.Tests/DataDirectorySecurityTests.cs",
+    "winclient/WinClient.Tests/IpcTests.cs",
+    "winclient/WinClient.Tests/TestData.cs",
+    "docs/winclient/断网保护加固说明.md",
+    "docs/winclient/服务化与自启说明.md",
+    "docs/winclient/架构说明.md"
+  ],
+  "forbiddenPaths": [
+    "node/**",
+    "authserver/**",
+    "scripts/**",
+    "docs/开工须知.md",
+    "docs/口径速查表.md",
+    "docs/design/**",
+    "docs/交接/**",
+    "docs/node/**",
+    "docs/plans/**",
+    "docs/acceptance/**",
+    "docs/authserver/**",
+    "docs/winclient/打包与发布说明.md",
+    "docs/winclient/自动更新说明.md",
+    ".github/**",
+    ".codex/**",
+    ".gitignore",
+    "pyproject.toml",
+    "winclient/third_party/**",
+    "winclient/Directory.Build.props",
+    "winclient/NuGet.Config",
+    "winclient/WinClient.Core/Firewall/CommandRunner.cs",
+    "winclient/WinClient.Core/Auth/**",
+    "winclient/WinClient.Core/Client/IClientFacade.cs",
+    "winclient/WinClient.Core/Client/PairingSessionSource.cs",
+    "winclient/WinClient.Core/Client/AuthServerSessionSource.cs",
+    "winclient/WinClient.Core/Client/ISessionSource.cs",
+    "winclient/WinClient.Core/Client/DesiredStateStore.cs",
+    "winclient/WinClient.Core/Hosting/**",
+    "winclient/WinClient.Core/Ipc/**",
+    "winclient/WinClient.Core/Kernel/**",
+    "winclient/WinClient.Core/Logging/**",
+    "winclient/WinClient.Core/Pairing/**",
+    "winclient/WinClient.Core/Process/**",
+    "winclient/WinClient.Core/State/**",
+    "winclient/WinClient.Core/Storage/**",
+    "winclient/WinClient.Core/Update/**",
+    "winclient/WinClient.Core/WinClient.Core.csproj",
+    "winclient/WinClient.App/Hosting/ControlServer.cs",
+    "winclient/WinClient.App/Hosting/UpdateApplier.cs",
+    "winclient/WinClient.App/Hosting/UpdateRecovery.cs",
+    "winclient/WinClient.App/Hosting/UpdateWindowsHost.cs",
+    "winclient/WinClient.App/Hosting/InstallerRunner.cs",
+    "winclient/WinClient.App/MainViewModel.cs",
+    "winclient/WinClient.App/MainWindow.xaml",
+    "winclient/WinClient.App/MainWindow.xaml.cs",
+    "winclient/WinClient.App/App.xaml.cs",
+    "winclient/WinClient.App/Program.cs",
+    "winclient/WinClient.App/WinClient.App.csproj",
+    "winclient/WinClient.Tests/AuthTests.cs",
+    "winclient/WinClient.Tests/HostingTests.cs",
+    "winclient/WinClient.Tests/KernelInstallerTests.cs.bak",
+    "winclient/WinClient.Tests/PairingCertificateTests.cs",
+    "winclient/WinClient.Tests/ProcessStorageTests.cs",
+    "winclient/WinClient.Tests/StateTests.cs",
+    "winclient/WinClient.Tests/Update*.cs",
+    "winclient/WinClient.Tests/Fixtures/**",
+    "winclient/WinClient.Tests/WinClient.Tests.csproj"
+  ],
+  "expectArtifacts": [
+    "winclient/WinClient.Core/Firewall/KillSwitchPlanner.cs",
+    "winclient/WinClient.Core/Client/ClientController.cs",
+    "winclient/WinClient.Core/Client/ClientRuntime.cs",
+    "winclient/WinClient.Core/Client/ClientSettings.cs",
+    "winclient/WinClient.App/Hosting/ControlService.cs",
+    "winclient/WinClient.Tests/ControllerTests.cs",
+    "docs/winclient/断网保护加固说明.md"
+  ],
+  "acceptance": [
+    {
+      "id": "BUILD",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "build",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1200,
+      "note": "首轮会生成 third_party/bin 让指纹漂一次,正常"
+    },
+    {
+      "id": "TEST",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "test",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--no-build",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 900,
+      "note": "既有测试全过;替身补属性与域名改 IPv4 属接口适配,断言不改"
+    },
+    {
+      "id": "SHAPE-FW",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda p:pathlib.Path(p).read_text(encoding='utf-8');pl=r('winclient/WinClient.Core/Firewall/KillSwitchPlanner.cs');ap=r('winclient/WinClient.Core/Firewall/KillSwitchApplier.cs');bad=[k for k,ok in (('auth.record','record AuthEndpoint' in pl),('auth.rule','Prefix + \"Auth\"' in pl),('auth.tcp','\"TCP\"' in pl),('pending','HasPendingState' in ap),('apply.auth','AuthEndpoint' in ap)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60,
+      "note": "鉴权窄规则记录与规则、恢复记录在的属性、Apply 透传"
+    },
+    {
+      "id": "SHAPE-WIRE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda p:pathlib.Path(p).read_text(encoding='utf-8');ct=r('winclient/WinClient.Core/Client/ClientController.cs');rt=r('winclient/WinClient.Core/Client/ClientRuntime.cs');st=r('winclient/WinClient.Core/Client/ClientSettings.cs');cs=r('winclient/WinClient.App/Hosting/ControlService.cs');sm=r('winclient/WinClient.Core/State/ConnectionStateMachine.cs');bad=[k for k,ok in (('ctl.keep','keepProtection' in ct and 'HasPendingState' in ct),('ctl.msg','断网保护保持' in ct),('rt.keep','keepProtection' in rt),('cfg.ipv4','UriHostNameType.IPv4' in st and 'AuthEndpoint' in st),('svc.keep','keepProtection' in cs and 'desired.Read()' in cs),('sm.untouched','KillSwitchRequired = true;' in sm and 'keepProtection' not in sm)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60,
+      "note": "控制器/运行时/宿主接线,服务器地址 IPv4 校验,状态机没被动"
+    },
+    {
+      "id": "NOWINDOW",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;norm=lambda p:str(p).replace(chr(92),'/');files=[p for root in ('winclient/WinClient.Core','winclient/WinClient.App') for p in pathlib.Path(root).rglob('*.cs') if '/obj/' not in norm(p) and '/bin/' not in norm(p)];bad=[norm(p) for p in files if 'ProcessStartInfo' in p.read_text(encoding='utf-8') and p.parent.name!='Process' and 'CreateNoWindow = true' not in p.read_text(encoding='utf-8')];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda p:pathlib.Path(p).read_text(encoding='utf-8');a=r('docs/winclient/断网保护加固说明.md');b=r('docs/winclient/服务化与自启说明.md');c=r('docs/winclient/架构说明.md');bad=[k for k in ('服务重启时保持保护','YuanC-KS-Auth','IPv4','重连中','点断开','真机') if k not in a]+[k for k in ('保持','IPv4') if k not in b]+([] if 'IPv4' in c else ['架构说明']);print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "NOBIN",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess,sys;out=subprocess.run(['git','ls-files','winclient','build'],capture_output=True,text=True).stdout.split();bad=[f for f in out if f.endswith(('.exe','.dll','.zip','.pdb'))];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "model": null,
+  "timeoutSec": 7200,
+  "repoRoot": "E:/yuanc",
+  "engine": "codex",
+  "reasoningEffort": "high",
+  "steps": [
+    "读 background 列的源文件与测试;画出今天的启动调用链(CreateAsync→InitializeAsync→RecoverAsync 两处)与 ApplyKillSwitch 的触发点。",
+    "先写 ControllerTests 的五条新用例与 Auth 规则测试跑红;再加 HasPendingState、AuthEndpoint 与 Plan/ApplyAsync 透传、ClientSettings 的 IPv4 校验与 AuthEndpoint、Runtime/Controller 的 keepProtection 分路、ControlService 读期望状态;适配替身与域名测试数据。",
+    "本机跑 BUILD/TEST 与断言;改三份文档;交活说明列真机三项与适配过的既有测试行。"
+  ]
+}
