@@ -37,6 +37,7 @@ class Proxy:
     handshake_server: str = "www.microsoft.com"
     hy2_server_name: str = "exitnode"
     binary: str = "/opt/exitnode/current/bin/sing-box"
+    maintenance_device_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -129,7 +130,8 @@ def load(path: str, runner: Runner | None = None) -> Config:
                     and (type(value) is not int or value <= 0)):
                 invalid("node.config_version", "须为正整数")
             if spec.type == list[str]:
-                valid = (type(value) is list and bool(value)
+                allow_empty = name == "proxy" and key == "maintenance_device_ids"
+                valid = (type(value) is list and (allow_empty or bool(value))
                          and all(type(v) is str and v.strip() for v in value))
             else:
                 valid = type(value) is spec.type

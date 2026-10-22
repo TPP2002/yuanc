@@ -10,6 +10,15 @@ def render_server(ctx: ProxyContext, devices: list[Device]) -> dict:
     validate_devices(devices)
     secret_path(ctx.hy2_key_path)
     active = sorted((d for d in devices if d.revoked_at is None), key=lambda d: d.device_id)
+    maintenance = [d.device_id for d in active if d.device_id in ctx.maintenance_device_ids]
+    rules = [{"ip_cidr": ["198.18.255.1/32"], "outbound": "admin-local"}]
+    if maintenance:
+        rules.append({"auth_user": maintenance, "ip_is_private": True,
+                      "port": [22], "outbound": "direct"})
+    rules.extend([
+        {"ip_is_private": True, "outbound": "block"},
+        {"ip_cidr": ["198.18.0.0/15"], "outbound": "block"},
+    ])
     hy2 = {
         "type": "hysteria2", "tag": "in-hy2", "listen": "::", "listen_port": ctx.hy2_port,
         "users": [{"name": d.device_id, "password": d.hy2_password} for d in active],
@@ -27,7 +36,8 @@ def render_server(ctx: ProxyContext, devices: list[Device]) -> dict:
             {
                 "type": "vless", "tag": "in-reality", "listen": "::",
                 "listen_port": ctx.reality_port,
-                "users": [{"uuid": d.uuid, "flow": "xtls-rprx-vision"} for d in active],
+                "users": [{"name": d.device_id, "uuid": d.uuid, "flow": "xtls-rprx-vision"}
+                          for d in active],
                 "tls": {
                     "enabled": True, "server_name": ctx.sni,
                     "reality": {
@@ -45,6 +55,5 @@ def render_server(ctx: ProxyContext, devices: list[Device]) -> dict:
             {"type": "direct", "tag": "admin-local", "override_address": ctx.admin_bind,
              "override_port": ctx.admin_port},
         ],
-        "route": {"rules": [{"ip_cidr": ["198.18.255.1/32"], "outbound": "admin-local"}],
-                  "final": "direct"},
+        "route": {"rules": rules, "final": "direct"},
     }

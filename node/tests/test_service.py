@@ -216,6 +216,16 @@ def test_context_and_custom_binary_reach_service_and_check():
     assert ("/opt/sing-box", "check", "-c", LIVE + ".check.tmp") in commands(runner)
 
 
+def test_build_context_passes_maintenance_device_ids():
+    runner = fake()
+    runner.files[CONFIG] = runner.files[CONFIG].replace(
+        "[proxy]", '[proxy]\nmaintenance_device_ids = ["dev-b", "dev-a"]')
+    config = load(CONFIG, runner)
+    keys = ensure_reality_keys(SECRETS, ProxyRunner(runner))
+    ctx = build_context(config, keys, runner)
+    assert ctx.maintenance_device_ids == ("dev-b", "dev-a")
+
+
 def test_adapter_atomic_failure_preserves_original_and_hides_scratch(monkeypatch):
     runner = fake()
     path = SECRETS + "/devices.json"
