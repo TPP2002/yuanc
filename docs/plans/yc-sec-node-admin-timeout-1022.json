@@ -1,0 +1,145 @@
+{
+  "schemaVersion": 1,
+  "taskId": "SEC-NODE-ADMIN-TIMEOUT-1022",
+  "slug": "yc-sec-node-admin-timeout-1022",
+  "title": "节点客户端包托管服务加连接限制:每连接 15 秒套接字超时、并发上限 32(超限直接关闭不开线程)、监听队列 64;exitnode-admin.service 加 TasksMax/LimitNOFILE/MemoryMax;慢客户端与半开连接不再拖死服务",
+  "goal": "以主干 f16a6d5 为基点。做完后:\n\n① node/exitnode/admin/server.py:\n  (a) PackageHandler 类属性 `timeout = 15`(BaseHTTPRequestHandler 会据此给套接字 settimeout;读请求头或写响应卡住超过 15 秒就断开该连接,不影响其他连接)。\n  (b) PackageServer:类属性 `request_queue_size = 64`;`__init__(self, *args, max_connections=32, **kwargs)` 建 `self._slots = threading.BoundedSemaphore(max_connections)`;覆写 `process_request(self, request, client_address)`:`self._slots.acquire(blocking=False)` 拿不到 → `self.shutdown_request(request)` 直接关闭(不开线程、不写任何响应字节),拿到 → 调父类;覆写 `process_request_thread` 用 try/finally 在结束时 `self._slots.release()`(父类里 handle_error / shutdown_request 的行为保持)。daemon_threads 保持 True。\n  (c) `create_server(bind, port, root, *, max_connections=32, timeout=15)`:把 timeout 赋给本服务使用的 handler(用 type() 派生一个子类或在 server 上挂属性由 handler 读取,工人自定,但不能改全局 PackageHandler.timeout 影响其他实例),max_connections 传给 PackageServer。serve() 用默认值。\n  (d) handle_error 仍只记一行脱敏日志;超时断开不记日志(没有可操作信息)。\n\n② 单元模板 node/exitnode/templates/exitnode-admin.service 的 [Service] 段在 `UMask=0077` 之后追加三行:`TasksMax=64`、`LimitNOFILE=1024`、`MemoryMax=256M`;node/tests/golden/exitnode-admin.service 同步为 render(name, {}) 的新输出。test_systemd_render.py **不改**(既有统一断言:admin 有 StartLimit、有 Restart=、有 PYTHONPATH 行,新模板都满足)。\n\n③ node/tests/test_admin_server.py 新增(既有用例不改;服务端用 create_server 起在 127.0.0.1 随机端口,测试用原始 socket 连接):\n  (a) 慢客户端:create_server(..., timeout=0.5);连上后一个字节不发,`sock.settimeout(3)` 后 recv 应在 2 秒内返回 b\"\"(服务端关闭);同时另一条正常连接能拿到 latest.json 的 200/404。\n  (b) 并发上限:create_server(..., max_connections=2);先开 2 条连上不发请求的连接,第 3 条连接 recv 应在 1 秒内得到 b\"\"(被直接关闭,且响应里没有任何 HTTP 状态行);关掉其中一条挂住的连接后,新连接能正常拿到响应。\n  (c) 超限关闭不开线程:在 (b) 的第 3 条连接被拒前后,threading.active_count() 不增加(或用 monkeypatch 计 process_request_thread 调用次数 == 2)。\n  (d) check() 行为不变(既有用例覆盖)。\n  测试只用 127.0.0.1 与 tmp_path,不写受测目录。\n\n④ docs/node/客户端包托管说明.md 新增「连接限制」小节:15 秒套接字超时、并发 32、超限直接关闭、监听队列 64、单元 TasksMax=64 / LimitNOFILE=1024 / MemoryMax=256M 的含义(小内存软路由上一个慢客户端不能拖垮整机);真机待验证:1100 条半开连接与 1 字节每秒慢读期间 `exitnode check` 的「客户端托管服务」层仍通过、正常客户端仍能下载。\n\n⑤ 全程中文;不新增依赖;不改协议路径与响应头;不改 publish.py。",
+  "background": "项目:外包,澳洲 Debian 软路由 node/exitnode(Python 3.11 目标、本机 3.14 跑测试)。admin/server.py 是隧道内只读 HTTP 服务(ThreadingHTTPServer 子类 PackageServer + BaseHTTPRequestHandler 子类 PackageHandler,只服务 /winclient/latest.json 与 YuanC-Client-<版本>.exe/.manifest.json/.sig,支持 Range,无访问日志,错误响应不带正文);现在每连接一线程、无超时、无并发上限,单元 exitnode-admin.service 没有资源上限(看板卡 SEC-NODE-ADMIN-TIMEOUT-1022 的现象,来源对抗审查 A4)。既有测试 node/tests/test_admin_server.py 用 hosted 夹具起真实服务在 127.0.0.1 随机端口、用 http.client 请求。单元模板经 exitnode/systemd.py 的 render(name, ctx) 渲染,黄金在 node/tests/golden/,test_systemd_render.py 对每个单元做黄金比对与统一断言。另一张在跑的工单(yc-sec-node-upgrade-health-recover-1022)会改 test_systemd_render.py 的 UNITS 元组并新增 exitnode-recover.service,本单不碰那些文件。",
+  "nonGoals": [
+    "不加 TLS、鉴权或访问日志;不改 publish.py 与发布流程",
+    "不改其他单元模板、不改 test_systemd_render.py、不改 cli.py 的安装步骤",
+    "不在真机实测;真机项写进文档待验证清单"
+  ],
+  "allowedPaths": [
+    "node/exitnode/admin/server.py",
+    "node/exitnode/templates/exitnode-admin.service",
+    "node/tests/golden/exitnode-admin.service",
+    "node/tests/test_admin_server.py",
+    "docs/node/客户端包托管说明.md"
+  ],
+  "forbiddenPaths": [
+    "winclient/**",
+    "authserver/**",
+    "scripts/**",
+    "docs/开工须知.md",
+    "docs/口径速查表.md",
+    "docs/design/**",
+    "docs/交接/**",
+    "docs/plans/**",
+    "docs/acceptance/**",
+    "docs/authserver/**",
+    "docs/winclient/**",
+    "docs/node/更新与回退说明.md",
+    "docs/node/配置说明.md",
+    "docs/node/看门狗说明.md",
+    "docs/node/救援单元说明.md",
+    "docs/node/隧道配置说明.md",
+    "docs/node/自用配对说明.md",
+    ".github/**",
+    ".codex/**",
+    ".gitignore",
+    "pyproject.toml",
+    "node/exitnode/admin/publish.py",
+    "node/exitnode/admin/__init__.py",
+    "node/exitnode/cli.py",
+    "node/exitnode/config.py",
+    "node/exitnode/runner.py",
+    "node/exitnode/manifest.py",
+    "node/exitnode/systemd.py",
+    "node/exitnode/service.py",
+    "node/exitnode/device.py",
+    "node/exitnode/updater/**",
+    "node/exitnode/watchdog/**",
+    "node/exitnode/rescue/**",
+    "node/exitnode/proxy/**",
+    "node/exitnode/templates/exitnode-proxy.service",
+    "node/exitnode/templates/exitnode-rescue.service",
+    "node/exitnode/templates/exitnode-rescue.timer",
+    "node/exitnode/templates/exitnode-watchdog.service",
+    "node/exitnode/templates/exitnode-watchdog.timer",
+    "node/tests/golden/exitnode-proxy.service",
+    "node/tests/golden/exitnode-rescue.service",
+    "node/tests/golden/exitnode-rescue.timer",
+    "node/tests/golden/exitnode-watchdog.service",
+    "node/tests/golden/exitnode-watchdog.timer",
+    "node/tests/golden/device/**",
+    "node/tests/golden/proxy/**",
+    "node/tests/test_systemd_render.py",
+    "node/tests/test_admin_publish.py",
+    "node/tests/test_cli.py",
+    "node/tests/test_updater.py",
+    "node/tests/test_watchdog.py",
+    "node/tests/test_rescue.py",
+    "node/tests/test_service.py",
+    "node/tests/test_device.py"
+  ],
+  "expectArtifacts": [
+    "node/exitnode/admin/server.py",
+    "node/exitnode/templates/exitnode-admin.service",
+    "node/tests/golden/exitnode-admin.service",
+    "node/tests/test_admin_server.py",
+    "docs/node/客户端包托管说明.md"
+  ],
+  "acceptance": [
+    {
+      "id": "RUFF",
+      "kind": "command",
+      "argv": ["python", "-m", "ruff", "check", "node", "scripts", "authserver"],
+      "required": true,
+      "timeoutSec": 300
+    },
+    {
+      "id": "PYTEST",
+      "kind": "command",
+      "argv": ["python", "-m", "pytest", "-q", "node/tests"],
+      "required": true,
+      "timeoutSec": 900
+    },
+    {
+      "id": "SHAPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda p:pathlib.Path(p).read_text(encoding='utf-8');s=r('node/exitnode/admin/server.py');t=r('node/exitnode/templates/exitnode-admin.service');bad=[k for k,ok in (('timeout','timeout' in s and '15' in s),('semaphore','BoundedSemaphore' in s),('process_request','def process_request' in s),('thread','def process_request_thread' in s),('queue','request_queue_size' in s),('max_connections','max_connections' in s),('unit.tasks','TasksMax=64' in t),('unit.nofile','LimitNOFILE=1024' in t),('unit.mem','MemoryMax=256M' in t)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "UNITS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;sys.path.insert(0,'node');from exitnode.systemd import render;t=render('exitnode-admin.service',{});g=pathlib.Path('node/tests/golden/exitnode-admin.service').read_text(encoding='utf-8');bad=[k for k,ok in (('golden',t==g),('tasks','TasksMax=64' in t),('startlimit','StartLimitBurst=3' in t)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;a=pathlib.Path('docs/node/客户端包托管说明.md').read_text(encoding='utf-8');bad=[k for k in ('连接限制','15 秒','32','TasksMax','LimitNOFILE','MemoryMax','半开','慢读') if k not in a];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "model": null,
+  "timeoutSec": 3600,
+  "repoRoot": "E:/yuanc",
+  "engine": "codex",
+  "reasoningEffort": "medium",
+  "steps": [
+    "读 server.py 与 test_admin_server.py;先写 ③ 的三条红测试(慢客户端、并发上限、不开线程)。",
+    "改 PackageHandler/PackageServer/create_server;改模板与黄金;跑 RUFF/PYTEST/UNITS。",
+    "改文档;交活说明列真机待验证项。"
+  ]
+}

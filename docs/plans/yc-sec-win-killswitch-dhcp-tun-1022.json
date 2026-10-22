@@ -1,0 +1,147 @@
+{
+  "schemaVersion": 1,
+  "taskId": "SEC-WIN-DHCP-RULE-1022",
+  "slug": "yc-sec-win-killswitch-dhcp-tun-1022",
+  "title": "Windows 断网保护两条放行规则收窄(一单覆盖看板卡 SEC-WIN-DHCP-RULE-1022 与 SEC-WIN-TUN-RULE-ALIAS-1022):①动态地址分配规则只放行 svchost.exe 的 Dhcp 服务到 255.255.255.255 与本地子网;②隧道网卡规则改按本地地址 172.19.0.1 匹配,不再依赖网卡别名(别名在规则创建时网卡还不存在)",
+  "goal": "以主干 f16a6d5 为基点。做完后:\n\n① winclient/WinClient.Core/Firewall/KillSwitchPlanner.cs:\n  (a) AddRule 记录新增两个可选成员 `string? Service = null`、`string[]? LocalAddress = null`(放在现有成员之后,既有位置参数调用不受影响)。ToPowerShellScript 的 AddRule 分支按顺序输出:`-Program`、`-Service`(AddArgument)、`-LocalAddress @('…')`(与 RemoteAddress 同样的 @() 引号数组写法)、`-RemoteAddress`、`-Protocol`、`-LocalPort`、`-RemotePort`、`-InterfaceAlias`;为 null 的不输出。\n  (b) 新增 `public static string DhcpProgram => Path.Combine(Environment.SystemDirectory, \"svchost.exe\");` 与 `public const string TunAddress = \"172.19.0.1\";`。\n  (c) DHCP 规则改为 `new AddRule(Prefix + \"Dhcp\", \"Outbound\", \"Allow\", Program: DhcpProgram, Service: \"Dhcp\", RemoteAddress: [\"255.255.255.255\", \"LocalSubnet\"], Protocol: \"UDP\", LocalPort: \"68\", RemotePort: \"67\")`(Windows 防火墙的 RemoteAddress 关键字 LocalSubnet 原样写,不展开)。\n  (d) TUN 规则改为 `new AddRule(Prefix + \"Tun\", \"Outbound\", \"Allow\", LocalAddress: [TunAddress])`,**不再写 InterfaceAlias**(规则在隧道网卡出现之前创建也能成功;强主机模型下源地址 172.19.0.1 只会从隧道网卡发出)。Plan() 的 tunInterfaceName 参数与非空校验保留(接口不变,TunnelTransport 仍用 TunAlias 给网卡命名),规则不再使用它;在参数旁加一句中文注释说明。规则总数、顺序不变(KillSwitchHardenTests.ApplyActionOrderIsExact 与 KillSwitchAuthRuleTests 的位置断言必须原样通过)。\n\n② 测试:\n  (a) **显式授权修改** FirewallTests.ApplyHasOnlyApprovedAllowsAndAuditDoesNotModifyOtherRules 里关于 Tun 与 Dhcp 两条规则的断言:Tun 改为 LocalAddress == [\"172.19.0.1\"] 且 InterfaceAlias 为 null;Dhcp 改为 Program == KillSwitchPlanner.DhcpProgram、Service == \"Dhcp\"、RemoteAddress == [\"255.255.255.255\",\"LocalSubnet\"]、Protocol/LocalPort/RemotePort 不变;其余断言一字不改。\n  (b) 新文件 winclient/WinClient.Tests/KillSwitchNarrowRuleTests.cs:脚本里 `New-NetFirewallRule -Name 'YuanC-KS-Dhcp'` 那一行含 `-Program '<DhcpProgram 单引号转义>'`、`-Service 'Dhcp'`、`-RemoteAddress @('255.255.255.255','LocalSubnet')`、`-Protocol 'UDP' -LocalPort '68' -RemotePort '67'`;`-Name 'YuanC-KS-Tun'` 那一行含 `-LocalAddress @('172.19.0.1')` 且不含 `-InterfaceAlias`;一条同时设 LocalAddress 与 InterfaceAlias 的人造 AddRule 两者都输出且顺序 LocalAddress 在 RemoteAddress 之前;Service 含单引号时被正确转义(复用 Quote);UpdateNode 的输出里仍没有 Tun/Dhcp(既有语义)。\n  (c) 一致性:LocalConfigRenderer.Render(TestData.Session().Node 或 PairingTests.ValidPairing().Node) 的 inbounds[0].address[0] 必须等于 KillSwitchPlanner.TunAddress + \"/30\"(防止将来有人改了隧道地址忘了改防火墙)。\n  (d) 既有 KillSwitchHardenTests / KillSwitchAuthRuleTests / KillSwitchProfileTests / KillSwitchRecoveryTests 一条不改。\n\n③ docs/winclient/断网保护加固说明.md 新增两小节:「动态地址分配规则收窄」(为什么:原规则不限程序与远端,能绑本地 UDP 68 的任何进程都可往公网任意地址的 67 端口发包;现在只放行 svchost.exe 的 Dhcp 服务、远端只到广播地址与本地子网)与「隧道网卡规则按本地地址匹配」(为什么:原按 InterfaceAlias 建规则时 wintun 网卡尚不存在,系统行为无真机记录;现在按源地址 172.19.0.1 匹配,网卡出现前就能建;IPv6 的隧道地址 fdfe:dcba:9876::1 不放行,与路由里阻止 IPv6 一致);真机待验证清单追加:DHCP 续租成功且 ipconfig /renew 正常;静态 IP 机器上用测试程序绑 UDP 68 向公网 67 发包应被阻止;连接前就建好 Tun 规则、连接后浏览正常;用 Wireshark 核物理网卡上没有源地址 172.19.0.1 的包。文档第 7 行一带「四类放行的地址、端口和网卡口径保持不变」这句相应改写。\n\n④ 纪律:工人不自己跑 dotnet build/test(用派单器自测通道);构建产物只落 build/;全程中文。",
+  "background": "项目:外包,中国侧 Windows 10/11 客户端(.NET 9)。断网保护由 WinClient.Core/Firewall/KillSwitchPlanner.cs 生成动作列表与 PowerShell 脚本(New-NetFirewallRule 等),KillSwitchApplier 执行。现有 Apply 顺序:三条 SetProfileDefault → DisableForeignAllowRules → Node-Tcp → Node-Udp →(分发版 Auth)→ Tun → Loopback → Dhcp → VerifyProfiles → Audit。Tun 规则按 InterfaceAlias \"YuanC-TUN\" 建(状态机先套用防火墙再启动隧道内核,此时 wintun 网卡还不存在;看板卡 TUN-RULE-ALIAS 的现象,来源对抗审查 C-L2);Dhcp 规则只限 UDP 68→67、不限程序与远端(看板卡 DHCP-RULE 的现象,来源 C-L1)。隧道网卡地址由 LocalConfigRenderer / 节点 client_config 渲染为 172.19.0.1/30 与 fdfe:dcba:9876::1/126,路由规则把 IPv6 全部 block。AddRule 现有成员:Name/Direction/Action/Program/RemoteAddress/Protocol/LocalPort/RemotePort/InterfaceAlias;脚本输出用 AddArgument(script, 名, 值) 与 Quote() 单引号转义。测试:FirewallTests(精确断言五条规则)、KillSwitchHardenTests(动作顺序/脚本片段)、KillSwitchAuthRuleTests(Auth 规则位置,比对去掉 Auth 后与基线逐项 JSON 相等)。另一张在跑的工单改 Core/Ipc 与 App/Hosting,不碰 Firewall;再一张改 Pairing/AuthModels,也不碰 Firewall。docs/winclient/架构说明.md 由派单方收官时自己改,本单不碰。第三方件缓存 winclient/third_party/cache 由派单方放进工位。",
+  "nonGoals": [
+    "不改状态机顺序(仍先套用防火墙再启动内核),不做「网卡就绪后再加规则」",
+    "不改 Node/Loopback/Auth 规则、不改 Remove/Recover/Audit 脚本",
+    "不改 TunnelTransport、LocalConfigRenderer、docs/winclient/架构说明.md",
+    "不在真机实测;真机项写进文档待验证清单"
+  ],
+  "allowedPaths": [
+    "winclient/WinClient.Core/Firewall/KillSwitchPlanner.cs",
+    "winclient/WinClient.Tests/FirewallTests.cs",
+    "winclient/WinClient.Tests/KillSwitchNarrowRuleTests.cs",
+    "docs/winclient/断网保护加固说明.md"
+  ],
+  "forbiddenPaths": [
+    "node/**",
+    "authserver/**",
+    "scripts/**",
+    "docs/开工须知.md",
+    "docs/口径速查表.md",
+    "docs/design/**",
+    "docs/交接/**",
+    "docs/plans/**",
+    "docs/acceptance/**",
+    "docs/authserver/**",
+    "docs/node/**",
+    "docs/winclient/架构说明.md",
+    "docs/winclient/服务化与自启说明.md",
+    "docs/winclient/自动更新说明.md",
+    ".github/**",
+    ".codex/**",
+    ".gitignore",
+    "pyproject.toml",
+    "winclient/WinClient.sln",
+    "winclient/Directory.Build.props",
+    "winclient/third_party/**",
+    "winclient/WinClient.App/**",
+    "winclient/WinClient.Core/Firewall/KillSwitchApplier.cs",
+    "winclient/WinClient.Core/Client/**",
+    "winclient/WinClient.Core/Ipc/**",
+    "winclient/WinClient.Core/State/**",
+    "winclient/WinClient.Core/Update/**",
+    "winclient/WinClient.Core/Hosting/**",
+    "winclient/WinClient.Core/Storage/**",
+    "winclient/WinClient.Core/Kernel/**",
+    "winclient/WinClient.Core/Logging/**",
+    "winclient/WinClient.Core/Pairing/**",
+    "winclient/WinClient.Core/Auth/**",
+    "winclient/WinClient.Core/Process/**",
+    "winclient/WinClient.Tests/KillSwitchHardenTests.cs",
+    "winclient/WinClient.Tests/KillSwitchAuthRuleTests.cs",
+    "winclient/WinClient.Tests/KillSwitchProfileTests.cs",
+    "winclient/WinClient.Tests/KillSwitchRecoveryTests.cs",
+    "winclient/WinClient.Tests/ControllerTests.cs",
+    "winclient/WinClient.Tests/Pairing*.cs",
+    "winclient/WinClient.Tests/Update*.cs",
+    "winclient/WinClient.Tests/IpcTests.cs",
+    "winclient/WinClient.Tests/HostingTests.cs",
+    "winclient/WinClient.Tests/TestData.cs",
+    "winclient/WinClient.Tests/Fixtures/**"
+  ],
+  "expectArtifacts": [
+    "winclient/WinClient.Core/Firewall/KillSwitchPlanner.cs",
+    "winclient/WinClient.Tests/FirewallTests.cs",
+    "winclient/WinClient.Tests/KillSwitchNarrowRuleTests.cs",
+    "docs/winclient/断网保护加固说明.md"
+  ],
+  "acceptance": [
+    {
+      "id": "BUILD",
+      "kind": "command",
+      "argv": ["dotnet", "build", "winclient/WinClient.sln", "-c", "Release", "--nologo"],
+      "required": true,
+      "timeoutSec": 1200,
+      "note": "首轮会生成 third_party/bin 让指纹漂一次,正常"
+    },
+    {
+      "id": "TEST",
+      "kind": "command",
+      "argv": ["dotnet", "test", "winclient/WinClient.sln", "-c", "Release", "--no-build", "--nologo"],
+      "required": true,
+      "timeoutSec": 900
+    },
+    {
+      "id": "SHAPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,re,sys;pl=pathlib.Path('winclient/WinClient.Core/Firewall/KillSwitchPlanner.cs').read_text(encoding='utf-8');tun=next((l for l in pl.splitlines() if 'Prefix + \"Tun\"' in l),'');dh=next((l for l in pl.splitlines() if 'Prefix + \"Dhcp\"' in l),'');bad=[k for k,ok in (('record.service','string? Service' in pl),('record.local','string[]? LocalAddress' in pl),('const.tun','TunAddress = \"172.19.0.1\"' in pl),('prop.dhcp','svchost.exe' in pl),('tun.local','LocalAddress' in tun and 'InterfaceAlias' not in tun),('dhcp.narrow','Service: \"Dhcp\"' in dh and 'LocalSubnet' in dh and '255.255.255.255' in dh and 'DhcpProgram' in dh),('script.service','\"Service\"' in pl),('script.local','-LocalAddress' in pl),('test.file',pathlib.Path('winclient/WinClient.Tests/KillSwitchNarrowRuleTests.cs').exists())) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "NOWINDOW",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;norm=lambda p:str(p).replace(chr(92),'/');files=[p for root in ('winclient/WinClient.Core','winclient/WinClient.App') for p in pathlib.Path(root).rglob('*.cs') if '/obj/' not in norm(p) and '/bin/' not in norm(p)];bad=[norm(p) for p in files if 'ProcessStartInfo' in p.read_text(encoding='utf-8') and p.parent.name!='Process' and 'CreateNoWindow = true' not in p.read_text(encoding='utf-8')];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;a=pathlib.Path('docs/winclient/断网保护加固说明.md').read_text(encoding='utf-8');bad=[k for k in ('动态地址分配规则收窄','隧道网卡规则按本地地址匹配','svchost','LocalSubnet','255.255.255.255','172.19.0.1','Wireshark','续租') if k not in a];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "NOBIN",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess,sys;out=subprocess.run(['git','ls-files','winclient','build'],capture_output=True,text=True).stdout.split();bad=[f for f in out if f.endswith(('.exe','.dll','.zip','.pdb'))];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "model": null,
+  "timeoutSec": 3600,
+  "repoRoot": "E:/yuanc",
+  "engine": "codex",
+  "reasoningEffort": "medium",
+  "steps": [
+    "读 KillSwitchPlanner.cs 与三份 KillSwitch 测试;先写 KillSwitchNarrowRuleTests 红测试并按授权改 FirewallTests 的两条规则断言。",
+    "加 Service/LocalAddress 成员与脚本输出、DhcpProgram/TunAddress、两条规则;经派单器自测通道跑 BUILD/TEST。",
+    "改文档;交活说明列真机待验证项与被改的既有断言行。"
+  ]
+}

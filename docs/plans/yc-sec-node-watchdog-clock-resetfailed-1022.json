@@ -1,0 +1,144 @@
+{
+  "schemaVersion": 1,
+  "taskId": "SEC-NODE-WATCHDOG-RESETFAILED-1022",
+  "slug": "yc-sec-node-watchdog-clock-resetfailed-1022",
+  "title": "看门狗与救援两处加固(一单覆盖看板卡 SEC-NODE-WATCHDOG-RESETFAILED-1022 与 SEC-NODE-CLOCK-FUTURE-1022):①看门狗重启/回滚隧道服务前先 systemctl reset-failed,撞上 systemd 启动限制时不再白耗重启额度;②时钟跳到未来再回拨后,看门狗与救援里「未来时间戳」的频率记录(重启、回滚、整机重启、重装)按失效丢弃并记一笔,自动恢复不再被永久锁死",
+  "goal": "以主干 f16a6d5 为基点。统一口径:时间戳比当前时间晚超过 **300 秒**(常量 CLOCK_SKEW_TOLERANCE_SEC = 300)才算「未来时间戳」;恰好晚 300 秒以内算正常(NTP 小幅校正不触发)。做完后:\n\n① node/exitnode/watchdog/ladder.py execute():restart_service 分支在 `systemctl restart <unit>` 之前先 `runner.run([\"systemctl\", \"reset-failed\", action.unit], check=False)`;rollback_config 分支在 `systemctl restart exitnode-proxy.service` 之前同样先 reset-failed 该单元;reset-failed 失败(非 0)不影响后续 restart、不记日志原文、不改状态。\n\n② ladder.py 新增 `sanitize_clock(state, now) -> int`:逐项检查 state 的 first_failure_at / last_ok_at / last_rollback_at / last_reboot_at / updated_at / last_failure_tick_at / next_action_at 以及 restart_times 的每一条;凡 storage.timestamp(值) > now + 300 秒 的:restart_times 里的条目丢弃(并同步 restart_count_window);first_failure_at 置为 now.isoformat()(连续失联时长从现在重新计,不能因为回拨就立刻满足整机重启的 30 分钟条件);其余字段置 None。有任何改动时 storage.record(state, \"clock_adjusted\", now, \"检测到时间回拨，已丢弃未来时间的频率记录\") 并返回改动条数,没有改动返回 0 且不 record。`elapsed(at, now, seconds)` 同时改为:at 为未来时间戳(> now + 300 秒)时返回 True(双保险;refresh_window 据此也会把未来条目滤掉)。actions 历史里已有的记录不改写。\n   watchdog/__init__.py tick():在 state.load 之后、probe 之前调用 ladder.sanitize_clock(value, now);本轮若有改动,即使检查全部通过也要保存(既有「全通过」分支已经 save,保持)。\n\n③ node/exitnode/rescue/actions.py:`limit(times, now, seconds, maximum)` 改为忽略 `at > now + 300` 的条目(只按仍有效的条目计数);tick() 在 s.read 之后,把 value[\"reinstall_times\"] 与 value[\"restart_times\"] 中 > now + 300 的条目剔除,有剔除时 s.history(runner, \"clock_adjusted\", \"ok\") 记一行并在本轮 save 时一起落盘(reason 不改)。rescue 包仍只许 import 标准库(既有 test_rescue_package_only_imports_stdlib_and_itself 会核)。\n\n④ 测试(既有断言只加不改):\n  node/tests/test_watchdog.py:(a) 第 4 次失败触发 restart 时,commands 里 (\"systemctl\",\"reset-failed\",\"exitnode-proxy.service\") 紧挨在 RESTART 之前;把 reset-failed 的响应设成 CompletedResult(1) 时 RESTART 仍执行且状态照旧;(b) 回滚分支同样 reset-failed 在 restart 之前;(c) restart_times 里塞 3 条 NOW+1 小时 的条目、窗口计数 3,tick 后这些条目被丢弃、能执行 restart,state 的 actions 里有一条 clock_adjusted 且 reason 不含凭据;(d) last_rollback_at 为 NOW+1 天 时,额度耗尽场景下回滚仍能执行(不再永久锁死);(e) last_reboot_at 为未来 → 置 None 后按 reboot 既有条件判;first_failure_at 为未来 → 被置为 NOW,此时 reboot 不满足 30 分钟条件;(f) 时间戳恰为 NOW+299 秒 不算未来、NOW+301 秒 算未来;(g) 没有未来时间戳时 sanitize_clock 返回 0 且 actions 里没有 clock_adjusted。\n  node/tests/test_rescue.py:(h) reinstall_times 含一条 clock+3600 的条目时不计入额度(六小时限制不触发),tick 后状态文件里该条目被清掉、history 多一行 action clock_adjusted;(i) restart_times 同理;(j) 既有 test_reinstall_six_hour_and_daily_limit 等额度用例不变。\n\n⑤ 文档:docs/node/看门狗说明.md 加两小段「重启前先清除启动限制」(为什么:内核连续崩溃约 10 秒就撞 StartLimitBurst=3/300s,直接 restart 会被 systemd 拒掉但额度已计入)与「时钟异常」(未来时间戳 300 秒容差、丢弃并记 clock_adjusted、first_failure_at 重新计);docs/node/救援单元说明.md 加「时钟异常」一段;两份都在真机待验证里加:把系统时间拨快一天触发一次重启后拨回,下一轮检查应记 clock_adjusted 且恢复动作不被锁。\n\n⑥ 全程中文;状态/历史里不出现凭据。",
+  "background": "项目:外包,澳洲 Debian 软路由 node/exitnode(Python,主机操作经 Runner,测试 FakeRunner;rescue/ 子包独立、只 import 标准库,自己的 runner 用 now() 返回浮点秒)。看门狗:watchdog/__init__.py tick(config, runner, clock) → state.load → probes.probe → ladder.decide → ladder.execute;ladder.elapsed(at, now, seconds) 对 at 为 None 返回 True,否则 (now - at) ≥ seconds;refresh_window 用 elapsed 过滤 restart_times(1 小时窗);reboot_allowed 看 first_failure_at 与 last_reboot_at;execute 的 restart_service 直接 `systemctl restart`,rollback_config 替换配置后 `systemctl restart exitnode-proxy.service`。state.py 的 fresh()/read()/save()/record()(actions 只留 50 条;时间戳用 ISO 带时区字串)。救援:rescue/actions.py 的 limit(times, now, seconds, maximum) 用 `now - at < seconds` 计数(未来条目恒计入);tick 读 s.read(runner),reinstall_times/restart_times 是浮点秒列表;s.history 记 jsonl。两张卡现象:A10 看门狗重启不先 reset-failed,被 systemd 启动限制拒掉却已计入 restart_times;A11 未来时间戳让 elapsed 永远 False、limit 永远计满。测试辅助:test_watchdog.py 的 setup()/commands()/run_at()/broken()/exhausted()、常量 NOW/RESTART/REBOOT;test_rescue.py 的 ready()/damage()/service_actions(),runner.clock 可直接加。",
+  "nonGoals": [
+    "不改阶梯的额度数值(每小时 3 次、回滚 6 小时一次、重装 6 小时一次/24 小时两次)",
+    "不换单调时钟或 boot_id 方案(本单只按 300 秒容差丢弃未来时间戳)",
+    "不改 probes.py、state.py 的字段集合与校验",
+    "不在真机实测;真机项写进文档待验证清单"
+  ],
+  "allowedPaths": [
+    "node/exitnode/watchdog/ladder.py",
+    "node/exitnode/watchdog/__init__.py",
+    "node/exitnode/rescue/actions.py",
+    "node/tests/test_watchdog.py",
+    "node/tests/test_rescue.py",
+    "docs/node/看门狗说明.md",
+    "docs/node/救援单元说明.md"
+  ],
+  "forbiddenPaths": [
+    "winclient/**",
+    "authserver/**",
+    "scripts/**",
+    "docs/开工须知.md",
+    "docs/口径速查表.md",
+    "docs/design/**",
+    "docs/交接/**",
+    "docs/plans/**",
+    "docs/acceptance/**",
+    "docs/authserver/**",
+    "docs/winclient/**",
+    "docs/node/更新与回退说明.md",
+    "docs/node/配置说明.md",
+    "docs/node/隧道配置说明.md",
+    "docs/node/自用配对说明.md",
+    "docs/node/客户端包托管说明.md",
+    ".github/**",
+    ".codex/**",
+    ".gitignore",
+    "pyproject.toml",
+    "node/exitnode/watchdog/probes.py",
+    "node/exitnode/watchdog/state.py",
+    "node/exitnode/rescue/__init__.py",
+    "node/exitnode/rescue/__main__.py",
+    "node/exitnode/rescue/runner.py",
+    "node/exitnode/rescue/state.py",
+    "node/exitnode/rescue/probes.py",
+    "node/exitnode/rescue/lastgood.py",
+    "node/exitnode/updater/**",
+    "node/exitnode/admin/**",
+    "node/exitnode/proxy/**",
+    "node/exitnode/service.py",
+    "node/exitnode/device.py",
+    "node/exitnode/cli.py",
+    "node/exitnode/config.py",
+    "node/exitnode/runner.py",
+    "node/exitnode/manifest.py",
+    "node/exitnode/systemd.py",
+    "node/exitnode/templates/**",
+    "node/tests/golden/**",
+    "node/tests/test_updater.py",
+    "node/tests/test_cli.py",
+    "node/tests/test_service.py",
+    "node/tests/test_device.py",
+    "node/tests/test_systemd_render.py",
+    "node/tests/test_admin_server.py",
+    "node/tests/test_proxy_sync.py",
+    "node/tests/test_proxy_server_render.py",
+    "node/tests/test_config.py"
+  ],
+  "expectArtifacts": [
+    "node/exitnode/watchdog/ladder.py",
+    "node/exitnode/watchdog/__init__.py",
+    "node/exitnode/rescue/actions.py",
+    "node/tests/test_watchdog.py",
+    "node/tests/test_rescue.py",
+    "docs/node/看门狗说明.md"
+  ],
+  "acceptance": [
+    {
+      "id": "RUFF",
+      "kind": "command",
+      "argv": ["python", "-m", "ruff", "check", "node", "scripts", "authserver"],
+      "required": true,
+      "timeoutSec": 300
+    },
+    {
+      "id": "PYTEST",
+      "kind": "command",
+      "argv": ["python", "-m", "pytest", "-q", "node/tests"],
+      "required": true,
+      "timeoutSec": 900
+    },
+    {
+      "id": "SHAPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda p:pathlib.Path(p).read_text(encoding='utf-8');la=r('node/exitnode/watchdog/ladder.py');wd=r('node/exitnode/watchdog/__init__.py');ra=r('node/exitnode/rescue/actions.py');bad=[k for k,ok in (('ladder.reset',la.count('reset-failed')>=2),('ladder.const','CLOCK_SKEW_TOLERANCE_SEC = 300' in la),('ladder.sanitize','def sanitize_clock' in la),('ladder.record','clock_adjusted' in la),('tick.call','sanitize_clock' in wd),('rescue.skew','300' in ra and 'clock_adjusted' in ra)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "RESCUE-STDLIB",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import ast,pathlib,sys;bad=[p.name+':'+x for p in pathlib.Path('node/exitnode/rescue').glob('*.py') for n in ast.walk(ast.parse(p.read_text(encoding='utf-8'))) for x in (([a.name for a in n.names] if isinstance(n,ast.Import) else ([n.module or ''] if isinstance(n,ast.ImportFrom) and n.level==0 else []))) if x.startswith('exitnode')];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda p:pathlib.Path(p).read_text(encoding='utf-8');a=r('docs/node/看门狗说明.md');b=r('docs/node/救援单元说明.md');bad=[k for k in ('reset-failed','启动限制','时钟异常','300 秒','clock_adjusted','拨') if k not in a]+[k for k in ('时钟异常','clock_adjusted') if k not in b];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "model": null,
+  "timeoutSec": 3600,
+  "repoRoot": "E:/yuanc",
+  "engine": "codex",
+  "reasoningEffort": "medium",
+  "steps": [
+    "读 ladder.py / watchdog/__init__.py / rescue/actions.py 与两份测试的辅助函数;先写 ④ 的红测试。",
+    "改 reset-failed、sanitize_clock、elapsed、tick 接线、rescue limit 与剔除;跑 RUFF/PYTEST/RESCUE-STDLIB。",
+    "改两份文档;交活说明列真机待验证项。"
+  ]
+}
