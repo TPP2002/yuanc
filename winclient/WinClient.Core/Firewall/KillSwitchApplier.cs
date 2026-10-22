@@ -15,8 +15,11 @@ public interface IKillSwitch
         realityPort == 443 ? UpdateNodeAsync(ips, program, hy2Port) : throw new InvalidOperationException("当前断网保护不支持此出口端口。");
 }
 
+public sealed class FirewallIneffectiveException(string message) : InvalidOperationException(message);
+
 public sealed class KillSwitchApplier : IKillSwitch
 {
+    public const int VerifyFailedExitCode = 3;
     private readonly ICommandRunner runner;
     private readonly SemaphoreSlim gate = new(1, 1);
     public string StatePath { get; }
@@ -98,6 +101,8 @@ public sealed class KillSwitchApplier : IKillSwitch
         {
             using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(180));
             var result = await runner.RunAsync(CreateStartInfo(KillSwitchPlanner.ToPowerShellScript(actions, StatePath, AuditPath)), timeout.Token).ConfigureAwait(false);
+            if (result.ExitCode == VerifyFailedExitCode)
+                throw new FirewallIneffectiveException("系统防火墙已被关闭或被策略覆盖，断网保护无法生效，已拒绝连接。请点击断开，在 Windows 安全中心开启防火墙（或联系管理员解除策略）后重新连接。");
             if (result.ExitCode != 0) throw new InvalidOperationException("防火墙操作失败，恢复记录已保留，请联系管理员。");
         }
         finally { gate.Release(); }

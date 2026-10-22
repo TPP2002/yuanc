@@ -60,7 +60,7 @@ public sealed class ClientController : IDisposable
         }
         catch (Exception ex) when (IsOperational(ex))
         {
-            await FailAsync();
+            await FailAsync(ex);
             message = "启动时未能恢复上次的断网保护设置，恢复记录已保留；请联系管理员处理后重新启动后台服务。";
         }
         finally { Publish(); gate.Release(); }
@@ -111,7 +111,7 @@ public sealed class ClientController : IDisposable
             await FetchSessionAsync();
         }
         catch (OperationCanceledException) when (lifetime.IsCancellationRequested) { }
-        catch (Exception ex) when (IsOperational(ex)) { await FailAsync(); }
+        catch (Exception ex) when (IsOperational(ex)) { await FailAsync(ex); }
         finally { Publish(); gate.Release(); }
     }
 
@@ -127,7 +127,7 @@ public sealed class ClientController : IDisposable
             session = null;
             message = "已断开，原网络设置已恢复。";
         }
-        catch (Exception ex) when (IsOperational(ex)) { await FailAsync(); }
+        catch (Exception ex) when (IsOperational(ex)) { await FailAsync(ex); }
         finally { Publish(); gate.Release(); }
     }
 
@@ -139,7 +139,7 @@ public sealed class ClientController : IDisposable
             if (machine.State is ConnectionState.Connected or ConnectionState.Reconnecting) await FetchSessionAsync();
         }
         catch (OperationCanceledException) when (lifetime.IsCancellationRequested) { }
-        catch (Exception ex) when (IsOperational(ex)) { await FailAsync(); }
+        catch (Exception ex) when (IsOperational(ex)) { await FailAsync(ex); }
         finally { Publish(); gate.Release(); }
     }
 
@@ -199,9 +199,9 @@ public sealed class ClientController : IDisposable
                         await ExecuteAsync(machine.Handle(new(ConnectionEventKind.TunnelUp)));
                         message = "虚拟网卡已就绪。";
                     }
-                    catch (FileNotFoundException)
+                    catch (FileNotFoundException ex)
                     {
-                        await FailAsync();
+                        await FailAsync(ex);
                         message = "未找到连接内核，请联系管理员配置 sing-box.exe 路径。";
                     }
                     catch (Exception ex) when (ex is IOException or TimeoutException)
@@ -251,7 +251,7 @@ public sealed class ClientController : IDisposable
                 if (!disposed && expected == Interlocked.Read(ref generation)) await action();
             }
             catch (OperationCanceledException) when (token.IsCancellationRequested) { }
-            catch (Exception ex) when (IsOperational(ex)) { await FailAsync(); }
+            catch (Exception ex) when (IsOperational(ex)) { await FailAsync(ex); }
             finally { Publish(); gate.Release(); }
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested) { }
@@ -276,13 +276,14 @@ public sealed class ClientController : IDisposable
         finally { Publish(); gate.Release(); }
     }
 
-    private async Task FailAsync()
+    private async Task FailAsync(Exception? cause = null)
     {
         lifetime.Cancel();
         message = "操作失败，请联系管理员；断网保护没有自动撤销。";
         var transition = machine.Handle(new(ConnectionEventKind.OperationFailed));
         try { await ExecuteAsync(transition); }
         catch (Exception ex) when (IsOperational(ex)) { message = "连接内核未能停止，请联系管理员；断网保护保留。"; }
+        if (cause is FirewallIneffectiveException) message = cause.Message;
     }
     private static IPAddress[] NodeIps(SessionResponse value)
     {
