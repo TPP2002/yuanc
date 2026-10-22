@@ -60,7 +60,19 @@ def test_install_manifest_order_permissions_and_repeat(monkeypatch, capsys):
     assert main(["init"], runner) == 0
     files = [SECRETS + "/" + name for name in
              ("reality.json", "hy2.crt", "hy2.key", "hy2.obfs", "devices.json", "sing-box.json")]
-    assert all(path in runner.files and runner.modes[path] == 0o600 for path in files)
+    assert all(path in runner.files for path in files)
+    for name in ("reality.json", "hy2.obfs", "devices.json"):
+        assert runner.modes[SECRETS + "/" + name] == 0o600
+        assert SECRETS + "/" + name not in runner.owners
+    for name in ("hy2.crt", "hy2.key", "sing-box.json"):
+        assert runner.modes[SECRETS + "/" + name] == 0o640
+        assert runner.owners[SECRETS + "/" + name] == ("root", "exitnode")
+    assert runner.modes[SECRETS] == 0o710
+    assert runner.owners[SECRETS] == ("root", "exitnode")
+    assert runner.modes["/var/lib/exitnode"] == 0o711
+    assert "/var/lib/exitnode" not in runner.owners
+    backup = LIVE.replace(".json", ".last-good.json")
+    assert runner.modes[backup] == 0o600 and backup not in runner.owners
     keys = json.loads(runner.files[files[0]])
     assert set(keys) == {"private_key", "public_key", "short_id"}
     assert len(keys["short_id"]) == 8
@@ -103,6 +115,24 @@ def test_install_manifest_order_permissions_and_repeat(monkeypatch, capsys):
     assert commands(runner) == calls
     assert runner.files == before
     assert keys["private_key"] not in capsys.readouterr().out
+
+
+def test_apply_permissions_fixes_old_modes_and_skips_missing_files():
+    runner = fake()
+    for name in ("sing-box.json", "reality.json", "hy2.obfs"):
+        runner.write_file(SECRETS + "/" + name, "旧节点内容", 0o600)
+    del runner.files[SECRETS + "/hy2.key"]
+    service.apply_permissions(runner)
+    assert runner.modes[LIVE] == runner.modes[SECRETS + "/hy2.crt"] == 0o640
+    assert runner.owners[LIVE] == runner.owners[SECRETS + "/hy2.crt"] == ("root", "exitnode")
+    assert SECRETS + "/hy2.key" not in runner.modes and SECRETS + "/hy2.key" not in runner.owners
+    assert runner.modes[SECRETS + "/reality.json"] == runner.modes[SECRETS + "/hy2.obfs"] == 0o600
+    assert runner.modes[SECRETS] == 0o710 and runner.owners[SECRETS] == ("root", "exitnode")
+    assert runner.modes["/var/lib/exitnode"] == 0o711
+    calls = list(runner.calls)
+    service.apply_permissions(runner)
+    assert [c for c in runner.calls[len(calls):] if c[0] in {"chmod", "chown"}] == [
+        c for c in calls if c[0] in {"chmod", "chown"}]
 
 
 def test_existing_credentials_reused_without_regeneration():
@@ -380,9 +410,17 @@ def test_publication_updates_last_good_after_success(registered):
     backup = LIVE.replace(".json", ".last-good.json")
     assert runner.files[backup] == runner.files[LIVE]
     assert runner.modes[backup] == 0o600
+    assert backup not in runner.owners
+    assert runner.modes[LIVE] == 0o640
+    assert runner.owners[LIVE] == ("root", "exitnode")
     write = next(i for i, c in enumerate(runner.calls)
                  if c[:2] == ("write_file", backup + ".tmp"))
     replaced = runner.calls.index(("replace", LIVE + ".check.tmp", LIVE))
+    chowned = runner.calls.index(("chown", LIVE + ".check.tmp", "root", "exitnode"))
+    candidate = next(i for i, c in enumerate(runner.calls)
+                     if c[:2] == ("write_file", LIVE + ".check.tmp"))
+    assert runner.calls[candidate][3] == 0o640
+    assert candidate < chowned < replaced
     assert replaced < write
     assert ("replace", backup + ".tmp", backup) in runner.calls
     if registered:
@@ -422,3 +460,7 @@ def test_failed_publication_never_writes_last_good(monkeypatch, failure, existin
     assert not any(c[0] == "write_file" and c[1].startswith(backup) for c in runner.calls)
     if failure != "reload":
         assert runner.files[LIVE] == "原配置"
+    if failure == "registry":
+        # 回退后线上配置仍可被降权运行的隧道服务读取。
+        assert runner.modes[LIVE] == 0o640
+        assert runner.owners[LIVE] == ("root", "exitnode")

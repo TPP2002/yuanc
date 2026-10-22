@@ -54,9 +54,11 @@ def restore(runner, *, required):
             if required:
                 raise ValueError("没有可校验通过的上次可用配置")
             return False, 0
-        runner.write(temporary, content, 0o600)
+        # 线上配置 0640 root:exitnode，降权运行的隧道服务靠属组读取。
+        runner.write(temporary, content, 0o640)
         if not p.command(runner, [p.BINARY, "check", "-c", temporary]):
             raise ValueError("上次可用配置校验失败")
+        runner.chown(temporary, "root", "exitnode")
         runner.replace(temporary, p.LIVE)
         return True, removed
     finally:

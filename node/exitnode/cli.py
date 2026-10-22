@@ -2,6 +2,7 @@
 
 import argparse
 import io
+import ipaddress
 import json
 import subprocess
 import sys
@@ -200,11 +201,27 @@ def _install(config, config_path, runner, manifest):
         if not any(runner.exists(path) for path in (program_path + "/bin/sing-box",
                    config.proxy.binary, "/usr/bin/sing-box", "/usr/local/bin/sing-box")):
             raise ValueError("未找到 sing-box，请先安装 sing-box 内核；不会自动下载")
+        # 托管服务以动态账户运行、没有任何能力，只能监听高端口并只收本机连接。
+        if config.admin.port < 1024:
+            raise ValueError("托管服务已降权运行，admin.port 须不小于 1024")
+        if not ipaddress.ip_address(config.admin.bind).is_loopback:
+            raise ValueError("托管服务只允许监听回环地址(IPAddressAllow=localhost 只放本机连接)")
         for name, directory in (("数据目录", config.node.data_dir),
                                 ("凭据目录", config.node.secrets_dir)):
             # 数据与凭据在撤回时保留，卸载只清除清单管理的产物。
             apply(name, lambda p=directory: runner.mkdir(p),
                   {"kind": "remove_file", "path": directory, "preserve": True})
+
+        def create_account():
+            if runner.run(["getent", "passwd", service.SERVICE_USER], check=False).code:
+                runner.run(["useradd", "--system", "--no-create-home",
+                            "--home-dir", "/nonexistent", "--shell", "/usr/sbin/nologin",
+                            "--user-group", service.SERVICE_USER])
+
+        apply("创建服务账户", create_account, {"kind": "user", "name": service.SERVICE_USER})
+        # 配置文件按设计不含凭据(凭据只在 secrets 目录)，托管服务以动态账户读取它。
+        apply("配置文件权限", lambda: runner.chmod(config_path, 0o644),
+              {"kind": "remove_file", "path": config_path, "preserve": True})
         if not apply("安装程序目录", lambda: layout.bootstrap(config, runner),
                      {"kind": "remove_file", "path": layout.releases(config), "preserve": True}):
             layout.bootstrap(config, runner)
@@ -234,6 +251,10 @@ def _install(config, config_path, runner, manifest):
         context = {"reality_port": config.proxy.reality_port, "hy2_port": config.proxy.hy2_port,
                    "admin_port": config.admin.port, "admin_bind": config.admin.bind}
         apply("安装网络规则", lambda: nft.apply(runner, context), {"kind": "nft"})
+        # 规则已由上一步加载，只设开机重新加载，不加 --now。
+        apply("启用防火墙规则单元",
+              lambda: runner.run(["systemctl", "enable", "exitnode-nft.service"]),
+              {"kind": "systemctl", "unit": "exitnode-nft.service"})
         apply("检查 sing-box 二进制", lambda: None,
               {"kind": "remove_file", "path": config.proxy.binary, "preserve": True})
         service.ensure_credentials(config, runner)
@@ -242,6 +263,9 @@ def _install(config, config_path, runner, manifest):
         service.publish(config, runner)
         manifest.steps = Manifest(manifest.path, runner).steps
         successful.append("渲染隧道配置：已完成")
+        # 老节点再跑 init 时这一步把旧的 0600 修成新权限。
+        apply("设置凭据文件权限", lambda: service.apply_permissions(runner),
+              {"kind": "remove_file", "path": service.SECRETS, "preserve": True})
         path = "/etc/systemd/system/" + service.UNIT
         step = "写入" + service.UNIT
         if runner.exists(path) and not any(s["step"] == step for s in manifest.steps):
@@ -465,6 +489,7 @@ def main(argv=None, runner=None, rescue_runner=None):
             if args.command == "check":
                 result["layers"].insert(-1, watchdog_check(config, runner))
                 result["layers"].insert(-1, _rescue_check(runner))
+                result["layers"].insert(-1, service.harden_check(runner))
                 result["layers"].append(admin_server.check(config))
             if args.command == "status":
                 result["public_ipv4"] = public_ipv4(runner)

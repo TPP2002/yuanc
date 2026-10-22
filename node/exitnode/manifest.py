@@ -9,7 +9,8 @@ from .runner import Runner
 UNITS = {"exitnode-admin.service", "exitnode-proxy.service",
          "exitnode-watchdog.service", "exitnode-watchdog.timer",
          "exitnode-rescue.service", "exitnode-rescue.timer",
-         "exitnode-recover.service"}
+         "exitnode-recover.service", "exitnode-nft.service"}
+SERVICE_ACCOUNT = "exitnode"
 
 
 class Manifest:
@@ -46,8 +47,10 @@ class Manifest:
         if not isinstance(spec, dict):
             raise TypeError("撤回方案格式错误")
         kind = spec.get("kind")
-        if kind not in {"remove_file", "restore_file", "systemctl", "nft"}:
+        if kind not in {"remove_file", "restore_file", "systemctl", "nft", "user"}:
             raise ValueError("撤回方案类型不支持")
+        if kind == "user" and spec.get("name") != SERVICE_ACCOUNT:
+            raise ValueError("只允许撤回本项目的服务账户")
         if kind in {"remove_file", "restore_file"}:
             path = PurePosixPath(spec.get("path", ""))
             if not path.is_absolute() or str(path) == "/" or ".." in path.parts:
@@ -69,7 +72,8 @@ class Manifest:
             return False
         if item is None:
             item = {"step": step_id, "action": undo_spec.get("action", step_id),
-                    "target": undo_spec.get("path", undo_spec.get("unit", "exitnode")),
+                    "target": undo_spec.get("path", undo_spec.get(
+                        "unit", undo_spec.get("name", "exitnode"))),
                     "undo": undo_spec, "done_at": None}
             self.steps.append(item)
             self._save()
@@ -101,6 +105,9 @@ class Manifest:
         elif kind == "nft":
             from .nft import remove
             remove(self.runner)
+        elif kind == "user":
+            # 账户不存在也算撤回成功。
+            self.runner.run(["userdel", SERVICE_ACCOUNT], check=False)
 
     def rollback(self, to_step=None):
         if to_step is not None and not any(s["step"] == to_step for s in self.steps):

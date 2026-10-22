@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from ..proxy.lastgood import prune_revoked
-from ..service import LAST_GOOD, LIVE, SECRETS
+from ..service import LAST_GOOD, LIVE, SECRETS, SERVICE_GROUP
 from . import state as storage
 
 ALLOWED_SERVICES = {"exitnode-proxy.service", "exitnode-admin.service"}
@@ -147,10 +147,12 @@ def execute(action, runner, config):
                 except ValueError:
                     registry_corrupt = True
                     raise
-                runner.write_file(temporary, text, 0o600)
+                # 线上配置 0640 root:exitnode，降权运行的隧道服务靠属组读取。
+                runner.write_file(temporary, text, 0o640)
                 valid = runner.run([config.proxy.binary, "check", "-c", temporary], check=False)
                 if valid.code:
                     raise ValueError("上次配置校验未通过，当前配置未更改，请联系维护人员")
+                runner.chown(temporary, "root", SERVICE_GROUP)
                 runner.replace(temporary, LIVE)
                 runner.run(["systemctl", "reset-failed", "exitnode-proxy.service"], check=False)
                 runner.run(["systemctl", "restart", "exitnode-proxy.service"])

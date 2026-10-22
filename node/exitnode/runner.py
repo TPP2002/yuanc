@@ -34,6 +34,8 @@ class Runner(Protocol):
     def remove(self, path: str) -> None: ...
     def replace(self, source: str, target: str) -> None: ...
     def mkdir(self, path: str, mode: int = 0o700) -> None: ...
+    def chown(self, path: str, user: str, group: str) -> None: ...
+    def chmod(self, path: str, mode: int) -> None: ...
     def write_bytes(self, path: str, data: bytes, mode: int = 0o600) -> None: ...
     def tcp_connect(self, host: str, port: int, timeout: float) -> bool: ...
     def purge_secrets(self) -> None: ...
@@ -252,6 +254,17 @@ class RealRunner:
     def mkdir(self, path, mode=0o700):
         Path(path).mkdir(mode=mode, parents=True, exist_ok=True)
 
+    def chown(self, path, user, group):
+        # 不跟随符号链接：链接可能把属主改到别处的文件上。
+        if Path(path).is_symlink():
+            raise RunnerError("不能修改链接的权限")
+        shutil.chown(path, user, group)
+
+    def chmod(self, path, mode):
+        if Path(path).is_symlink():
+            raise RunnerError("不能修改链接的权限")
+        os.chmod(path, mode)
+
     def tcp_connect(self, host, port, timeout):
         try:
             with socket.create_connection((host, port), timeout=timeout):
@@ -276,6 +289,7 @@ class FakeRunner:
         self.connections = connections or {}
         self.directories = set()
         self.modes = {}
+        self.owners = {}
         self.calls = []
         self.links = {}
         self.free_bytes = 10 * 1024 ** 3
@@ -352,7 +366,7 @@ class FakeRunner:
         if path in self.links:
             self.links.pop(path)
             return
-        for mapping in (self.files, self.modes, self.links):
+        for mapping in (self.files, self.modes, self.owners, self.links):
             for name in list(mapping):
                 if name == path or name.startswith(path + "/"):
                     del mapping[name]
@@ -468,6 +482,7 @@ class FakeRunner:
             self.directories.remove(path)
         self.files.pop(path, None)
         self.modes.pop(path, None)
+        self.owners.pop(path, None)
 
     def replace(self, source, target):
         self.calls.append(("replace", source, target))
@@ -477,7 +492,7 @@ class FakeRunner:
         if source in self.directories:
             if self.exists(target):
                 raise FileExistsError("模拟替换目标已存在")
-            for mapping in (self.files, self.modes, self.links):
+            for mapping in (self.files, self.modes, self.owners, self.links):
                 for path in list(mapping):
                     if path == source or path.startswith(source + "/"):
                         mapping[target + path[len(source):]] = mapping.pop(path)
@@ -487,10 +502,26 @@ class FakeRunner:
         else:
             self.files[target] = self.files.pop(source)
             self.modes[target] = self.modes.pop(source, 0o600)
+            # 与真实改名一致：目标继承源文件的属主，未记录即视为 root。
+            owner = self.owners.pop(source, None)
+            if owner is None:
+                self.owners.pop(target, None)
+            else:
+                self.owners[target] = owner
 
     def mkdir(self, path, mode=0o700):
         self.calls.append(("mkdir", path, mode))
+        # 与 Path.mkdir(exist_ok=True) 一致：已有目录不改权限。
+        if path not in self.directories:
+            self.modes[path] = mode
         self.directories.add(path)
+
+    def chown(self, path, user, group):
+        self.calls.append(("chown", path, user, group))
+        self.owners[path] = (user, group)
+
+    def chmod(self, path, mode):
+        self.calls.append(("chmod", path, mode))
         self.modes[path] = mode
 
     def tcp_connect(self, host, port, timeout):

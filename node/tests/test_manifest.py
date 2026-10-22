@@ -111,3 +111,33 @@ def test_service_and_table_undo_only_owned_resources():
     assert ("systemctl", "disable", "--now", "exitnode-admin.service") in commands
     with pytest.raises(ValueError):
         manifest.apply("foreign", lambda: None, {"kind": "systemctl", "unit": "ssh.service"})
+
+
+def test_nft_unit_is_an_owned_service():
+    runner = FakeRunner(responses={("systemctl",): CompletedResult()},
+                        files={"/etc/systemd/system/exitnode-nft.service": "单元"})
+    manifest = Manifest(PATH, runner)
+    manifest.apply("rules", lambda: None, {"kind": "systemctl", "unit": "exitnode-nft.service"})
+    assert not manifest.rollback()["failed"]
+    assert ("run", ("systemctl", "disable", "--now", "exitnode-nft.service"), True, None) in runner.calls
+
+
+def test_user_undo_only_owned_account_and_tolerates_missing_account():
+    runner = FakeRunner(responses={("userdel",): CompletedResult(6, err="用户不存在")})
+    manifest = Manifest(PATH, runner)
+    for name in ("root", "nobody", "", None):
+        with pytest.raises(ValueError, match="只允许撤回本项目的服务账户"):
+            manifest.apply("foreign-" + str(name), lambda: None, {"kind": "user", "name": name})
+    manifest.apply("account", lambda: None, {"kind": "user", "name": "exitnode"})
+    step = Manifest(PATH, runner).steps[0]
+    assert step["target"] == "exitnode"
+    assert step["undo"] == {"kind": "user", "name": "exitnode"}
+    report = manifest.rollback()
+    assert report == {"removed": ["account"], "failed": []}
+    assert ("run", ("userdel", "exitnode"), False, None) in runner.calls
+    # 清单里被篡改成别的账户名时拒绝加载，不会删别人的账户。
+    runner.files[PATH] = json.dumps({"steps": [{
+        "step": "account", "action": "account", "target": "root",
+        "undo": {"kind": "user", "name": "root"}, "done_at": "2026-10-22T00:00:00+00:00"}]})
+    with pytest.raises(ValueError, match="安装清单损坏"):
+        Manifest(PATH, runner)

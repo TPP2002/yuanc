@@ -17,6 +17,10 @@ LIVE = SECRETS + "/sing-box.json"
 LAST_GOOD = LIVE.replace(".json", ".last-good.json")
 UNIT = "exitnode-proxy.service"
 HY2_OBFS = SECRETS + "/hy2.obfs"
+DATA = "/var/lib/exitnode"
+# 隧道服务的系统账户：只靠属组读取线上配置与备用通道证书对。
+SERVICE_USER = "exitnode"
+SERVICE_GROUP = "exitnode"
 HY2_OBFS_CORRUPT = "备用通道混淆密码文件损坏，请联系维护人员；已有文件未覆盖"
 
 
@@ -166,6 +170,18 @@ def ensure_credentials(config, runner):
     return ensure_reality_keys(config.node.secrets_dir, adapter)
 
 
+def apply_permissions(runner):
+    """幂等设置数据目录、凭据目录与隧道服务需读文件的权限；其余凭据保持 0600 root。"""
+    # 数据目录只许穿越不许列目录：托管服务与隧道服务都要穿过它。
+    runner.chmod(DATA, 0o711)
+    runner.chmod(SECRETS, 0o710)
+    runner.chown(SECRETS, "root", SERVICE_GROUP)
+    for path in (LIVE, SECRETS + "/hy2.crt", SECRETS + "/hy2.key"):
+        if runner.exists(path):
+            runner.chmod(path, 0o640)
+            runner.chown(path, "root", SERVICE_GROUP)
+
+
 def read_hy2_obfs_password(runner):
     """未生成时返回空串(按不混淆发布);文件存在但格式不对时拒绝发布。"""
     if not runner.exists(HY2_OBFS):
@@ -207,7 +223,9 @@ def _publish_checked(config, runner, devices, registry=None):
                       ensure_ascii=False, indent=2) + "\n"
     temporary = LIVE + ".check.tmp"
     try:
-        runner.write_file(temporary, text, 0o600)
+        # 线上配置 0640 root:exitnode，降权运行的隧道服务靠属组读取。
+        runner.write_file(temporary, text, 0o640)
+        runner.chown(temporary, "root", SERVICE_GROUP)
         result = runner.run([config.proxy.binary, "check", "-c", temporary], check=False)
         if result.code:
             raise ValueError("隧道配置校验失败，线上配置与登记表未变；命令输出已隐藏")
@@ -217,7 +235,8 @@ def _publish_checked(config, runner, devices, registry=None):
             try:
                 registry.save(devices)
             except (OSError, RuntimeError, ValueError):
-                adapter.write_file(LIVE, old_text, 0o600)
+                adapter.write_file(LIVE, old_text, 0o640)
+                runner.chown(LIVE, "root", SERVICE_GROUP)
                 raise ValueError("登记表写入失败，线上配置已回退，未重载") from None
             try:
                 reload(ReloadRunner(runner))
@@ -248,6 +267,19 @@ def publish(config, runner, *, devices=None):
         _publish_checked(config, runner, registry.all())
 
     manifest.apply(step, action, {"kind": "remove_file", "path": LIVE})
+
+
+def harden_check(runner):
+    try:
+        user = runner.run(["systemctl", "show", UNIT, "-p", "User", "--value"], check=False)
+        rules = runner.run(["systemctl", "is-active", "exitnode-nft.service"], check=False)
+        ok = (user.out.strip() == SERVICE_USER
+              and rules.code == 0 and rules.out.strip() == "active")
+    except (OSError, RuntimeError):
+        ok = False
+    return {"layer": "hardening", "name": "服务加固", "result": "通过" if ok else "失败",
+            "reason": ("隧道服务以 exitnode 账户运行且防火墙规则单元已加载" if ok
+                       else "隧道服务未降权或防火墙规则单元未加载")}
 
 
 def check(runner, config):

@@ -32,6 +32,7 @@ class Runner(Protocol):
     def remove_tree(self, path: str) -> None: ...
     def copy_tree(self, source: str, target: str) -> None: ...
     def mkdir(self, path: str, mode: int = 0o700) -> None: ...
+    def chown(self, path: str, user: str, group: str) -> None: ...
     def now(self) -> float: ...
     def lock_busy(self, path: str) -> bool: ...
 
@@ -74,6 +75,12 @@ class RealRunner:
 
     def mkdir(self, path, mode=0o700):
         Path(path).mkdir(mode=mode, parents=True, exist_ok=True)
+
+    def chown(self, path, user, group):
+        # 不跟随符号链接：链接可能把属主改到别处的文件上。
+        if Path(path).is_symlink():
+            raise OSError("不能修改链接的权限")
+        shutil.chown(path, user, group)
 
     def remove_tree(self, path):
         if Path(path).is_symlink() or Path(path).is_file():
@@ -156,6 +163,7 @@ class FakeRunner:
         self.directories = set()
         self.links = {}
         self.modes = {}
+        self.owners = {}
         self.calls = []
         self.locks = set()
 
@@ -225,6 +233,10 @@ class FakeRunner:
         self.directories.add(path)
         self.modes[path] = mode
 
+    def chown(self, path, user, group):
+        self.calls.append(("chown", path, user, group))
+        self.owners[path] = (user, group)
+
     def now(self):
         return self.clock
 
@@ -234,7 +246,7 @@ class FakeRunner:
 
     def remove_tree(self, path):
         self.calls.append(("remove_tree", path))
-        for mapping in (self.files, self.links, self.modes):
+        for mapping in (self.files, self.links, self.modes, self.owners):
             for name in list(mapping):
                 if name == path or name.startswith(path + "/"):
                     del mapping[name]
@@ -263,7 +275,7 @@ class FakeRunner:
         if not self.exists(source):
             raise FileNotFoundError(source)
         self.remove_tree(target)
-        for mapping in (self.files, self.links, self.modes):
+        for mapping in (self.files, self.links, self.modes, self.owners):
             for path in list(mapping):
                 if path == source or path.startswith(source + "/"):
                     mapping[target + path[len(source):]] = mapping.pop(path)

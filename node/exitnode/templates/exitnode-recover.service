@@ -6,10 +6,22 @@ Wants=network-online.target
 [Service]
 Environment=PYTHONPATH=$program_path
 Type=oneshot
-ExecStart=/usr/bin/python3 -m exitnode --config "$config_path" upgrade --recover
+ExecStart=/usr/bin/python3 -P -m exitnode --config "$config_path" upgrade --recover
 Restart=no
 NoNewPrivileges=true
 UMask=0077
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=multi-user.target

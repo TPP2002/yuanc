@@ -208,7 +208,17 @@ def test_bad_live_restores_only_checked_last_good(good):
         assert runner.files[p.LIVE] == b"private-last-good-content"
         check = next(i for i, c in enumerate(runner.calls)
                      if c[0] == "run" and c[1][-1] == p.LIVE + ".rescue.tmp")
-        assert check < runner.calls.index(("replace", p.LIVE + ".rescue.tmp", p.LIVE))
+        replaced = runner.calls.index(("replace", p.LIVE + ".rescue.tmp", p.LIVE))
+        assert check < replaced
+        # 线上配置 0640 root:exitnode；属主在第二次校验通过后、替换之前设好。
+        chowned = runner.calls.index(("chown", p.LIVE + ".rescue.tmp", "root", "exitnode"))
+        assert check < chowned < replaced
+        assert runner.modes[p.LIVE] == 0o640
+        assert runner.owners[p.LIVE] == ("root", "exitnode")
+        candidate = p.LAST_GOOD + ".rescue.check.tmp"
+        assert ("write", candidate, 0o600) in runner.calls
+        assert ("write", p.LIVE + ".rescue.tmp", 0o640) in runner.calls
+        assert not any(c[0] == "chown" and c[1] == candidate for c in runner.calls)
         assert service_actions(runner) == [("systemctl", "restart", "exitnode-proxy.service")]
         before = list(service_actions(runner))
         runner.clock += 1
@@ -528,7 +538,8 @@ def test_rescue_prunes_both_checks_and_reports_record_count(monkeypatch, reinsta
     assert users == [[{"uuid": "保留凭据"}], [{"name": "保留设备", "password": "测试密码"}]]
     assert "已剔除 2 条不在登记表上的用户记录" in s.read(runner)["reason"]
     assert ("systemctl", "restart", "exitnode-proxy.service") in service_actions(runner)
-    assert runner.modes[p.LIVE] == 0o600
+    assert runner.modes[p.LIVE] == 0o640
+    assert runner.owners[p.LIVE] == ("root", "exitnode")
     for path in (s.STATE, s.HISTORY):
         for secret in ("保留设备", "保留凭据", "吊销设备", "吊销凭据", "测试密码"):
             assert secret.encode() not in runner.files[path]
