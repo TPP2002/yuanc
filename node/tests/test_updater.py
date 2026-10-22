@@ -26,7 +26,7 @@ CURRENT = ROOT + "/current"
 DATA = "/var/lib/exitnode"
 INCOMING = DATA + "/updater/incoming"
 LOCK = DATA + "/updater.lock"
-HEALTH = ("env", "PYTHONPATH=" + CURRENT, "python3", "-m", "exitnode")
+HEALTH = ("env", "PYTHONPATH=" + CURRENT, "python3", "-P", "-m", "exitnode")
 IS_ACTIVE = ("systemctl", "is-active", "exitnode-proxy.service")
 NRESTARTS = ("systemctl", "show", "exitnode-proxy.service", "-p", "NRestarts", "--value")
 
@@ -143,6 +143,8 @@ def test_success_switches_atomically_restarts_records_and_cleans(signing):
         assert ("systemctl", "restart", unit) in commands
     assert ("systemctl", "daemon-reload") in commands
     assert commands[-1] == (*HEALTH, "--config", CONFIG, "check", "--json")
+    health = commands[-1]
+    assert health[health.index("python3") + 1:health.index("python3") + 3] == ("-P", "-m")
     history = runner.read_file(DATA + "/updater/history.jsonl").splitlines()
     assert len(history) == 1 and json.loads(history[0])["status"] == "ok"
     assert_clean(runner)

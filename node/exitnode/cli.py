@@ -139,7 +139,7 @@ def refresh(source_dir, target_dir, rescue_runner=None):
             "m=importlib.util.module_from_spec(s); sys.modules['exitnode_rescue']=m; "
             "s.loader.exec_module(m); import exitnode_rescue.__main__")
     try:
-        import_result = runner.run(["python3", "-c", code, staging], timeout=30)
+        import_result = runner.run(["python3", "-P", "-c", code, staging], timeout=30)
     except (OSError, subprocess.TimeoutExpired):
         raise ValueError("救援副本导入失败或超时，未更新") from None
     if import_result.code:
