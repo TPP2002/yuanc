@@ -1,0 +1,228 @@
+{
+  "schemaVersion": 1,
+  "taskId": "SEC-WIN-ENV-SELFCHECK-1022",
+  "slug": "yc-env-selfcheck-1022",
+  "title": "Windows 客户端「环境一致性」增值包第二部分:连上后自动跑八项环境自检(出口归属 AU、出口与节点一致、系统时区、自动时区已关、Chrome/Edge 策略、配置无直连路径、IPv6 已封堵),界面一行显示,报告落盘并随「导出诊断」一起导出;自检只报告不修复不断开",
+  "goal": "以主干 main(含 yc-env-consistency-1022 合并后的头)为基点。背景:增值包「环境一致性」承诺 IP、DNS、系统时区、浏览器首选语言一致为澳洲,但客户在界面上看不到任何证据。本单做第二部分「环境自检」:连上后每次出口核验出终局结果时,后台服务顺带把七项检查跑一遍,结果一行显示在界面,完整报告写到 run/selfcheck.json,「导出诊断」按钮把防火墙审计与自检报告一起导出。**自检只报告,不修复、不断开、不撤保护、不改任何系统设置**。\n\n① 出口探测补国家归属(winclient/WinClient.Core/Client/ExitProbe.cs)\n`public sealed record ExitProbeResult(System.Net.IPAddress Address, string? Country);` IExitProbe 加默认接口成员 `Task<ExitProbeResult?> ProbeDetailedAsync(CancellationToken token)`(默认实现:调 ProbeAsync,非 null 则包成 Country=null 的结果)。HttpExitProbe 把解析抽成 `internal static ExitProbeResult? Parse(string body)`:逐行读 `ip=` 与 `loc=`(两个字母大写国家码,正则 `^[A-Z]{2}$`,不合法当 null),ip 解析失败整体返 null;ProbeAsync 与 ProbeDetailedAsync 共用一次请求与 Parse,请求参数不变(5 秒超时、不跳转、不代理、不 Cookie、不记响应正文)。\n\n② 环境巡查接口(winclient/WinClient.Core/Environment/)\nEnvironmentApplier.cs:`public sealed record EnvironmentInspection(string TimeZone, int? AutoTimeZoneStart, IReadOnlyDictionary<string, string?> Chrome, IReadOnlyDictionary<string, string?> Edge, string[] ChromeForcedLanguages);` IEnvironmentEnforcer 加默认接口成员 `Task<EnvironmentInspection?> InspectAsync() => Task.FromResult<EnvironmentInspection?>(null);` EnvironmentApplier 实现:跑既有 `EnvironmentPlanner.InspectScript()`(同一 gate、60 秒超时),退出码非 0 或最后一个非空行 JSON 解析失败 → 返回 null(不抛);成功按 InspectScript 的字段解析(Chrome/Edge 字典键为三个值名,缺失为 null;DefaultGeolocationSetting 转成字符串)。若上一单的 InspectScript 输出字段名与此处不符,以本单为准改 InspectScript 并同步上一单的 EnvironmentPlannerTests 断言(允许)。\n新文件 EnvironmentSelfCheck.cs:`public sealed record CheckItem(string Id, string Name, string Result, string Detail);`(Result 只许「通过」「未通过」「跳过」「无法核验」四种)`public sealed record EnvironmentReport(DateTimeOffset CheckedAt, IReadOnlyList<CheckItem> Items) { public int Passed; public int Failed; public string Summary }`:Summary 规则——Failed==0 且 Passed>0 → 「{Passed} 项通过」(有跳过/无法核验时追加「,{n} 项未能检查」);Failed>0 → 「{Failed} 项未通过:」+ 未通过项 Name 用「、」拼接。`public interface IIpv6Probe { Task<bool> CanReachAsync(CancellationToken token); }` 与 `public sealed class SocketIpv6Probe : IIpv6Probe`:对 `[2606:4700:4700::1111]:443` 发起 TCP 连接,3 秒超时;连上返 true(=IPv6 有直连路径,坏事),任何异常/超时/本机无 IPv6 返 false。`public static class EnvironmentSelfCheck` 纯函数 `public static EnvironmentReport Evaluate(SelfCheckInput input)`,`SelfCheckInput` 记录:ExitProbeResult? Exit、string NodeHost、string ExpectedCountry、bool EnvironmentEnabled、bool EnvironmentApplied、EnvironmentTarget Target、EnvironmentInspection? Inspection、bool? Ipv6Reachable、System.Text.Json.JsonElement SingboxConfig、DateTimeOffset Now。七项(Id/Name 固定,顺序固定):\n  1. exit_country /「出口归属澳洲」:Exit 为 null → 无法核验;Country 为 null → 无法核验(Detail「探测点未返回国家码」);== ExpectedCountry → 通过(Detail 含国家码);否则未通过(Detail 含实际国家码,不含 IP)。\n  2. exit_node /「出口与节点一致」:Exit 为 null → 无法核验;Address 等于 NodeHost → 通过;否则未通过。\n  3. time_zone /「系统时区」:!EnvironmentEnabled → 跳过(「环境一致性未启用」);Inspection 为 null → 无法核验;TimeZone == Target.TimeZoneId → 通过;否则未通过(Detail 含当前 ID)。\n  4. auto_time_zone /「自动时区已关」:同上前两条;AutoTimeZoneStart == 4 → 通过;null → 无法核验;否则未通过。\n  5. chrome_policy /「Chrome 策略」:前两条同;Chrome[ForcedLanguages 由 ChromeForcedLanguages 判] 序列等于 Target.Languages 且 WebRtcIPHandling == default_public_interface_only 且 DefaultGeolocationSetting == \"2\" → 通过;否则未通过(Detail 列出不符的值名,不列值)。\n  6. edge_policy /「Edge 策略」:DefinePreferredLanguages == 逗号拼接的 Target.Languages、WebRtcLocalhostIpHandling == default_public_interface_only、DefaultGeolocationSetting == \"2\" → 通过;否则同上。\n  7. no_direct_path /「配置无直连路径」:纯读 SingboxConfig:`route.final == \"proxy\"`;`route.rules` 里存在 `ip_version == 6 && outbound == \"block\"`;`dns.servers` 每项 `detour == \"proxy\"`;`outbounds` 里不存在 `type == \"direct\"`;四条全满足 → 通过,否则未通过(Detail 列出缺的条目名);SingboxConfig 缺这些键 → 未通过。\n  另:ipv6_direct /「IPv6 已封堵」作为第 8 项:Ipv6Reachable 为 null → 无法核验;false → 通过;true → 未通过(「IPv6 可直连,可能泄漏」)。共 8 项。\n\n③ 控制器接线(winclient/WinClient.Core/Client/ClientController.cs)\n构造函数加可选 `IIpv6Probe? ipv6Probe = null, Action<EnvironmentReport>? reportSink = null`;ClientSnapshot 加 `public string SelfCheckStatus { get; init; } = \"未检测\";`。CheckExitAsync 改用 `ProbeDetailedAsync`,记 `exitCountry`;**每次出口核验到达终局(已核验/不一致/无法核验)后、安排 5 分钟复查之前**,在同一回调里跑自检:SelfCheckStatus=「检测中」并 Publish;`inspection = environment is null ? null : await environment.InspectAsync()`(policy.Enabled 为 false 时不跑 Inspect,传 null);`ipv6 = ipv6Probe is null ? null : await ipv6Probe.CanReachAsync(lifetime.Token)`(异常按 null);组 SelfCheckInput(ExpectedCountry 取 environmentSettings.Read() 新增字段,见 ④;NodeHost=session.Node.Host;SingboxConfig=session.SingboxConfig)→ Evaluate → SelfCheckStatus=report.Summary;`reportSink?.Invoke(report)`(异常按 IsOperational 吞掉,不影响状态)。离开 Connected 时 SelfCheckStatus 清回「未检测」。自检任何结果**不改 message、不动状态机、不撤保护、不断开**。\n\n④ 设置、门面、协议、界面\nEnvironmentSettings.cs:EnvironmentPolicy 加 `string ExpectedCountry`(environment.json 字段 `country`,默认 \"AU\",校验 `^[A-Z]{2}$`,不合法回默认);IEnvironmentSettingsStore 不变。ClientRuntime.cs:构造控制器时传 `ipv6Probe: new SocketIpv6Probe()` 与 `reportSink: report => 原子写 Path.Combine(run, \"selfcheck.json\")`(JSON snake_case,含 checked_at、summary、items[{id,name,result,detail}],.tmp 再 Move,参照 DesiredStateStore;写失败吞掉不抛);`public string? ReadSelfCheck()` 读该文件(不存在返 null)。IClientFacade.cs 加 `string? ReadSelfCheck();`。ControlProtocol.cs:ControlResponse 加 `string? SelfCheck = null`;ControlSnapshot 加 `SelfCheckStatus`(默认「未检测」),两个 implicit operator 搬运(JSON self_check_status)。ControlServer.cs:新只读 op `read_selfcheck`(不在 StateChangingOps,进指令信号量,返回 `SelfCheck: facade.ReadSelfCheck()`,超长处理同 read_audit);服务化说明的只读指令列表加它。MainViewModel.cs:`SelfCheckLine` => 「环境自检:」+ SelfCheckStatus;Refresh 里 Notify;ExportAuditAsync 改为先后发 read_audit 与 read_selfcheck,把两者合成一个 JSON 对象 `{\"firewall_audit\": <审计 JSON 原样或 null>, \"self_check\": <自检 JSON 原样或 null>}` 写到用户选的路径(两者都为 null 时提示「尚无可导出的诊断记录,请完成一次连接后重试。」),成功提示「已导出诊断(防火墙审计 + 环境自检)。」。MainWindow.xaml:GuardLine 之后、环境一致性复选框之前加 `<TextBlock Text=\"{Binding SelfCheckLine}\" TextWrapping=\"Wrap\" HorizontalAlignment=\"Center\" Margin=\"0,8,0,0\" Foreground=\"#536174\" AutomationProperties.LiveSetting=\"Polite\"/>`;「导出诊断」按钮 ToolTip 改为「导出防火墙审计与环境自检报告」。MainWindow.xaml.cs 的保存对话框标题改「导出诊断」、默认文件名「诊断报告.json」。\n\n⑤ 测试(先写红)\nwinclient/WinClient.Tests/EnvironmentSelfCheckTests.cs(新):Evaluate 纯函数——全好输入 8 项全通过、Summary 为「8 项通过」;Country=\"CN\" → exit_country 未通过且 Summary 含「出口归属澳洲」;EnvironmentEnabled=false → 时区/自动时区/Chrome/Edge 四项为「跳过」且 Summary 为「4 项通过,4 项未能检查」;Inspection=null(启用时)→ 四项无法核验;Ipv6Reachable=true → 未通过;SingboxConfig 含 `type:\"direct\"` 出站或 dns detour 不是 proxy 或缺 ip_version 6 阻断 → no_direct_path 未通过,Detail 列出缺项;Result 只出现四种字面。`HttpExitProbe.Parse`:`ip=1.2.3.4\\nloc=AU` → 地址与国家;`loc=au`(小写)→ Country null;无 ip 行 → null。EnvironmentApplierTests.cs:InspectAsync 对假 runner 的 JSON 解析成 EnvironmentInspection;退出码 1 → null;坏 JSON → null。ControllerTests.cs:加假件 `ScriptedIpv6 : IIpv6Probe` 与 reportSink 收集器;出口核验终局后 SelfCheckStatus 不再是「未检测」/「检测中」且 reportSink 收到 8 项报告;probe 全 null 五次后仍跑自检且前两项「无法核验」;ipv6 假件返 true → Summary 含「IPv6 已封堵」且 State 仍 Connected、order 无 stop/remove;Disconnect 后 SelfCheckStatus 回「未检测」;environment 为 null 且 ipv6Probe 为 null 的既有测试不改。IpcTests.cs:self_check_status 往返与旧 JSON 默认;read_selfcheck 返回门面内容且不受调用者核验限制。实现 IClientFacade 的假件按「旧测试夹具适配持续授权」补 ReadSelfCheck。\n\n⑥ 文档:docs/winclient/环境一致性说明.md 加「环境自检」节(八项表格:编号、名称、判定、四种结果含义;触发时机;界面文字;报告文件与导出;**自检通过不等于任何检测都查不出**,国家归属只采信探测点返回的国家码一个数据源;真机待验证:连上后一分钟内界面出现「8 项通过」;把时区手改回北京时间后下一轮显示「1 项未通过:系统时区」;关总开关后显示「4 项通过,4 项未能检查」;导出文件含两段)。docs/winclient/架构说明.md「验证与交付边界」加一句;docs/winclient/服务化与自启说明.md 只读指令列表加 read_selfcheck。\n\n⑦ 边界:全程中文;不新增 NuGet;自检只读不改系统;Socket 探测只连一个固定 IPv6 字面地址一次、3 秒超时;不记 IP 到日志(报告文件里可以有国家码与时区 ID,不写出口 IP);不改状态机、断网保护、巡检、既有断言;IExitProbe/IEnvironmentEnforcer 新成员一律默认接口成员,既有假件不被迫改。",
+  "background": "项目:外包,中国 Windows 客户端(.NET 9 WPF,后台服务 SYSTEM + 托盘界面,sing-box TUN strict_route)+ 澳洲出口节点。上一单 yc-env-consistency-1022 已落地 Environment 目录(EnvironmentPlanner 的 ApplyScript/RestoreScript/InspectScript、EnvironmentApplier、EnvironmentSettingsStore、总开关、快照字段 EnvironmentEnabled/EnvironmentStatus、op set_environment),本单在其上加自检。出口核验(ExitProbe、CheckExitAsync、5 分钟复查)与巡检见 PR #40;ClientController 用 Schedule+gate 串行,ExecuteAsync 后 UpdateMonitoring 统一清状态;ControlSnapshot/ClientSnapshot implicit 互转 JSON snake_case;MainViewModel.ExportAuditAsync 现只导出防火墙审计。详见 docs/winclient/环境一致性说明.md、架构说明.md、docs/plans/yc-env-consistency-1022.json。",
+  "nonGoals": [
+    "不修复任何未通过项(修复路径是既有巡检与环境套用)",
+    "不因自检结果断开、撤保护或改消息",
+    "不做 DNS 泄漏在线探测(需要自控域名,另议);配置层检查代替",
+    "不在真机实测;真机项写进文档待验证清单"
+  ],
+  "allowedPaths": [
+    "winclient/WinClient.Core/Client/ExitProbe.cs",
+    "winclient/WinClient.Core/Client/ClientController.cs",
+    "winclient/WinClient.Core/Client/ClientRuntime.cs",
+    "winclient/WinClient.Core/Client/IClientFacade.cs",
+    "winclient/WinClient.Core/Environment/EnvironmentPlanner.cs",
+    "winclient/WinClient.Core/Environment/EnvironmentApplier.cs",
+    "winclient/WinClient.Core/Environment/EnvironmentSettings.cs",
+    "winclient/WinClient.Core/Environment/EnvironmentSelfCheck.cs",
+    "winclient/WinClient.Core/Ipc/ControlProtocol.cs",
+    "winclient/WinClient.Core/Ipc/ControlServer.cs",
+    "winclient/WinClient.Core/Ipc/ControlClient.cs",
+    "winclient/WinClient.App/MainViewModel.cs",
+    "winclient/WinClient.App/MainWindow.xaml",
+    "winclient/WinClient.App/MainWindow.xaml.cs",
+    "winclient/WinClient.Tests/ControllerTests.cs",
+    "winclient/WinClient.Tests/IpcTests.cs",
+    "winclient/WinClient.Tests/UpdateIpcTests.cs",
+    "winclient/WinClient.Tests/EnvironmentPlannerTests.cs",
+    "winclient/WinClient.Tests/EnvironmentApplierTests.cs",
+    "winclient/WinClient.Tests/EnvironmentSelfCheckTests.cs",
+    "winclient/WinClient.Tests/TestData.cs",
+    "docs/winclient/环境一致性说明.md",
+    "docs/winclient/架构说明.md",
+    "docs/winclient/服务化与自启说明.md"
+  ],
+  "forbiddenPaths": [
+    "docs/开工须知.md",
+    "docs/口径速查表.md",
+    "docs/design/**",
+    "docs/交接/**",
+    "docs/plans/**",
+    "docs/acceptance/**",
+    "docs/node/**",
+    "docs/authserver/**",
+    "docs/winclient/自动更新说明.md",
+    "docs/winclient/打包与发布说明.md",
+    "docs/winclient/断网保护加固说明.md",
+    ".github/**",
+    ".codex/**",
+    ".gitignore",
+    "pyproject.toml",
+    "scripts/**",
+    "node/**",
+    "authserver/**",
+    "winclient/third_party/**",
+    "winclient/*.sln",
+    "winclient/*/*.csproj",
+    "winclient/WinClient.Core/Auth/**",
+    "winclient/WinClient.Core/Hosting/**",
+    "winclient/WinClient.Core/Kernel/**",
+    "winclient/WinClient.Core/Logging/**",
+    "winclient/WinClient.Core/Pairing/**",
+    "winclient/WinClient.Core/Process/**",
+    "winclient/WinClient.Core/State/**",
+    "winclient/WinClient.Core/Storage/**",
+    "winclient/WinClient.Core/Update/**",
+    "winclient/WinClient.Core/Firewall/**",
+    "winclient/WinClient.Core/Client/ClientSettings.cs",
+    "winclient/WinClient.Core/Client/DesiredStateStore.cs",
+    "winclient/WinClient.Core/Client/ISessionSource.cs",
+    "winclient/WinClient.Core/Client/TunnelTransport.cs",
+    "winclient/WinClient.Core/Ipc/CallerIdentity.cs",
+    "winclient/WinClient.Core/Ipc/ConnectionBudget.cs",
+    "winclient/WinClient.Core/Ipc/ServerIdentity.cs",
+    "winclient/WinClient.App/App.xaml*",
+    "winclient/WinClient.App/Hosting/**",
+    "winclient/WinClient.App/Program.cs",
+    "winclient/WinClient.App/Views/**",
+    "winclient/WinClient.App/EmbeddedKernelSource.cs",
+    "winclient/WinClient.Tests/AuthTests.cs",
+    "winclient/WinClient.Tests/DataDirectorySecurityTests.cs",
+    "winclient/WinClient.Tests/FirewallTests.cs",
+    "winclient/WinClient.Tests/HostingTests.cs",
+    "winclient/WinClient.Tests/KernelInstallerTests.cs",
+    "winclient/WinClient.Tests/KillSwitch*.cs",
+    "winclient/WinClient.Tests/PairingCertificateTests.cs",
+    "winclient/WinClient.Tests/PairingTests.cs",
+    "winclient/WinClient.Tests/ProcessStorageTests.cs",
+    "winclient/WinClient.Tests/StateTests.cs",
+    "winclient/WinClient.Tests/UpdateApplierTests.cs",
+    "winclient/WinClient.Tests/UpdateCoordinatorTests.cs",
+    "winclient/WinClient.Tests/UpdateHttpTests.cs",
+    "winclient/WinClient.Tests/UpdateTests.cs",
+    "winclient/WinClient.Tests/Fixtures/**"
+  ],
+  "expectArtifacts": [
+    "winclient/WinClient.Core/Client/ExitProbe.cs",
+    "winclient/WinClient.Core/Environment/EnvironmentSelfCheck.cs",
+    "winclient/WinClient.Core/Environment/EnvironmentApplier.cs",
+    "winclient/WinClient.Core/Client/ClientController.cs",
+    "winclient/WinClient.Core/Ipc/ControlProtocol.cs",
+    "winclient/WinClient.App/MainViewModel.cs",
+    "winclient/WinClient.Tests/EnvironmentSelfCheckTests.cs",
+    "docs/winclient/环境一致性说明.md"
+  ],
+  "acceptance": [
+    {
+      "id": "BUILD",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "build",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 900
+    },
+    {
+      "id": "TEST",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "test",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--no-build",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 900
+    },
+    {
+      "id": "SHAPE-A",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda p:pathlib.Path(p).read_text(encoding='utf-8');ep=r('winclient/WinClient.Core/Client/ExitProbe.cs');sc=r('winclient/WinClient.Core/Environment/EnvironmentSelfCheck.cs');ap=r('winclient/WinClient.Core/Environment/EnvironmentApplier.cs');bad=[k for k,ok in (('probe','record ExitProbeResult' in ep and 'ProbeDetailedAsync' in ep and 'loc=' in ep and 'static ExitProbeResult? Parse' in ep),('selfcheck','record CheckItem' in sc and 'record EnvironmentReport' in sc and 'interface IIpv6Probe' in sc and 'class SocketIpv6Probe' in sc and '2606:4700:4700::1111' in sc and 'static EnvironmentReport Evaluate' in sc),('items',all(k in sc for k in ('exit_country','exit_node','time_zone','auto_time_zone','chrome_policy','edge_policy','no_direct_path','ipv6_direct'))),('results',all(k in sc for k in ('通过','未通过','跳过','无法核验'))),('inspect','record EnvironmentInspection' in ap and 'InspectAsync' in ap)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "SHAPE-B",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda p:pathlib.Path(p).read_text(encoding='utf-8');cc=r('winclient/WinClient.Core/Client/ClientController.cs');cp=r('winclient/WinClient.Core/Ipc/ControlProtocol.cs');cs=r('winclient/WinClient.Core/Ipc/ControlServer.cs');fa=r('winclient/WinClient.Core/Client/IClientFacade.cs');rt=r('winclient/WinClient.Core/Client/ClientRuntime.cs');bad=[k for k,ok in (('ctrl','IIpv6Probe? ipv6Probe = null' in cc and 'Action<EnvironmentReport>? reportSink = null' in cc and 'SelfCheckStatus' in cc and 'ProbeDetailedAsync' in cc and 'EnvironmentSelfCheck.Evaluate' in cc and '检测中' in cc),('proto','SelfCheckStatus' in cp and 'SelfCheck' in cp),('server','\"read_selfcheck\"' in cs),('facade','ReadSelfCheck' in fa),('rt','new SocketIpv6Probe()' in rt and 'selfcheck.json' in rt)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "SHAPE-C",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda p:pathlib.Path(p).read_text(encoding='utf-8');vm=r('winclient/WinClient.App/MainViewModel.cs');x=r('winclient/WinClient.App/MainWindow.xaml');xc=r('winclient/WinClient.App/MainWindow.xaml.cs');st=r('winclient/WinClient.Core/Environment/EnvironmentSettings.cs');bad=[k for k,ok in (('vm','SelfCheckLine' in vm and 'read_selfcheck' in vm and 'firewall_audit' in vm and 'self_check' in vm),('xaml','{Binding SelfCheckLine}' in x),('xamlcs','诊断报告.json' in xc),('settings','ExpectedCountry' in st and '\"AU\"' in st)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "TESTS-EXIST",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;t='winclient/WinClient.Tests/';bad=[] if pathlib.Path(t+'EnvironmentSelfCheckTests.cs').exists() else ['EnvironmentSelfCheckTests.cs'];cc=pathlib.Path(t+'ControllerTests.cs').read_text(encoding='utf-8');bad+=[k for k in ('IIpv6Probe','SelfCheckStatus') if k not in cc];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "NOWINDOW",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;norm=lambda p:str(p).replace(chr(92),'/');files=[p for root in ('winclient/WinClient.Core','winclient/WinClient.App') for p in pathlib.Path(root).rglob('*.cs') if '/obj/' not in norm(p) and '/bin/' not in norm(p)];bad=[norm(p) for p in files if 'ProcessStartInfo' in p.read_text(encoding='utf-8') and p.parent.name!='Process' and 'CreateNoWindow = true' not in p.read_text(encoding='utf-8')];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda p:pathlib.Path(p).read_text(encoding='utf-8');a=r('docs/winclient/环境一致性说明.md');b=r('docs/winclient/架构说明.md');c=r('docs/winclient/服务化与自启说明.md');bad=[k for k in ('环境自检','出口归属澳洲','IPv6 已封堵','配置无直连路径','无法核验','selfcheck.json','不等于任何检测都查不出') if k not in a]+['arch:'+k for k in ('环境自检',) if k not in b]+['svc:'+k for k in ('read_selfcheck',) if k not in c];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "NOBIN",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess,sys;out=subprocess.run(['git','ls-files','winclient','build'],capture_output=True,text=True).stdout.split();bad=[f for f in out if f.endswith(('.exe','.dll','.zip','.pdb'))];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    }
+  ],
+  "steps": [
+    "读 ExitProbe.cs / ClientController.cs(CheckExitAsync、UpdateMonitoring、环境接线)/ ClientRuntime.cs / IClientFacade.cs / Environment 三文件 / ControlProtocol.cs / ControlServer.cs / ControlClient.cs / MainViewModel.cs / MainWindow.xaml(.cs)/ ControllerTests.cs / IpcTests.cs / UpdateIpcTests.cs / EnvironmentApplierTests.cs 与三份文档;先写 ⑤ 的红测试。",
+    "实现 ①②(探测国家码、巡查接口、自检纯函数与 IPv6 探测)与 ③④(控制器接线、设置字段、门面、协议、服务端 op、界面与导出);跑 BUILD / TEST / 形状断言。",
+    "写文档 ⑥;交活说明列真机待验证项。不许自己跑 dotnet build/test/restore 以外的命令改环境;不许在工位机器上执行 Apply/Restore/Inspect 脚本;第三方件缓存由派单方放进 winclient/third_party/cache/。"
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "timeoutSec": 7200,
+  "repoRoot": "E:/yuanc"
+}
