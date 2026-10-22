@@ -9,6 +9,39 @@ namespace WinClient.Tests;
 public sealed class EnvironmentApplierTests
 {
     [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task ForceRestoreSelectsRecordOrFallbackAndKeepsHiddenRunner(bool record)
+    {
+        using var temp = new TempDirectory();
+        var runner = new Runner(0);
+        var applier = new EnvironmentApplier(temp.Path, runner);
+        if (record) File.WriteAllText(applier.StatePath, "{}");
+        await applier.ForceRestoreAsync(new("UTC", ["en"]));
+        var script = runner.Start!.ArgumentList.Last();
+        if (record) Assert.Contains("Remove-Item -LiteralPath $statePath", script);
+        else
+        {
+            Assert.Contains("Start-Service tzautoupdate", script);
+            Assert.DoesNotContain("$statePath", script);
+        }
+        Assert.True(runner.Start.CreateNoWindow);
+        Assert.False(runner.Start.UseShellExecute);
+        Assert.True(runner.Cancellable);
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(4)]
+    public async Task ForceRestoreFallbackFailureUsesDefaultSettingsError(int exitCode)
+    {
+        using var temp = new TempDirectory();
+        var applier = new EnvironmentApplier(temp.Path, new Runner(exitCode));
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(() => applier.ForceRestoreAsync(new("UTC", ["en"])));
+        Assert.Contains("未能恢复默认设置", error.Message);
+    }
+
+    [Theory]
     [InlineData("AU", "AU")]
     [InlineData("NZ", "NZ")]
     [InlineData("au", "AU")]

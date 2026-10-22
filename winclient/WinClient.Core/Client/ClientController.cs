@@ -288,6 +288,31 @@ public sealed class ClientController : IDisposable
         finally { Publish(); gate.Release(); }
     }
 
+    public async Task ForceRestoreEnvironmentAsync()
+    {
+        await gate.WaitAsync();
+        try
+        {
+            if (protection || machine.State != ConnectionState.Disconnected)
+            { message = "请先断开连接,再强制恢复默认环境。"; return; }
+            if (environment is null)
+            { message = "环境一致性功能不可用。"; return; }
+            var hadRecord = environment.HasPendingState;
+            var policy = (environmentSettings?.Read() ?? EnvironmentSettingsStore.Default).ForNode(session?.Node);
+            await environment.ForceRestoreAsync(policy.Target);
+            environmentApplied = false;
+            environmentStatus = policy.Enabled ? "未应用" : "未启用";
+            message = hadRecord ? "已按恢复记录恢复原来的时区与浏览器设置。"
+                : "没有恢复记录:已恢复自动时区并清除本产品写入的浏览器策略;系统时区未改动,如需请在 Windows 设置里调整。";
+        }
+        catch (Exception ex) when (ex is EnvironmentVerifyException || IsOperational(ex))
+        {
+            environmentStatus = "恢复失败,请联系管理员";
+            message = "强制恢复未完成,请联系管理员。";
+        }
+        finally { Publish(); gate.Release(); }
+    }
+
     public async Task SetEnvironmentEnabledAsync(bool enabled)
     {
         await gate.WaitAsync();

@@ -14,7 +14,8 @@ public sealed class ControlServer(IClientFacade facade, DesiredStateStore desire
     /// <summary>不可信调用者发会改变连接状态的指令时返回的错误文案。</summary>
     public const string UntrustedCallerError = "只有本产品的界面程序可以执行此操作";
     // 会改变连接状态的指令，以及 check_update（会触发对外网络检查）、read_audit（含本机其他程序的规则名与完整路径）、read_selfcheck（含产品核验到的真实出口地址），只允许程序位于安装目录之下的调用者执行；status 与 subscribe 对任何本机程序开放。
-    private static readonly HashSet<string> TrustedOnlyOps = ["connect", "disconnect", "redeem", "import_pairing", "clear_pairing", "set_environment", "set_routing", "check_update", "read_audit", "read_selfcheck"];
+    // restore_environment 会修改系统环境，同样只允许可信调用者。
+    private static readonly HashSet<string> TrustedOnlyOps = ["connect", "disconnect", "redeem", "import_pairing", "clear_pairing", "set_environment", "restore_environment", "set_routing", "check_update", "read_audit", "read_selfcheck"];
     // One ordering across connections keeps persisted intent consistent with completed commands.
     private readonly SemaphoreSlim commands = new(1, 1);
     // 未订阅连接的空闲上限；零或负数表示不限。已订阅连接靠推送保活，不受此限。
@@ -131,6 +132,7 @@ public sealed class ControlServer(IClientFacade facade, DesiredStateStore desire
                     if (request.Enabled is null) return new(request.Id, false, "指令缺少 enabled");
                     await facade.SetEnvironmentEnabledAsync(request.Enabled.Value).ConfigureAwait(false);
                     break;
+                case "restore_environment": await facade.RestoreEnvironmentAsync().ConfigureAwait(false); break;
                 case "set_routing":
                     if (request.Mode is null) return new(request.Id, false, "指令缺少 mode");
                     await facade.SetRoutingAsync(request.Mode, request.Apps ?? []).ConfigureAwait(false);

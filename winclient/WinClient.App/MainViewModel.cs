@@ -64,6 +64,8 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
 
     public bool IsBusy { get; private set; }
     public bool CanUseConnection => client is not null && availability == ServiceAvailability.Ready && !IsBusy;
+    public bool CanRestoreEnvironment => CanUseConnection && !ShouldDisconnect;
+    public ICommand RestoreEnvironmentCommand { get; }
     private bool ShouldDisconnect => snapshot.ProtectionActive || snapshot.State is ConnectionState.Connected or ConnectionState.Connecting or ConnectionState.Reconnecting;
     public string ConnectLabel => IsBusy ? Hero.BusyLabel : Hero.PrimaryLabel;
     public ICommand RedeemCommand { get; }
@@ -127,6 +129,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         this.publishVerifyPage = publishVerifyPage ?? VerifyPagePublisher.WriteAndOpen;
         OpenVerifyPageCommand = new AsyncCommand(OpenVerifyPageAsync, () => !IsBusy);
         CreateBrowserProfileCommand = new AsyncCommand(CreateBrowserProfileAsync, () => !IsBusy);
+        RestoreEnvironmentCommand = new AsyncCommand(() => RunAsync(() => SendAsync("restore_environment")), () => CanRestoreEnvironment);
         GoToAccountCommand = new AsyncCommand(() => { CurrentPage = PageKind.Account; return Task.CompletedTask; }, () => true);
         AddRoutingAppCommand = new AsyncCommand(() => RunAsync(async () =>
         {
@@ -367,6 +370,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
     private void Refresh()
     {
         if (disposed) return;
+        Notify(nameof(CanRestoreEnvironment));
         Hero = StatusPresentation.Build(snapshot, availability, ShouldDisconnect);
         Notify(nameof(Hero)); Notify(nameof(Status)); Notify(nameof(Message)); Notify(nameof(ConnectLabel)); Notify(nameof(ModeText)); Notify(nameof(IsBusy)); Notify(nameof(CanUseConnection));
         Notify(nameof(ServiceVersionText)); Notify(nameof(ServiceVersionDisplay)); Notify(nameof(ServiceStateText)); Notify(nameof(ServiceStateTone));

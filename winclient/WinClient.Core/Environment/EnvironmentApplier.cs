@@ -11,6 +11,7 @@ public interface IEnvironmentEnforcer
     bool HasPendingState { get; }
     Task ApplyAsync(EnvironmentTarget target);
     Task RestoreAsync();
+    Task ForceRestoreAsync(EnvironmentTarget target) => RestoreAsync();
     Task<EnvironmentInspection?> InspectAsync() => Task.FromResult<EnvironmentInspection?>(null);
     Task<EnvironmentInspection?> InspectAsync(CancellationToken token) => InspectAsync();
 }
@@ -25,6 +26,7 @@ public sealed class EnvironmentApplier(string runDirectory, ICommandRunner? runn
     public bool HasPendingState => File.Exists(StatePath);
     public Task ApplyAsync(EnvironmentTarget target) => ExecuteAsync(EnvironmentPlanner.ApplyScript(target, StatePath), restoring: false);
     public Task RestoreAsync() => ExecuteAsync(EnvironmentPlanner.RestoreScript(StatePath), restoring: true);
+    public Task ForceRestoreAsync(EnvironmentTarget target) => ExecuteAsync("", restoring: true, forceTarget: target);
 
     public Task<EnvironmentInspection?> InspectAsync() => InspectAsync(CancellationToken.None);
 
@@ -73,14 +75,20 @@ public sealed class EnvironmentApplier(string runDirectory, ICommandRunner? runn
         finally { gate.Release(); }
     }
 
-    private async Task ExecuteAsync(string script, bool restoring)
+    private async Task ExecuteAsync(string script, bool restoring, EnvironmentTarget? forceTarget = null)
     {
         await gate.WaitAsync().ConfigureAwait(false);
         try
         {
             using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(120));
+            // 在同一把锁内选择记录恢复或无记录兜底，避免与套用环境交错。
+            var fallback = forceTarget is not null && !HasPendingState;
+            if (forceTarget is not null)
+                script = fallback ? EnvironmentPlanner.ForceRestoreScript(forceTarget) : EnvironmentPlanner.RestoreScript(StatePath);
             // 复用隐藏窗口的既有执行器，不记录脚本输出或异常中的系统信息。
             var result = await runner.RunAsync(KillSwitchApplier.CreateStartInfo(script), timeout.Token).ConfigureAwait(false);
+            if (fallback && result.ExitCode != 0)
+                throw new InvalidOperationException("未能恢复默认设置,请联系管理员。");
             if (result.ExitCode == 4)
                 throw new EnvironmentVerifyException("时区切换未生效,可能被组策略锁定;连接与断网保护不受影响。");
             if (result.ExitCode != 0)

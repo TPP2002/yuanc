@@ -8,6 +8,7 @@ public interface IClientFacade
     Task DisconnectAsync();
     Task SetRoutingAsync(string mode, IReadOnlyList<string> apps);
     Task SetEnvironmentEnabledAsync(bool enabled);
+    Task RestoreEnvironmentAsync();
     Task RedeemAsync(string code);
     Task ImportPairingAsync(string json);
     Task ClearPairingAsync();
