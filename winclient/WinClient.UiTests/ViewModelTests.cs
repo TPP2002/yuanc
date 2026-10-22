@@ -11,6 +11,26 @@ namespace WinClient.UiTests;
 public class ViewModelTests(UiThreadFixture ui)
 {
     [Fact]
+    public void 浏览器复核无需后台且保留主消息() => ui.Invoke(() =>
+    {
+        string? received = null;
+        using var model = new MainViewModel(() => null, () => null, null,
+            html => { received = html; return @"C:\fake\verify.html"; });
+        model.ApplyPreview(new ControlSnapshot(ConnectionState.Disconnected, "未连接", "", false)
+            { RoutingMode = "apps", EnvironmentEnabled = false }, ServiceAvailability.Unavailable);
+        var message = model.Message;
+        Assert.True(model.OpenVerifyPageCommand.CanExecute(null));
+        model.OpenVerifyPageAsync().GetAwaiter().GetResult();
+        Assert.Contains("data-mode=\"apps\"", received);
+        Assert.Contains("data-env=\"off\"", received);
+        Assert.Contains(@"C:\fake\verify.html", model.VerifyPageMessage);
+        Assert.Equal(message, model.Message);
+        using var failed = new MainViewModel(() => null, () => null, null, _ => null);
+        failed.OpenVerifyPageAsync().GetAwaiter().GetResult();
+        Assert.Contains("未完成", failed.VerifyPageMessage);
+    });
+
+    [Fact]
     public void 专用浏览器无需后台且不修改主消息() => ui.Invoke(() =>
     {
         using var model = new MainViewModel(() => null, () => null,
