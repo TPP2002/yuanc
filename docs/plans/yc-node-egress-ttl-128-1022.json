@@ -1,0 +1,196 @@
+{
+  "schemaVersion": 1,
+  "taskId": "SEC-NODE-TTL-128-1022",
+  "slug": "yc-node-egress-ttl-128-1022",
+  "title": "出口节点:自管规则表加 output 链,只对隧道服务账户 exitnode 自己发起的连接把 IPv4 TTL / IPv6 跳数设为 128(与客户端系统默认值一致),应答与节点自身流量不改;黄金文件、测试、文档同步",
+  "goal": "以派单时 origin/main 头为基点。出口节点(Debian 12,nft 1.0.6)上隧道服务 sing-box 以系统账户 `exitnode` 运行,它替客户端向目标网站发起的连接目前带 Linux 默认 TTL 64,而客户端是 Windows(默认 128);本单让节点**自管规则表** `table inet exitnode` 新增一条 output 链,只对 `exitnode` 账户自己发起的连接把 IPv4 TTL 与 IPv6 跳数设为 128。做完后:\n\n① node/exitnode/nft.py 的 render_ruleset(ctx):\n  - 读取 `ctx.get(\"service_user\", \"exitnode\")`,用 `re.fullmatch(r\"[a-z_][a-z0-9_-]{0,31}\", user)` 校验,不合法 raise ValueError(\"服务账户名不合法\")(与端口校验同一防注入思路)。\n  - 在 postrouting 链之后、表结束的 `}` 之前追加 output 链,文本逐字如下(四空格缩进与现有链一致;账户名由 service_user 拼入):\n        chain output {\n            type filter hook output priority mangle; policy accept;\n            # 只改隧道服务账户自己发起的连接(代理出口流量与它的域名解析):与客户端系统的默认值 128 一致;给客户端的应答与节点自身的其他流量不改。\n            meta skuid \"exitnode\" ct direction original ip ttl set 128\n            meta skuid \"exitnode\" ct direction original ip6 hoplimit set 128\n        }\n  - 首行注释在「不限制其他流量;」之后插入「隧道服务发起的出站连接 TTL 设为 128;」,其余字样不变(既有测试仍要求首行含「占位」「exitnode-nft.service」「IPAddressAllow」)。\n  - 不改 input / forward / postrouting 三条链;不用 sysctl、不改 net.ipv4.ip_default_ttl / net.ipv6.conf.*.hop_limit;不新建第二张表;apply/remove 流程不变(表整体重建与删除已覆盖新链,幂等且可撤回)。\n② node/exitnode/cli.py init 构造规则上下文的 `context = {...}` 加 `\"service_user\": service.SERVICE_USER`(账户在「创建服务账户」步骤已先于「安装网络规则」创建,开机 exitnode-nft.service 重新加载时账户也已存在)。\n③ node/tests/golden/exitnode.nft 更新为新渲染结果(既有 test_ruleset_matches_golden_and_only_owns_one_table 逐字比对,仍只含一个 `table `)。\n④ node/tests/test_nft_render.py 末尾追加两个测试(既有五个测试一字不改):\n  - test_output_chain_sets_ttl_only_for_service_originated_connections:render_ruleset(CTX) 含 `chain output {`、`type filter hook output priority mangle; policy accept;`;`ip ttl set 128` 与 `ip6 hoplimit set 128` 各恰好出现 1 次,且这两行都含 `meta skuid \"exitnode\"` 与 `ct direction original`;input / forward / postrouting 三链文本与基点相同(可用「去掉 output 链后与旧黄金内容一致」或逐链断言);扫描 node/exitnode 下全部 .py 不含 `ip_default_ttl` 与 `sysctl`。\n  - test_service_user_cannot_inject_rules:`render_ruleset({**CTX, \"service_user\": 'exitnode\" accept; delete table inet other'})` 与 `{**CTX, \"service_user\": \"Root\"}` 都 raise ValueError;`{**CTX, \"service_user\": \"svc-user_1\"}` 正常渲染且规则行含 `meta skuid \"svc-user_1\"`。\n⑤ node/tests/test_cli.py:在 init 全流程测试里(断言 `\"/var/lib/exitnode/exitnode.nft\" in runner.files` 处之后)加一句:写出的规则文件含 `meta skuid \"exitnode\" ct direction original ip ttl set 128`(证明 cli 把 service.SERVICE_USER 接进了上下文);其余断言不动。\n⑥ docs/node/服务加固说明.md:\n  - 「防火墙规则表」一节补一段「出口连接 TTL 与客户端一致」:为什么(客户端 Windows 默认 128、节点 Linux 默认 64,目标网站看到的是节点发出的包)、改法(output 链 + `meta skuid \"exitnode\"` + `ct direction original`,只改隧道服务账户发起的连接,给客户端的应答、SSH、更新、鉴权等节点自身流量不改)、为什么不用 sysctl(全局改会把节点自身所有流量一起改,范围更大且不随本表撤回)、撤回(随表删除)。\n  - 「真机待验证」追加一条:在节点出口网卡抓包(例如 `tcpdump -ni <网卡> -v 'src host <节点地址> and not src port 443 and not src port 24443'`),客户端经隧道访问网站时节点发出的新连接 SYN 的 ttl 应为 128,而节点自己 SSH / apt / 鉴权的包仍是 64,给客户端的 443/24443 应答仍是 64;IPv6 同理看 hlim;尚未实测。\n  - 全文不得出现「伪装」「反追踪」「不可追踪」「IP 隐匿」「指纹浏览器」「风控」「对抗检测」这些词;描述目的只写「与客户端系统的默认值一致」。\n⑦ docs/node/隧道配置说明.md 可选:若有合适的位置,加一句指向服务加固说明的 TTL 段落;没有就不改。\n⑧ 全程中文;ruff(行宽 100)与 pytest 全绿;不在真机实测。",
+  "background": "项目:外包,澳洲出口节点 Python 包 node/exitnode(Debian 12,sing-box 1.10.7,nft 1.0.6),测试 node/tests(pytest,FakeRunner 假执行器)。\nnft.py 现状(64 行):render_ruleset(ctx) 用 ctx 的 reality_port / hy2_port / admin_port(整数校验防注入)与 admin_bind 渲染 `table inet exitnode`,三条链 input(放行 443/24443/管理端口)、forward(占位注释)、postrouting(nat 占位注释),首行一句注释;apply(runner, ctx) 把「table inet exitnode / delete table inet exitnode / 规则表」写到 /var/lib/exitnode/exitnode.nft(.tmp 原子替换,0600)后 `nft -f`;remove 删表删文件。黄金文件 node/tests/golden/exitnode.nft 与 render_ruleset(CTX) 逐字比对(CTX = 443 / 24443 / 8443,admin_bind 缺省 127.0.0.1)。\ncli.py init(第 249~257 行)先核「已有同名规则表未在清单」,再构造 context = {reality_port, hy2_port, admin_port, admin_bind},apply(\"安装网络规则\", nft.apply) 后 enable exitnode-nft.service(开机 `nft -f` 同一文件,DefaultDependencies=no、After=local-fs.target、Before=network-pre.target exitnode-proxy.service)。「创建服务账户」步骤(useradd --system exitnode)排在「安装网络规则」之前(test_cli 断言步骤顺序)。service.SERVICE_USER = \"exitnode\",exitnode-proxy.service 以 User=exitnode / Group=exitnode 运行,只保留 CAP_NET_BIND_SERVICE。\ntest_nft_render.py 现状(68 行,5 个测试):golden 逐字比对 + 只有一个 table + 源码不含 flush ruleset;首行注释含「占位」「exitnode-nft.service」「IPAddressAllow」;apply 单批写入与加载顺序;表不存在时删除是空操作、命令失败不隐藏;端口注入 raise ValueError。test_cli.py 的 init 全流程测试(约第 200~262 行)断言步骤顺序、nft -f 早于 enable、规则文件与单元文件存在、uninstall 撤回删规则文件。\n服务端 sing-box 出站是 direct(节点自己向目标发起连接),所以目标网站看到的 TTL 是节点内核的默认值 64;客户端侧 Windows 默认 128。节点的 SSH、apt、鉴权服务(另一账户)、给客户端的隧道应答都不是 exitnode 账户发起的新连接,用 `meta skuid` + `ct direction original` 就能只圈住代理出口流量。conntrack 在 output 钩子上先于 mangle 优先级生效,首包即有方向信息;`ip ttl set` / `ip6 hoplimit set` 由 nft 自动修正首部校验和。看板卡 SEC-NODE-TTL-128-1022(sonnet·小,来源会审·浏览器指纹 高4),卡上两种修法(nft 表 / sysctl)选 nft 表、且收窄到服务账户发起的连接。",
+  "nonGoals": [
+    "不用 sysctl 改全局 TTL;不改 input / forward / postrouting 三条链;不新建第二张表",
+    "不改 systemd 单元模板、服务账户、manifest 撤回机制",
+    "不改客户端(winclient)与鉴权服务",
+    "不在真机实测;抓包核实写进文档真机待验证"
+  ],
+  "allowedPaths": [
+    "node/exitnode/nft.py",
+    "node/exitnode/cli.py",
+    "node/tests/golden/exitnode.nft",
+    "node/tests/test_nft_render.py",
+    "node/tests/test_cli.py",
+    "docs/node/服务加固说明.md",
+    "docs/node/隧道配置说明.md"
+  ],
+  "forbiddenPaths": [
+    ".codex/**",
+    ".github/**",
+    ".gitignore",
+    "authserver/**",
+    "docs/acceptance/**",
+    "docs/authserver/**",
+    "docs/design/**",
+    "docs/node/客户端包托管说明.md",
+    "docs/node/救援单元说明.md",
+    "docs/node/更新与回退说明.md",
+    "docs/node/看门狗说明.md",
+    "docs/node/自用配对说明.md",
+    "docs/node/配置说明.md",
+    "docs/plans/**",
+    "docs/winclient/**",
+    "docs/交接/**",
+    "docs/口径速查表.md",
+    "docs/开工须知.md",
+    "node/README.md",
+    "node/examples/**",
+    "node/exitnode/__init__.py",
+    "node/exitnode/__main__.py",
+    "node/exitnode/admin/**",
+    "node/exitnode/config.py",
+    "node/exitnode/device.py",
+    "node/exitnode/log.py",
+    "node/exitnode/manifest.py",
+    "node/exitnode/netinfo.py",
+    "node/exitnode/proxy/**",
+    "node/exitnode/rescue/**",
+    "node/exitnode/runner.py",
+    "node/exitnode/service.py",
+    "node/exitnode/status.py",
+    "node/exitnode/systemd.py",
+    "node/exitnode/templates/**",
+    "node/exitnode/updater/**",
+    "node/exitnode/watchdog/**",
+    "node/exitnode/watchdog/probes.py",
+    "node/exitnode/watchdog/state.py",
+    "node/tests/golden/exitnode-nft.service",
+    "node/tests/golden/exitnode-proxy.service",
+    "node/tests/test_admin_publish.py",
+    "node/tests/test_admin_server.py",
+    "node/tests/test_config.py",
+    "node/tests/test_device.py",
+    "node/tests/test_hy2_certificate.py",
+    "node/tests/test_hy2_service.py",
+    "node/tests/test_manifest.py",
+    "node/tests/test_netinfo_public.py",
+    "node/tests/test_proxy_client_render.py",
+    "node/tests/test_proxy_keys.py",
+    "node/tests/test_proxy_registry.py",
+    "node/tests/test_proxy_server_render.py",
+    "node/tests/test_proxy_sync.py",
+    "node/tests/test_release_script.py",
+    "node/tests/test_renderer_parity.py",
+    "node/tests/test_rescue.py",
+    "node/tests/test_service.py",
+    "node/tests/test_sign_winclient.py",
+    "node/tests/test_systemd_render.py",
+    "node/tests/test_updater.py",
+    "node/tests/test_watchdog.py",
+    "pyproject.toml",
+    "scripts/**",
+    "winclient/**"
+  ],
+  "expectArtifacts": [
+    "node/exitnode/nft.py",
+    "node/exitnode/cli.py",
+    "node/tests/golden/exitnode.nft",
+    "node/tests/test_nft_render.py",
+    "node/tests/test_cli.py",
+    "docs/node/服务加固说明.md"
+  ],
+  "acceptance": [
+    {
+      "id": "RUFF",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "ruff",
+        "check",
+        "node",
+        "scripts",
+        "authserver"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "PYTEST",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+        "node/tests"
+      ],
+      "required": true,
+      "timeoutSec": 600
+    },
+    {
+      "id": "SHAPE-NFT",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;p=pathlib.Path('node/exitnode/nft.py').read_text(encoding='utf-8');c=pathlib.Path('node/exitnode/cli.py').read_text(encoding='utf-8');src=[q for q in pathlib.Path('node/exitnode').rglob('*.py')];bad=[k for k,ok in (('chain','chain output {' in p and 'type filter hook output priority mangle; policy accept;' in p),('ttl4',p.count('ip ttl set 128')==1),('ttl6',p.count('ip6 hoplimit set 128')==1),('skuid','meta skuid' in p and 'ct direction original' in p),('user','service_user' in p and 're.fullmatch' in p),('cli','\"service_user\": service.SERVICE_USER' in c),('no-sysctl',not any('ip_default_ttl' in q.read_text(encoding='utf-8') or 'sysctl' in q.read_text(encoding='utf-8') for q in src))) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "GOLDEN",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;g=pathlib.Path('node/tests/golden/exitnode.nft').read_text(encoding='utf-8');bad=[k for k,ok in (('one-table',g.count('table ')==1),('chain','chain output {' in g),('rule4','meta skuid \"exitnode\" ct direction original ip ttl set 128' in g),('rule6','meta skuid \"exitnode\" ct direction original ip6 hoplimit set 128' in g),('first-line','占位' in g.splitlines()[0] and 'TTL' in g.splitlines()[0] and 'IPAddressAllow' in g.splitlines()[0]),('input','tcp dport 443 accept' in g and 'udp dport 24443 accept' in g and 'ip daddr 127.0.0.1 tcp dport 8443 accept' in g)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "TESTS-NFT",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess as sp,pathlib,re,sys;mb=sp.check_output(['git','merge-base','origin/main','HEAD'],text=True).strip();f='node/tests/test_nft_render.py';old=sp.check_output(['git','show',mb+':'+f]).decode('utf-8');new=pathlib.Path(f).read_text(encoding='utf-8');cli=pathlib.Path('node/tests/test_cli.py').read_text(encoding='utf-8');n=lambda s:len(re.findall(r'^def test_',s,re.M));bad=[k for k,ok in (('prefix',new.startswith(old.rstrip())),('count',n(new)-n(old)>=2),('names','test_output_chain_sets_ttl_only_for_service_originated_connections' in new and 'test_service_user_cannot_inject_rules' in new),('inject','delete table inet other' in new and 'svc-user_1' in new),('cli','meta skuid \"exitnode\" ct direction original ip ttl set 128' in cli)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "SCOPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess as sp,sys;g=lambda *a:sp.check_output(['git','-c','core.quotepath=false']+list(a)).decode('utf-8').split(chr(10));mb=g('merge-base','origin/main','HEAD')[0].strip();ch={p.strip() for p in g('diff','--name-only',mb)+g('ls-files','--others','--exclude-standard') if p.strip()};ok=[\"node/exitnode/nft.py\", \"node/exitnode/cli.py\", \"node/tests/golden/exitnode.nft\", \"node/tests/test_nft_render.py\", \"node/tests/test_cli.py\", \"docs/node/服务加固说明.md\", \"docs/node/隧道配置说明.md\"];bad=sorted(ch-set(ok));print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;d=pathlib.Path('docs/node/服务加固说明.md').read_text(encoding='utf-8');i=d.find('真机待验证');tail=d[i:] if i>=0 else '';banned=[w for w in ('伪装','反追踪','不可追踪','IP 隐匿','指纹浏览器','风控','对抗检测') if w in d];bad=[k for k,ok in (('ttl',d.count('128')>=3 and 'TTL' in d and 'hoplimit' in d),('skuid','skuid' in d and 'ct direction original' in d),('sysctl','sysctl' in d),('verify','128' in tail and ('tcpdump' in tail or '抓包' in tail) and '64' in tail),('banned',not banned)) if not ok];print(bad,banned);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "model": null,
+  "timeoutSec": 3600,
+  "repoRoot": "E:/yuanc",
+  "engine": "codex",
+  "reasoningEffort": "medium",
+  "steps": [
+    "读 nft.py / cli.py / 黄金文件 / test_nft_render.py / test_cli.py init 测试;先按 ④⑤ 写新测试与新断言并更新黄金文件,跑红。",
+    "改 nft.py(service_user 校验、首行注释、output 链)与 cli.py 上下文;RUFF / PYTEST / SHAPE-NFT / GOLDEN / TESTS-NFT / SCOPE 全绿。",
+    "改文档;DOCS 绿;交活说明写明真机抓包待验证与「只改服务账户发起的连接」口径。"
+  ]
+}
