@@ -1,4 +1,7 @@
 using System.Windows;
+using System.ComponentModel;
+using WinClient.App.Presentation;
+using WinClient.App.Themes;
 using Forms = System.Windows.Forms;
 
 namespace WinClient.App;
@@ -10,6 +13,7 @@ public partial class App : Application
     private RegisteredWaitHandle? notification;
     private Forms.NotifyIcon? tray;
     private MainWindow? window;
+    private readonly Dictionary<TrayIcon, System.Drawing.Icon> trayIcons = [];
     protected override void OnStartup(StartupEventArgs e)
     {
         showWindow = new EventWaitHandle(false, EventResetMode.AutoReset, @"Local\YuanC-ShowWindow", out var created);
@@ -19,6 +23,15 @@ public partial class App : Application
         }
         ShutdownMode = ShutdownMode.OnExplicitShutdown;
         base.OnStartup(e);
+        ThemeManager.Apply(Resources, ThemeManager.Detect());
+        ThemeManager.Start();
+        foreach (var kind in Enum.GetValues<TrayIcon>())
+        {
+            var uri = new Uri($"pack://application:,,,/WinClient.App;component/Assets/tray-{kind.ToString().ToLowerInvariant()}.ico");
+            using var stream = GetResourceStream(uri)!.Stream;
+            using var icon = new System.Drawing.Icon(stream);
+            trayIcons.Add(kind, (System.Drawing.Icon)icon.Clone());
+        }
         window = new MainWindow();
         MainWindow = window;
         notification = ThreadPool.RegisterWaitForSingleObject(showWindow, (_, _) =>
@@ -31,7 +44,8 @@ public partial class App : Application
         var disconnect = menu.Items.Add("断开", null, async (_, _) => await window.Model.DisconnectFromTrayAsync());
         menu.Items.Add("退出界面(隧道不受影响)", null, (_, _) => Shutdown());
         menu.Opening += (_, _) => { connect.Enabled = window.Model.CanUseConnection; disconnect.Enabled = window.Model.CanUseConnection; };
-        tray = new Forms.NotifyIcon { Icon = System.Drawing.SystemIcons.Application, Text = "澳洲出口客户端", ContextMenuStrip = menu, Visible = true };
+        tray = new Forms.NotifyIcon { Icon = trayIcons[TrayIcon.N], Text = "澳洲出口客户端", ContextMenuStrip = menu, Visible = true };
+        window.Model.PropertyChanged += ModelChanged;
         tray.DoubleClick += (_, _) => ShowWindow();
         DispatcherUnhandledException += (_, args) =>
         {
@@ -41,6 +55,12 @@ public partial class App : Application
         };
         if (!StartInTray) ShowWindow();
         _ = InitializeWindowAsync();
+    }
+    private void ModelChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        if (e.PropertyName != nameof(MainViewModel.Hero) || tray is null || window is null) return;
+        tray.Icon = trayIcons[window.Model.Hero.Tray];
+        tray.Text = window.Model.Hero.TrayText;
     }
     private async Task InitializeWindowAsync()
     {
@@ -60,9 +80,13 @@ public partial class App : Application
     }
     protected override void OnExit(ExitEventArgs e)
     {
+        ThemeManager.Stop();
+        if (window is not null) window.Model.PropertyChanged -= ModelChanged;
         notification?.Unregister(null);
         showWindow?.Dispose();
         if (tray is not null) { tray.Visible = false; tray.ContextMenuStrip?.Dispose(); tray.Dispose(); }
+        foreach (var icon in trayIcons.Values) icon.Dispose();
+        trayIcons.Clear();
         window?.Model.Dispose();
         base.OnExit(e);
     }

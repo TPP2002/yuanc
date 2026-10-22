@@ -1,0 +1,31 @@
+<UserControl x:Class="WinClient.App.Views.ConnectPage"
+ xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+ xmlns:c="clr-namespace:WinClient.App.Controls" xmlns:t="clr-namespace:WinClient.App.Themes">
+ <Grid><Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="132"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+  <StackPanel Orientation="Horizontal" Margin="0,0,0,16"><TextBlock Text="连接" Style="{DynamicResource Yc.Title}"/>
+   <Border Style="{DynamicResource Yc.ModeBadge}" Margin="12,0,0,0"><TextBlock Text="{Binding ModeText}" Style="{DynamicResource Yc.ModeBadgeText}"/></Border>
+  </StackPanel>
+  <Border Grid.Row="1" Style="{DynamicResource Yc.Card}"><Grid>
+   <Grid.ColumnDefinitions><ColumnDefinition Width="56"/><ColumnDefinition Width="*"/><ColumnDefinition Width="144"/></Grid.ColumnDefinitions>
+   <c:StatusTile TileSize="56" Spec="{Binding Hero.Tile}" VerticalAlignment="Center"/>
+   <StackPanel Grid.Column="1" VerticalAlignment="Center" Margin="16,0"><TextBlock Text="{Binding Hero.Title}" Style="{DynamicResource Yc.Title}" TextWrapping="Wrap"/>
+    <TextBlock Text="{Binding Hero.Subtitle}" FontSize="{DynamicResource Yc.FontSize.Sm}" t:SemanticText.NormalKey="Yc.Text2" t:SemanticText.Tone="{Binding Hero.SubtitleTone}" TextWrapping="Wrap" Margin="0,4,0,0"/>
+   </StackPanel>
+   <Button x:Name="PrimaryButton" Grid.Column="2" Width="144" VerticalAlignment="Center" Padding="4,8" Style="{DynamicResource Yc.Button.Primary}" Content="{Binding ConnectLabel}" Command="{Binding ConnectCommand}" t:ControlMotion.IsBusy="{Binding IsBusy}"/>
+  </Grid></Border>
+  <ScrollViewer Grid.Row="2" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" Focusable="False"><StackPanel>
+   <TextBlock Text="{Binding Message}" MinHeight="42" Margin="0,12,0,16" FontSize="{DynamicResource Yc.FontSize.Sm}" TextWrapping="Wrap" t:SemanticText.NormalKey="Yc.Text2" t:SemanticText.Tone="{Binding Hero.SubtitleTone}" AutomationProperties.LiveSetting="Polite"/>
+   <ItemsControl x:Name="Rows" ItemsSource="{Binding Hero.Rows}"><ItemsControl.ItemTemplate><DataTemplate>
+    <Border Style="{DynamicResource Yc.StatusRow}"><Grid>
+     <Grid.ColumnDefinitions><ColumnDefinition Width="20"/><ColumnDefinition Width="100"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+     <c:StatusTile Spec="{Binding Tile}" VerticalAlignment="Center"/>
+     <TextBlock Grid.Column="1" Text="{Binding Label}" Width="88" Margin="12,0,0,0" FontSize="{DynamicResource Yc.FontSize.Sm}" Foreground="{DynamicResource Yc.Text2}" VerticalAlignment="Center"/>
+     <TextBlock Grid.Column="2" Text="{Binding Text, NotifyOnTargetUpdated=True}" TargetUpdated="RowTextUpdated" t:SemanticText.Tone="{Binding TextTone}" TextWrapping="Wrap" VerticalAlignment="Center"/>
+     <TextBlock Grid.Column="3" Text="{Binding Right}" FontSize="{DynamicResource Yc.FontSize.Xs}" FontFamily="{DynamicResource Yc.Font.Mono}" Foreground="{DynamicResource Yc.Text3}" Margin="8,0,0,0" VerticalAlignment="Center"/>
+    </Grid></Border>
+   </DataTemplate></ItemsControl.ItemTemplate></ItemsControl>
+   <Button Content="去兑换邀请码" Command="{Binding GoToAccountCommand}" HorizontalAlignment="Left" Margin="0,4,0,0" Visibility="{Binding Hero.ShowGoToAccount, Converter={x:Static t:VisibilityConverter.Instance}}"/>
+   <TextBlock Style="{DynamicResource Yc.Hint}" Text="关闭窗口只是缩到托盘;隧道与断网保护由后台服务管理,窗口关了不受影响。"/>
+  </StackPanel></ScrollViewer>
+ </Grid>
+</UserControl>

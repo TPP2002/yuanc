@@ -1,0 +1,11 @@
+<UserControl x:Class="WinClient.App.Controls.StatusTile"
+ xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+ xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Focusable="False">
+  <Border x:Name="Outer" Background="{DynamicResource Yc.Line}">
+    <Border x:Name="Inner" Background="{DynamicResource Yc.NBg}">
+      <Viewbox x:Name="MarkBox" HorizontalAlignment="Center" VerticalAlignment="Center">
+        <Canvas x:Name="Mark" Width="24" Height="24" IsHitTestVisible="False"/>
+      </Viewbox>
+    </Border>
+  </Border>
+</UserControl>

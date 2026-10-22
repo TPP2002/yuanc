@@ -1,0 +1,32 @@
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                    xmlns:sys="clr-namespace:System;assembly=System.Runtime">
+  <FontFamily x:Key="Yc.Font.Cn">Microsoft YaHei UI, Microsoft YaHei, Segoe UI</FontFamily>
+  <FontFamily x:Key="Yc.Font.Mono">Cascadia Mono, Consolas</FontFamily>
+  <sys:Double x:Key="Yc.FontSize.Xs">12</sys:Double>
+  <sys:Double x:Key="Yc.FontSize.Sm">14</sys:Double>
+  <sys:Double x:Key="Yc.FontSize.Base">16</sys:Double>
+  <sys:Double x:Key="Yc.FontSize.Md">18</sys:Double>
+  <sys:Double x:Key="Yc.FontSize.Lg">20</sys:Double>
+  <sys:Double x:Key="Yc.FontSize.Xl">24</sys:Double>
+  <sys:Double x:Key="Yc.FontSize.Xxl">28</sys:Double>
+  <CornerRadius x:Key="Yc.Radius.Sm">4</CornerRadius>
+  <CornerRadius x:Key="Yc.Radius.Md">6</CornerRadius>
+  <CornerRadius x:Key="Yc.Radius.Lg">8</CornerRadius>
+  <CornerRadius x:Key="Yc.Radius.Tile">7</CornerRadius>
+  <CornerRadius x:Key="Yc.Radius.Hero">14</CornerRadius>
+  <sys:Double x:Key="Yc.Space.1">4</sys:Double>
+  <sys:Double x:Key="Yc.Space.2">8</sys:Double>
+  <sys:Double x:Key="Yc.Space.3">12</sys:Double>
+  <sys:Double x:Key="Yc.Space.4">16</sys:Double>
+  <sys:Double x:Key="Yc.Space.5">24</sys:Double>
+  <sys:Double x:Key="Yc.Space.6">32</sys:Double>
+  <sys:Double x:Key="Yc.Space.7">48</sys:Double>
+  <Duration x:Key="Yc.Dur.Press">0:0:.12</Duration>
+  <Duration x:Key="Yc.Dur.Small">0:0:.18</Duration>
+  <Duration x:Key="Yc.Dur.Panel">0:0:.24</Duration>
+  <Duration x:Key="Yc.Dur.Draw">0:0:.6</Duration>
+  <Duration x:Key="Yc.Dur.Number">0:0:.3</Duration>
+  <Duration x:Key="Yc.Dur.Flow">0:0:3.4</Duration>
+  <Duration x:Key="Yc.Dur.FlowFast">0:0:2.4</Duration>
+</ResourceDictionary>

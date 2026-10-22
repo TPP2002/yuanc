@@ -1,0 +1,85 @@
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                    xmlns:sys="clr-namespace:System;assembly=System.Runtime">
+  <Color x:Key="Yc.Color.Bg">#fbfbfa</Color>
+  <SolidColorBrush x:Key="Yc.Bg" Color="#fbfbfa"/>
+  <Color x:Key="Yc.Color.Surface">#ffffff</Color>
+  <SolidColorBrush x:Key="Yc.Surface" Color="#ffffff"/>
+  <Color x:Key="Yc.Color.Surface2">#f6f6f5</Color>
+  <SolidColorBrush x:Key="Yc.Surface2" Color="#f6f6f5"/>
+  <Color x:Key="Yc.Color.Surface3">#eeeeed</Color>
+  <SolidColorBrush x:Key="Yc.Surface3" Color="#eeeeed"/>
+  <Color x:Key="Yc.Color.Line">#e4e4e2</Color>
+  <SolidColorBrush x:Key="Yc.Line" Color="#e4e4e2"/>
+  <Color x:Key="Yc.Color.LineStrong">#d2d2cf</Color>
+  <SolidColorBrush x:Key="Yc.LineStrong" Color="#d2d2cf"/>
+  <Color x:Key="Yc.Color.CtrlBorder">#8a8a85</Color>
+  <SolidColorBrush x:Key="Yc.CtrlBorder" Color="#8a8a85"/>
+  <Color x:Key="Yc.Color.Text">#1a1a19</Color>
+  <SolidColorBrush x:Key="Yc.Text" Color="#1a1a19"/>
+  <Color x:Key="Yc.Color.Text2">#5c5c58</Color>
+  <SolidColorBrush x:Key="Yc.Text2" Color="#5c5c58"/>
+  <Color x:Key="Yc.Color.Text3">#6b6b66</Color>
+  <SolidColorBrush x:Key="Yc.Text3" Color="#6b6b66"/>
+  <Color x:Key="Yc.Color.Ok">#2c7a45</Color>
+  <SolidColorBrush x:Key="Yc.Ok" Color="#2c7a45"/>
+  <Color x:Key="Yc.Color.OkBg">#e8f4ec</Color>
+  <SolidColorBrush x:Key="Yc.OkBg" Color="#e8f4ec"/>
+  <Color x:Key="Yc.Color.Warn">#7d5609</Color>
+  <SolidColorBrush x:Key="Yc.Warn" Color="#7d5609"/>
+  <Color x:Key="Yc.Color.WarnBg">#fdf3e0</Color>
+  <SolidColorBrush x:Key="Yc.WarnBg" Color="#fdf3e0"/>
+  <Color x:Key="Yc.Color.Bad">#b3382f</Color>
+  <SolidColorBrush x:Key="Yc.Bad" Color="#b3382f"/>
+  <Color x:Key="Yc.Color.BadBg">#fdecea</Color>
+  <SolidColorBrush x:Key="Yc.BadBg" Color="#fdecea"/>
+  <Color x:Key="Yc.Color.Info">#2b5fa8</Color>
+  <SolidColorBrush x:Key="Yc.Info" Color="#2b5fa8"/>
+  <Color x:Key="Yc.Color.InfoBg">#e8f0fb</Color>
+  <SolidColorBrush x:Key="Yc.InfoBg" Color="#e8f0fb"/>
+  <Color x:Key="Yc.Color.N">#6b6b66</Color>
+  <SolidColorBrush x:Key="Yc.N" Color="#6b6b66"/>
+  <Color x:Key="Yc.Color.NBg">#eeeeed</Color>
+  <SolidColorBrush x:Key="Yc.NBg" Color="#eeeeed"/>
+  <Color x:Key="Yc.Color.Action">#1a1a19</Color>
+  <SolidColorBrush x:Key="Yc.Action" Color="#1a1a19"/>
+  <Color x:Key="Yc.Color.ActionText">#fbfbfa</Color>
+  <SolidColorBrush x:Key="Yc.ActionText" Color="#fbfbfa"/>
+  <Color x:Key="Yc.Color.ActionHover">#2e2e2c</Color>
+  <SolidColorBrush x:Key="Yc.ActionHover" Color="#2e2e2c"/>
+  <Color x:Key="Yc.Color.ActionPress">#000000</Color>
+  <SolidColorBrush x:Key="Yc.ActionPress" Color="#000000"/>
+  <Color x:Key="Yc.Color.Focus">#2b5fa8</Color>
+  <SolidColorBrush x:Key="Yc.Focus" Color="#2b5fa8"/>
+  <LinearGradientBrush x:Key="Yc.Spec.Info" StartPoint="0,0" EndPoint="1,0" SpreadMethod="Repeat">
+    <GradientStop Color="#4a9eff" Offset="0"/>
+    <GradientStop Color="#4ad9c4" Offset="0.333"/>
+    <GradientStop Color="#6d8cff" Offset="0.667"/>
+    <GradientStop Color="#4a9eff" Offset="1"/>
+  </LinearGradientBrush>
+  <LinearGradientBrush x:Key="Yc.Spec.Warn" StartPoint="0,0" EndPoint="1,0" SpreadMethod="Repeat">
+    <GradientStop Color="#f0b429" Offset="0"/>
+    <GradientStop Color="#f5825b" Offset="0.333"/>
+    <GradientStop Color="#f6d365" Offset="0.667"/>
+    <GradientStop Color="#f0b429" Offset="1"/>
+  </LinearGradientBrush>
+  <LinearGradientBrush x:Key="Yc.Spec.Ok" StartPoint="0,0" EndPoint="1,0" SpreadMethod="Repeat">
+    <GradientStop Color="#6fbf82" Offset="0"/>
+    <GradientStop Color="#2c7a45" Offset="0.333"/>
+    <GradientStop Color="#a8e6b9" Offset="0.667"/>
+    <GradientStop Color="#6fbf82" Offset="1"/>
+  </LinearGradientBrush>
+  <LinearGradientBrush x:Key="Yc.Spec.Bad" StartPoint="0,0" EndPoint="1,0" SpreadMethod="Repeat">
+    <GradientStop Color="#e0736a" Offset="0"/>
+    <GradientStop Color="#8a2f27" Offset="0.333"/>
+    <GradientStop Color="#f2a59d" Offset="0.667"/>
+    <GradientStop Color="#e0736a" Offset="1"/>
+  </LinearGradientBrush>
+  <LinearGradientBrush x:Key="Yc.Spec.N" StartPoint="0,0" EndPoint="1,0" SpreadMethod="Repeat">
+    <GradientStop Color="#c9c9c6" Offset="0"/>
+    <GradientStop Color="#8e8e89" Offset="0.333"/>
+    <GradientStop Color="#e4e4e2" Offset="0.667"/>
+    <GradientStop Color="#c9c9c6" Offset="1"/>
+  </LinearGradientBrush>
+  <DropShadowEffect x:Key="Yc.Shadow" Color="#000000" BlurRadius="3" ShadowDepth="1" Opacity=".08"/>
+</ResourceDictionary>

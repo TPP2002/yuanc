@@ -7,6 +7,7 @@ using System.Text.Json;
 using System.Windows;
 using System.Windows.Input;
 using WinClient.App.Hosting;
+using WinClient.App.Presentation;
 using WinClient.Core.Client;
 using WinClient.Core.Ipc;
 using WinClient.Core.State;
@@ -17,8 +18,7 @@ namespace WinClient.App;
 
 public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
 {
-    private enum Availability { Unavailable, NeedInstall, NeedRepair, Ready }
-    private Availability availability;
+    private ServiceAvailability availability;
     private ControlClient? client;
     private bool disposed;
     private readonly CancellationTokenSource lifetime = new();
@@ -28,20 +28,6 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
     private string code = "";
     public string Code { get => code; set { code = value; Notify(); } }
     public string Status => snapshot.Status;
-    public string ExitLine => snapshot.ExitStatus switch
-    {
-        "核验中" => "当前出口 IP:核验中…",
-        "已核验" => $"当前出口 IP:{snapshot.ExitIp}(与澳洲节点一致)",
-        "不一致" => $"⚠ 当前出口 IP:{snapshot.ExitIp},与澳洲节点不一致,请联系管理员",
-        "已核验(后台服务出口)" => $"后台服务出口 IP:{snapshot.ExitIp}(与澳洲节点一致,仅证明后台服务出口)",
-        "不一致(后台服务出口)" => $"⚠ 后台服务出口 IP:{snapshot.ExitIp},与澳洲节点不一致,请联系管理员",
-        "无法核验" => "当前出口 IP:无法核验(隧道内暂无回应)",
-        _ => "当前出口 IP:待检测"
-    };
-    public string GuardLine => snapshot.GuardStatus.Length == 0 ? "" : "断网保护巡检:" + snapshot.GuardStatus;
-    public string SelfCheckLine => "环境自检:" + snapshot.SelfCheckStatus;
-    public string EnvironmentLine => "环境一致性:" + snapshot.EnvironmentStatus;
-    public string RoutingLine => RoutingIsGlobal ? "代理范围:全部流量" : $"代理范围:仅 {RoutingApps.Count} 个指定程序(其他程序直连)";
     public bool RoutingIsGlobal
     {
         get => snapshot.RoutingMode == "global";
@@ -69,28 +55,65 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
     }
     public string Message => snapshot.Message + (serviceVersion.Length != 0 && serviceVersion != ControlSnapshot.CurrentVersion
         ? $" 后台已更新到 {serviceVersion}，下次打开界面将使用新版" : "");
-    public string ServiceVersion => serviceVersion.Length == 0 ? "后台版本：等待连接" : "后台版本 " + serviceVersion;
+
     public string UpdateMessage => updateMessage;
-    public string Mode => "当前模式：" + snapshot.Mode;
+
     public bool IsBusy { get; private set; }
-    public bool CanUseConnection => client is not null && availability == Availability.Ready && !IsBusy;
+    public bool CanUseConnection => client is not null && availability == ServiceAvailability.Ready && !IsBusy;
     private bool ShouldDisconnect => snapshot.ProtectionActive || snapshot.State is ConnectionState.Connected or ConnectionState.Connecting or ConnectionState.Reconnecting;
-    public string ConnectLabel => availability switch
-    {
-        Availability.NeedInstall => "安装后台服务(需管理员确认一次)",
-        Availability.NeedRepair => "修复",
-        Availability.Ready => ShouldDisconnect ? "断开" : "连接",
-        _ => "重试"
-    };
+    public string ConnectLabel => IsBusy ? Hero.BusyLabel : Hero.PrimaryLabel;
     public ICommand RedeemCommand { get; }
     public ICommand ConnectCommand { get; }
     public ICommand ImportPairingCommand { get; }
     public ICommand ClearPairingCommand { get; }
     public ICommand CheckUpdateCommand { get; }
+    public ICommand GoToAccountCommand { get; }
+    public HeroPresentation Hero { get; private set; } = null!;
+    private PageKind currentPage;
+    public PageKind CurrentPage
+    {
+        get => currentPage;
+        set
+        {
+            if (currentPage == value) return;
+            currentPage = value; Notify();
+            if (value == PageKind.Environment) _ = LoadSelfCheckAsync();
+        }
+    }
+    public string ServiceStateText => "后台服务 · " + (availability switch
+    {
+        ServiceAvailability.Ready => "运行中", ServiceAvailability.NeedInstall => "未安装", ServiceAvailability.NeedRepair => "未运行",
+        _ when snapshot.Status.Contains("身份核验失败") => "身份核验失败",
+        _ when snapshot.Status.Contains("中断") => "已中断", _ => "未运行"
+    });
+    public Tone ServiceStateTone => availability switch
+    {
+        ServiceAvailability.Ready => Tone.Ok, ServiceAvailability.NeedInstall => Tone.N,
+        ServiceAvailability.NeedRepair => Tone.Warn, _ => Tone.Bad
+    };
+    public string ServiceVersionText => serviceVersion.Length == 0 ? "" : "版本 " + serviceVersion;
+    public string ServiceVersionDisplay => ServiceVersionText.Length == 0 ? "等待连接" : ServiceVersionText;
+    public string ModeText => snapshot.Mode;
+    public string CurrentVersion => ControlSnapshot.CurrentVersion;
+    private UpdateStatus updateStatus = new();
+    public string UpdateCheckedAtText => updateStatus.CheckedAt?.ToLocalTime().ToString("yyyy-MM-dd HH:mm") ?? "尚未检查";
+    public bool IsUpdateInProgress => updateStatus.Stage != "idle" && UpdateMessage.Length > 0;
+    public string EnvironmentBadgeText => EnvironmentEnabled ? "已应用" : "未启用";
+    public string SelfCheckStatus => snapshot.SelfCheckStatus;
+    public Tone SelfCheckTone => Hero.Rows[2].Tile.Tone;
+    public IReadOnlyList<SelfCheckItemView> SelfCheckItems { get; private set; } = [];
+    public string SelfCheckCheckedAtText { get; private set; } = "";
+    public string SelfCheckSummary { get; private set; } = "";
+    private string observedSelfCheckStatus = "";
+    private int selfCheckRequest;
+    public string ConnectionDisabledReason => IsBusy ? "正在处理,请稍候。" : CanUseConnection ? "" : "后台服务未就绪,请先在「连接」页处理。";
+    public string PairingDisabledReason => ConnectionDisabledReason.Length > 0 ? ConnectionDisabledReason : ShouldDisconnect ? "连接中不能更换配对文件,请先断开。" : "";
+    public string ClearPairingDisabledReason => PairingDisabledReason.Length > 0 ? PairingDisabledReason : snapshot.Mode != "自用模式" ? "尚无可清除的本机配对文件。" : "";
     public event PropertyChangedEventHandler? PropertyChanged;
 
     public MainViewModel(Func<string?> choosePairingFile, Func<string?> chooseProgram)
     {
+        GoToAccountCommand = new AsyncCommand(() => { CurrentPage = PageKind.Account; return Task.CompletedTask; }, () => true);
         AddRoutingAppCommand = new AsyncCommand(() => RunAsync(async () =>
         {
             var path = chooseProgram();
@@ -111,6 +134,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         }), CanChangePairing);
         ClearPairingCommand = new AsyncCommand(() => RunAsync(() => SendAsync("clear_pairing")),
             () => CanChangePairing() && snapshot.Mode == "自用模式");
+        Refresh();
     }
     private bool CanChangePairing() => CanUseConnection && !ShouldDisconnect;
     public Task InitializeAsync() => RunAsync(InitializeCoreAsync);
@@ -120,13 +144,13 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         var status = InstallerRunner.ServiceStatus();
         if (status is null)
         {
-            availability = Availability.NeedInstall;
+            availability = ServiceAvailability.NeedInstall;
             Update(snapshot with { Status = "需安装后台服务", Message = "首次使用请安装后台服务，确认一次管理员权限后即可使用。" });
             return;
         }
         if (status != ServiceControllerStatus.Running)
         {
-            availability = Availability.NeedRepair;
+            availability = ServiceAvailability.NeedRepair;
             Update(snapshot with { Status = "后台服务未运行", Message = "请点击修复以启动后台服务。" });
             return;
         }
@@ -142,7 +166,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
                 if (!PipePeer.VerifyServer(pipe, UpdatePlanner.DefaultAppRoot))
                 {
                     pipe.Dispose();
-                    availability = Availability.Unavailable;
+                    availability = ServiceAvailability.Unavailable;
                     Update(snapshot with { Status = "后台服务身份核验失败", Message = "连接到的不是本产品的后台服务，已断开；请联系管理员。" });
                     return;
                 }
@@ -151,7 +175,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
                 client.ConnectionClosed += OnConnectionClosed;
                 var response = await client.SendAsync("subscribe", cancellationToken: lifetime.Token);
                 if (!response.Ok || response.Snapshot is null) throw new IOException();
-                availability = Availability.Ready;
+                availability = ServiceAvailability.Ready;
                 UpdateProtocol(response.Snapshot);
                 return;
             }
@@ -161,14 +185,14 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
                 if (attempt < 5) await Task.Delay(1000, lifetime.Token);
             }
         }
-        availability = Availability.Unavailable;
+        availability = ServiceAvailability.Unavailable;
         Update(snapshot with { Status = "无法连接后台服务", Message = "无法连接后台服务,请重启电脑或联系管理员" });
     }
     private async Task MainActionAsync()
     {
-        if (availability is Availability.NeedInstall or Availability.NeedRepair)
+        if (availability is ServiceAvailability.NeedInstall or ServiceAvailability.NeedRepair)
         {
-            var action = availability == Availability.NeedInstall ? "--install" : "--repair";
+            var action = availability == ServiceAvailability.NeedInstall ? "--install" : "--repair";
             if (!await InstallerRunner.ElevateAsync(action))
             {
                 Update(snapshot with { Message = "操作未完成，请重试或联系管理员。" });
@@ -176,7 +200,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
             }
             await InitializeCoreAsync();
         }
-        else if (availability == Availability.Ready) await SendAsync(ShouldDisconnect ? "disconnect" : "connect");
+        else if (availability == ServiceAvailability.Ready) await SendAsync(ShouldDisconnect ? "disconnect" : "connect");
         else await InitializeCoreAsync();
     }
     public Task ConnectFromTrayAsync() => CanUseConnection ? RunAsync(() => SendAsync("connect")) : Task.CompletedTask;
@@ -212,40 +236,102 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
     }
     private void OnConnectionClosed()
     {
-        var dispatcher = Application.Current.Dispatcher;
-        if (disposed || dispatcher.HasShutdownStarted) return;
-        dispatcher.InvokeAsync(() =>
+        var dispatcher = Application.Current?.Dispatcher;
+        if (disposed || dispatcher?.HasShutdownStarted == true) return;
+        void Closed()
         {
             if (disposed) return;
-            availability = Availability.Unavailable;
+            availability = ServiceAvailability.Unavailable;
             Update(snapshot with { Status = "后台服务连接已中断", Message = "请点击重试；连接与断网保护由后台服务管理。" });
-        });
+        }
+        if (dispatcher is null) Closed(); else dispatcher.InvokeAsync(Closed);
     }
     private void Update(ClientSnapshot value)
     {
-        if (disposed || Application.Current.Dispatcher.HasShutdownStarted) return;
-        if (!Application.Current.Dispatcher.CheckAccess()) { Application.Current.Dispatcher.InvokeAsync(() => Update(value)); return; }
+        var dispatcher = Application.Current?.Dispatcher;
+        if (disposed || dispatcher?.HasShutdownStarted == true) return;
+        if (dispatcher is not null && !dispatcher.CheckAccess()) { dispatcher.InvokeAsync(() => Update(value)); return; }
         snapshot = value; Refresh();
     }
     private void UpdateProtocol(ControlSnapshot value)
     {
-        if (disposed || Application.Current.Dispatcher.HasShutdownStarted) return;
-        if (!Application.Current.Dispatcher.CheckAccess()) { Application.Current.Dispatcher.InvokeAsync(() => UpdateProtocol(value)); return; }
-        serviceVersion = value.ServiceVersion; updateMessage = value.Update.Message;
+        var dispatcher = Application.Current?.Dispatcher;
+        if (disposed || dispatcher?.HasShutdownStarted == true) return;
+        if (dispatcher is not null && !dispatcher.CheckAccess()) { dispatcher.InvokeAsync(() => UpdateProtocol(value)); return; }
+        serviceVersion = value.ServiceVersion; updateMessage = value.Update.Message; updateStatus = value.Update;
         Update(value);
+    }
+    public void ApplyPreview(ControlSnapshot snapshot, ServiceAvailability availability)
+    {
+        this.availability = availability;
+        this.snapshot = snapshot;
+        serviceVersion = snapshot.ServiceVersion; updateMessage = snapshot.Update.Message; updateStatus = snapshot.Update;
+        Refresh();
+    }
+    public async Task LoadSelfCheckAsync()
+    {
+        var request = ++selfCheckRequest;
+        var source = client;
+        if (source is null) { ApplySelfCheckJson(null); return; }
+        try
+        {
+            var response = await source.SendAsync("read_selfcheck", cancellationToken: lifetime.Token);
+            if (disposed || request != selfCheckRequest || source != client) return;
+            ApplySelfCheckJson(response.Ok ? response.SelfCheck : null);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException or
+            JsonException or ArgumentException or OperationCanceledException or TimeoutException)
+        {
+            if (!disposed && request == selfCheckRequest) ApplySelfCheckJson(null);
+        }
+    }
+    internal void ApplySelfCheckJson(string? json)
+    {
+        IReadOnlyList<SelfCheckItemView> items = [];
+        var checkedAt = "";
+        var summary = "";
+        try
+        {
+            if (!string.IsNullOrWhiteSpace(json))
+            {
+                using var document = JsonDocument.Parse(json);
+                var root = document.RootElement;
+                checkedAt = root.GetProperty("checked_at").GetString() ?? "";
+                summary = root.GetProperty("summary").GetString() ?? "";
+                var parsed = new List<SelfCheckItemView>();
+                foreach (var item in root.GetProperty("items").EnumerateArray())
+                {
+                    var result = item.GetProperty("result").GetString();
+                    if (result is not ("通过" or "未通过" or "跳过" or "无法核验")) throw new JsonException("自检结果无效");
+                    parsed.Add(new(parsed.Count + 1, item.GetProperty("name").GetString() ?? "", result,
+                        item.TryGetProperty("detail", out var detail) ? detail.GetString() ?? "" : ""));
+                }
+                items = parsed;
+            }
+        }
+        catch (Exception ex) when (ex is JsonException or InvalidOperationException or KeyNotFoundException)
+        { items = []; checkedAt = ""; summary = ""; }
+        SelfCheckItems = items; SelfCheckCheckedAtText = checkedAt; SelfCheckSummary = summary;
+        Notify(nameof(SelfCheckItems)); Notify(nameof(SelfCheckCheckedAtText)); Notify(nameof(SelfCheckSummary));
     }
     private void Refresh()
     {
         if (disposed) return;
-        Notify(nameof(Status)); Notify(nameof(Message)); Notify(nameof(ConnectLabel)); Notify(nameof(Mode)); Notify(nameof(IsBusy)); Notify(nameof(CanUseConnection));
-        Notify(nameof(ServiceVersion)); Notify(nameof(UpdateMessage));
-        Notify(nameof(EnvironmentLine)); Notify(nameof(EnvironmentEnabled));
-        Notify(nameof(ExitLine)); Notify(nameof(GuardLine));
-        Notify(nameof(SelfCheckLine));
-        Notify(nameof(RoutingLine)); Notify(nameof(RoutingIsGlobal)); Notify(nameof(RoutingIsApps));
+        Hero = StatusPresentation.Build(snapshot, availability, ShouldDisconnect);
+        Notify(nameof(Hero)); Notify(nameof(Status)); Notify(nameof(Message)); Notify(nameof(ConnectLabel)); Notify(nameof(ModeText)); Notify(nameof(IsBusy)); Notify(nameof(CanUseConnection));
+        Notify(nameof(ServiceVersionText)); Notify(nameof(ServiceVersionDisplay)); Notify(nameof(ServiceStateText)); Notify(nameof(ServiceStateTone));
+        Notify(nameof(UpdateMessage)); Notify(nameof(UpdateCheckedAtText)); Notify(nameof(IsUpdateInProgress));
+        Notify(nameof(EnvironmentEnabled)); Notify(nameof(EnvironmentBadgeText)); Notify(nameof(SelfCheckStatus)); Notify(nameof(SelfCheckTone));
+        Notify(nameof(ConnectionDisabledReason)); Notify(nameof(PairingDisabledReason)); Notify(nameof(ClearPairingDisabledReason));
+        Notify(nameof(RoutingIsGlobal)); Notify(nameof(RoutingIsApps));
         Notify(nameof(RoutingApps)); Notify(nameof(CanChangeRouting));
         if (selectedRoutingApp is not null && !RoutingApps.Contains(selectedRoutingApp)) selectedRoutingApp = null;
         Notify(nameof(SelectedRoutingApp));
+        if (observedSelfCheckStatus != SelfCheckStatus)
+        {
+            observedSelfCheckStatus = SelfCheckStatus;
+            if (CurrentPage == PageKind.Environment) _ = LoadSelfCheckAsync();
+        }
         CommandManager.InvalidateRequerySuggested();
     }
     public Task ExportAuditAsync(string path) => RunAsync(async () =>

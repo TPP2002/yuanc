@@ -7,6 +7,7 @@
     <StartupObject>WinClient.App.Program</StartupObject>
     <OutputType>WinExe</OutputType>
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>Assets/app.ico</ApplicationIcon>
   </PropertyGroup>
   <PropertyGroup Condition="'$(PublishProfile)' == 'SingleFile'">
     <PublishSingleFile>true</PublishSingleFile>
@@ -16,6 +17,10 @@
     <PublishTrimmed>false</PublishTrimmed>
   </PropertyGroup>
   <ItemGroup><ProjectReference Include="../WinClient.Core/WinClient.Core.csproj" /></ItemGroup>
+  <ItemGroup>
+    <Resource Include="Assets/*.ico" />
+    <InternalsVisibleTo Include="WinClient.UiTests" />
+  </ItemGroup>
   <ItemGroup>
     <PackageReference Include="System.ServiceProcess.ServiceController" Version="10.0.9" />
     <Using Remove="System.Windows.Forms" />
