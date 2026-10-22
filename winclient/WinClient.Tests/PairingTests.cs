@@ -13,6 +13,39 @@ namespace WinClient.Tests;
 
 public sealed class PairingTests
 {
+    [Theory]
+    [InlineData("ycpair/2")]
+    [InlineData("ycpair/3")]
+    public void OptionalNodeEnvironmentFieldsAreParsedOrDefaultEmpty(string version)
+    {
+        var document = ValidDocument();
+        document["format"] = version;
+        var original = PairingFile.Parse(document.ToJsonString());
+        Assert.Equal("", original.Node.TimeZone);
+        Assert.Equal("", original.Node.Country);
+        document["node"]!["time_zone"] = "Australia/Perth";
+        document["node"]!["country"] = "AU";
+        var pair = PairingFile.Parse(document.ToJsonString());
+        Assert.Equal("Australia/Perth", pair.Node.TimeZone);
+        Assert.Equal("AU", pair.Node.Country);
+    }
+
+    [Theory]
+    [InlineData("time_zone", "\"bad;zone\"", "配对文件的时区标识格式不正确,请重新导出。")]
+    [InlineData("time_zone", "42", "配对文件的时区标识格式不正确,请重新导出。")]
+    [InlineData("time_zone", "null", "配对文件的时区标识格式不正确,请重新导出。")]
+    [InlineData("time_zone", "\"\"", "配对文件的时区标识格式不正确,请重新导出。")]
+    [InlineData("country", "\"au\"", "配对文件的国家码格式不正确,请重新导出。")]
+    [InlineData("country", "42", "配对文件的国家码格式不正确,请重新导出。")]
+    [InlineData("country", "null", "配对文件的国家码格式不正确,请重新导出。")]
+    [InlineData("country", "\"\"", "配对文件的国家码格式不正确,请重新导出。")]
+    public void InvalidNodeEnvironmentFieldsHaveSpecificErrors(string field, string value, string message)
+    {
+        var document = ValidDocument();
+        document["node"]![field] = JsonNode.Parse(value);
+        Assert.Equal(message, Assert.Throws<InvalidDataException>(() => PairingFile.Parse(document.ToJsonString())).Message);
+    }
+
     internal static string GoldenDirectory
     {
         get

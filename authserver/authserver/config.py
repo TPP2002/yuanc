@@ -42,6 +42,8 @@ class Security(Section):
 
 
 class Node(Section):
+    time_zone: str = ""
+    country: str = ""
     host: str = Field(min_length=1)
     reality_port: int = Field(ge=1, le=65535)
     hy2_port: int = Field(ge=1, le=65535)
@@ -54,6 +56,20 @@ class Node(Section):
     hy2_obfs_password_path: str = Field(default="", exclude=True, repr=False)
     _certificate: list[str] = PrivateAttr(default_factory=list)
     _obfs_password: str = PrivateAttr(default="")
+
+    @field_validator("time_zone")
+    @classmethod
+    def validate_time_zone(cls, value):
+        if value and not re.fullmatch(r"[A-Za-z0-9 ._+/()-]{1,64}", value):
+            raise ValueError("须为 IANA 时区名(如 Australia/Sydney)或 Windows 时区标识")
+        return value
+
+    @field_validator("country")
+    @classmethod
+    def validate_country(cls, value):
+        if value and not re.fullmatch(r"[A-Z]{2}", value):
+            raise ValueError("须为两位大写国家码(如 AU)")
+        return value
 
     @model_validator(mode="after")
     def read_certificate(self):

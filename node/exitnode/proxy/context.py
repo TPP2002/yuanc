@@ -38,6 +38,8 @@ class ProxyContext:
     admin_bind: str = "127.0.0.1"
     admin_port: int = 8443
     maintenance_device_ids: tuple[str, ...] = ()
+    time_zone: str = ""
+    country: str = ""
 
 
 def ipv4_host(ctx: ProxyContext) -> str:

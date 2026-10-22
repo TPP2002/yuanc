@@ -6,6 +6,10 @@ name = "请填写节点名称"
 data_dir = "/var/lib/exitnode"
 secrets_dir = "/var/lib/exitnode/secrets"
 log_level = "INFO"
+# 节点所在城市的 IANA 时区名；客户端连上后会把电脑时区切到这里；留空则客户端用自己的本机配置。
+time_zone = "Australia/Sydney"
+# 节点所在国家的两位大写国家码，用于客户端自检；留空则客户端用自己的本机配置。
+country = "AU"
 
 [network]
 iface = "auto"

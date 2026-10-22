@@ -194,6 +194,7 @@ def read_hy2_obfs_password(runner):
 
 def build_context(config, keys, runner):
     return ProxyContext(
+        time_zone=config.node.time_zone, country=config.node.country,
         reality=keys, sni=config.proxy.sni, handshake_server=config.proxy.handshake_server,
         reality_port=config.proxy.reality_port,
         maintenance_device_ids=tuple(config.proxy.maintenance_device_ids),

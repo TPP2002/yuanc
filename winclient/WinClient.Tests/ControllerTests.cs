@@ -12,6 +12,83 @@ namespace WinClient.Tests;
 
 public sealed class ControllerTests
 {
+    [Fact]
+    public async Task PairingEnvironmentUsesNodeTimeZoneAndCountryForSelfCheck()
+    {
+        var document = PairingTests.ValidDocument();
+        document["node"]!["time_zone"] = "W. Australia Standard Time";
+        document["node"]!["country"] = "NZ";
+        var pair = WinClient.Core.Pairing.PairingFile.Parse(document.ToJsonString());
+        var order = new List<string>();
+        var timers = new Timers();
+        var environment = new FakeEnvironment(order);
+        var reports = new List<EnvironmentReport>();
+        using var controller = new ClientController(new PairingSessionSource(pair), new Firewall(order), new Tunnel(order),
+            Path.GetFullPath("fake.exe"), TestData.Device, timers.Delay, environment: environment,
+            environmentSettings: new MemoryEnvironmentSettings(), exitProbe: new NodeCountryProbe(pair.Node.Host),
+            reportSink: reports.Add) { DelayWithPurposeAsync = timers.Delay };
+        controller.Changed += _ => Interlocked.Increment(ref timers.Published);
+        await controller.ConnectAsync();
+        Assert.Equal("W. Australia Standard Time", Assert.Single(environment.Targets).TimeZoneId);
+        await FireAndPublish(controller, timers, "出口核验", TimeSpan.FromSeconds(3));
+        Assert.Equal("通过", Assert.Single(reports).Items.Single(item => item.Id == "exit_country").Result);
+        Assert.Equal("通过", Assert.Single(reports).Items.Single(item => item.Id == "time_zone").Result);
+    }
+
+    [Theory]
+    [InlineData("W. Australia Standard Time", "", "")]
+    [InlineData("", "", "")]
+    [InlineData("W. Australia Standard Time", "恢复", "")]
+    [InlineData("W. Australia Standard Time", "套用", "")]
+    [InlineData("AUS Eastern Standard Time", "", "NZ")]
+    public async Task RenewalOnlyReappliesChangedTimeZoneWithoutRestartingTunnel(string zone, string failure, string country)
+    {
+        var order = new List<string>();
+        var timers = new Timers();
+        var source = new ScriptedSource();
+        // 空字段续期覆盖从节点时区回到本机配置的分路。
+        var originalZone = zone == "" ? "W. Australia Standard Time" : "AUS Eastern Standard Time";
+        var first = TestData.SessionExpiringIn(TimeSpan.FromHours(6), node: TestData.Node(timeZone: originalZone));
+        source.Enqueue(Ok(first));
+        var environment = new FakeEnvironment(order);
+        using var controller = new ClientController(source, new Firewall(order), new Tunnel(order),
+            Path.GetFullPath("fake.exe"), TestData.Device, timers.Delay, environment: environment,
+            environmentSettings: new MemoryEnvironmentSettings()) { DelayWithPurposeAsync = timers.Delay };
+        controller.Changed += _ => Interlocked.Increment(ref timers.Published);
+        await controller.ConnectAsync();
+        order.Clear();
+        if (failure == "恢复") environment.RestoreError = new IOException("模拟恢复失败");
+        if (failure == "套用") environment.ApplyError = new IOException("模拟套用失败");
+        var next = TestData.SessionExpiringIn(TimeSpan.FromHours(7), node: TestData.Node(timeZone: zone, country: country));
+        Assert.True(ClientController.SameSession(first, next));
+        source.Enqueue(Ok(next));
+        timers.Fire("续期", d => Near(d, TimeSpan.FromHours(4.8)));
+        await Until(() => timers.For("续期").Length == 2);
+        await controller.ConnectAsync(); // 等续期回调释放串行锁。
+        Assert.Equal(zone == originalZone ? Array.Empty<string>() : failure == "恢复"
+            ? new[] { "env-restore" } : new[] { "env-restore", "env-apply" }, order);
+        Assert.DoesNotContain("stop", order);
+        Assert.DoesNotContain("start", order);
+        if (failure != "恢复")
+            Assert.Equal(zone == "" ? "AUS Eastern Standard Time" : zone, environment.Targets.Last().TimeZoneId);
+        Assert.Equal(failure switch
+        {
+            "恢复" => "恢复失败,请联系管理员",
+            "套用" => "设置失败,请联系管理员;连接与断网保护不受影响",
+            _ => "已切换到澳洲时区与浏览器策略"
+        }, controller.Snapshot.EnvironmentStatus);
+        Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
+        Assert.Equal("虚拟网卡已就绪。", controller.Snapshot.Message);
+        Assert.True(controller.Snapshot.ProtectionActive);
+    }
+
+    private sealed class NodeCountryProbe(string host) : IExitProbe
+    {
+        public Task<IPAddress?> ProbeAsync(CancellationToken token) => Task.FromResult<IPAddress?>(IPAddress.Parse(host));
+        public Task<ExitProbeResult?> ProbeDetailedAsync(CancellationToken token)
+            => Task.FromResult<ExitProbeResult?>(new(IPAddress.Parse(host), "NZ"));
+    }
+
     [Theory]
     [InlineData("192.0.2.5", false)]
     [InlineData("198.51.100.9", false)]
@@ -280,11 +357,14 @@ public sealed class ControllerTests
 
     private sealed class FakeEnvironment(List<string> order) : IEnvironmentEnforcer
     {
+        public List<EnvironmentTarget> Targets { get; } = [];
         public bool HasPendingState { get; set; }
         public Exception? ApplyError { get; set; }
         public Exception? RestoreError { get; set; }
         public Task ApplyAsync(EnvironmentTarget target)
-        { order.Add("env-apply"); HasPendingState = true; if (ApplyError is not null) throw ApplyError; return Task.CompletedTask; }
+        { order.Add("env-apply"); Targets.Add(target); HasPendingState = true; if (ApplyError is not null) throw ApplyError; return Task.CompletedTask; }
+        public Task<EnvironmentInspection?> InspectAsync() => Task.FromResult<EnvironmentInspection?>(
+            EnvironmentSelfCheckTests.GoodInspection with { TimeZone = Targets.Last().TimeZoneId });
         public Task RestoreAsync()
         { order.Add("env-restore"); if (RestoreError is not null) throw RestoreError; HasPendingState = false; return Task.CompletedTask; }
     }

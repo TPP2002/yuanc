@@ -51,6 +51,10 @@ public sealed class SessionResponse
 
 public sealed class NodeInfo
 {
+    [JsonPropertyName("time_zone")]
+    public string TimeZone { get; init; } = "";
+    [JsonPropertyName("country")]
+    public string Country { get; init; } = "";
     public required string Host { get; init; }
     public required int RealityPort { get; init; }
     public required int Hy2Port { get; init; }
