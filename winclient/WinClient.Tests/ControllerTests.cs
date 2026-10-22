@@ -12,6 +12,113 @@ namespace WinClient.Tests;
 
 public sealed class ControllerTests
 {
+    private sealed class MemoryRouting : IRoutingSettingsStore
+    {
+        public RoutingPolicy Policy = RoutingTests.Apps;
+        public int Writes;
+        public RoutingPolicy Read() => Policy;
+        public void Write(RoutingPolicy policy) { Writes++; Policy = policy; }
+    }
+    private static SessionResponse AppsSession(string host = "192.0.2.5") => TestData.SessionExpiringIn(
+        TimeSpan.FromHours(6), node: TestData.Node(host: host), config: WinClient.Core.Pairing.LocalConfigRenderer.Render(TestData.Node(host: host)));
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AppsAppliesOnlyUserProgramsAndRendersAuthOnlyForDistribution(bool distribution)
+    {
+        var order = new List<string>(); var firewall = new Firewall(order); var tunnel = new Tunnel(order);
+        var credentials = new InMemoryCredentialStore(); credentials.Save("test-refresh");
+        using var http = SessionHttp(() => AppsSession());
+        ISessionSource source = distribution ? new AuthServerSessionSource(new AuthApiClient(http), credentials)
+            : new PairingSessionSource(PairingTests.ValidPairing());
+        using var controller = new ClientController(source, firewall, tunnel, Path.GetFullPath("fake.exe"), TestData.Device,
+            routingSettings: new MemoryRouting(), serviceProcessPath: RoutingTests.Service,
+            authEndpoint: new(IPAddress.Parse("192.0.2.5"), 8080, RoutingTests.Service));
+        await controller.ConnectAsync();
+        Assert.Equal(new[] { "apply-apps", "start" }, order);
+        Assert.Equal(new[] { RoutingTests.Chrome }, firewall.AppliedApps);
+        var rules = tunnel.Config.GetProperty("route").GetProperty("rules").EnumerateArray().ToArray();
+        Assert.Contains(RoutingRenderer.PathPattern(RoutingTests.Service), rules[^1].GetProperty("process_path_regex").EnumerateArray().Select(x => x.GetString()));
+        Assert.Equal(distribution, rules.Any(r => r.GetProperty("outbound").GetString() == "direct"));
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task AppsRejectsMismatchOrEmptyListBeforeStateMachine(bool mismatch)
+    {
+        var order = new List<string>(); var store = new MemoryRouting();
+        if (!mismatch) store.Policy = RoutingPolicy.Create("apps", []);
+        var firewall = new Firewall(order) { HasPendingState = mismatch, PendingMode = "global" };
+        using var controller = new ClientController(new PairingSessionSource(PairingTests.ValidPairing()), firewall,
+            new Tunnel(order), Path.GetFullPath("fake.exe"), TestData.Device, routingSettings: store);
+        await controller.ConnectAsync();
+        Assert.Empty(order); Assert.Equal(ConnectionState.Disconnected, controller.Snapshot.State);
+        Assert.Contains(mismatch ? "不一致" : "至少要选一个程序", controller.Snapshot.Message);
+    }
+
+    [Fact]
+    public async Task SetRoutingAsyncRequiresDisconnectedAndNoRecoveryRecord()
+    {
+        var order = new List<string>(); var store = new MemoryRouting { Policy = RoutingPolicy.Global };
+        var firewall = new Firewall(order) { HasPendingState = true };
+        using var controller = new ClientController(new PairingSessionSource(PairingTests.ValidPairing()), firewall,
+            new Tunnel(order), Path.GetFullPath("fake.exe"), TestData.Device, routingSettings: store, serviceProcessPath: RoutingTests.Service);
+        await controller.SetRoutingAsync("apps", [RoutingTests.Chrome]);
+        Assert.Contains("恢复记录尚在", controller.Snapshot.Message); Assert.Equal(0, store.Writes);
+        firewall.HasPendingState = false;
+        await controller.ConnectAsync();
+        await controller.SetRoutingAsync("apps", [RoutingTests.Chrome]);
+        Assert.Equal("请先断开连接,再更改代理范围。", controller.Snapshot.Message); Assert.Equal(0, store.Writes);
+        await controller.DisconnectAsync();
+        await controller.SetRoutingAsync("apps", [RoutingTests.Chrome]);
+        Assert.Equal(1, store.Writes); Assert.Equal("apps", controller.Snapshot.RoutingMode);
+        Assert.Equal(new[] { RoutingTests.Chrome }, controller.Snapshot.RoutingApps);
+        await controller.SetRoutingAsync("bad", []);
+        Assert.Equal(1, store.Writes); Assert.Equal("apps", controller.Snapshot.RoutingMode);
+    }
+
+    [Fact]
+    public async Task AppsPatrolRebuildsWithoutDefaultBlockAndSelfCheckSkipsIpv6()
+    {
+        var order = new List<string>(); var timers = new Timers(); var firewall = new Firewall(order);
+        var source = new ScriptedSource(); source.Enqueue(Ok(AppsSession()));
+        var ipv6 = new ScriptedIpv6(true); var reports = new List<EnvironmentReport>();
+        using var controller = new ClientController(source, firewall, new Tunnel(order), Path.GetFullPath("fake.exe"), TestData.Device,
+            timers.Delay, routingSettings: new MemoryRouting(), serviceProcessPath: RoutingTests.Service,
+            exitProbe: new DetailedProbe(), ipv6Probe: ipv6, reportSink: reports.Add) { DelayWithPurposeAsync = timers.Delay };
+        controller.Changed += _ => Interlocked.Increment(ref timers.Published);
+        await controller.ConnectAsync();
+        firewall.PatrolResults.Enqueue(new PatrolReport([], [], [KillSwitchPlanner.AppPrefix + "1"]));
+        await FireAndPublish(controller, timers, "巡检", TimeSpan.FromSeconds(60));
+        Assert.False(Assert.Single(firewall.EnforceDefaultCalls));
+        Assert.Equal(KillSwitchPlanner.AppRuleNames(1), Assert.Single(firewall.PatrolCalls));
+        Assert.Equal(2, order.Count(x => x == "apply-apps"));
+        await FireAndPublish(controller, timers, "出口核验", TimeSpan.FromSeconds(3));
+        Assert.Equal(0, ipv6.Calls); Assert.Equal("跳过", Assert.Single(reports).Items[7].Result);
+        Assert.Equal("已核验(后台服务出口)", controller.Snapshot.ExitStatus);
+    }
+
+    [Fact]
+    public async Task AppsNodeChangeDoesNotUpdateAllowRulesOrProbeDuringReconnect()
+    {
+        var order = new List<string>(); var timers = new Timers(); var source = new ScriptedSource();
+        source.Enqueue(Ok(AppsSession())); var probe = new ScriptedProbe(IPAddress.Parse("192.0.2.5"));
+        using var controller = new ClientController(source, new Firewall(order), new Tunnel(order), Path.GetFullPath("fake.exe"),
+            TestData.Device, timers.Delay, exitProbe: probe, routingSettings: new MemoryRouting(), serviceProcessPath: RoutingTests.Service)
+            { DelayWithPurposeAsync = timers.Delay };
+        controller.Changed += _ => Interlocked.Increment(ref timers.Published);
+        await controller.ConnectAsync();
+        source.Enqueue(Ok(AppsSession("192.0.2.6")));
+        await controller.RefreshSessionAsync();
+        Assert.Equal(ConnectionState.Reconnecting, controller.Snapshot.State);
+        Assert.DoesNotContain(order, x => x.StartsWith("update", StringComparison.Ordinal));
+        var calls = probe.Calls;
+        await FireAndPublish(controller, timers, "出口核验", TimeSpan.FromSeconds(3));
+        Assert.Equal(calls, probe.Calls);
+    }
+
     [Fact]
     public async Task PairingEnvironmentUsesNodeTimeZoneAndCountryForSelfCheck()
     {
@@ -1205,6 +1312,13 @@ public sealed class ControllerTests
     { BaseAddress = new("https://unit.invalid") };
     private sealed class Firewall(List<string> order) : IKillSwitch
     {
+        public string? PendingMode { get; set; }
+        public string[] AppliedApps { get; private set; } = [];
+        public List<bool> EnforceDefaultCalls { get; } = [];
+        public Task ApplyAppsAsync(IReadOnlyList<string> programs)
+        { AppliedApps = programs.ToArray(); order.Add("apply-apps"); return Task.CompletedTask; }
+        public Task<PatrolReport> PatrolAsync(IReadOnlyList<string> rules, bool enforceDefaultBlock)
+        { EnforceDefaultCalls.Add(enforceDefaultBlock); return PatrolAsync(rules); }
         public List<string[]> PatrolCalls { get; } = [];
         public Queue<object> PatrolResults { get; } = new();
         public Exception? ReapplyError { get; set; }
@@ -1238,8 +1352,9 @@ public sealed class ControllerTests
     }
     private sealed class Tunnel(List<string> order) : ITunnelTransport
     {
+        public JsonElement Config { get; private set; }
         public event EventHandler? TunnelDown { add { } remove { } }
-        public Task StartAsync(JsonElement configuration, CancellationToken cancellationToken) { order.Add("start"); return Task.CompletedTask; }
+        public Task StartAsync(JsonElement configuration, CancellationToken cancellationToken) { Config = configuration; order.Add("start"); return Task.CompletedTask; }
         public void Stop() => order.Add("stop");
         public void Dispose() { }
     }

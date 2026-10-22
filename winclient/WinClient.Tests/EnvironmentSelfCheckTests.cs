@@ -8,6 +8,20 @@ namespace WinClient.Tests;
 
 public sealed class EnvironmentSelfCheckTests
 {
+    [Fact]
+    public void AppsChecksScopedRoutesAndSkipsWholeMachineIpv6()
+    {
+        var config = RoutingRenderer.Render(Good.SingboxConfig, RoutingTests.Apps, RoutingTests.Service);
+        var report = EnvironmentSelfCheck.Evaluate(Good with { Routing = RoutingTests.Apps, SingboxConfig = config, Ipv6Reachable = null });
+        Assert.Equal("通过", report.Items[6].Result); Assert.StartsWith("仅指定程序模式:", report.Items[6].Detail);
+        Assert.Equal("跳过", report.Items[7].Result);
+        Assert.Equal("7 项通过,1 项未能检查", report.Summary);
+        var original = EnvironmentSelfCheck.Evaluate(Good with { Routing = RoutingTests.Apps });
+        Assert.Equal("未通过", original.Items[6].Result); Assert.Contains("指定程序→proxy", original.Items[6].Detail);
+        var bad = JsonSerializer.Deserialize<JsonElement>(config.GetRawText().Replace("\"detour\":\"proxy\"", "\"detour\":\"direct\""));
+        report = EnvironmentSelfCheck.Evaluate(Good with { Routing = RoutingTests.Apps, SingboxConfig = bad });
+        Assert.Equal("未通过", report.Items[6].Result); Assert.Contains("dns.servers", report.Items[6].Detail);
+    }
     internal const string GoodConfig = """
         {"inbounds":[{"type":"tun"}],"route":{"final":"proxy","rules":[{"ip_version":6,"outbound":"block"}]},
          "dns":{"servers":[{"detour":"proxy"}]},"outbounds":[{"type":"vless","tag":"proxy"}]}

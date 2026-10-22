@@ -11,12 +11,17 @@ public partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
-        model = new MainViewModel(ChoosePairingFile);
+        model = new MainViewModel(ChoosePairingFile, ChooseProgram);
         DataContext = model;
     }
     private string? ChoosePairingFile()
     {
         var dialog = new OpenFileDialog { Title = "导入配对文件", Filter = "配对文件 (*.ycpair)|*.ycpair", CheckFileExists = true, Multiselect = false };
+        return dialog.ShowDialog(this) == true ? dialog.FileName : null;
+    }
+    private string? ChooseProgram()
+    {
+        var dialog = new OpenFileDialog { Title = "选择要走澳洲出口的程序", Filter = "程序 (*.exe)|*.exe", CheckFileExists = true, Multiselect = false };
         return dialog.ShowDialog(this) == true ? dialog.FileName : null;
     }
     private async void Export_Click(object sender, RoutedEventArgs e)

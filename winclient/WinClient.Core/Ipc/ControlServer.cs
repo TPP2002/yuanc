@@ -14,7 +14,7 @@ public sealed class ControlServer(IClientFacade facade, DesiredStateStore desire
     /// <summary>不可信调用者发会改变连接状态的指令时返回的错误文案。</summary>
     public const string UntrustedCallerError = "只有本产品的界面程序可以执行此操作";
     // 会改变连接状态或配对的指令：只允许程序位于安装目录之下的调用者执行。其余（status/subscribe/check_update/read_audit/read_selfcheck）只读，不受限。
-    private static readonly HashSet<string> StateChangingOps = ["connect", "disconnect", "redeem", "import_pairing", "clear_pairing", "set_environment"];
+    private static readonly HashSet<string> StateChangingOps = ["connect", "disconnect", "redeem", "import_pairing", "clear_pairing", "set_environment", "set_routing"];
     // One ordering across connections keeps persisted intent consistent with completed commands.
     private readonly SemaphoreSlim commands = new(1, 1);
     // 未订阅连接的空闲上限；零或负数表示不限。已订阅连接靠推送保活，不受此限。
@@ -130,6 +130,10 @@ public sealed class ControlServer(IClientFacade facade, DesiredStateStore desire
                 case "set_environment":
                     if (request.Enabled is null) return new(request.Id, false, "指令缺少 enabled");
                     await facade.SetEnvironmentEnabledAsync(request.Enabled.Value).ConfigureAwait(false);
+                    break;
+                case "set_routing":
+                    if (request.Mode is null) return new(request.Id, false, "指令缺少 mode");
+                    await facade.SetRoutingAsync(request.Mode, request.Apps ?? []).ConfigureAwait(false);
                     break;
                 case "read_audit":
                     var response = new ControlResponse(request.Id, true, Audit: facade.ReadAudit());
