@@ -1,0 +1,204 @@
+{
+  "schemaVersion": 1,
+  "taskId": "DOC-ENV-PROMISE-BOUNDARY-1022",
+  "slug": "yc-env-promise-boundary-1022",
+  "title": "环境一致层承诺边界:文档写全做不到的事(跨境延迟、显示语言/区域格式/字体/语音包/设备名不改、国产浏览器与 Firefox 不在策略覆盖范围、一节点一使用者、出口核验只证明后台服务进程)并加承诺/不承诺对照表;自检第 5、6 项明细点名只覆盖 Chrome/Edge;区域格式按负责人拍板不处理只写边界",
+  "goal": "以主干 main 为基点。两张卡合并:DOC-ENV-PROMISE-BOUNDARY-1022(环境一致层做不到的事要白纸黑字写成承诺边界,供销售与验收对照)与 SEC-WIN-ENV-INTL-LOCALE-1022(负责人 2026-10-22 拍板「区域格式不处理」,只写进承诺边界,不改代码、不加自检项)。\n\n① 文档(docs/winclient/环境一致性说明.md)「目的与承诺边界」节:把「做不到与使用影响」扩成完整的承诺边界清单,保留既有五条,新增:\na) 跨境往返延迟:国内到澳洲节点的网络往返约 100 毫秒以上,与澳洲本地用户的延迟特征不同,本包无法消除,也不承诺消除;\nb) 不改 Windows 显示语言、区域格式(日期与数字写法)、中文语音包、中文字体清单、设备名与用户名里的中文标签——区域格式一条注明「负责人 2026-10-22 拍板不处理:它与系统时区、浏览器语言可能不一致,属已知边界」;\nc) 浏览器策略只对 Chrome 与 Edge 生效:360、QQ、搜狗、夸克等国产浏览器与 Firefox 不在覆盖范围;环境自检第 5、6 项的明细会点名这一点;\nd) 一节点一使用者:一个出口只应由一个使用者使用;多个账号或多人共用同一出口时,对方服务可能把它们关联到一起,本包不承诺隔离;\ne) 出口核验与自检第 1、2 项只证明后台服务这一个进程的出口;名单外程序(仅指定程序模式)、其他账户不在证明范围。\n再加一张两列表「承诺 / 不承诺」供销售与验收对照:承诺四项(IP、DNS、系统时区、浏览器首选语言的一致性目标,按本说明的条件);不承诺:a~e 与既有各条。「环境自检」表第 5、6 行判定文字末尾补一句「明细末尾注明只覆盖 Chrome/Edge」。本说明最后一段「交付边界」保留并与新表一致。\n\n② 代码(winclient/WinClient.Core/Environment/EnvironmentSelfCheck.cs):chrome_policy 与 edge_policy 两项,在「通过」与「未通过」两种结果的 Detail 末尾都追加「;策略只覆盖 Chrome 与 Edge,360、QQ、搜狗、夸克等浏览器不受约束」(两项用同一句;分号用中文「;」与现有文案一致)。「跳过」「无法核验」两种结果的明细不变。其他六项、报告形状、Summary 规则一字不改。\n\n③ 测试(先写红,winclient/WinClient.Tests/EnvironmentSelfCheckTests.cs)新增一条:GoodInspection 下第 5、6 项(索引 4、5)Result 为「通过」且 Detail 含「360」「夸克」「Chrome」「Edge」;策略不符时(沿用 PolicyMismatchOnlyNamesValuesAndResultsUseFourLiterals 的 inspection)第 5、6 项 Detail 仍以「不符项:」开头、含不符值名、末尾含「360」且不含「en-AU」;EnvironmentEnabled=false 的「跳过」与 Inspection=null 的「无法核验」两种 Detail 不含「360」。既有断言一字不改。\n\n④ 边界:全程中文;只改上述三个文件;不新增 NuGet;不在工位执行任何环境脚本;**措辞只写「做不到什么、不承诺什么」,不写「规避检测」「伪装」「反追踪」一类说法**;真机项不模拟成通过。",
+  "background": "项目:外包,中国 Windows 客户端(.NET 9 WPF,后台服务 SYSTEM + 托盘界面,sing-box 1.10.7 TUN auto_route+strict_route)+ 澳洲出口节点。主干 main 已含 PR #44 分应用模式(代理范围 global/apps)。跑法 dotnet build/test winclient/WinClient.sln;工位无外网;第三方件缓存由派单方放进 winclient/third_party/cache/。红线:只动本项目自己的服务/路由/防火墙规则;凭据不入库不入日志;隧道断了不静默回落;Windows 子进程一律隐藏窗口;真机未测不标通过;全程中文。 环境一致层现状:连接后设系统时区(随节点下发)、关自动时区、给 Chrome/Edge 写语言与 WebRTC/定位三项机器策略,断开恢复;自检八项由 EnvironmentSelfCheck.Evaluate 产出(第 5 chrome_policy、第 6 edge_policy 用 Policy() 生成「符合目标要求」或「不符项:…」明细);docs/winclient/环境一致性说明.md 已有「目的与承诺边界」「环境自检」表与「交付边界」段。本单来自会审(浏览器一致性)中 5/中 8/中 10/中 11 四条与负责人同日拍板。",
+  "nonGoals": [
+    "不改区域格式、显示语言或任何系统设置",
+    "不新增自检项、不改报告形状",
+    "不改口径速查表(由派单方维护)",
+    "不写任何规避检测类的措辞"
+  ],
+  "allowedPaths": [
+    "docs/winclient/环境一致性说明.md",
+    "winclient/WinClient.Core/Environment/EnvironmentSelfCheck.cs",
+    "winclient/WinClient.Tests/EnvironmentSelfCheckTests.cs"
+  ],
+  "forbiddenPaths": [
+    "docs/开工须知.md",
+    "docs/口径速查表.md",
+    "docs/design/**",
+    "docs/交接/**",
+    "docs/plans/**",
+    "docs/acceptance/**",
+    "docs/node/**",
+    "docs/authserver/**",
+    "docs/winclient/自动更新说明.md",
+    "docs/winclient/打包与发布说明.md",
+    "docs/winclient/分应用代理说明.md",
+    "docs/winclient/架构说明.md",
+    "docs/winclient/服务化与自启说明.md",
+    "docs/winclient/断网保护加固说明.md",
+    ".github/**",
+    ".codex/**",
+    ".gitignore",
+    "pyproject.toml",
+    "scripts/**",
+    "node/**",
+    "authserver/**",
+    "winclient/third_party/**",
+    "winclient/*.sln",
+    "winclient/*/*.csproj",
+    "winclient/WinClient.Core/Auth/**",
+    "winclient/WinClient.Core/Hosting/**",
+    "winclient/WinClient.Core/Kernel/**",
+    "winclient/WinClient.Core/Logging/**",
+    "winclient/WinClient.Core/Pairing/**",
+    "winclient/WinClient.Core/Process/**",
+    "winclient/WinClient.Core/State/**",
+    "winclient/WinClient.Core/Storage/**",
+    "winclient/WinClient.Core/Update/**",
+    "winclient/WinClient.Core/Ipc/**",
+    "winclient/WinClient.App/**",
+    "winclient/WinClient.Core/Firewall/CommandRunner.cs",
+    "winclient/WinClient.Core/Firewall/KillSwitchApplier.cs",
+    "winclient/WinClient.Core/Firewall/KillSwitchPlanner.cs",
+    "winclient/WinClient.Core/Environment/EnvironmentPlanner.cs",
+    "winclient/WinClient.Core/Environment/EnvironmentApplier.cs",
+    "winclient/WinClient.Core/Environment/EnvironmentSettings.cs",
+    "winclient/WinClient.Core/Client/**",
+    "winclient/WinClient.Tests/AuthTests.cs",
+    "winclient/WinClient.Tests/DataDirectorySecurityTests.cs",
+    "winclient/WinClient.Tests/FirewallTests.cs",
+    "winclient/WinClient.Tests/HostingTests.cs",
+    "winclient/WinClient.Tests/KernelInstallerTests.cs",
+    "winclient/WinClient.Tests/KillSwitchAuthRuleTests.cs",
+    "winclient/WinClient.Tests/KillSwitchHardenTests.cs",
+    "winclient/WinClient.Tests/KillSwitchNarrowRuleTests.cs",
+    "winclient/WinClient.Tests/KillSwitchPatrolTests.cs",
+    "winclient/WinClient.Tests/KillSwitchProfileTests.cs",
+    "winclient/WinClient.Tests/KillSwitchRecoveryTests.cs",
+    "winclient/WinClient.Tests/KillSwitchAppsModeTests.cs",
+    "winclient/WinClient.Tests/RoutingTests.cs",
+    "winclient/WinClient.Tests/IpcTests.cs",
+    "winclient/WinClient.Tests/UpdateIpcTests.cs",
+    "winclient/WinClient.Tests/PairingCertificateTests.cs",
+    "winclient/WinClient.Tests/PairingTests.cs",
+    "winclient/WinClient.Tests/EnvironmentPlannerTests.cs",
+    "winclient/WinClient.Tests/EnvironmentApplierTests.cs",
+    "winclient/WinClient.Tests/EnvironmentPolicyTests.cs",
+    "winclient/WinClient.Tests/ControllerTests.cs",
+    "winclient/WinClient.Tests/TestData.cs",
+    "winclient/WinClient.Tests/ProcessStorageTests.cs",
+    "winclient/WinClient.Tests/StateTests.cs",
+    "winclient/WinClient.Tests/UpdateApplierTests.cs",
+    "winclient/WinClient.Tests/UpdateCoordinatorTests.cs",
+    "winclient/WinClient.Tests/UpdateHttpTests.cs",
+    "winclient/WinClient.Tests/UpdateTests.cs",
+    "winclient/WinClient.Tests/Fixtures/**"
+  ],
+  "expectArtifacts": [
+    "docs/winclient/环境一致性说明.md",
+    "winclient/WinClient.Core/Environment/EnvironmentSelfCheck.cs",
+    "winclient/WinClient.Tests/EnvironmentSelfCheckTests.cs"
+  ],
+  "acceptance": [
+    {
+      "id": "BUILD",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "build",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 900
+    },
+    {
+      "id": "TEST",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "test",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--no-build",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 900
+    },
+    {
+      "id": "SHAPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;sc=pathlib.Path('winclient/WinClient.Core/Environment/EnvironmentSelfCheck.cs').read_text(encoding='utf-8');bad=[k for k in ('360','夸克','只覆盖 Chrome 与 Edge') if k not in sc];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "TESTS-EXIST",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;t=pathlib.Path('winclient/WinClient.Tests/EnvironmentSelfCheckTests.cs').read_text(encoding='utf-8');bad=[k for k in ('360','夸克','PolicyMismatchOnlyNamesValuesAndResultsUseFourLiterals','AllEightPassInContractOrderWithoutExportingAddress') if k not in t];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "OLD-TESTS-UNCHANGED",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess,sys;out=subprocess.run(['git','diff','--name-only','origin/main','--']+[\"winclient/WinClient.Tests/ControllerTests.cs\", \"winclient/WinClient.Tests/RoutingTests.cs\", \"winclient/WinClient.Tests/IpcTests.cs\", \"winclient/WinClient.Tests/EnvironmentApplierTests.cs\", \"winclient/WinClient.Tests/EnvironmentPlannerTests.cs\", \"winclient/WinClient.Tests/EnvironmentPolicyTests.cs\", \"winclient/WinClient.Core/Client/ClientController.cs\", \"winclient/WinClient.Core/Environment/EnvironmentPlanner.cs\"],capture_output=True,text=True).stdout.split();print(out);sys.exit(1 if out else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "NOWINDOW",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;norm=lambda p:str(p).replace(chr(92),'/');files=[p for root in ('winclient/WinClient.Core','winclient/WinClient.App') for p in pathlib.Path(root).rglob('*.cs') if '/obj/' not in norm(p) and '/bin/' not in norm(p)];bad=[norm(p) for p in files if 'ProcessStartInfo' in p.read_text(encoding='utf-8') and p.parent.name!='Process' and 'CreateNoWindow = true' not in p.read_text(encoding='utf-8')];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;e=pathlib.Path('docs/winclient/环境一致性说明.md').read_text(encoding='utf-8');bad=[k for k in ('往返','字体','区域格式','2026-10-22','360','夸克','Firefox','一节点一使用者','后台服务','承诺边界','不承诺','显示语言') if k not in e];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "NOBIN",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess,sys;out=subprocess.run(['git','ls-files','winclient','build'],capture_output=True,text=True).stdout.split();bad=[f for f in out if f.endswith(('.exe','.dll','.zip','.pdb'))];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    }
+  ],
+  "steps": [
+    "读 docs/winclient/环境一致性说明.md 全文、EnvironmentSelfCheck.cs、EnvironmentSelfCheckTests.cs;先写 ③ 的红测试。",
+    "实现 ②;跑 BUILD / TEST;再写 ①;最后跑 SHAPE / TESTS-EXIST / DOCS / OLD-TESTS-UNCHANGED。",
+    "交活说明列出新增的边界条目;除 dotnet build/test/restore 外不跑别的命令。"
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "timeoutSec": 3600,
+  "repoRoot": "E:/yuanc"
+}

@@ -1,0 +1,227 @@
+{
+  "schemaVersion": 1,
+  "taskId": "SEC-WIN-FW-INEFFECTIVE-STOPS-TUNNEL-1022",
+  "slug": "yc-ks-keep-tunnel-lan-1022",
+  "title": "断网保护两处加固:已持有保护时防火墙失效不再停隧道(保持隧道并持续告警,首次连接仍拒连;巡检转绿后清告警)+ 全部流量模式放行局域网目标地址(YuanC-KS-Lan,RemoteAddress=LocalSubnet,列入巡检预期规则);同步既有规则数断言与文档",
+  "goal": "以主干 main(含 PR #44 分应用模式,头 8912a6b 之后)为基点。本单合并两张已拍板的卡,改同一组文件:\n\n【甲】SEC-WIN-FW-INEFFECTIVE-STOPS-TUNNEL-1022(负责人 2026-10-22 原话「只要保证使用中,不管什么意外,IP 一直是澳洲宽带就行」;拍板「保持隧道并报警」)。现状:控制器在**已经持有保护**的路径上再次套用断网保护时——①后台服务重启走 InitializeAsync(keepProtection:true) 后 ConnectAsync;②分发版鉴权被网络类拒绝(AuthRejected Network/RateLimited)进入重连、退避后重新取会话,ApplySessionAsync 在 protection && previous!=null && !machine.HasSession 时发 SessionOk;③仅指定程序模式同样路径走 ApplyAppsAsync——防火墙核验失败(exit 3)抛 FirewallIneffectiveException,被 ConnectAsync / RunScheduledAsync 的 IsOperational 捕获 → FailAsync → OperationFailed → StopTunnel:防火墙本来已挡不住,隧道再一停,整机直连。要改成:已持有保护时套用失败**不停隧道、照常启动隧道、持续红字告警**;首次连接(本进程内尚无成功套用记录)遇到防火墙失效**照旧拒连**(既有测试 IneffectiveFirewallKeepsProtectionAndShowsSpecificReasonWithoutStartingTunnel 一字不改)。\n\n【乙】WINCLIENT-LAN-BLOCKED-POLICY-1022(拍板「放行局域网目标地址」):全部流量模式的断网保护只放行节点/鉴权/TUN/回环/DHCP,局域网目标(打印机、NAS、投屏、路由器管理页)被三档默认出站 Block 挡掉。加一条本项目放行规则 `YuanC-KS-Lan`:出站、Allow、RemoteAddress=[\"LocalSubnet\"],不限程序/协议/端口;列入 ExpectedRuleNames 供巡检与重建;断开时随 YuanC-KS- 前缀一并删除。仅指定程序模式不改(它没有默认阻断)。\n\n① 控制器(winclient/WinClient.Core/Client/ClientController.cs)\n新增私有字段 `bool protectionVerified`(本进程内断网保护是否已成功套用过)与 `string? firewallWarning`(保持隧道时的告警文案,null 表示无告警),以及常量 `KeepTunnelWarning` 原文:「断网保护未能重新套用:系统防火墙已被关闭或被策略覆盖,隧道保持但失去断网兜底;请立即在 Windows 安全中心开启防火墙或联系管理员」。\n- InitializeAsync 的保持保护分支(现在写 protection = true 的那几行)同时置 protectionVerified = true(上次运行的保护记录仍在,视为已持有)。\n- ExecuteEffectsAsync 的 ApplyKillSwitch 分支改为:`var held = protectionVerified; protection = true;` 然后 try 里按现状调 ApplyAppsAsync / ApplyAsync,成功后 `protectionVerified = true; firewallWarning = null;`;`catch (FirewallIneffectiveException) when (held)` 里 `firewallWarning = KeepTunnelWarning; guardStatus = KeepTunnelWarning; message = KeepTunnelWarning;` 吞掉异常,同一迁移里后续的 StartTunnel 效果照常执行。held 为 false 时不捕获,走既有失败路径(拒连、NeedsManual、message = 异常原文)。\n- StartTunnel 成功后的 `message = \"虚拟网卡已就绪。\"` 改为 `message = firewallWarning ?? \"虚拟网卡已就绪。\"`。\n- RemoveKillSwitch 分支:protection = false 的同时 protectionVerified = false、firewallWarning = null。\n- PatrolAsync 的 try 块末尾(guardStatus 已算出且没有抛异常时):若 firewallWarning 不为 null → `firewallWarning = null; protectionVerified = true; message = \"断网保护已重新生效。\";`(巡检退出码 0 证明 MpsSvc 在跑、三档已重新收紧、缺失规则已重建)。巡检抛 FirewallIneffectiveException 的既有分支不变(guardStatus/message 沿用既有文案)。\n- 其余逻辑、文案、顺序一字不改;Apps 模式与 Global 模式共用同一处理。\n\n② 防火墙计划(winclient/WinClient.Core/Firewall/KillSwitchPlanner.cs)\n- Plan(Apply) 在 Dhcp 规则之后、VerifyProfiles 之前追加 `new AddRule(Prefix + \"Lan\", \"Outbound\", \"Allow\", RemoteAddress: [\"LocalSubnet\"])`(不带 Program/Service/Protocol/端口/LocalAddress)。\n- ExpectedRuleNames(withAuth) 末尾追加 Prefix + \"Lan\"(顺序:Node-Tcp、Node-Udp、[Auth]、Tun、Loopback、Dhcp、Lan)。\n- UpdateNode、Remove、Audit、Patrol、PlanApps 与所有脚本模板一字不改(AddRule 既有脚本分支已支持 RemoteAddress)。\n\n③ 测试(先写红;ControllerTests.cs 的 Firewall 假件按需把 `ApplyError` 改成可 set、新增 `Exception? ApplyAppsError { get; set; }` 在 ApplyAppsAsync 里抛)\nControllerTests.cs 新增:\na) 保持保护启动 + 防火墙失效:Firewall{HasPendingState=true, ApplyError=new FirewallIneffectiveException(\"模拟\")} + PairingSessionSource;InitializeAsync(autoConnect:false, keepProtection:true) → State==Connected、ProtectionActive、order==[\"apply\",\"start\"]、GuardStatus 与 Message 都含「断网保护未能重新套用」、order 不含 stop/remove。\nb) 同上但仅指定程序模式(MemoryRouting 默认 Apps、PendingMode=\"apps\"、ApplyAppsError=FirewallIneffectiveException)→ order==[\"apply-apps\",\"start\"]、Connected、告警同 a。\nc) 重新鉴权路径:ScriptedSource 先 Ok(TestData.Session()) 连上(apply 成功);把 ApplyError 置为 FirewallIneffectiveException;Enqueue new AuthResponse<SessionResponse>(AuthResult.Network);RefreshSessionAsync → State==Reconnecting;Enqueue Ok(TestData.Session());FireAndPublish 退避 2 秒 → State==Connected、order==[\"apply\",\"start\",\"stop\",\"apply\",\"start\"]、GuardStatus 含「断网保护未能重新套用」、ProtectionActive、不含 remove。\nd) 首次连接仍拒连且再点连接仍拒连:沿用既有场景(ApplyError=FirewallIneffectiveException,不保持保护)ConnectAsync 两次 → 两次都 NeedsManual、order 不含 start、Message==异常原文。\ne) 巡检转绿清告警:场景 a 之后 PatrolResults 不入队(默认 Empty),FireAndPublish 巡检 60 秒 → GuardStatus==\"正常\"、Message==\"断网保护已重新生效。\";随后 DisconnectAsync → order 末尾为 stop、remove。\nf) 保持隧道期间巡检仍失效:场景 a 之后 PatrolResults.Enqueue(new FirewallIneffectiveException(\"x\")),FireAndPublish 巡检 → GuardStatus 为既有巡检告警文案(含「断网保护可能失效」)、State 仍 Connected、order 不含 stop。\n既有断言按本卡明确授权只改这几处(逐条列进交活说明,其余一字不改):ControllerTests.PatrolUsesModeSpecificRulesAfterSixtySeconds 的 `authMode ? 6 : 5` → `authMode ? 7 : 6`;FirewallTests.ApplyHasOnlyApprovedAllowsAndAuditDoesNotModifyOtherRules 的 `Assert.Equal(5, rules.Length)` → 6;KillSwitchPatrolTests.ExpectedNamesHaveExactOrderAndAuthOnlyForAuthMode 的 InlineData (true,6)/(false,5) → (true,7)/(false,6) 且 expected 列表在 \"YuanC-KS-Dhcp\" 后加 \"YuanC-KS-Lan\";KillSwitchHardenTests.ApplyActionOrderIsExact 的数组在第五个 \"AddRule\" 后再加一个 \"AddRule\"(VerifyProfiles 之前)。另加断言:FirewallTests 里 Lan 规则 RemoteAddress==[\"LocalSubnet\"] 且 Program/Service/Protocol/LocalPort/RemotePort/LocalAddress 全为 null,脚本里恰有一行以 `New-NetFirewallRule -Name 'YuanC-KS-Lan'` 开头且含 `-RemoteAddress @('LocalSubnet')`;KillSwitchPatrolTests 里 ExpectedRuleNames 最后一项为 \"YuanC-KS-Lan\"。KillSwitchAuthRuleTests / KillSwitchNarrowRuleTests / KillSwitchProfileTests / KillSwitchRecoveryTests / KillSwitchAppsModeTests / RoutingTests / IpcTests / StateTests 等其余测试文件一字不动。\n\n④ 文档(docs/winclient/断网保护加固说明.md)\n新节「已持有保护时防火墙失效:保持隧道并告警」:负责人原则原话、哪几条路径算「已持有」、首次连接仍拒连、告警文案原文、巡检转绿后的「断网保护已重新生效。」、剩余窟窿(防火墙失效期间隧道进程崩溃到重连前会直连;根治见 SEC-WIN-WFP-KILLSWITCH-1022)、真机待验证项(停 MpsSvc 后重启后台服务:隧道应起来且界面红字;停 MpsSvc 后首次连接:应拒连;恢复 MpsSvc 后 60 秒内出现「断网保护已重新生效。」)。新节「局域网放行」:规则名与写法、为什么不泄漏(目标在局域网内、包不出公网)、唯一例外(局域网内另有代理设备且用户手动把流量指过去,属用户自己的行为)、真机待验证(连接中能打印、访问路由器页与 NAS;断开后规则随前缀删除;公网目标仍只能经隧道)。「连接期间巡检」节第 3 步的规则数改为自用六条、邀请码七条,真机清单对应条目同步。\n\n⑤ 边界:全程中文;不新增 NuGet;不改 KillSwitchApplier.cs、状态机、协议、界面;仅指定程序模式的 PlanApps / 巡检脚本逐字节不变;所有 PowerShell 仍经既有隐藏窗口执行器;不在工位机器上执行任何防火墙/环境脚本;真机项写进文档不模拟成通过;拿不准停下交 blocked + forks,不猜。",
+  "background": "项目:外包,中国 Windows 客户端(.NET 9 WPF,后台服务 SYSTEM + 托盘界面,sing-box 1.10.7 TUN auto_route+strict_route)+ 澳洲出口节点。主干 main 已含 PR #44 分应用模式(代理范围 global/apps)。跑法 dotnet build/test winclient/WinClient.sln;工位无外网;第三方件缓存由派单方放进 winclient/third_party/cache/。红线:只动本项目自己的服务/路由/防火墙规则;凭据不入库不入日志;隧道断了不静默回落;Windows 子进程一律隐藏窗口;真机未测不标通过;全程中文。 关键代码:ClientController.ExecuteEffectsAsync 的 ApplyKillSwitch/StartTunnel/RemoveKillSwitch 分支、InitializeAsync 保持保护分支(protection = true; message = protectionNotice)、PatrolAsync(try 里算 guardStatus,catch FirewallIneffectiveException 写既有告警)、FailAsync(cause 为 FirewallIneffectiveException 时 message = 原文);状态机 ConnectionStateMachine:SessionOk(Connecting/Reconnecting 且未接受会话)→ [ApplyKillSwitch, StartTunnel];AuthRejected Network → StopTunnel + ScheduleBackoff(Reconnecting);BackoffElapsed 无会话 → ShowMessage,控制器随后 FetchSessionAsync;OperationFailed → NeedsManual + StopTunnel。KillSwitchPlanner.Plan(Apply) 现在顺序:SetProfileDefault×3、DisableForeignAllowRules、Node-Tcp、Node-Udp、[Auth]、Tun、Loopback、Dhcp、VerifyProfiles、Audit;ExpectedRuleNames 给巡检用;AddRule 脚本分支支持 RemoteAddress 数组(Dhcp 规则已用 'LocalSubnet' 关键字,原样写入不展开)。测试工具:ControllerTests 里 Timers/FireAndPublish(controller, timers, 用途, 时长) 触发定时回调并以 ConnectAsync 做串行锁屏障;Firewall 假件记 order(apply/apply-apps/update:ip/remove/recover)、PatrolResults 队列(可放异常)、HasPendingState/PendingMode 可 set、ApplyError 目前是 init;ScriptedSource.Enqueue 预设会话结果;MemoryRouting 默认 RoutingTests.Apps。文档正本 docs/winclient/断网保护加固说明.md(已有「连接期间巡检」「仅指定程序模式的断网保护」等节)。",
+  "nonGoals": [
+    "不改 KillSwitchApplier、状态机、IPC 协议与界面",
+    "不改仅指定程序模式的任何脚本与断言",
+    "不做 WFP 过滤(另卡 SEC-WIN-WFP-KILLSWITCH-1022)",
+    "不在真机实测;真机项写进文档待验证清单"
+  ],
+  "allowedPaths": [
+    "winclient/WinClient.Core/Client/ClientController.cs",
+    "winclient/WinClient.Core/Firewall/KillSwitchPlanner.cs",
+    "winclient/WinClient.Tests/ControllerTests.cs",
+    "winclient/WinClient.Tests/FirewallTests.cs",
+    "winclient/WinClient.Tests/KillSwitchPatrolTests.cs",
+    "winclient/WinClient.Tests/KillSwitchHardenTests.cs",
+    "docs/winclient/断网保护加固说明.md"
+  ],
+  "forbiddenPaths": [
+    "docs/开工须知.md",
+    "docs/口径速查表.md",
+    "docs/design/**",
+    "docs/交接/**",
+    "docs/plans/**",
+    "docs/acceptance/**",
+    "docs/node/**",
+    "docs/authserver/**",
+    "docs/winclient/自动更新说明.md",
+    "docs/winclient/打包与发布说明.md",
+    "docs/winclient/分应用代理说明.md",
+    "docs/winclient/架构说明.md",
+    "docs/winclient/服务化与自启说明.md",
+    "docs/winclient/环境一致性说明.md",
+    ".github/**",
+    ".codex/**",
+    ".gitignore",
+    "pyproject.toml",
+    "scripts/**",
+    "node/**",
+    "authserver/**",
+    "winclient/third_party/**",
+    "winclient/*.sln",
+    "winclient/*/*.csproj",
+    "winclient/WinClient.Core/Auth/**",
+    "winclient/WinClient.Core/Hosting/**",
+    "winclient/WinClient.Core/Kernel/**",
+    "winclient/WinClient.Core/Logging/**",
+    "winclient/WinClient.Core/Pairing/**",
+    "winclient/WinClient.Core/Process/**",
+    "winclient/WinClient.Core/State/**",
+    "winclient/WinClient.Core/Storage/**",
+    "winclient/WinClient.Core/Update/**",
+    "winclient/WinClient.Core/Ipc/**",
+    "winclient/WinClient.App/**",
+    "winclient/WinClient.Core/Firewall/CommandRunner.cs",
+    "winclient/WinClient.Core/Firewall/KillSwitchApplier.cs",
+    "winclient/WinClient.Core/Environment/EnvironmentPlanner.cs",
+    "winclient/WinClient.Core/Environment/EnvironmentApplier.cs",
+    "winclient/WinClient.Core/Environment/EnvironmentSettings.cs",
+    "winclient/WinClient.Core/Environment/EnvironmentSelfCheck.cs",
+    "winclient/WinClient.Tests/AuthTests.cs",
+    "winclient/WinClient.Tests/DataDirectorySecurityTests.cs",
+    "winclient/WinClient.Tests/HostingTests.cs",
+    "winclient/WinClient.Tests/KernelInstallerTests.cs",
+    "winclient/WinClient.Tests/KillSwitchAuthRuleTests.cs",
+    "winclient/WinClient.Tests/KillSwitchNarrowRuleTests.cs",
+    "winclient/WinClient.Tests/KillSwitchProfileTests.cs",
+    "winclient/WinClient.Tests/KillSwitchRecoveryTests.cs",
+    "winclient/WinClient.Tests/KillSwitchAppsModeTests.cs",
+    "winclient/WinClient.Tests/RoutingTests.cs",
+    "winclient/WinClient.Tests/IpcTests.cs",
+    "winclient/WinClient.Tests/UpdateIpcTests.cs",
+    "winclient/WinClient.Tests/PairingCertificateTests.cs",
+    "winclient/WinClient.Tests/PairingTests.cs",
+    "winclient/WinClient.Tests/EnvironmentPlannerTests.cs",
+    "winclient/WinClient.Tests/EnvironmentApplierTests.cs",
+    "winclient/WinClient.Tests/EnvironmentPolicyTests.cs",
+    "winclient/WinClient.Tests/EnvironmentSelfCheckTests.cs",
+    "winclient/WinClient.Tests/TestData.cs",
+    "winclient/WinClient.Tests/ProcessStorageTests.cs",
+    "winclient/WinClient.Tests/StateTests.cs",
+    "winclient/WinClient.Tests/UpdateApplierTests.cs",
+    "winclient/WinClient.Tests/UpdateCoordinatorTests.cs",
+    "winclient/WinClient.Tests/UpdateHttpTests.cs",
+    "winclient/WinClient.Tests/UpdateTests.cs",
+    "winclient/WinClient.Tests/Fixtures/**"
+  ],
+  "expectArtifacts": [
+    "winclient/WinClient.Core/Client/ClientController.cs",
+    "winclient/WinClient.Core/Firewall/KillSwitchPlanner.cs",
+    "winclient/WinClient.Tests/ControllerTests.cs",
+    "docs/winclient/断网保护加固说明.md"
+  ],
+  "acceptance": [
+    {
+      "id": "BUILD",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "build",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 900
+    },
+    {
+      "id": "TEST",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "test",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--no-build",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 900
+    },
+    {
+      "id": "SHAPE-CTRL",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda p:pathlib.Path(p).read_text(encoding='utf-8');cc=r('winclient/WinClient.Core/Client/ClientController.cs');bad=[k for k,ok in (('warn','断网保护未能重新套用' in cc and '断网保护已重新生效' in cc),('catch',cc.count('catch (FirewallIneffectiveException')>=2),('ready','firewallWarning ?? \"虚拟网卡已就绪。\"' in cc or 'firewallWarning ?? \"虚拟网卡已就绪。\"'.replace('\"',chr(34)) in cc),('held','protectionVerified' in cc)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "SHAPE-PLAN",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;kp=pathlib.Path('winclient/WinClient.Core/Firewall/KillSwitchPlanner.cs').read_text(encoding='utf-8');i=kp.index('ExpectedRuleNames');bad=[k for k,ok in (('lan','Prefix + \"Lan\"' in kp),('subnet',kp.count('LocalSubnet')>=2),('expected','Lan' in kp[i:i+400]),('apps-untouched','PlanApps' in kp and 'RecordState(\"apps\")' in kp)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "ASSERT-SYNC",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda p:pathlib.Path('winclient/WinClient.Tests/'+p).read_text(encoding='utf-8');ft=r('FirewallTests.cs');pt=r('KillSwitchPatrolTests.cs');ht=r('KillSwitchHardenTests.cs');ct=r('ControllerTests.cs');seg=ht[ht.index('ApplyActionOrderIsExact'):ht.index('ApplyRecordsUnion')];bad=[k for k,ok in (('fw6','Assert.Equal(6, rules.Length)' in ft and 'YuanC-KS-Lan' in ft),('patrol','\"YuanC-KS-Lan\"' in pt and '(true, 7)' in pt and '(false, 6)' in pt),('harden',seg.count('\"AddRule\"')==6),('ctrl','authMode ? 7 : 6' in ct)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "TESTS-EXIST",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;ct=pathlib.Path('winclient/WinClient.Tests/ControllerTests.cs').read_text(encoding='utf-8');bad=[k for k,ok in (('warn','断网保护未能重新套用' in ct),('green','断网保护已重新生效' in ct),('apps','ApplyAppsError' in ct),('count',ct.count('FirewallIneffectiveException(')>=5),('old','IneffectiveFirewallKeepsProtectionAndShowsSpecificReasonWithoutStartingTunnel' in ct)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "OLD-TESTS-UNCHANGED",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess,sys;out=subprocess.run(['git','diff','--name-only','origin/main','--']+[\"winclient/WinClient.Tests/KillSwitchAuthRuleTests.cs\", \"winclient/WinClient.Tests/KillSwitchNarrowRuleTests.cs\", \"winclient/WinClient.Tests/KillSwitchProfileTests.cs\", \"winclient/WinClient.Tests/KillSwitchRecoveryTests.cs\", \"winclient/WinClient.Tests/KillSwitchAppsModeTests.cs\", \"winclient/WinClient.Tests/RoutingTests.cs\", \"winclient/WinClient.Tests/IpcTests.cs\", \"winclient/WinClient.Tests/StateTests.cs\", \"winclient/WinClient.Tests/EnvironmentSelfCheckTests.cs\", \"winclient/WinClient.Tests/PairingTests.cs\", \"winclient/WinClient.Core/Firewall/KillSwitchApplier.cs\", \"winclient/WinClient.Core/State/ConnectionStateMachine.cs\"],capture_output=True,text=True).stdout.split();print(out);sys.exit(1 if out else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "NOWINDOW",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;norm=lambda p:str(p).replace(chr(92),'/');files=[p for root in ('winclient/WinClient.Core','winclient/WinClient.App') for p in pathlib.Path(root).rglob('*.cs') if '/obj/' not in norm(p) and '/bin/' not in norm(p)];bad=[norm(p) for p in files if 'ProcessStartInfo' in p.read_text(encoding='utf-8') and p.parent.name!='Process' and 'CreateNoWindow = true' not in p.read_text(encoding='utf-8')];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;b=pathlib.Path('docs/winclient/断网保护加固说明.md').read_text(encoding='utf-8');bad=[k for k in ('局域网','LocalSubnet','YuanC-KS-Lan','保持隧道','使用中','首次连接','断网保护已重新生效','WFP','六条','七条') if k not in b];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "NOBIN",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess,sys;out=subprocess.run(['git','ls-files','winclient','build'],capture_output=True,text=True).stdout.split();bad=[f for f in out if f.endswith(('.exe','.dll','.zip','.pdb'))];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    }
+  ],
+  "steps": [
+    "读 ClientController.cs(InitializeAsync、ConnectAsync、ExecuteEffectsAsync、PatrolAsync、FailAsync)/ ConnectionStateMachine.cs(只读)/ KillSwitchPlanner.cs(Plan、ExpectedRuleNames、AddRule 脚本分支)/ ControllerTests.cs(Firewall 假件、Timers、FireAndPublish、既有 Ineffective 与 Patrol 测试)/ FirewallTests.cs / KillSwitchPatrolTests.cs / KillSwitchHardenTests.cs 与 docs/winclient/断网保护加固说明.md;先写 ③ 的红测试并同步 ③ 列出的既有断言。",
+    "实现 ②(规则 + ExpectedRuleNames)→ ①(控制器);每步跑 BUILD / TEST;最后跑全部形状断言与 OLD-TESTS-UNCHANGED。",
+    "写文档 ④;交活说明逐条列出改过的既有断言行与真机待验证项。除 dotnet build/test/restore 外不跑别的命令、不改环境;不许在工位机器上执行任何防火墙/环境脚本。"
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "timeoutSec": 7200,
+  "repoRoot": "E:/yuanc"
+}
