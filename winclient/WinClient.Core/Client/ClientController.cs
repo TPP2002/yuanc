@@ -37,6 +37,9 @@ public sealed class ClientController : IDisposable
     internal static readonly TimeSpan ExitCheckDelay = TimeSpan.FromSeconds(3);
     internal static readonly TimeSpan ExitCheckRetry = TimeSpan.FromSeconds(5);
     internal const int ExitCheckAttempts = 5;
+    internal const int UnverifiableHintRounds = 3;
+    internal static readonly string PairingUnverifiableHint = $"出口已连续 {UnverifiableHintRounds} 轮无法核验,出口地址可能已变;若持续如此,请在小主机上重新导出配对文件再导入。连接与断网保护保持,未自动断开。";
+    internal static readonly string AuthUnverifiableHint = $"出口已连续 {UnverifiableHintRounds} 轮无法核验,请检查网络或联系管理员;连接与断网保护保持,未自动断开。";
     internal static readonly TimeSpan ExitRecheckInterval = TimeSpan.FromMinutes(5);
     internal static readonly TimeSpan PatrolInterval = TimeSpan.FromSeconds(60);
     // 测试可同时记录所有用途；未注入时仍使用原有 delayAsync，不改变调度行为。
@@ -54,6 +57,8 @@ public sealed class ClientController : IDisposable
     private string environmentStatus = "未应用";
     private string exitStatus = "未检测";
     private string exitIp = "";
+    private int unverifiableRounds;
+    private string? messageBeforeUnverifiableHint;
     private string guardStatus = "";
     private object? exitCycle;
     private bool patrolScheduled;
@@ -540,6 +545,8 @@ public sealed class ClientController : IDisposable
             selfCheckStatus = "未检测";
             exitStatus = "未检测";
             exitIp = "";
+            unverifiableRounds = 0;
+            messageBeforeUnverifiableHint = null;
             if (activeRouting.Mode != RoutingMode.Apps || machine.State != ConnectionState.Reconnecting) exitCycle = null;
         }
         else if (session is not null && exitProbe is not null && exitCycle is null)
@@ -583,6 +590,10 @@ public sealed class ClientController : IDisposable
         var address = exit?.Address;
         if (address is not null)
         {
+            unverifiableRounds = 0;
+            if (message == PairingUnverifiableHint || message == AuthUnverifiableHint)
+                message = string.IsNullOrEmpty(messageBeforeUnverifiableHint) ? "虚拟网卡已就绪。" : messageBeforeUnverifiableHint;
+            messageBeforeUnverifiableHint = null;
             exitIp = address.ToString();
             var matches = IPAddress.TryParse(session.Node.Host, out var expected) && address.Equals(expected);
             exitStatus = matches ? "已核验" : "不一致";
@@ -598,6 +609,13 @@ public sealed class ClientController : IDisposable
         {
             exitStatus = "无法核验";
             exitIp = "";
+            unverifiableRounds++;
+            if (unverifiableRounds >= UnverifiableHintRounds && machine.State == ConnectionState.Connected &&
+                message != PairingUnverifiableHint && message != AuthUnverifiableHint)
+            {
+                messageBeforeUnverifiableHint = message;
+                message = sessionSource is PairingSessionSource ? PairingUnverifiableHint : AuthUnverifiableHint;
+            }
         }
         await CheckEnvironmentAsync(exit);
         if (!lifetime.IsCancellationRequested && !disposed) ScheduleExitCheck(ExitRecheckInterval, cycle, 1);
@@ -611,7 +629,7 @@ public sealed class ClientController : IDisposable
         EnvironmentInspection? inspection = null;
         if (policy.Enabled && environment is not null)
         {
-            try { inspection = await environment.InspectAsync(); }
+            try { inspection = await environment.InspectAsync(lifetime.Token); }
             catch (Exception ex) when (IsOperational(ex)) { }
         }
         if (lifetime.IsCancellationRequested || disposed) return;
@@ -641,8 +659,8 @@ public sealed class ClientController : IDisposable
         try
         {
             var report = activeRouting.Mode == RoutingMode.Apps
-                ? await firewall.PatrolAsync(KillSwitchPlanner.AppRuleNames(activeRouting.Apps.Count), enforceDefaultBlock: false)
-                : await firewall.PatrolAsync(KillSwitchPlanner.ExpectedRuleNames(sessionSource is AuthServerSessionSource));
+                ? await firewall.PatrolAsync(KillSwitchPlanner.AppRuleNames(activeRouting.Apps.Count), enforceDefaultBlock: false, lifetime.Token)
+                : await firewall.PatrolAsync(KillSwitchPlanner.ExpectedRuleNames(sessionSource is AuthServerSessionSource), enforceDefaultBlock: true, lifetime.Token);
             if (lifetime.IsCancellationRequested || disposed) return;
             if (report.MissingRules.Count > 0)
             {

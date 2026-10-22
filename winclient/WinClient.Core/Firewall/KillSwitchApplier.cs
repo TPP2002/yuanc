@@ -14,6 +14,7 @@ public interface IKillSwitch
 {
     Task ApplyAppsAsync(IReadOnlyList<string> programs) => throw new InvalidOperationException("当前断网保护不支持仅指定程序模式。");
     Task<PatrolReport> PatrolAsync(IReadOnlyList<string> expectedRules, bool enforceDefaultBlock) => PatrolAsync(expectedRules);
+    Task<PatrolReport> PatrolAsync(IReadOnlyList<string> expectedRules, bool enforceDefaultBlock, CancellationToken token) => PatrolAsync(expectedRules, enforceDefaultBlock);
     string? PendingMode => null;
     Task<PatrolReport> PatrolAsync(IReadOnlyList<string> expectedRules) => Task.FromResult(PatrolReport.Empty);
     bool HasPendingState { get; }
@@ -71,12 +72,16 @@ public sealed class KillSwitchApplier : IKillSwitch
     public Task ApplyAppsAsync(IReadOnlyList<string> programs) => ExecuteAsync(KillSwitchPlanner.PlanApps(programs));
     public Task<PatrolReport> PatrolAsync(IReadOnlyList<string> expectedRules) => PatrolAsync(expectedRules, true);
 
-    public async Task<PatrolReport> PatrolAsync(IReadOnlyList<string> expectedRules, bool enforceDefaultBlock)
+    public Task<PatrolReport> PatrolAsync(IReadOnlyList<string> expectedRules, bool enforceDefaultBlock)
+        => PatrolAsync(expectedRules, enforceDefaultBlock, CancellationToken.None);
+
+    public async Task<PatrolReport> PatrolAsync(IReadOnlyList<string> expectedRules, bool enforceDefaultBlock, CancellationToken token)
     {
         await gate.WaitAsync().ConfigureAwait(false);
         try
         {
-            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(180));
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
+            timeout.CancelAfter(TimeSpan.FromSeconds(180));
             var script = KillSwitchPlanner.ToPowerShellScript([new Patrol(expectedRules.ToArray(), EnforceDefaultBlock: enforceDefaultBlock)], StatePath, AuditPath);
             var result = await runner.RunAsync(CreateStartInfo(script), timeout.Token).ConfigureAwait(false);
             if (result.ExitCode == VerifyFailedExitCode)

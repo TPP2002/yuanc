@@ -59,6 +59,28 @@ public sealed class EnvironmentApplierTests
         Assert.Null(await new EnvironmentApplier(temp.Path, new InspectionRunner(exitCode, output)).InspectAsync());
     }
 
+    [Fact]
+    public async Task InspectReturnsNullWhenCancelled()
+    {
+        using var temp = new TempDirectory();
+        using var cancelled = new CancellationTokenSource();
+        cancelled.Cancel();
+        var runner = new CancelledInspectionRunner();
+        Assert.Null(await new EnvironmentApplier(temp.Path, runner).InspectAsync(cancelled.Token));
+        Assert.True(runner.Token.IsCancellationRequested);
+    }
+
+    private sealed class CancelledInspectionRunner : ICommandRunner
+    {
+        public CancellationToken Token { get; private set; }
+        public Task<CommandResult> RunAsync(ProcessStartInfo startInfo, CancellationToken cancellationToken = default)
+        {
+            Token = cancellationToken;
+            cancellationToken.ThrowIfCancellationRequested();
+            throw new InvalidOperationException("巡查必须收到已取消令牌。");
+        }
+    }
+
     private sealed class InspectionRunner(int exitCode, string output) : ICommandRunner
     {
         public ProcessStartInfo? Start;

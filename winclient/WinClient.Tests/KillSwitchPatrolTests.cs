@@ -149,6 +149,31 @@ public sealed class KillSwitchPatrolTests
         }
     }
 
+    [Fact]
+    public async Task PatrolCancellationReachesRunnerAndPropagates()
+    {
+        var runner = new CancellationRunner();
+        var applier = new KillSwitchApplier("run", runner);
+        using var cancelled = new CancellationTokenSource();
+        cancelled.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => applier.PatrolAsync([], true, cancelled.Token));
+        Assert.True(runner.Token.IsCancellationRequested);
+        await applier.PatrolAsync([], true, CancellationToken.None);
+        Assert.False(runner.Token.IsCancellationRequested);
+        Assert.True(runner.Token.CanBeCanceled);
+    }
+
+    private sealed class CancellationRunner : ICommandRunner
+    {
+        public CancellationToken Token { get; private set; }
+        public Task<CommandResult> RunAsync(ProcessStartInfo startInfo, CancellationToken cancellationToken = default)
+        {
+            Token = cancellationToken;
+            cancellationToken.ThrowIfCancellationRequested();
+            return Task.FromResult(new CommandResult(0, "{\"reenforced\":[],\"newly_disabled\":[],\"missing_rules\":[]}"));
+        }
+    }
+
     private sealed class Runner(CommandResult result) : ICommandRunner
     {
         public ProcessStartInfo? Start { get; private set; }

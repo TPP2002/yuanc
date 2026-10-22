@@ -796,6 +796,93 @@ public sealed class ControllerTests
         await controller.ConnectAsync(); // 串行锁屏障，等待本次回调完成。
     }
 
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task UnverifiableExitShowsHintAfterThreeRoundsWithoutDisconnecting(bool pairing)
+    {
+        var order = new List<string>();
+        var timers = new Timers();
+        var firewall = new Firewall(order);
+        using var http = SessionHttp(() => TestData.Session());
+        var store = new InMemoryCredentialStore(); store.Save("refresh");
+        ISessionSource source = pairing ? new PairingSessionSource(PairingTests.ValidPairing())
+            : new AuthServerSessionSource(new AuthApiClient(http), store);
+        var probe = new ScriptedProbe(Enumerable.Repeat<IPAddress?>(null, 20)
+            .Append(IPAddress.Parse(pairing ? PairingTests.ValidPairing().Node.Host : TestData.Node().Host)).ToArray());
+        using var controller = new ClientController(source, firewall, new Tunnel(order), Path.GetFullPath("fake.exe"),
+            TestData.Device, timers.Delay, exitProbe: probe) { DelayWithPurposeAsync = timers.Delay };
+        controller.Changed += _ => Interlocked.Increment(ref timers.Published);
+        await controller.ConnectAsync();
+        for (var round = 0; round < 4; round++)
+        {
+            await CompleteUnverifiableRound(controller, timers, round == 0);
+            if (round < 2)
+            {
+                Assert.Equal("虚拟网卡已就绪。", controller.Snapshot.Message);
+                Assert.DoesNotContain("无法核验", controller.Snapshot.Message);
+            }
+            else Assert.Equal(pairing ? ClientController.PairingUnverifiableHint : ClientController.AuthUnverifiableHint,
+                controller.Snapshot.Message);
+            Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
+            Assert.True(controller.Snapshot.ProtectionActive);
+            Assert.Equal("无法核验", controller.Snapshot.ExitStatus);
+            Assert.DoesNotContain("stop", order);
+            Assert.DoesNotContain("remove", order);
+        }
+        await FireAndPublish(controller, timers, "出口核验", TimeSpan.FromMinutes(5));
+        Assert.Equal("已核验", controller.Snapshot.ExitStatus);
+        Assert.Equal("虚拟网卡已就绪。", controller.Snapshot.Message);
+    }
+
+    [Fact]
+    public async Task UnverifiableCounterResetsWhenExitRecovers()
+    {
+        var probe = new ScriptedProbe(Enumerable.Repeat<IPAddress?>(null, 10)
+            .Append(IPAddress.Parse(TestData.Node().Host)).Concat(Enumerable.Repeat<IPAddress?>(null, 15)).ToArray());
+        var (controller, timers, _, _) = await ConnectMonitored(probe);
+        using (controller)
+        {
+            await CompleteUnverifiableRound(controller, timers, true);
+            await CompleteUnverifiableRound(controller, timers, false);
+            Assert.Equal("虚拟网卡已就绪。", controller.Snapshot.Message);
+            await FireAndPublish(controller, timers, "出口核验", TimeSpan.FromMinutes(5));
+            Assert.Equal("已核验", controller.Snapshot.ExitStatus);
+            Assert.Equal("虚拟网卡已就绪。", controller.Snapshot.Message);
+            for (var round = 0; round < 3; round++)
+            {
+                await CompleteUnverifiableRound(controller, timers, false);
+                Assert.Equal(round < 2 ? "虚拟网卡已就绪。" : ClientController.AuthUnverifiableHint, controller.Snapshot.Message);
+            }
+        }
+    }
+
+    private static async Task CompleteUnverifiableRound(ClientController controller, Timers timers, bool first)
+    {
+        await FireAndPublish(controller, timers, "出口核验", first ? TimeSpan.FromSeconds(3) : TimeSpan.FromMinutes(5));
+        for (var attempt = 1; attempt < 5; attempt++)
+            await FireAndPublish(controller, timers, "出口核验", TimeSpan.FromSeconds(5));
+        Assert.Equal("无法核验", controller.Snapshot.ExitStatus);
+    }
+
+    [Fact]
+    public async Task DisconnectCancelsRunningPatrolAndFinishesPromptly()
+    {
+        var (controller, timers, firewall, order) = await ConnectMonitored(null);
+        using (controller)
+        {
+            firewall.BlockPatrol = true;
+            timers.Fire("巡检", d => d == TimeSpan.FromSeconds(60));
+            await firewall.PatrolStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await controller.DisconnectAsync().WaitAsync(TimeSpan.FromSeconds(2));
+            Assert.True(firewall.PatrolToken.IsCancellationRequested);
+            Assert.Equal(ConnectionState.Disconnected, controller.Snapshot.State);
+            Assert.Contains("remove", order);
+            Assert.Equal("", controller.Snapshot.GuardStatus);
+            Assert.Single(timers.For("巡检"));
+        }
+    }
+
     private sealed class ScriptedProbe(params IPAddress?[] results) : IExitProbe
     {
         private readonly Queue<IPAddress?> results = new(results);
@@ -1480,6 +1567,17 @@ public sealed class ControllerTests
     { BaseAddress = new("https://unit.invalid") };
     private sealed class Firewall(List<string> order) : IKillSwitch
     {
+        public bool BlockPatrol { get; set; }
+        public TaskCompletionSource PatrolStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public CancellationToken PatrolToken { get; private set; }
+        public async Task<PatrolReport> PatrolAsync(IReadOnlyList<string> rules, bool enforceDefaultBlock, CancellationToken token)
+        {
+            if (!BlockPatrol) return await PatrolAsync(rules, enforceDefaultBlock);
+            PatrolToken = token;
+            PatrolStarted.TrySetResult();
+            await Task.Delay(Timeout.InfiniteTimeSpan, token);
+            throw new InvalidOperationException("巡检应只在取消时结束。");
+        }
         public string? PendingMode { get; set; }
         public string[] AppliedApps { get; private set; } = [];
         public List<bool> EnforceDefaultCalls { get; } = [];
