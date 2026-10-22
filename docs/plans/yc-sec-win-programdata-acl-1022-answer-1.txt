@@ -1,0 +1,5 @@
+两问拍板:
+
+1. kernelRoot 未传时,默认限制到程序安装目录(选「默认执行安装目录限制」)。硬规矩③修正为:只有 ownerIsTrusted 为 null 时跳过所有者核查、行为与现状一致;kernelRoot 为 null 一律按 %ProgramFiles%\YuanC 校验——漏传参数的调用也必须受保护,这正是本卡要堵的提权口。既有测试里用了安装目录以外内核路径的用例,显式传 kernelRoot 指向用例自己的目录即可(属接口适配)。
+
+2. 允许同步调整 PairingTests 第 195 行的配置路径(选「允许同步调整测试配置路径」):把 sing_box_path 写成 Path.Combine(directory.Path, "fake.exe"),第 199 行 Load 传 kernelRoot: directory.Path;该用例全部既有断言保持不变。KernelInstallerTests 第 109~114 行同理,explicitPath 若不在 directory.Path 之下也一并挪进去,断言不改。交活说明里列出改动的这几行。
