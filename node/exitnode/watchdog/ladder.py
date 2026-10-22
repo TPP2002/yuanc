@@ -19,8 +19,38 @@ class Action:
     unit: str = "exitnode-proxy.service"
 
 
+CLOCK_SKEW_TOLERANCE_SEC = 300
+
+
+def is_future(at, now):
+    return (storage.timestamp(at) - now).total_seconds() > CLOCK_SKEW_TOLERANCE_SEC
+
+
 def elapsed(at, now, seconds):
-    return at is None or (now - storage.timestamp(at)).total_seconds() >= seconds
+    if at is None:
+        return True
+    if is_future(at, now):
+        return True  # 未来时间戳视为失效，不能把自动恢复永久锁死。
+    return (now - storage.timestamp(at)).total_seconds() >= seconds
+
+
+def sanitize_clock(state, now):
+    """丢弃晚于当前时间超过容差的频率记录，返回改动条数。"""
+    changed = 0
+    kept = [at for at in state["restart_times"] if not is_future(at, now)]
+    changed += len(state["restart_times"]) - len(kept)
+    if len(kept) != len(state["restart_times"]):
+        state["restart_times"] = kept
+        state["restart_count_window"] = len(kept)
+    for key in ("first_failure_at", "last_ok_at", "last_rollback_at", "last_reboot_at",
+                "updated_at", "last_failure_tick_at", "next_action_at"):
+        if state[key] is not None and is_future(state[key], now):
+            # 连续失联时长从现在重新计，回拨不能立刻满足整机重启条件。
+            state[key] = now.isoformat() if key == "first_failure_at" else None
+            changed += 1
+    if changed:
+        storage.record(state, "clock_adjusted", now, "检测到时间回拨，已丢弃未来时间的频率记录")
+    return changed
 
 
 def refresh_window(state, now):
@@ -101,6 +131,8 @@ def execute(action, runner, config):
     registry_corrupt = False
     try:
         if name == "restart_service":
+            # 先清启动限制；失败不影响后续 restart，也不记原文。
+            runner.run(["systemctl", "reset-failed", action.unit], check=False)
             runner.run(["systemctl", "restart", action.unit])
         elif name == "rollback_config":
             # 检查暂存副本，替换的必须是刚刚校验过的同一份内容。
@@ -120,6 +152,7 @@ def execute(action, runner, config):
                 if valid.code:
                     raise ValueError("上次配置校验未通过，当前配置未更改，请联系维护人员")
                 runner.replace(temporary, LIVE)
+                runner.run(["systemctl", "reset-failed", "exitnode-proxy.service"], check=False)
                 runner.run(["systemctl", "restart", "exitnode-proxy.service"])
                 if removed:
                     state["reason"] += f"；已剔除 {removed} 条不在登记表上的用户记录"
