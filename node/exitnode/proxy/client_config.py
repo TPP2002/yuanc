@@ -13,6 +13,13 @@ def render_client_windows(ctx: ProxyContext, device: Device) -> dict:
     hy2_tls = {"enabled": True, "server_name": ctx.hy2_server_name}
     if ctx.hy2_certificate:
         hy2_tls["certificate"] = list(ctx.hy2_certificate)
+    backup = {
+        "type": "hysteria2", "tag": "backup", "server": host,
+        "server_port": ctx.hy2_port, "password": device.hy2_password,
+    }
+    if ctx.hy2_obfs_password:
+        backup["obfs"] = {"type": "salamander", "password": ctx.hy2_obfs_password}
+    backup["tls"] = hy2_tls
     return {
         "log": {"disabled": True},
         "dns": {
@@ -41,10 +48,7 @@ def render_client_windows(ctx: ProxyContext, device: Device) -> dict:
                     },
                 },
             },
-            {
-                "type": "hysteria2", "tag": "backup", "server": host,
-                "server_port": ctx.hy2_port, "password": device.hy2_password, "tls": hy2_tls,
-            },
+            backup,
             {
                 "type": "urltest", "tag": "proxy", "outbounds": ["main", "backup"],
                 "url": ctx.urltest_url, "interval": ctx.urltest_interval,

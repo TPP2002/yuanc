@@ -55,6 +55,18 @@ def test_windows_exact_golden_and_no_fallback(inputs):
     ).read_text(encoding="utf-8")
     assert_no_fallback(config)
     assert ctx.reality.private_key not in json.dumps(config)
+    assert config["outbounds"][1]["obfs"] == {
+        "type": "salamander", "password": ctx.hy2_obfs_password}
+    assert "obfs" not in config["outbounds"][0]
+
+
+def test_android_subscription_keeps_obfs_and_vless_link_omits_it(inputs):
+    ctx, device = inputs
+    android = render_android_subscription(ctx, device)
+    assert android["outbounds"][1]["obfs"]["password"] == ctx.hy2_obfs_password
+    assert ctx.hy2_obfs_password not in vless_link(ctx, device)
+    plain = replace(ctx, hy2_obfs_password="")
+    assert "obfs" not in render_android_subscription(plain, device)["outbounds"][1]
 
 
 @pytest.mark.parametrize("host", ["node.example", "::1", "", "203.0.113.999", 2130706433, None])

@@ -1,8 +1,10 @@
 """Only the node FakeRunner is used; openssl side effects are in-memory fixtures."""
 
 import json
+import re
 
 import pytest
+from exitnode import service
 from exitnode.cli import main
 from exitnode.config import load
 from exitnode.manifest import Manifest
@@ -57,7 +59,7 @@ def test_install_manifest_order_permissions_and_repeat(monkeypatch, capsys):
     runner = new_install(monkeypatch)
     assert main(["init"], runner) == 0
     files = [SECRETS + "/" + name for name in
-             ("reality.json", "hy2.crt", "hy2.key", "devices.json", "sing-box.json")]
+             ("reality.json", "hy2.crt", "hy2.key", "hy2.obfs", "devices.json", "sing-box.json")]
     assert all(path in runner.files and runner.modes[path] == 0o600 for path in files)
     keys = json.loads(runner.files[files[0]])
     assert set(keys) == {"private_key", "public_key", "short_id"}
@@ -75,7 +77,7 @@ def test_install_manifest_order_permissions_and_repeat(monkeypatch, capsys):
     steps = Manifest(MANIFEST, runner).steps
     names = [s["step"] for s in steps]
     for name in ("检查 sing-box 二进制", "生成 Reality 凭据", "生成备用通道证书",
-                 "准备设备登记表", "渲染隧道配置", "写入" + UNIT,
+                 "生成备用通道混淆密码", "准备设备登记表", "渲染隧道配置", "写入" + UNIT,
                  "重载隧道服务定义", "启用隧道服务"):
         assert names.count(name) == 1
     assert all(s["done_at"] for s in steps)
@@ -275,9 +277,97 @@ def test_tunnel_check_requires_active_service_and_valid_config(active, valid, ca
     assert layer["name"] == "隧道服务" and layer["result"] == "失败"
 
 
+OBFS = SECRETS + "/hy2.obfs"
+OBFS_PATTERN = re.compile(r"[A-Za-z0-9_-]{16,128}")
+UPGRADE_NOTICE = "备用通道已启用混淆,旧配对文件的备用线路将不可用,请重新导出"
+
+
+def test_init_generates_obfs_password_once_and_live_uses_it(capsys):
+    runner = fake()
+    assert main(["init"], runner) == 0
+    password = runner.files[OBFS]
+    assert runner.modes[OBFS] == 0o600
+    assert OBFS_PATTERN.fullmatch(password) and len(password) == 43
+    assert OBFS + ".tmp" not in runner.files
+    backup = json.loads(runner.files[LIVE])["inbounds"][1]
+    assert backup["type"] == "hysteria2"
+    assert backup["obfs"] == {"type": "salamander", "password": password}
+    names = [s["step"] for s in Manifest(MANIFEST, runner).steps]
+    assert names.index("生成备用通道混淆密码") < names.index("准备设备登记表")
+    step = next(s for s in Manifest(MANIFEST, runner).steps if s["step"] == "生成备用通道混淆密码")
+    assert step["undo"] == {"kind": "remove_file", "path": OBFS, "preserve": True}
+    output = capsys.readouterr().out
+    assert password not in output and UPGRADE_NOTICE not in output
+    assert main(["init"], runner) == 0
+    assert runner.files[OBFS] == password
+    assert password not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("content", ["", "   \n", "has space 0123456789abc", "short", "a" * 129,
+                                     "with=equals-0123456789"])
+def test_corrupt_obfs_file_fails_and_is_not_overwritten(content):
+    runner = fake()
+    runner.files[OBFS] = content
+    with pytest.raises(ValueError, match="混淆密码文件损坏") as error:
+        service.ensure_credentials(load(CONFIG, runner), runner)
+    assert "已有文件未覆盖" in str(error.value)
+    assert runner.files[OBFS] == content
+    assert not any(c[0] in {"write_file", "replace", "remove"} and c[1].startswith(OBFS)
+                   for c in runner.calls)
+
+
+def test_existing_valid_obfs_file_is_kept_with_whitespace():
+    runner = fake()
+    runner.files[OBFS] = "TEST-ONLY-hy2-obfs-0123456789abcdef\n"
+    config = load(CONFIG, runner)
+    keys = service.ensure_credentials(config, runner)
+    assert runner.files[OBFS] == "TEST-ONLY-hy2-obfs-0123456789abcdef\n"
+    ctx = build_context(config, keys, runner)
+    assert ctx.hy2_obfs_password == "TEST-ONLY-hy2-obfs-0123456789abcdef"
+
+
+@pytest.mark.parametrize("registry,notice", [(None, False), ("[]", False), ("device", True)])
+def test_upgrade_notice_only_when_devices_already_registered(capsys, registry, notice):
+    from exitnode.proxy.registry import DeviceRegistry
+
+    runner = fake()
+    if registry == "device":
+        DeviceRegistry(SECRETS + "/devices.json", ProxyRunner(runner)).add(
+            "old-device", "local", "windows", "旧电脑")
+    elif registry is not None:
+        runner.files[SECRETS + "/devices.json"] = registry
+    capsys.readouterr()
+    service.ensure_credentials(load(CONFIG, runner), runner)
+    output = capsys.readouterr().out
+    assert (UPGRADE_NOTICE in output) is notice
+    assert runner.files[OBFS] not in output
+    service.ensure_credentials(load(CONFIG, runner), runner)
+    assert UPGRADE_NOTICE not in capsys.readouterr().out
+
+
+def test_build_context_without_obfs_file_is_plain_and_corrupt_file_fails():
+    runner = fake()
+    config = load(CONFIG, runner)
+    keys = ensure_reality_keys(SECRETS, ProxyRunner(runner))
+    assert OBFS not in runner.files
+    assert build_context(config, keys, runner).hy2_obfs_password == ""
+    runner.files[OBFS] = "not valid!"
+    with pytest.raises(ValueError, match="备用通道混淆密码格式不正确"):
+        build_context(config, keys, runner)
+
+
+def test_corrupt_obfs_file_blocks_publication():
+    runner = fake()
+    assert main(["init"], runner) == 0
+    live = runner.files[LIVE]
+    runner.files[OBFS] = "broken obfs"
+    with pytest.raises(ValueError, match="混淆"):
+        service._publish_checked(load(CONFIG, runner), runner, [])
+    assert runner.files[LIVE] == live
+
+
 @pytest.mark.parametrize("registered", [False, True])
 def test_publication_updates_last_good_after_success(registered):
-    from exitnode import service
     from exitnode.proxy.registry import DeviceRegistry
 
     runner = fake()
@@ -306,7 +396,6 @@ def test_publication_updates_last_good_after_success(registered):
 @pytest.mark.parametrize("failure", ["check", "registry", "reload"])
 @pytest.mark.parametrize("existing", [False, True])
 def test_failed_publication_never_writes_last_good(monkeypatch, failure, existing):
-    from exitnode import service
     from exitnode.proxy.registry import DeviceRegistry
 
     runner = fake()

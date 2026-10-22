@@ -31,7 +31,7 @@ public sealed class PairingTests
         var input = JsonNode.Parse(File.ReadAllText(Path.Combine(GoldenDirectory, "inputs.json")))!;
         return new JsonObject
         {
-            ["format"] = "ycpair/2", ["exported_at"] = "2026-10-22T00:00:00+00:00",
+            ["format"] = "ycpair/3", ["exported_at"] = "2026-10-22T00:00:00+00:00",
             ["node"] = new JsonObject
             {
                 ["host"] = input["context"]!["server_host"]!.DeepClone(),
@@ -41,7 +41,8 @@ public sealed class PairingTests
                 ["uuid"] = input["device"]!["uuid"]!.DeepClone(),
                 ["hy2_password"] = input["device"]!["hy2_password"]!.DeepClone(),
                 ["hy2_server_name"] = input["context"]!["hy2_server_name"]!.DeepClone(),
-                ["hy2_certificate"] = input["context"]!["hy2_certificate"]!.DeepClone()
+                ["hy2_certificate"] = input["context"]!["hy2_certificate"]!.DeepClone(),
+                ["hy2_obfs_password"] = input["context"]!["hy2_obfs_password"]!.DeepClone()
             }
         };
     }
@@ -49,7 +50,7 @@ public sealed class PairingTests
     internal static PairingFile ValidPairing() => PairingFile.Parse(ValidDocument().ToJsonString());
 
     [Theory]
-    [InlineData("format", "\"ycpair/3\"")]
+    [InlineData("format", "\"ycpair/4\"")]
     [InlineData("host", "\"node.invalid\"")]
     [InlineData("host", "\"::1\"")]
     [InlineData("host", "\"127.1\"")]
@@ -149,7 +150,7 @@ public sealed class PairingTests
     }
 
     [Fact]
-    public async Task LocalSessionHasFixedLifetimeAndRegistersBothSecrets()
+    public async Task LocalSessionHasFixedLifetimeAndRegistersAllThreeSecrets()
     {
         var pairing = ValidPairing(); var sink = new AuthTests.MemoryLog(); var log = new RedactingLog(sink);
         var source = new PairingSessionSource(pairing, log);
@@ -159,9 +160,11 @@ public sealed class PairingTests
         Assert.Equal(DateTimeOffset.MaxValue, response.Value.SessionExpiresAt);
         Assert.Equal(DateTimeOffset.MaxValue, response.Value.AccountExpiresAt);
         Assert.Same(pairing.Node, response.Value.Node);
-        log.Write(pairing.Node.Uuid + " " + pairing.Node.Hy2Password);
+        Assert.False(string.IsNullOrEmpty(pairing.Node.Hy2ObfsPassword));
+        log.Write(pairing.Node.Uuid + " " + pairing.Node.Hy2Password + " " + pairing.Node.Hy2ObfsPassword);
         Assert.DoesNotContain(pairing.Node.Uuid, Assert.Single(sink.Lines));
         Assert.DoesNotContain(pairing.Node.Hy2Password, Assert.Single(sink.Lines));
+        Assert.DoesNotContain(pairing.Node.Hy2ObfsPassword, Assert.Single(sink.Lines));
         using var cancelled = new CancellationTokenSource(); cancelled.Cancel();
         await Assert.ThrowsAnyAsync<OperationCanceledException>(async () => await source.GetSessionAsync(cancelled.Token));
     }
@@ -179,7 +182,8 @@ public sealed class PairingTests
         var ciphertext = Encoding.UTF8.GetString(File.ReadAllBytes(store.FilePath));
         Assert.DoesNotContain(pairing.Node.Uuid, ciphertext);
         Assert.DoesNotContain(pairing.Node.Hy2Password, ciphertext);
-        Assert.DoesNotContain("ycpair/1", ciphertext);
+        Assert.DoesNotContain(pairing.Node.Hy2ObfsPassword, ciphertext);
+        Assert.DoesNotContain("ycpair/3", ciphertext);
         Assert.Equal(new[] { store.FilePath }, Directory.GetFiles(directory.Path, "*", SearchOption.AllDirectories));
         File.WriteAllText(store.FilePath, "corrupt");
         Assert.Throws<System.Security.Cryptography.CryptographicException>(() => store.Load());

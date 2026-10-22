@@ -1,6 +1,6 @@
 {
   "_comment": "测试向量,不是真凭据",
-  "format": "ycpair/2",
+  "format": "ycpair/3",
   "exported_at": "2026-10-22T00:00:00+00:00",
   "node": {
     "host": "203.0.113.10",
@@ -22,6 +22,7 @@
       "KoZIzj0EAwIDRwAwRAIgRL42tQXA8zgMGx6YWuDVZbT4h5kS23KjkiQhLgaMVUkC",
       "ID5gxni4Gm3yC8aOV4dNxXpPitBAEMAkiMPIgcYVpZyi",
       "-----END CERTIFICATE-----"
-    ]
+    ],
+    "hy2_obfs_password": "TEST-ONLY-hy2-obfs-0123456789abcdef"
   }
 }

@@ -22,10 +22,12 @@ def render_server(ctx: ProxyContext, devices: list[Device]) -> dict:
     hy2 = {
         "type": "hysteria2", "tag": "in-hy2", "listen": "::", "listen_port": ctx.hy2_port,
         "users": [{"name": d.device_id, "password": d.hy2_password} for d in active],
-        "tls": {
-            "enabled": True, "server_name": ctx.hy2_server_name,
-            "certificate_path": ctx.hy2_certificate_path, "key_path": ctx.hy2_key_path,
-        },
+    }
+    if ctx.hy2_obfs_password:
+        hy2["obfs"] = {"type": "salamander", "password": ctx.hy2_obfs_password}
+    hy2["tls"] = {
+        "enabled": True, "server_name": ctx.hy2_server_name,
+        "certificate_path": ctx.hy2_certificate_path, "key_path": ctx.hy2_key_path,
     }
     if ctx.masquerade:
         hy2["masquerade"] = ctx.masquerade

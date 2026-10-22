@@ -7,8 +7,9 @@ from authserver.config import Node, load_config
 
 
 def write_config(tmp_path, settings, **changes):
-    node = settings.node.model_dump(exclude={"hy2_certificate"})
+    node = settings.node.model_dump(exclude={"hy2_certificate", "hy2_obfs_password"})
     node["hy2_certificate_path"] = settings.node.hy2_certificate_path
+    node["hy2_obfs_password_path"] = settings.node.hy2_obfs_password_path
     node.update(changes)
     sections = {
         "security": {name: getattr(settings.security, name).get_secret_value()
@@ -65,21 +66,24 @@ def test_certificate_loaded_once_and_blank_lines_removed(tmp_path, settings):
 
 
 def test_default_certificate_name(settings):
-    values = settings.node.model_dump(exclude={"hy2_server_name", "hy2_certificate"})
+    values = settings.node.model_dump(
+        exclude={"hy2_server_name", "hy2_certificate", "hy2_obfs_password"})
     values["hy2_certificate_path"] = settings.node.hy2_certificate_path
     assert Node.model_validate(values).hy2_server_name == "exitnode"
 
 
-def test_session_has_ten_node_keys_and_explicit_backup_trust(client, enrolled, settings):
+def test_session_has_eleven_node_keys_and_explicit_backup_trust(client, enrolled, settings):
     settings.node.hy2_server_name = "backup.example.test"
     response = client.post("/client/session", json={"refresh_token": enrolled["refresh_token"]})
     assert response.status_code == 200
     body = response.json()
     node = body["node"]
     assert set(node) == {"host", "reality_port", "hy2_port", "sni", "reality_public_key",
-                         "short_id", "uuid", "hy2_password", "hy2_server_name", "hy2_certificate"}
+                         "short_id", "uuid", "hy2_password", "hy2_server_name", "hy2_certificate",
+                         "hy2_obfs_password"}
     assert node["hy2_certificate"] == settings.node.hy2_certificate
     backup = next(o for o in body["singbox_config"]["outbounds"] if o["type"] == "hysteria2")
     assert backup["tls"] == {"enabled": True, "server_name": "backup.example.test",
                               "certificate": settings.node.hy2_certificate}
     assert "hy2_certificate_path" not in response.text
+    assert "hy2_obfs_password_path" not in response.text
