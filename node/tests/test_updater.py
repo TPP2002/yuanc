@@ -490,3 +490,230 @@ def test_upgrade_never_changes_independent_rescue(signing):
     before = {p: v for p, v in runner.files.items() if p.startswith("/opt/exitnode-rescue/")}
     assert run(config, runner) == 0
     assert {p: v for p, v in runner.files.items() if p.startswith("/opt/exitnode-rescue/")} == before
+
+
+HIGHEST = DATA + "/updater/highest.json"
+PENDING = DATA + "/updater/pending.json"
+
+
+def assert_releases_untouched(runner, before):
+    assert release_snapshot(runner) == before
+    assert not any(c[0] in {"write_file", "write_bytes", "mkdir", "extract_tar", "replace"}
+                   and any(isinstance(v, str) and v.startswith(RELEASES + "/") for v in c[1:])
+                   for c in runner.calls)
+    assert_clean(runner)
+
+
+def test_downgrade_rejected_without_writing_releases(signing, capsys):
+    config, runner = prepared(signing, version="0.0.9")
+    before = release_snapshot(runner)
+    assert run(config, runner) == 1
+    assert "降级" in capsys.readouterr().out
+    assert runner.readlink(CURRENT) == OLD
+    assert_releases_untouched(runner, before)
+
+
+def test_allowed_downgrade_preserves_old_floor_for_next_package(signing, capsys):
+    config, runner = prepared(signing, version="0.0.9")
+    assert run(config, runner, allow_downgrade=True) == 0
+    assert runner.readlink(CURRENT) == RELEASES + "/0.0.9"
+    assert json.loads(runner.read_file(HIGHEST)) == {"version": "0.1.0"}
+    data = archive_bytes("0.0.9.post1")
+    runner.files["/push/update.tar.gz"] = data
+    runner.files["/push/update.tar.gz.sig"] = signing.sign(data)
+    runner.calls.clear()
+    before = release_snapshot(runner)
+    assert run(config, runner) == 1
+    assert "降级" in capsys.readouterr().out
+    assert_releases_untouched(runner, before)
+
+
+def test_success_records_highest_atomically_and_privately(signing):
+    config, runner = prepared(signing)
+    assert run(config, runner) == 0
+    assert json.loads(runner.read_file(HIGHEST)) == {"version": "0.2.0"}
+    assert runner.modes[HIGHEST] == 0o600
+    assert ("replace", HIGHEST + ".tmp", HIGHEST) in runner.calls
+    assert not runner.exists(HIGHEST + ".tmp")
+    assert_clean(runner)
+
+
+def test_historical_highest_gates_install_and_never_decreases(signing, capsys):
+    config, runner = prepared(signing)
+    runner.files[HIGHEST] = json.dumps({"version": "0.3.0"})
+    before = release_snapshot(runner)
+    assert run(config, runner) == 1
+    assert "降级" in capsys.readouterr().out
+    assert_releases_untouched(runner, before)
+    assert run(config, runner, allow_downgrade=True) == 0
+    assert runner.readlink(CURRENT) == NEW
+    assert json.loads(runner.read_file(HIGHEST)) == {"version": "0.3.0"}
+    assert_clean(runner)
+
+
+@pytest.mark.parametrize("content", ["broken-json", '{"version":"invalid"}', "[]",
+                                     "null", "{}", '{"version":12}'])
+def test_invalid_highest_is_ignored(signing, content):
+    config, runner = prepared(signing)
+    runner.files[HIGHEST] = content
+    assert run(config, runner) == 0
+    assert json.loads(runner.read_file(HIGHEST)) == {"version": "0.2.0"}
+    assert_clean(runner)
+
+
+def test_github_tag_and_package_version_must_match(signing, monkeypatch, capsys):
+    config, runner = prepared(signing)
+    config.updater.source, config.updater.github_repo = "github", "owner/repo"
+    base = "https://api.github.com/repos/owner/repo/releases/"
+    metadata = {"tag_name": "v0.3.0", "assets": [
+        {"name": "exitnode-0.3.0.tar.gz", "url": base + "assets/1"},
+        {"name": "exitnode-0.3.0.tar.gz.sig", "url": base + "assets/2"}]}
+    original = runner.run
+
+    def request(argv, check=True, input=None, timeout=30):
+        if argv[0] != "curl":
+            return original(argv, check, input, timeout)
+        runner.calls.append(("run", tuple(argv), check, input))
+        if argv[-1].endswith("latest"):
+            return CompletedResult(out=json.dumps(metadata) + "\n200")
+        suffix = ".sig" if argv[-1].endswith("/2") else ""
+        runner.write_bytes(argv[argv.index("--output") + 1],
+                           runner.read_bytes("/push/update.tar.gz" + suffix))
+        return CompletedResult(out="\n200")
+
+    monkeypatch.setattr(runner, "run", request)
+    before = release_snapshot(runner)
+    assert upgrade(config, runner) == 1
+    assert "不一致" in capsys.readouterr().out
+    assert_releases_untouched(runner, before)
+
+
+def test_existing_complete_package_switches_without_extracting(signing, capsys):
+    config, runner = prepared(signing)
+    put_release(runner, "0.2.0")
+    runner.calls.clear()
+    before = release_snapshot(runner)
+    assert run(config, runner) == 0
+    assert runner.readlink(CURRENT) == NEW
+    assert_releases_untouched(runner, before)
+    commands = [c[1] for c in runner.calls if c[0] == "run"]
+    for unit in ("exitnode-proxy.service", "exitnode-admin.service"):
+        assert ("systemctl", "restart", unit) in commands
+    assert (*HEALTH, "--config", CONFIG, "check", "--json") in commands
+    assert json.loads(runner.read_file(DATA + "/updater/history.jsonl"))['status'] == "ok"
+    assert json.loads(runner.read_file(HIGHEST)) == {"version": "0.2.0"}
+    assert not runner.exists(PENDING)
+    assert "切换完成" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("damage,message", [("different", "内容不同"), ("missing", "校验失败"),
+                                            ("bad", "失败标记")])
+def test_existing_package_refuses_changed_incomplete_or_bad_release(signing, damage, message, capsys):
+    config, runner = prepared(signing)
+    put_release(runner, "0.2.0")
+    if damage == "different":
+        runner.files[NEW + "/bin/sing-box"] = b"different-binary"
+        manifest = json.loads(runner.read_file(NEW + "/manifest.json"))
+        manifest["files"]["bin/sing-box"] = hashlib.sha256(b"different-binary").hexdigest()
+        runner.files[NEW + "/manifest.json"] = json.dumps(manifest)
+        assert layout.valid_release(runner, NEW)
+    elif damage == "missing":
+        del runner.files[NEW + "/bin/sing-box"]
+    else:
+        runner.files[NEW + ".bad"] = "失败"
+    runner.calls.clear()
+    before = release_snapshot(runner)
+    assert run(config, runner) == 1
+    assert message in capsys.readouterr().out
+    assert runner.readlink(CURRENT) == OLD
+    assert_releases_untouched(runner, before)
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_switch_health_failure_rolls_back_and_marks_bad(signing, explicit, capsys):
+    config, runner = prepared(signing)
+    put_release(runner, "0.2.0")
+    config.updater.health_timeout_sec = 5
+    runner.responses[HEALTH] = CompletedResult(out='{"layers":[]}')
+    result = upgrade(config, runner, switch="0.2.0") if explicit else run(config, runner)
+    assert result == 1
+    assert "新版启动失败，已恢复旧版" in capsys.readouterr().out
+    assert runner.readlink(CURRENT) == OLD and NEW + ".bad" in runner.files
+    assert json.loads(runner.read_file(DATA + "/updater/history.jsonl"))["status"] == "rolled_back"
+    assert not runner.exists(PENDING)
+    assert not runner.exists(HIGHEST)
+    assert_clean(runner)
+
+
+def test_cli_switch_works_offline_without_source_or_package(signing, capsys):
+    _, runner = prepared(signing)
+    put_release(runner, "0.2.0")
+    runner.connections.clear()
+    del runner.files["/push/update.tar.gz"]
+    del runner.files["/push/update.tar.gz.sig"]
+    runner.calls.clear()
+    before = release_snapshot(runner)
+    assert main(["upgrade", "--switch", "0.2.0"], runner) == 0
+    assert runner.readlink(CURRENT) == NEW
+    assert not any(c[0] == "tcp_connect" or c[0] == "run" and c[1][0] == "curl"
+                   for c in runner.calls)
+    assert "切换完成" in capsys.readouterr().out
+    assert_releases_untouched(runner, before)
+
+
+@pytest.mark.parametrize("target,damage,message", [
+    ("0.3.0", None, "未安装"), ("0.1.0", None, "已是当前"),
+    ("invalid", None, "版本号格式不正确"), ("0.2.0", "bad", "失败标记"),
+    ("0.2.0", "missing", "校验失败"), ("0.3.0", "link", "未安装")])
+def test_switch_target_validation(signing, target, damage, message, capsys):
+    config, runner = prepared(signing)
+    put_release(runner, "0.2.0")
+    if damage == "bad":
+        runner.files[NEW + ".bad"] = "失败"
+    elif damage == "missing":
+        del runner.files[NEW + "/bin/sing-box"]
+    elif damage == "link":
+        runner.symlink(NEW, RELEASES + "/0.3.0")
+    runner.calls.clear()
+    before = release_snapshot(runner)
+    assert upgrade(config, runner, switch=target) == 1
+    assert message in capsys.readouterr().out
+    assert runner.readlink(CURRENT) == OLD
+    assert_releases_untouched(runner, before)
+
+
+def test_cli_switch_downgrade_requires_flag_and_preserves_floor(signing, capsys):
+    _, runner = prepared(signing)
+    target = put_release(runner, "0.0.9")
+    runner.calls.clear()
+    before = release_snapshot(runner)
+    assert main(["upgrade", "--switch", "0.0.9"], runner) == 1
+    assert "降级" in capsys.readouterr().out
+    assert_releases_untouched(runner, before)
+    assert main(["upgrade", "--switch", "0.0.9", "--allow-downgrade"], runner) == 0
+    assert runner.readlink(CURRENT) == target
+    assert json.loads(runner.read_file(HIGHEST)) == {"version": "0.1.0"}
+    assert runner.modes[HIGHEST] == 0o600
+    assert_clean(runner)
+
+
+@pytest.mark.parametrize("option", ["--file", "--signature"])
+def test_cli_switch_rejects_package_options_without_system_calls(option, capsys):
+    runner = FakeRunner()
+    assert main(["upgrade", "--switch", "0.2.0", option, "/unused"], runner) == 2
+    assert "--switch 不能与 --file 或 --signature 同时使用" in capsys.readouterr().err
+    assert runner.calls == []
+
+
+def test_cli_switch_check_does_not_restart_or_change_current(signing, capsys):
+    _, runner = prepared(signing)
+    put_release(runner, "0.2.0")
+    runner.calls.clear()
+    before = release_snapshot(runner)
+    assert main(["upgrade", "--switch", "0.2.0", "--check"], runner) == 0
+    assert "可以切换到 0.2.0，未执行。" in capsys.readouterr().out
+    assert runner.readlink(CURRENT) == OLD
+    assert not any(c[0] == "run" for c in runner.calls)
+    assert not runner.exists(HIGHEST)
+    assert not runner.exists(PENDING)
+    assert_releases_untouched(runner, before)
