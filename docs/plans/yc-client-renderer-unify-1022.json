@@ -1,0 +1,320 @@
+{
+  "schemaVersion": 1,
+  "taskId": "CLIENT-RENDERER-UNIFY-1022",
+  "slug": "yc-client-renderer-unify-1022",
+  "title": "客户端连接配置只由客户端本地渲染:分发版鉴权服务不再渲染、不再下发 singbox_config(删掉它那份口径已脱节的渲染器),客户端两种模式都用 LocalConfigRenderer(黄金锁住),旧服务返回的 singbox_config 忽略;鉴权服务被攻破也塞不进直连配置",
+  "goal": "以派单时 origin/main 头为基点。客户端的 sing-box 连接配置今后**只由客户端按节点 11 个字段本地渲染**(LocalConfigRenderer,口径正本是节点仓 node/exitnode/proxy/client_config.py,黄金文件 node/tests/golden/proxy/client-windows.json 锁住),分发版鉴权服务不再渲染、不再下发 `singbox_config`;客户端对旧服务仍返回的 `singbox_config` 一律忽略。做完后:\n\n【C# 客户端】\n① winclient/WinClient.Core/Auth/AuthModels.cs:SessionResponse 删掉 `SingboxConfig` 属性(服务器响应里若仍有 `singbox_config`,System.Text.Json 默认忽略未知成员,不报错)。\n② winclient/WinClient.Core/Client/ISessionSource.cs:PairingSessionSource 不再给 SingboxConfig 赋值,其余不动。\n③ winclient/WinClient.Core/Client/ClientController.cs:加 `using WinClient.Core.Pairing;`,新增私有方法(名字施工方定,例如 `RenderedConfiguration(SessionResponse value)`)返回 `RoutingRenderer.Render(LocalConfigRenderer.Render(value.Node), activeRouting, serviceProcessPath, sessionSource is AuthServerSessionSource ? authEndpoint : null)`;原来三处 `RoutingRenderer.Render(…SingboxConfig…)`(套用会话前校验、StartTunnel、环境自检 Evaluate)全部改调它;`SameSession` 去掉对 SingboxConfig 原文的比较(节点 11 键比较已覆盖),其余逻辑、状态机、文案一字不改。\n④ 测试:\n  - winclient/WinClient.Tests/TestData.cs:Session / SessionExpiringIn 去掉 SingboxConfig 赋值与 `config` 参数;`Config` 静态属性保留(ProcessStorageTests 还在用)。\n  - winclient/WinClient.Tests/ControllerTests.cs:SameSessionDetectsAnyNodeOrConfigDifference 删掉 `[InlineData(\"singbox_config\")]` 与对应分支;文件开头用 `config:` 参数构造会话的辅助方法改成不传 config(控制器现在自己按 Node 渲染);其余既有断言一字不改。\n  - 新增一个测试 `ServerProvidedSingboxConfigIsIgnored`(放 ControllerTests.cs 或 AuthTests.cs):服务器会话 JSON 带 `\"singbox_config\": {\"outbounds\": [{\"type\": \"direct\", \"tag\": \"direct\"}]}` 时,① 反序列化成功且 SessionResponse 没有该字段;② 用该会话连接(分发模式、全部流量),假隧道收到的配置原文等于 `LocalConfigRenderer.Render(node).GetRawText()`,其中没有任何 `\"type\":\"direct\"` 出站。[Fact]+[Theory] 总数(ControllerTests + AuthTests)比基点至少多 1。\n  - 既有夹具因接口变化要补的字段按持续授权处理,不放宽任何断言。\n\n【Python 鉴权服务与节点测试】\n⑤ authserver/authserver/app.py:删掉 `from .clientconfig import render` 与 `/client/session` 里 `result[\"singbox_config\"] = render(...)` 那行,响应只含 session_token / session_expires_at / account_expires_at / node(13 键:11 键 + time_zone + country)。\n⑥ 删除文件 authserver/authserver/clientconfig.py(含文件头 TODO);仓内不再有任何地方引用 clientconfig。\n⑦ authserver/tests/test_sessions.py:去掉所有对 `singbox_config` 的断言与 `render` 导入;`test_session_credentials_and_config` 改为只断言 node 字段(uuid 非空、hy2_password ≥32、与 settings.node 一致)并加 `assert \"singbox_config\" not in body`;`test_session_carries_obfs_password_into_node_and_backup` 只保留 node 里混淆密码的断言;`test_empty_obfs_path_sends_empty_password_and_no_obfs` 只保留 node[\"hy2_obfs_password\"] == \"\";删掉 `test_render_without_obfs_key_has_no_obfs`。\n   authserver/tests/test_certificate.py:`test_session_has_eleven_node_keys_and_explicit_backup_trust` 去掉从 body[\"singbox_config\"] 取 backup 的两条断言,其余(13 键、证书、不泄漏路径字段)不动。\n⑧ node/tests/test_renderer_parity.py:去掉 `from authserver.clientconfig import render` 与所有 `auth = render(...)`/`auth[...]` 比较;改为断言 session[\"node\"] 与 pair[\"node\"] 在节点级键(host / reality_port / hy2_port / sni / reality_public_key / short_id / hy2_server_name / hy2_certificate / hy2_obfs_password)上逐键相等(uuid 与 hy2_password 按设备不同,不比),并保留对 render_client_windows 的既有断言(obfs、tls、urltest 三参、端口 14443)。\n\n【文档】\n⑨ docs/authserver/接口说明.md:会话响应示例删掉 `\"singbox_config\": {}`;删掉「上例最后一项只是示意位置,实际响应包含完整配置…」那段与 `hy2_obfs_password` 段里关于 `singbox_config` 的 backup 描述;新增一段「连接配置不再下发」:客户端(自用与分发两种模式)按 node 的 11 键本地渲染,口径正本 node/exitnode/proxy/client_config.py、黄金 node/tests/golden/proxy/client-windows.json;旧版服务仍返回的 `singbox_config` 客户端忽略;这样鉴权服务被攻破也不能给客户端塞入带直连出站的配置。\n⑩ docs/winclient/架构说明.md:「自用模式与配对文件」里「本地渲染口径取自…」那段补一句:分发模式的会话同样只用 node 本地渲染,服务器不再下发连接配置(旧服务返回的忽略),两种模式都走同一个 LocalConfigRenderer;「两种来源随后共用…」保持。\n⑪ 全程中文;不新增 NuGet 与 pip 依赖;不改 RoutingRenderer / TunnelTransport / LocalConfigRenderer / 节点渲染器 / 黄金文件;不在真机实测。",
+  "background": "项目:外包,澳洲出口节点(Python 包 node/exitnode)+ 分发版鉴权服务(authserver,FastAPI)+ Windows 客户端(.NET 9,Core 类库 + WPF App + xunit Tests)。\n现状:客户端连接配置有三份生成器——节点 node/exitnode/proxy/client_config.py(render_client_windows,黄金 client-windows.json)、鉴权服务 authserver/authserver/clientconfig.py(render,/client/session 响应里的 singbox_config)、客户端 C# LocalConfigRenderer(自用模式按配对文件 node 渲染,测试逐字段比对节点黄金)。自用模式用 C# 渲染;分发模式用服务器下发的 singbox_config(ClientController 三处 RoutingRenderer.Render(session.SingboxConfig, …))。\n问题:鉴权服务那份口径已脱节——DNS 写 `tls://1.1.1.1` 且 detour 是 `urltest`(节点/客户端是 `https://1.1.1.1/dns-query` detour `proxy`)、选择器 tag 叫 `urltest`(节点/客户端叫 `proxy`)、log 开着、tun stack mixed(节点/客户端 system)、多一条 port 53 规则、route final 为 urltest。后果:分发版用户切到「仅指定程序」模式时 RoutingRenderer 要求 DNS detour 为 proxy、规则出站写 `proxy`,拿服务器配置会抛「服务器配置缺少经隧道的 DNS」或生成引用不存在出站的配置;环境自检第 7 项「配置无直连路径」按 final=proxy / detour proxy 判,分发版也对不上。\n选定修法:三份合成「一份 Python 正本 + 一份 C# 实现」——服务器不再渲染,客户端两种模式都用 LocalConfigRenderer(已被黄金锁住);顺带收紧安全边界(服务器不能再给客户端塞任意配置)。不走「authserver import node 包」路线:两边部署形态独立,跨包依赖要改安装方式。\n相关代码:AuthModels.SessionResponse(SessionToken / SessionExpiresAt / AccountExpiresAt / Node / SingboxConfig,均 required);AuthApiClient.SessionAsync 反序列化;ClientController 第 363 / 450 / 504 / 622 行用 SingboxConfig,SameSession 比较 11 键 + 配置原文;PairingSessionSource 构造 SessionResponse 时 SingboxConfig = LocalConfigRenderer.Render(pairing.Node);TestData.Session / SessionExpiringIn 带 SingboxConfig = Config(`{\"inbounds\":[{\"type\":\"tun\"}]}` 假配置),ControllerTests 第 23 行辅助方法用 LocalConfigRenderer.Render 当 config,第 1318~1351 行 Theory 的 InlineData(\"singbox_config\") 分支;EnvironmentSelfCheck 的输入记录也有 SingboxConfig 字段(另一类型,不改)。authserver/app.py 第 12 行导入 render、第 178 行赋值;authserver/tests/test_sessions.py 第 30 / 56~62 / 153~158 / 171~172 / 175~180 行与 test_certificate.py 第 87~89 行断言 singbox_config;node/tests/test_renderer_parity.py 导入 authserver.clientconfig.render 比较 obfs / tls / urltest 三参。\nCI:Python `python -m ruff check .` + `python -m pytest -q`(根 pyproject testpaths = node/tests + authserver/tests,pythonpath = node + authserver);dotnet `dotnet test winclient --nologo`。本单验收跑整个 sln 的 Release 构建与测试。看板卡 CLIENT-RENDERER-UNIFY-1022(来源 PROXY-CONFIG-1023 自审观察项)。",
+  "nonGoals": [
+    "不改 LocalConfigRenderer / RoutingRenderer / TunnelTransport / 节点渲染器 / 黄金文件(口径本身不变,只是去掉第三份)",
+    "不做续期请求走隧道的回环问题(另卡 SEC-AUTH-RENEW-VIA-TUNNEL-HAIRPIN-1022)",
+    "不改鉴权服务其他接口、数据库、鉴权流程",
+    "不在真机实测"
+  ],
+  "allowedPaths": [
+    "winclient/WinClient.Core/Auth/AuthModels.cs",
+    "winclient/WinClient.Core/Client/ClientController.cs",
+    "winclient/WinClient.Core/Client/ISessionSource.cs",
+    "winclient/WinClient.Tests/ControllerTests.cs",
+    "winclient/WinClient.Tests/AuthTests.cs",
+    "winclient/WinClient.Tests/TestData.cs",
+    "authserver/authserver/app.py",
+    "authserver/authserver/clientconfig.py",
+    "authserver/tests/test_sessions.py",
+    "authserver/tests/test_certificate.py",
+    "node/tests/test_renderer_parity.py",
+    "docs/authserver/接口说明.md",
+    "docs/winclient/架构说明.md"
+  ],
+  "forbiddenPaths": [
+    ".codex/**",
+    ".github/**",
+    ".gitignore",
+    "authserver/authserver/__init__.py",
+    "authserver/authserver/admin_cli.py",
+    "authserver/authserver/config.py",
+    "authserver/authserver/db.py",
+    "authserver/authserver/models.py",
+    "authserver/authserver/security.py",
+    "authserver/authserver/service.py",
+    "authserver/examples/**",
+    "authserver/pyproject.toml",
+    "authserver/tests/conftest.py",
+    "authserver/tests/test_devices.py",
+    "authserver/tests/test_invites.py",
+    "authserver/tests/test_node_sync.py",
+    "authserver/tests/test_security.py",
+    "docs/acceptance/**",
+    "docs/design/**",
+    "docs/node/**",
+    "docs/plans/**",
+    "docs/winclient/分应用代理说明.md",
+    "docs/winclient/打包与发布说明.md",
+    "docs/winclient/断网保护加固说明.md",
+    "docs/winclient/服务化与自启说明.md",
+    "docs/winclient/环境一致性说明.md",
+    "docs/winclient/界面说明.md",
+    "docs/winclient/自动更新说明.md",
+    "docs/交接/**",
+    "docs/口径速查表.md",
+    "docs/开工须知.md",
+    "node/examples/**",
+    "node/exitnode/**",
+    "node/pyproject.toml",
+    "node/tests/golden/**",
+    "node/tests/test_admin_publish.py",
+    "node/tests/test_admin_server.py",
+    "node/tests/test_cli.py",
+    "node/tests/test_config.py",
+    "node/tests/test_device.py",
+    "node/tests/test_hy2_certificate.py",
+    "node/tests/test_hy2_service.py",
+    "node/tests/test_manifest.py",
+    "node/tests/test_netinfo_public.py",
+    "node/tests/test_nft_render.py",
+    "node/tests/test_proxy_client_render.py",
+    "node/tests/test_proxy_keys.py",
+    "node/tests/test_proxy_registry.py",
+    "node/tests/test_proxy_server_render.py",
+    "node/tests/test_proxy_sync.py",
+    "node/tests/test_release_script.py",
+    "node/tests/test_rescue.py",
+    "node/tests/test_service.py",
+    "node/tests/test_sign_winclient.py",
+    "node/tests/test_systemd_render.py",
+    "node/tests/test_updater.py",
+    "node/tests/test_watchdog.py",
+    "pyproject.toml",
+    "requirements-dev.txt",
+    "scripts/**",
+    "winclient/*.sln",
+    "winclient/Directory.Build.props",
+    "winclient/NuGet.Config",
+    "winclient/WinClient.App/**",
+    "winclient/WinClient.Core/Auth/AuthApiClient.cs",
+    "winclient/WinClient.Core/Client/ClientRuntime.cs",
+    "winclient/WinClient.Core/Client/ClientSettings.cs",
+    "winclient/WinClient.Core/Client/DesiredStateStore.cs",
+    "winclient/WinClient.Core/Client/ExitProbe.cs",
+    "winclient/WinClient.Core/Client/IClientFacade.cs",
+    "winclient/WinClient.Core/Client/RoutingRenderer.cs",
+    "winclient/WinClient.Core/Client/RoutingSettings.cs",
+    "winclient/WinClient.Core/Client/TunnelTransport.cs",
+    "winclient/WinClient.Core/Environment/**",
+    "winclient/WinClient.Core/Environment/EnvironmentSettings.cs",
+    "winclient/WinClient.Core/Firewall/**",
+    "winclient/WinClient.Core/Hosting/**",
+    "winclient/WinClient.Core/Ipc/**",
+    "winclient/WinClient.Core/Kernel/**",
+    "winclient/WinClient.Core/Logging/**",
+    "winclient/WinClient.Core/Pairing/**",
+    "winclient/WinClient.Core/Process/**",
+    "winclient/WinClient.Core/Routing/**",
+    "winclient/WinClient.Core/Setup/**",
+    "winclient/WinClient.Core/State/**",
+    "winclient/WinClient.Core/Storage/**",
+    "winclient/WinClient.Core/Update/**",
+    "winclient/WinClient.Core/WinClient.Core.csproj",
+    "winclient/WinClient.Tests/DataDirectorySecurityTests.cs",
+    "winclient/WinClient.Tests/EnvironmentApplierTests.cs",
+    "winclient/WinClient.Tests/EnvironmentPlannerTests.cs",
+    "winclient/WinClient.Tests/EnvironmentPolicyTests.cs",
+    "winclient/WinClient.Tests/EnvironmentSelfCheckTests.cs",
+    "winclient/WinClient.Tests/FirewallTests.cs",
+    "winclient/WinClient.Tests/Fixtures/**",
+    "winclient/WinClient.Tests/HostingTests.cs",
+    "winclient/WinClient.Tests/IpcTests.cs",
+    "winclient/WinClient.Tests/KernelInstallerTests.cs",
+    "winclient/WinClient.Tests/KillSwitchAppsModeTests.cs",
+    "winclient/WinClient.Tests/KillSwitchAuthRuleTests.cs",
+    "winclient/WinClient.Tests/KillSwitchHardenTests.cs",
+    "winclient/WinClient.Tests/KillSwitchNarrowRuleTests.cs",
+    "winclient/WinClient.Tests/KillSwitchPatrolTests.cs",
+    "winclient/WinClient.Tests/KillSwitchProfileTests.cs",
+    "winclient/WinClient.Tests/KillSwitchRecoveryTests.cs",
+    "winclient/WinClient.Tests/PairingCertificateTests.cs",
+    "winclient/WinClient.Tests/PairingTests.cs",
+    "winclient/WinClient.Tests/ProcessStorageTests.cs",
+    "winclient/WinClient.Tests/RoutingTests.cs",
+    "winclient/WinClient.Tests/StateTests.cs",
+    "winclient/WinClient.Tests/UpdateApplierTests.cs",
+    "winclient/WinClient.Tests/UpdateCoordinatorTests.cs",
+    "winclient/WinClient.Tests/UpdateHttpTests.cs",
+    "winclient/WinClient.Tests/UpdateIpcTests.cs",
+    "winclient/WinClient.Tests/UpdateTests.cs",
+    "winclient/WinClient.Tests/WinClient.Tests.csproj",
+    "winclient/WinClient.UiTests/**",
+    "winclient/third_party/**"
+  ],
+  "expectArtifacts": [
+    "winclient/WinClient.Core/Auth/AuthModels.cs",
+    "winclient/WinClient.Core/Client/ClientController.cs",
+    "winclient/WinClient.Core/Client/ISessionSource.cs",
+    "winclient/WinClient.Tests/ControllerTests.cs",
+    "winclient/WinClient.Tests/AuthTests.cs",
+    "winclient/WinClient.Tests/TestData.cs",
+    "authserver/authserver/app.py",
+    "authserver/tests/test_sessions.py",
+    "authserver/tests/test_certificate.py",
+    "node/tests/test_renderer_parity.py",
+    "docs/authserver/接口说明.md",
+    "docs/winclient/架构说明.md"
+  ],
+  "acceptance": [
+    {
+      "id": "BUILD",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "build",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1200
+    },
+    {
+      "id": "TEST",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "test",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--no-build",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1200
+    },
+    {
+      "id": "RUFF",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "ruff",
+        "check",
+        "."
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "PYTEST",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "pytest",
+        "-q"
+      ],
+      "required": true,
+      "timeoutSec": 900
+    },
+    {
+      "id": "SHAPE-CS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda f:pathlib.Path(f).read_text(encoding='utf-8');m=r('winclient/WinClient.Core/Auth/AuthModels.cs');c=r('winclient/WinClient.Core/Client/ClientController.cs');s=r('winclient/WinClient.Core/Client/ISessionSource.cs');bad=[k for k,ok in (('models','SingboxConfig' not in m),('source','SingboxConfig' not in s),('controller-field','.SingboxConfig' not in c),('controller-render','LocalConfigRenderer.Render(' in c and 'using WinClient.Core.Pairing;' in c),('controller-routing','RoutingRenderer.Render(' in c)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "SHAPE-PY",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;a=pathlib.Path('authserver/authserver/app.py').read_text(encoding='utf-8');refs=[p.as_posix() for p in list(pathlib.Path('authserver').rglob('*.py'))+list(pathlib.Path('node').rglob('*.py')) if 'clientconfig' in p.read_text(encoding='utf-8')];bad=[k for k,ok in (('deleted',not pathlib.Path('authserver/authserver/clientconfig.py').exists()),('app','singbox_config' not in a and 'clientconfig' not in a),('refs',not refs)) if not ok];print(bad,refs);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "TESTS-CS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess as sp,pathlib,sys;mb=sp.check_output(['git','merge-base','origin/main','HEAD'],text=True).strip();fs=['winclient/WinClient.Tests/ControllerTests.cs','winclient/WinClient.Tests/AuthTests.cs'];c=lambda s:s.count('[Fact]')+s.count('[Theory]');old=sum(c(sp.check_output(['git','show',mb+':'+f]).decode('utf-8')) for f in fs);t=[pathlib.Path(f).read_text(encoding='utf-8') for f in fs];d=pathlib.Path('winclient/WinClient.Tests/TestData.cs').read_text(encoding='utf-8');bad=[k for k,ok in (('count',sum(c(x) for x in t)-old>=1),('inline','InlineData(\"singbox_config\")' not in t[0]),('testdata','SingboxConfig' not in d and 'Config =>' in d),('ignored',any('ServerProvidedSingboxConfigIsIgnored' in x and 'singbox_config' in x and 'direct' in x for x in t))) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "TESTS-PY",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda f:pathlib.Path(f).read_text(encoding='utf-8');s=r('authserver/tests/test_sessions.py');c=r('authserver/tests/test_certificate.py');p=r('node/tests/test_renderer_parity.py');bad=[k for k,ok in (('sessions','singbox_config\" not in' in s and 'render(' not in s and 'test_render_without_obfs_key_has_no_obfs' not in s),('cert','singbox_config' not in c),('parity','clientconfig' not in p and 'render_client_windows' in p and 'hy2_obfs_password' in p)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "SCOPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess as sp,sys;g=lambda *a:sp.check_output(['git','-c','core.quotepath=false']+list(a)).decode('utf-8').split(chr(10));mb=g('merge-base','origin/main','HEAD')[0].strip();ch={p.strip() for p in g('diff','--name-only',mb)+g('ls-files','--others','--exclude-standard') if p.strip()};ok=[\"winclient/WinClient.Core/Auth/AuthModels.cs\", \"winclient/WinClient.Core/Client/ClientController.cs\", \"winclient/WinClient.Core/Client/ISessionSource.cs\", \"winclient/WinClient.Tests/ControllerTests.cs\", \"winclient/WinClient.Tests/AuthTests.cs\", \"winclient/WinClient.Tests/TestData.cs\", \"authserver/authserver/app.py\", \"authserver/authserver/clientconfig.py\", \"authserver/tests/test_sessions.py\", \"authserver/tests/test_certificate.py\", \"node/tests/test_renderer_parity.py\", \"docs/authserver/接口说明.md\", \"docs/winclient/架构说明.md\"];bad=sorted(ch-set(ok));print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;a=pathlib.Path('docs/authserver/接口说明.md').read_text(encoding='utf-8');w=pathlib.Path('docs/winclient/架构说明.md').read_text(encoding='utf-8');bad=[k for k,ok in (('api-example','\"singbox_config\": {}' not in a),('api-text','不再下发' in a and 'client_config.py' in a and '忽略' in a and 'client-windows.json' in a),('arch','不再下发' in w and 'LocalConfigRenderer' in w)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "NOWINDOW",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;norm=lambda p:str(p).replace(chr(92),'/');files=[p for root in ('winclient/WinClient.Core','winclient/WinClient.App') for p in pathlib.Path(root).rglob('*.cs') if '/obj/' not in norm(p) and '/bin/' not in norm(p)];bad=[norm(p) for p in files if 'ProcessStartInfo' in p.read_text(encoding='utf-8') and p.parent.name!='Process' and 'CreateNoWindow = true' not in p.read_text(encoding='utf-8')];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "NOBIN",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess,sys;out=subprocess.run(['git','ls-files','winclient','build'],capture_output=True,text=True).stdout.split();bad=[f for f in out if f.endswith(('.exe','.dll','.zip','.pdb'))];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "model": null,
+  "timeoutSec": 7200,
+  "repoRoot": "E:/yuanc",
+  "engine": "codex",
+  "reasoningEffort": "medium",
+  "steps": [
+    "先改测试(C# 三份 + Python 三份)与新增测试,跑红;再改 AuthModels / ISessionSource / ClientController 与 app.py、删 clientconfig.py。",
+    "BUILD / TEST / RUFF / PYTEST / SHAPE-CS / SHAPE-PY / TESTS-CS / TESTS-PY / SCOPE / NOWINDOW / NOBIN 全绿。",
+    "改两份文档;DOCS 绿;交活说明写明「服务器不再下发配置、旧字段忽略」口径与安全收益。"
+  ]
+}
