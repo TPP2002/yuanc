@@ -43,10 +43,13 @@ def test_admin_uses_dynamic_user_without_capabilities_and_only_localhost():
     for line in ("DynamicUser=true", "IPAddressDeny=any", "IPAddressAllow=localhost",
                  "CapabilityBoundingSet=", "ProtectSystem=strict",
                  "RestrictAddressFamilies=AF_INET AF_INET6",
-                 "ReadOnlyPaths=/var/lib/exitnode/winclient",
+                 "ReadOnlyPaths=-/var/lib/exitnode/winclient",
                  "TasksMax=64", "LimitNOFILE=1024", "MemoryMax=256M"):
         assert line + "\n" in admin
     assert "\nUser=" not in admin
+    # 发布目录首次发布前不存在:带 - 前缀才会跳过,否则单元以 226/NAMESPACE 起不来。
+    assert [line for line in admin.splitlines() if line.startswith("ReadOnlyPaths=")] == [
+        "ReadOnlyPaths=-/var/lib/exitnode/winclient"]
 
 
 @pytest.mark.parametrize("name", ["exitnode-watchdog.service", "exitnode-recover.service",
