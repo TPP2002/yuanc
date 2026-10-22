@@ -29,7 +29,7 @@ public sealed class FirewallTests
         Assert.Single(plan.OfType<Audit>());
         Assert.DoesNotContain(rules, r => r.RemotePort == "53");
         var script = KillSwitchPlanner.ToPowerShellScript(plan, "state.json", "audit.json");
-        Assert.Contains("Set-NetFirewallProfile -DefaultOutboundAction Block", script);
+        Assert.Contains("Set-NetFirewallProfile -Enabled True -DefaultOutboundAction Block", script);
         Assert.Contains("$_.Name -notlike 'YuanC-KS-*'", script);
         Assert.Contains("Get-NetFirewallApplicationFilter", script);
         Assert.DoesNotContain("Set-NetFirewallRule", script);

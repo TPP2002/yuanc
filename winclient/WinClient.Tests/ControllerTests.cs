@@ -137,6 +137,23 @@ public sealed class ControllerTests
         Assert.DoesNotContain("start", order); Assert.DoesNotContain("remove", order);
     }
     [Fact]
+    public async Task IneffectiveFirewallKeepsProtectionAndShowsSpecificReasonWithoutStartingTunnel()
+    {
+        var order = new List<string>(); using var http = SessionHttp(() => TestData.Session());
+        var store = new InMemoryCredentialStore(); store.Save("refresh");
+        const string explanation = "系统防火墙被策略覆盖，请断开后联系管理员。";
+        using var controller = new ClientController(new AuthApiClient(http), store,
+            new Firewall(order) { ApplyError = new FirewallIneffectiveException(explanation) },
+            new Tunnel(order), Path.GetFullPath("fake.exe"), TestData.Device);
+        await controller.ConnectAsync();
+        Assert.Equal(ConnectionState.NeedsManual, controller.Snapshot.State);
+        Assert.True(controller.Snapshot.ProtectionActive);
+        Assert.Equal(explanation, controller.Snapshot.Message);
+        Assert.Contains("apply", order);
+        Assert.DoesNotContain("start", order);
+        Assert.DoesNotContain("remove", order);
+    }
+    [Fact]
     public async Task MissingServerIsExplicitAndClosingDoesNotRemove()
     {
         var order = new List<string>();
@@ -152,8 +169,9 @@ public sealed class ControllerTests
         public string? RecoveryWarning { get; init; }
         public bool FailRecovery { get; init; }
         public bool FailApply { get; init; }
+        public Exception? ApplyError { get; init; }
         public Task ApplyAsync(IReadOnlyList<IPAddress> ips, string program, int hy2Port)
-        { order.Add("apply"); if (FailApply) throw new InvalidOperationException(); return Task.CompletedTask; }
+        { order.Add("apply"); if (ApplyError is not null) throw ApplyError; if (FailApply) throw new InvalidOperationException(); return Task.CompletedTask; }
         public Task UpdateNodeAsync(IReadOnlyList<IPAddress> ips, string program, int hy2Port)
         { order.Add("update:" + ips[0]); return Task.CompletedTask; }
         public Task RemoveAsync() { order.Add("remove"); return Task.CompletedTask; }
