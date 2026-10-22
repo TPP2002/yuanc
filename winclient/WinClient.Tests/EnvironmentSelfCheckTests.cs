@@ -11,6 +11,74 @@ namespace WinClient.Tests;
 
 public sealed class EnvironmentSelfCheckTests
 {
+    [Fact]
+    public void 未取得网卡清单时无法核验()
+    {
+        var report = EnvironmentSelfCheck.Evaluate(Good with { Adapters = null });
+        Assert.Equal("tun_subnet", report.Items[8].Id);
+        Assert.Equal("无法核验", report.Items[8].Result);
+        Assert.Equal("未取得本机网卡清单", report.Items[8].Detail);
+        Assert.Equal("8 项通过,1 项未能检查", report.Summary);
+    }
+
+    [Fact]
+    public void 重叠网段点名占用网卡()
+    {
+        var report = EnvironmentSelfCheck.Evaluate(Good with
+        {
+            Adapters = [.. Good.Adapters!, new("vEthernet (WSL)", "Hyper-V Virtual Ethernet Adapter", [new("172.19.0.1", 16)])]
+        });
+        Assert.Equal("未通过", report.Items[8].Result);
+        Assert.Contains("vEthernet (WSL)", report.Items[8].Detail);
+        Assert.Contains("172.19.0.1/16", report.Items[8].Detail);
+        Assert.Equal("1 项未通过:虚拟网卡网段", report.Summary);
+    }
+
+    [Fact]
+    public void 不冲突时只提醒虚拟网卡()
+    {
+        var report = EnvironmentSelfCheck.Evaluate(Good with
+        {
+            Adapters = [.. Good.Adapters!,
+                new("vEthernet (Default Switch)", "Hyper-V Virtual Ethernet Adapter", [new("172.28.112.1", 20)]),
+                new("以太网", "物理网卡", [new("192.168.1.8", 24)])]
+        });
+        Assert.Equal("通过", report.Items[8].Result);
+        Assert.Contains("目前不冲突", report.Items[8].Detail);
+        Assert.Contains("vEthernet (Default Switch)", report.Items[8].Detail);
+        Assert.DoesNotContain("以太网", report.Items[8].Detail);
+    }
+
+    [Fact]
+    public void 隧道自身不算占用也不提醒()
+    {
+        var report = EnvironmentSelfCheck.Evaluate(Good);
+        Assert.Equal("通过", report.Items[8].Result);
+        Assert.Equal("隧道网段未被其他网卡占用", report.Items[8].Detail);
+        Assert.DoesNotContain("本机有虚拟网卡", report.Items[8].Detail);
+    }
+
+    [Fact]
+    public void 无效地址跳过且不抛异常()
+    {
+        var report = EnvironmentSelfCheck.Evaluate(Good with { Adapters = [new("网卡", "", [new("bad", 24)])] });
+        Assert.Equal("通过", report.Items[8].Result);
+    }
+
+    [Theory]
+    [InlineData("172.19.0.3", 32, "未通过")]
+    [InlineData("172.19.0.4", 32, "通过")]
+    [InlineData("172.18.0.1", 15, "未通过")]
+    [InlineData("192.168.1.1", 0, "未通过")]
+    public void 按较短前缀判定重叠且不受模式和总开关影响(string address, int prefix, string result)
+    {
+        var report = EnvironmentSelfCheck.Evaluate(Good with
+        {
+            EnvironmentEnabled = false, Routing = RoutingTests.Apps,
+            Adapters = [new("物理网卡", "", [new(address, prefix)])]
+        });
+        Assert.Equal(result, report.Items[8].Result);
+    }
     private static SelfCheckInput AuthInput()
     {
         var auth = new AuthEndpoint(IPAddress.Parse("192.0.2.5"), 8080, RoutingTests.Service);
@@ -24,7 +92,7 @@ public sealed class EnvironmentSelfCheckTests
         var report = EnvironmentSelfCheck.Evaluate(AuthInput());
         Assert.Equal("通过", report.Items[6].Result);
         Assert.Equal("符合目标要求", report.Items[6].Detail);
-        Assert.Equal("8 项通过", report.Summary);
+        Assert.Equal("9 项通过", report.Summary);
     }
 
     [Fact]
@@ -53,7 +121,7 @@ public sealed class EnvironmentSelfCheckTests
         var report = EnvironmentSelfCheck.Evaluate(Good with { Routing = RoutingTests.Apps, SingboxConfig = config, Ipv6Reachable = null });
         Assert.Equal("通过", report.Items[6].Result); Assert.StartsWith("仅指定程序模式:", report.Items[6].Detail);
         Assert.Equal("跳过", report.Items[7].Result);
-        Assert.Equal("7 项通过,1 项未能检查", report.Summary);
+        Assert.Equal("8 项通过,1 项未能检查", report.Summary);
         var original = EnvironmentSelfCheck.Evaluate(Good with { Routing = RoutingTests.Apps });
         Assert.Equal("未通过", original.Items[6].Result); Assert.Contains("指定程序→proxy", original.Items[6].Detail);
         var bad = JsonSerializer.Deserialize<JsonElement>(config.GetRawText().Replace("\"detour\":\"proxy\"", "\"detour\":\"direct\""));
@@ -70,7 +138,8 @@ public sealed class EnvironmentSelfCheckTests
         ["en-AU", "en"]);
     private static SelfCheckInput Good => new(new(IPAddress.Parse("192.0.2.5"), "AU"), "192.0.2.5", "AU",
         true, true, EnvironmentSettingsStore.Default.Target, GoodInspection, false,
-        JsonSerializer.Deserialize<JsonElement>(GoodConfig), DateTimeOffset.Parse("2026-10-22T00:00:00Z"));
+        JsonSerializer.Deserialize<JsonElement>(GoodConfig), DateTimeOffset.Parse("2026-10-22T00:00:00Z"))
+        { Adapters = [new AdapterInfo(KillSwitchPlanner.TunAlias, "Wintun Userspace Tunnel", [new("172.19.0.1", 30)])] };
 
     [Fact]
     public void DohPolicyMismatchNamesOnlyTheValueName()
@@ -100,8 +169,8 @@ public sealed class EnvironmentSelfCheckTests
         using (var json = JsonDocument.Parse(File.ReadAllText(path)))
         {
             Assert.Equal(Good.Now, json.RootElement.GetProperty("checked_at").GetDateTimeOffset());
-            Assert.Equal("8 项通过", json.RootElement.GetProperty("summary").GetString());
-            Assert.Equal(8, json.RootElement.GetProperty("items").GetArrayLength());
+            Assert.Equal("9 项通过", json.RootElement.GetProperty("summary").GetString());
+            Assert.Equal(9, json.RootElement.GetProperty("items").GetArrayLength());
             Assert.Equal(new[] { "id", "name", "result", "detail" }, json.RootElement.GetProperty("items")[0].EnumerateObject().Select(x => x.Name));
         }
         Assert.False(File.Exists(path + ".tmp"));
@@ -118,10 +187,10 @@ public sealed class EnvironmentSelfCheckTests
     public void AllEightPassInContractOrderWithoutExportingAddress()
     {
         var report = EnvironmentSelfCheck.Evaluate(Good);
-        Assert.Equal(new[] { "exit_country", "exit_node", "time_zone", "auto_time_zone", "chrome_policy", "edge_policy", "no_direct_path", "ipv6_direct" }, report.Items.Select(x => x.Id));
+        Assert.Equal(new[] { "exit_country", "exit_node", "time_zone", "auto_time_zone", "chrome_policy", "edge_policy", "no_direct_path", "ipv6_direct", "tun_subnet" }, report.Items.Select(x => x.Id));
         Assert.All(report.Items, item => Assert.Equal("通过", item.Result));
-        Assert.Equal(8, report.Passed); Assert.Equal(0, report.Failed);
-        Assert.Equal("8 项通过", report.Summary);
+        Assert.Equal(9, report.Passed); Assert.Equal(0, report.Failed);
+        Assert.Equal("9 项通过", report.Summary);
         Assert.Equal(Good.Now, report.CheckedAt);
         Assert.DoesNotContain("192.0.2.5", JsonSerializer.Serialize(report));
     }
@@ -171,7 +240,7 @@ public sealed class EnvironmentSelfCheckTests
     {
         var report = EnvironmentSelfCheck.Evaluate(Good with { EnvironmentEnabled = false, Inspection = null });
         Assert.All(report.Items.Skip(2).Take(4), item => { Assert.Equal("跳过", item.Result); Assert.Equal("环境一致性未启用", item.Detail); });
-        Assert.Equal("4 项通过,4 项未能检查", report.Summary);
+        Assert.Equal("5 项通过,4 项未能检查", report.Summary);
     }
 
     [Fact]
@@ -179,7 +248,7 @@ public sealed class EnvironmentSelfCheckTests
     {
         var report = EnvironmentSelfCheck.Evaluate(Good with { Inspection = null });
         Assert.All(report.Items.Skip(2).Take(4), item => Assert.Equal("无法核验", item.Result));
-        Assert.Equal("4 项通过,4 项未能检查", report.Summary);
+        Assert.Equal("5 项通过,4 项未能检查", report.Summary);
     }
 
     [Fact]

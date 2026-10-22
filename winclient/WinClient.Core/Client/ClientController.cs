@@ -48,6 +48,7 @@ public sealed class ClientController : IDisposable
     private readonly IEnvironmentEnforcer? environment;
     private readonly IEnvironmentSettingsStore? environmentSettings;
     private readonly IIpv6Probe? ipv6Probe;
+    private readonly IAdapterProbe? adapterProbe;
     private readonly Action<EnvironmentReport>? reportSink;
     private readonly IRoutingSettingsStore? routingSettings;
     private readonly string serviceProcessPath;
@@ -103,17 +104,17 @@ public sealed class ClientController : IDisposable
         ITunnelTransport tunnel, string program, DeviceInfo device, AuthEndpoint? authEndpoint = null, IExitProbe? exitProbe = null,
         IEnvironmentEnforcer? environment = null, IEnvironmentSettingsStore? environmentSettings = null,
         IIpv6Probe? ipv6Probe = null, Action<EnvironmentReport>? reportSink = null,
-        IRoutingSettingsStore? routingSettings = null, string? serviceProcessPath = null)
+        IRoutingSettingsStore? routingSettings = null, string? serviceProcessPath = null, IAdapterProbe? adapterProbe = null)
         : this(auth is null ? null : new AuthServerSessionSource(auth, credentials), firewall, tunnel, program, device,
             authEndpoint: authEndpoint, exitProbe: exitProbe, environment: environment, environmentSettings: environmentSettings,
-            ipv6Probe: ipv6Probe, reportSink: reportSink, routingSettings: routingSettings, serviceProcessPath: serviceProcessPath) { }
+            ipv6Probe: ipv6Probe, reportSink: reportSink, routingSettings: routingSettings, serviceProcessPath: serviceProcessPath, adapterProbe: adapterProbe) { }
 
     public ClientController(ISessionSource? sessionSource, IKillSwitch firewall,
         ITunnelTransport tunnel, string program, DeviceInfo device, Func<TimeSpan, CancellationToken, Task>? delayAsync = null,
         AuthEndpoint? authEndpoint = null, IExitProbe? exitProbe = null,
         IEnvironmentEnforcer? environment = null, IEnvironmentSettingsStore? environmentSettings = null,
         IIpv6Probe? ipv6Probe = null, Action<EnvironmentReport>? reportSink = null,
-        IRoutingSettingsStore? routingSettings = null, string? serviceProcessPath = null)
+        IRoutingSettingsStore? routingSettings = null, string? serviceProcessPath = null, IAdapterProbe? adapterProbe = null)
     {
         this.sessionSource = sessionSource;
         this.delayAsync = delayAsync ?? ((delay, token) => Task.Delay(delay, token));
@@ -126,6 +127,7 @@ public sealed class ClientController : IDisposable
         this.environment = environment;
         this.environmentSettings = environmentSettings;
         this.ipv6Probe = ipv6Probe;
+        this.adapterProbe = adapterProbe;
         this.reportSink = reportSink;
         this.routingSettings = routingSettings;
         this.serviceProcessPath = serviceProcessPath ?? Environment.ProcessPath ?? "WinClient.App.exe";
@@ -637,11 +639,14 @@ public sealed class ClientController : IDisposable
         try { if (activeRouting.Mode != RoutingMode.Apps && ipv6Probe is not null) ipv6 = await ipv6Probe.CanReachAsync(lifetime.Token); }
         catch (Exception) { } // 探测异常仅代表本项无法核验，不进入连接失败路径。
         if (lifetime.IsCancellationRequested || disposed) return;
+        IReadOnlyList<AdapterInfo>? adapters = null;
+        try { adapters = adapterProbe?.Snapshot(); }
+        catch (Exception ex) when (IsOperational(ex)) { }
         var report = EnvironmentSelfCheck.Evaluate(new(exit, session!.Node.Host, policy.ExpectedCountry,
             policy.Enabled, environmentApplied, policy.Target, inspection, ipv6,
             RenderedConfiguration(session),
             DateTimeOffset.UtcNow) { Routing = activeRouting,
-                Auth = sessionSource is AuthServerSessionSource ? authEndpoint : null, ServiceProcessPath = serviceProcessPath });
+                Auth = sessionSource is AuthServerSessionSource ? authEndpoint : null, ServiceProcessPath = serviceProcessPath, Adapters = adapters });
         selfCheckStatus = report.Summary;
         try { reportSink?.Invoke(report); }
         catch (Exception ex) when (IsOperational(ex)) { } // 写报告失败不影响已完成的检查与连接。

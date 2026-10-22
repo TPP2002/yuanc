@@ -242,7 +242,7 @@ public sealed class ControllerTests
         var ipv6 = new ScriptedIpv6(ipv6Reachable);
         var probe = new ScriptedProbe(Enumerable.Repeat(address is null ? null : IPAddress.Parse(address), 5).ToArray());
         using var controller = new ClientController(source, new Firewall(order), new Tunnel(order), Path.GetFullPath("fake.exe"),
-            TestData.Device, timers.Delay, exitProbe: probe, ipv6Probe: ipv6, reportSink: reports.Add)
+            TestData.Device, timers.Delay, exitProbe: probe, ipv6Probe: ipv6, reportSink: reports.Add, adapterProbe: new StaticAdapterProbe(TunAdapters))
             { DelayWithPurposeAsync = timers.Delay };
         controller.Changed += _ => Interlocked.Increment(ref timers.Published);
         await controller.ConnectAsync();
@@ -253,7 +253,7 @@ public sealed class ControllerTests
             for (var i = 1; i < 5; i++) await FireAndPublish(controller, timers, "出口核验", TimeSpan.FromSeconds(5));
         }
         var report = Assert.Single(reports);
-        Assert.Equal(8, report.Items.Count);
+        Assert.Equal(9, report.Items.Count);
         Assert.Equal(report.Summary, controller.Snapshot.SelfCheckStatus);
         Assert.DoesNotContain(controller.Snapshot.SelfCheckStatus, new[] { "未检测", "检测中" });
         Assert.Equal(1, ipv6.Calls);
@@ -272,6 +272,44 @@ public sealed class ControllerTests
         Assert.Equal("未检测", controller.Snapshot.SelfCheckStatus);
     }
 
+    private static IReadOnlyList<AdapterInfo> TunAdapters =>
+        [new(KillSwitchPlanner.TunAlias, "Wintun Userspace Tunnel", [new("172.19.0.1", 30)])];
+
+    private sealed class StaticAdapterProbe(IReadOnlyList<AdapterInfo>? adapters) : IAdapterProbe
+    {
+        public IReadOnlyList<AdapterInfo>? Snapshot() => adapters;
+    }
+
+    private sealed class ThrowingAdapterProbe : IAdapterProbe
+    {
+        public IReadOnlyList<AdapterInfo>? Snapshot() => throw new InvalidOperationException("模拟网卡清单读取失败");
+    }
+
+    [Fact]
+    public async Task 网卡探测失败仍出报告且保持连接和保护()
+    {
+        var order = new List<string>();
+        var timers = new Timers();
+        var source = new ScriptedSource(); source.Enqueue(Ok(TestData.Session()));
+        var reports = new List<EnvironmentReport>();
+        using var controller = new ClientController(source, new Firewall(order), new Tunnel(order), Path.GetFullPath("fake.exe"),
+            TestData.Device, timers.Delay, exitProbe: new DetailedProbe(),
+            environment: new InspectableEnvironment(false), ipv6Probe: new ScriptedIpv6(false),
+            reportSink: reports.Add, adapterProbe: new ThrowingAdapterProbe())
+            { DelayWithPurposeAsync = timers.Delay };
+        controller.Changed += _ => Interlocked.Increment(ref timers.Published);
+        await controller.ConnectAsync();
+        await FireAndPublish(controller, timers, "出口核验", TimeSpan.FromSeconds(3));
+        var report = Assert.Single(reports);
+        Assert.Equal(9, report.Items.Count);
+        Assert.Equal("无法核验", report.Items[8].Result);
+        Assert.Equal("未取得本机网卡清单", report.Items[8].Detail);
+        Assert.Equal("8 项通过,1 项未能检查", report.Summary);
+        Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
+        Assert.True(controller.Snapshot.ProtectionActive);
+        Assert.Equal(new[] { "apply", "start" }, order);
+        Assert.Contains(TimeSpan.FromMinutes(5), timers.For("出口核验"));
+    }
     private sealed class ScriptedIpv6(bool reachable) : IIpv6Probe
     {
         public int Calls;
@@ -298,7 +336,7 @@ public sealed class ControllerTests
             {
                 reports.Add(report);
                 if (fail) throw new IOException("模拟报告写入失败");
-            }) { DelayWithPurposeAsync = timers.Delay };
+            }, adapterProbe: new StaticAdapterProbe(TunAdapters)) { DelayWithPurposeAsync = timers.Delay };
         controller.Changed += snapshot => { snapshots.Add(snapshot); Interlocked.Increment(ref timers.Published); };
         await controller.ConnectAsync();
         await FireAndPublish(controller, timers, "出口核验", TimeSpan.FromSeconds(3));
@@ -306,7 +344,7 @@ public sealed class ControllerTests
         var report = Assert.Single(reports);
         Assert.Contains(snapshots, snapshot => snapshot.SelfCheckStatus == "检测中");
         Assert.Equal(report.Summary, controller.Snapshot.SelfCheckStatus);
-        Assert.Equal(fail ? "3 项通过,5 项未能检查" : enabled ? "8 项通过" : "4 项通过,4 项未能检查", report.Summary);
+        Assert.Equal(fail ? "4 项通过,5 项未能检查" : enabled ? "9 项通过" : "5 项通过,4 项未能检查", report.Summary);
         Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
         Assert.Equal("虚拟网卡已就绪。", controller.Snapshot.Message);
         Assert.True(controller.Snapshot.ProtectionActive);
