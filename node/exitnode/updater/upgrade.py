@@ -23,20 +23,24 @@ def _request(config, runner, url, output=None):
         argv.extend(["--output", output, "-H", "Accept: application/octet-stream"])
     else:
         argv.extend(["-H", "Accept: application/vnd.github+json"])
+    headers = None
     try:
         secret = config.node.secrets_dir + "/github-token"
         if runner.exists(secret):
             # 不缓存令牌，不拼入 URL 或错误消息，只在即将发出的请求头中使用。
-            argv.extend(["-H", "Authorization: Bearer " + runner.read_file(secret).strip()])
-            if any(ord(c) < 32 for c in argv[-1]):
+            headers = "Authorization: Bearer " + runner.read_file(secret).strip()
+            if any(ord(c) < 32 for c in headers):
                 raise UpdateError("发布源令牌格式不正确，请检查令牌")
+            headers += "\n"
+            argv.extend(["-H", "@-"])
         argv.append(url)
-        result = runner.run(argv, check=False)
+        result = runner.run(argv, check=False, input=headers)
     except Exception:
         raise UpdateError("下载升级包失败：连不上发布源") from None
     finally:
         # 不在后续异常栈的局部参数中保留请求头。
         argv.clear()
+        headers = None
     body, _, status = result.out.rpartition("\n")
     if status in {"401", "403"}:
         raise UpdateError("发布源拒绝访问，请检查令牌")
