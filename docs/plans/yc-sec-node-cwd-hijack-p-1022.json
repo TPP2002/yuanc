@@ -1,0 +1,153 @@
+{
+  "schemaVersion": 1,
+  "taskId": "SEC-NODE-CWD-HIJACK-1022",
+  "slug": "yc-sec-node-cwd-hijack-p-1022",
+  "title": "升级健康检查、救援刷新与救援探针起的 python3 子进程一律加 -P(不把当前目录放进模块搜索路径),文档里的维护命令同步,并写明不要在 /tmp 等可被他人写入的目录里运行",
+  "goal": "以主干 afb583c 之后的 main 为基点。做完后:\n\n① node/exitnode/updater/upgrade.py `_tunnel_passes`:argv 改为 [\"env\", \"PYTHONPATH=\" + layout.root(config) + \"/current\", \"python3\", \"-P\", \"-m\", \"exitnode\", \"--config\", config_path, \"check\", \"--json\"](-P 紧跟 python3,其余不变)。注释写明:维护人员在 /tmp 里跑升级时,-m 会把当前目录放到 sys.path 最前,低权用户预放的 /tmp/exitnode/__main__.py 会以 root 执行;-P(Python 3.11 起)关掉这一行为,PYTHONPATH 仍生效。\n\n② node/exitnode/cli.py `refresh()`:导入校验子进程 argv 改为 [\"python3\", \"-P\", \"-c\", code, staging](-c 模式同样会把当前目录放进 sys.path[0])。其他不改。\n\n③ node/exitnode/rescue/probes.py `probe()` 的 P2:argv 改为 [\"env\", \"PYTHONPATH=\" + CURRENT, \"python3\", \"-P\", \"-c\", \"import exitnode, exitnode.cli\"]。救援包只用标准库、不依赖主程序,这条改动不引入任何导入。\n\n④ 测试(既有用例只改受影响的夹具常量,断言语义不变):node/tests/test_updater.py 的 HEALTH 元组改为 (\"env\", \"PYTHONPATH=\" + CURRENT, \"python3\", \"-P\", \"-m\", \"exitnode\");node/tests/test_rescue.py 的 IMPORT 元组改为 (\"env\", \"PYTHONPATH=\" + p.CURRENT, \"python3\", \"-P\", \"-c\", \"import exitnode, exitnode.cli\");node/tests/test_cli.py 里核对 refresh 子进程调用的用例同步。新增三条断言(可以放进既有用例或新建小用例):升级健康检查实际发出的命令里 python3 后紧跟 -P 再跟 -m;refresh 的命令里 python3 后紧跟 -P 再跟 -c;救援 P2 的命令里 python3 后紧跟 -P。\n\n⑤ 文档:docs/node/更新与回退说明.md——所有手敲的 `python3 -m exitnode` 示例改为 `python3 -P -m exitnode`(第 128 行附近那条含 PYTHONPATH 的命令一并改),新增小节「在哪里运行维护命令」:不要在 /tmp、/var/tmp 或任何其他用户可写的目录里运行维护命令;-m 会把当前目录放进模块搜索路径最前,预放的同名包会以 root 执行;一律加 -P 并显式 `PYTHONPATH=/opt/exitnode/current`;程序内部起的检查子进程已都加 -P;布局目录 /opt/exitnode 与 /var/lib/exitnode 由配置校验固定(另一张单实施,见配置说明)。docs/node/救援单元说明.md——第 52、53、65 行附近三条 `python3 -m exitnode_rescue …` 改为 `python3 -P -m exitnode_rescue …`,并加一句同样的「不要在他人可写目录里运行」提醒。\n\n⑥ 全程中文;不改 systemd 模板(服务由 systemd 以 / 为工作目录启动,另一张加固单处理模板);不改 config.py;不新增依赖。",
+  "background": "项目:外包,澳洲 Debian 软路由 node/exitnode(Python 3.11 目标,本机 3.14 跑测试)。对抗审查 A14:upgrade.py 的健康检查与 cli.py 的救援刷新都起 `python3 -m exitnode` / `python3 -c` 子进程,-m 与 -c 都会把当前工作目录放到 sys.path 最前;维护人员按文档在 /tmp 操作时,本机低权用户预放的 /tmp/exitnode/__main__.py 会以 root 执行并被复制进救援目录。Runner.run(argv, check, input, timeout) 没有 cwd 参数,本单不扩 Runner 接口,用 -P 解决(Python 3.11 新增:不把脚本目录/当前目录加进 sys.path;PYTHONPATH 仍生效,与 -I 不同)。测试用内存 FakeRunner 按 argv 前缀匹配应答(test_updater.HEALTH、test_rescue.IMPORT 两个元组是前缀键),所以改 argv 必须同步改这两个常量。另一张并行单 yc-sec-tunnel-sni-urltest-1022 改 config.py / context.py / client_config.py / test_config.py / 配置说明.md 等,不碰 test_cli.py;本单对 test_cli.py 的改动只限 refresh 子进程断言(其 FakeRunner 只按 (\"python3\",) 前缀匹配,加 -P 不会让既有用例红);再一张并行单只改 winclient。工位沙箱无外网。",
+  "nonGoals": [
+    "不改 Runner 接口、不加 cwd 参数",
+    "不改 systemd 模板与安装步骤",
+    "不改 config.py(布局路径锁由并行单做)",
+    "不在真机实测"
+  ],
+  "allowedPaths": [
+    "node/exitnode/updater/upgrade.py",
+    "node/exitnode/cli.py",
+    "node/exitnode/rescue/probes.py",
+    "node/tests/test_updater.py",
+    "node/tests/test_rescue.py",
+    "node/tests/test_cli.py",
+    "docs/node/更新与回退说明.md",
+    "docs/node/救援单元说明.md"
+  ],
+  "forbiddenPaths": [
+    "docs/开工须知.md",
+    "docs/口径速查表.md",
+    "docs/design/**",
+    "docs/交接/**",
+    "docs/plans/**",
+    "docs/acceptance/**",
+    ".github/**",
+    ".codex/**",
+    ".gitignore",
+    "pyproject.toml",
+    "scripts/**",
+    "winclient/**",
+    "authserver/**",
+    "node/exitnode/config.py",
+    "node/exitnode/service.py",
+    "node/exitnode/device.py",
+    "node/exitnode/runner.py",
+    "node/exitnode/manifest.py",
+    "node/exitnode/systemd.py",
+    "node/exitnode/nft.py",
+    "node/exitnode/templates/**",
+    "node/exitnode/proxy/**",
+    "node/exitnode/watchdog/**",
+    "node/exitnode/admin/**",
+    "node/exitnode/updater/layout.py",
+    "node/exitnode/updater/package.py",
+    "node/exitnode/updater/trust.py",
+    "node/exitnode/updater/version.py",
+    "node/exitnode/rescue/actions.py",
+    "node/exitnode/rescue/state.py",
+    "node/exitnode/rescue/runner.py",
+    "node/exitnode/rescue/lastgood.py",
+    "node/exitnode/rescue/__main__.py",
+    "node/exitnode/rescue/__init__.py",
+    "node/examples/**",
+    "node/tests/golden/**",
+    "node/tests/test_config.py",
+    "node/tests/test_proxy_*.py",
+    "node/tests/test_renderer_parity.py",
+    "node/tests/test_service.py",
+    "node/tests/test_watchdog.py",
+    "node/tests/test_systemd_render.py",
+    "node/tests/test_nft_render.py",
+    "node/tests/test_manifest.py",
+    "node/tests/test_device.py",
+    "node/tests/test_admin_*.py",
+    "docs/node/配置说明.md",
+    "docs/node/隧道配置说明.md",
+    "docs/node/看门狗说明.md",
+    "docs/node/客户端包托管说明.md",
+    "docs/node/自用配对说明.md",
+    "docs/winclient/**",
+    "docs/authserver/**"
+  ],
+  "expectArtifacts": [
+    "node/exitnode/updater/upgrade.py",
+    "node/exitnode/cli.py",
+    "node/exitnode/rescue/probes.py",
+    "node/tests/test_updater.py",
+    "node/tests/test_rescue.py",
+    "docs/node/更新与回退说明.md",
+    "docs/node/救援单元说明.md"
+  ],
+  "acceptance": [
+    {
+      "id": "RUFF",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "ruff",
+        "check",
+        "node",
+        "scripts",
+        "authserver"
+      ],
+      "required": true,
+      "timeoutSec": 300
+    },
+    {
+      "id": "PYTEST",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+        "node/tests"
+      ],
+      "required": true,
+      "timeoutSec": 900
+    },
+    {
+      "id": "SHAPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda p:pathlib.Path(p).read_text(encoding='utf-8');up=r('node/exitnode/updater/upgrade.py');cl=r('node/exitnode/cli.py');pr=r('node/exitnode/rescue/probes.py');tu=r('node/tests/test_updater.py');tr=r('node/tests/test_rescue.py');bad=[k for k,ok in (('upgrade.-P','\"python3\", \"-P\", \"-m\", \"exitnode\"' in up),('cli.-P','\"python3\", \"-P\", \"-c\"' in cl),('probes.-P','\"python3\", \"-P\", \"-c\"' in pr),('probes.import','\"import exitnode, exitnode.cli\"' in pr),('test_updater.HEALTH','\"python3\", \"-P\", \"-m\", \"exitnode\"' in tu),('test_rescue.IMPORT','\"python3\", \"-P\", \"-c\"' in tr),('no-plain-m','\"python3\", \"-m\", \"exitnode\"' not in up)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda p:pathlib.Path(p).read_text(encoding='utf-8');a=r('docs/node/更新与回退说明.md');b=r('docs/node/救援单元说明.md');bad=[k for k in ('python3 -P -m exitnode','/tmp','在哪里运行维护命令','PYTHONPATH=/opt/exitnode/current') if k not in a]+['救援:'+k for k in ('python3 -P -m exitnode_rescue','可写') if k not in b]+(['残留 python3 -m exitnode'] if 'python3 -m exitnode ' in a or 'python3 -m exitnode_rescue' in b else []);print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "model": "claude-sonnet-5-5",
+  "timeoutSec": 3600,
+  "repoRoot": "E:/yuanc",
+  "engine": "claude",
+  "reasoningEffort": "medium",
+  "steps": [
+    "读三处 argv 与两个测试常量;先把测试常量加 -P 让既有用例红,再改三处实现转绿。",
+    "加三条 -P 位置断言;跑 RUFF/PYTEST。",
+    "改两份文档;交活。"
+  ]
+}

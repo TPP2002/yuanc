@@ -1,0 +1,162 @@
+{
+  "schemaVersion": 1,
+  "taskId": "SEC-AUTH-SESSION-EXPIRY-LOCK-1022",
+  "slug": "yc-sec-auth-session-renew-1022",
+  "title": "分发版(邀请码模式)连接期间在会话有效期走到八成时自动续期:会话内容不变就只换会话不重启隧道,变了才按既有刷新路径在保护下重启;网络类失败每五分钟重试到到期前一分钟,凭据类拒绝按既有规则进需重新登录;自用模式不续期",
+  "goal": "以主干 afb583c 之后的 main 为基点。只改 winclient/WinClient.Core/Client/ClientController.cs、winclient/WinClient.Tests/ControllerTests.cs、winclient/WinClient.Tests/TestData.cs 与 docs/winclient/架构说明.md。做完后:\n\n① ClientController 新增三个常量:`RenewAtFraction = 0.8`、`RenewRetryInterval = TimeSpan.FromMinutes(5)`、`RenewMinLead = TimeSpan.FromMinutes(1)`,以及私有方法 `ScheduleRenewal(SessionResponse value)` 与 `RenewAsync(SessionResponse value)`,和纯函数 `internal static bool SameSession(SessionResponse a, SessionResponse b)`(比较 Node.Host、RealityPort、Hy2Port、Uuid、Hy2Password、Hy2ServerName、Hy2ObfsPassword、Hy2Certificate 逐项、以及 SingboxConfig.GetRawText() 字符串相等;不比较令牌与到期时间;字段名以 AuthModels.cs 实际为准)。\n\n② ScheduleRenewal:`sessionSource is not AuthServerSessionSource` 直接返回(自用模式会话固定远期,不续);expiry = min(SessionExpiresAt, AccountExpiresAt);remaining = expiry - UtcNow;remaining <= RenewMinLead 直接返回(交给既有到期定时器);否则用既有 Schedule(delay, action) 以 delay = remaining * RenewAtFraction 安排 RenewAsync(value)。Schedule 已带代数(generation)与 lifetime 取消,断开/重连/更换来源后旧的续期回调自然失效,不另加状态。\n\n③ RenewAsync(value):在 gate 内由 Schedule 调起。若 !ReferenceEquals(value, session) 或 machine.State 不是 Connected/Reconnecting → 直接返回。调用 sessionSource.GetSessionAsync(lifetime.Token):\n  - Ok 且 Value 非空且未到期:SameSession(session, next) 为真 → `session = next; ScheduleExpiry(next); ScheduleRenewal(next);` 不产生任何状态机事件,不动隧道与防火墙,message 不变;为假 → 走与 FetchSessionAsync 相同的「有保护时的刷新」路径(NodeChanged → UpdateKillSwitchNode;HasSession 时 TunnelDown 让内核在既有保护下重启),随后 ScheduleExpiry + ScheduleRenewal。建议把 FetchSessionAsync 里「校验通过后的套用」抽成私有 `ApplySessionAsync(SessionResponse next)` 供两处复用。\n  - Ok 但 Value 已到期(SessionExpiresAt 或 AccountExpiresAt <= UtcNow)→ 既有 SessionExpired 事件。\n  - Result 为 InvalidToken / Expired / InviteNotFound / Disabled / Revoked / DeviceLimit → 既有 AuthRejected 事件(状态机按既有规则进 NeedsLogin 或 NeedsManual,停内核,保护保持)。\n  - Result 为 Network / RateLimited / UnexpectedResponse / InvalidParameters → 隧道与状态不动;remaining = expiry - UtcNow;若 remaining > RenewMinLead 则 Schedule(min(RenewRetryInterval, remaining - RenewMinLead), RenewAsync(value)) 再试,否则不再安排(到期定时器会按既有逻辑进需重新登录)。\n  - AuthResult 枚举成员名以 AuthModels.cs 实际为准,凭据类/网络类的归类按既有 FetchSessionAsync 的判定沿用。\n\n④ FetchSessionAsync:套用成功后除 ScheduleExpiry(next) 外再调 ScheduleRenewal(next)。另外「protection && previous != null && machine.HasSession && SameSession(previous, next)」时不再发 TunnelDown 重启,只换 session 并安排定时器(公开的 RefreshSessionAsync 走到这里时内容没变就不该重启隧道);其余分支保持原样。\n\n⑤ 测试 winclient/WinClient.Tests/ControllerTests.cs(可复用 PairingTests 里 internal 的 FakeFirewall / FakeTunnel 与 TestData;需要一个可脚本化的 ISessionSource 假件,按调用次序返回预设 AuthResponse;delayAsync 用注入的函数把每次延时记录到列表并返回可手动完成的 Task,测试按需「触发」某个延时):\n  (1) 邀请码模式连接成功、会话 6 小时后到期:记录到的延时里存在一个约 4.8 小时(与 6h×0.8 相差不超过 2 分钟)的续期等待,且仍存在到期等待。\n  (2) 触发续期、假件返回内容完全相同但令牌与到期时间更新的新会话:隧道假件没有新的 Stop/Start,防火墙假件没有新调用,状态仍为 Connected,controller 持有的会话到期时间已更新(可通过再次记录到新的到期等待与新的续期等待来断言)。\n  (3) 触发续期、假件返回节点地址不同的会话:防火墙假件收到 UpdateNode,隧道被 Stop 后重新 Start,状态最终 Connected。\n  (4) 触发续期、假件返回 Network:状态仍 Connected、隧道未动,新记录到一个 5 分钟的等待;再触发它、假件返回正常会话,流程回到 (2)。\n  (5) 触发续期、假件返回 InvalidToken:状态 NeedsLogin,隧道 Stop,ProtectionActive 仍为 true。\n  (6) 自用模式(PairingSessionSource):除既有的每日分段等待外,没有任何小于一天的续期等待。\n  (7) 会话到期剩余不足 1 分钟时连接:不安排续期等待(只有到期等待)。\n  (8) SameSession 对只改令牌/到期时间的两份会话返回 true,对任一节点字段或 SingboxConfig 不同的返回 false。\n  既有用例不改断言;TestData 可加构造带指定到期时间与节点字段的会话的辅助方法。若 ScheduleRenewal 需要识别 AuthServerSessionSource 而测试里只能用假件,可改为在 ISessionSource 之外用一个 internal 的只读属性/接口标记「是否续期」——但不许改 ISessionSource.cs(禁区),可在 ClientController 内用 `sessionSource is AuthServerSessionSource || sessionSource is IRenewableSessionSource`(新接口定义放在 ClientController.cs 同文件、internal)兼容假件。\n\n⑥ docs/winclient/架构说明.md:在「会话和账号任一个到期都停止内核、进入需重新登录」那段之后补一段「会话续期(邀请码模式)」:连接期间在有效期走到八成时向鉴权服务器续期;续期请求由后台服务进程从物理网卡发出,断网保护已为服务进程到鉴权地址放行窄规则(YuanC-KS-Auth,见断网保护加固说明);内容不变只换会话、不重启隧道,地址或凭据变了按既有刷新路径在保护下重启;网络类失败每五分钟重试到到期前一分钟,凭据类拒绝按既有规则进需重新登录;自用模式不续期。状态机不改。真机待验证:六小时真实到期前自动续期一次且上网不中断;鉴权服务器关机时续期失败、隧道照常直到到期进需重新登录;续期时服务端换了节点地址,规则与内核在保护下切换。\n\n⑦ 全程中文注释与文案;不改状态机、不改 Firewall、不改 Pairing、不改 App;不新增依赖;不碰 Windows 窗口。",
+  "background": "项目:外包,Windows 客户端 winclient(.NET 9,xunit)。ClientController(winclient/WinClient.Core/Client/ClientController.cs,343 行)串行处理用户流程与会话寿命:FetchSessionAsync 取会话、校验、套用(有保护且已有会话时发 NodeChanged / TunnelDown 让内核在保护下重启),ScheduleExpiry 在到期时刻发 SessionExpired(状态机进 NeedsLogin、停内核、保护保持);Schedule(delay, action) 带代数与 lifetime 取消,RunScheduledAsync 把超过一天的等待切成一天一段;delayAsync 可注入(测试用)。RefreshSessionAsync 公开但生产代码无人调用。对抗审查 C-M1:分发版会话 6 小时到期后停隧道但保护不撤,用户要手动断开再连接,每 6 小时断网一次。PR #27 已加 YuanC-KS-Auth 窄规则放行服务进程到鉴权地址,所以服务进程在保护下能直接访问鉴权服务器续期,本单不需要「经隧道续期」也不改防火墙。ISessionSource:AuthServerSessionSource(邀请码模式,GetSessionAsync 用刷新令牌换新会话)与 PairingSessionSource(自用模式,固定返回 MaxValue 到期)。既有测试 ControllerTests.cs 与 PairingTests.cs(FakeFirewall / FakeTunnel 为 internal,记录调用顺序)。另有两张并行单只改 node/authserver 与 LocalConfigRenderer.cs / PairingCertificateTests.cs,本单不碰。工位沙箱无外网;派单方已把 winclient/third_party/cache/ 两个 zip 放进工位,构建不会联网。",
+  "nonGoals": [
+    "不改 ConnectionStateMachine、不加新事件",
+    "不改 Firewall / Pairing / Ipc / App 任何文件",
+    "不做「经隧道续期」的地址映射",
+    "不改 authserver",
+    "不在真机实测"
+  ],
+  "allowedPaths": [
+    "winclient/WinClient.Core/Client/ClientController.cs",
+    "winclient/WinClient.Tests/ControllerTests.cs",
+    "winclient/WinClient.Tests/TestData.cs",
+    "docs/winclient/架构说明.md"
+  ],
+  "forbiddenPaths": [
+    "docs/开工须知.md",
+    "docs/口径速查表.md",
+    "docs/design/**",
+    "docs/交接/**",
+    "docs/plans/**",
+    "docs/acceptance/**",
+    ".github/**",
+    ".codex/**",
+    ".gitignore",
+    "pyproject.toml",
+    "scripts/**",
+    "node/**",
+    "authserver/**",
+    "docs/node/**",
+    "docs/authserver/**",
+    "docs/winclient/服务化与自启说明.md",
+    "docs/winclient/自动更新说明.md",
+    "docs/winclient/断网保护加固说明.md",
+    "winclient/WinClient.App/**",
+    "winclient/WinClient.Core/Client/ClientRuntime.cs",
+    "winclient/WinClient.Core/Client/ClientSettings.cs",
+    "winclient/WinClient.Core/Client/DesiredStateStore.cs",
+    "winclient/WinClient.Core/Client/IClientFacade.cs",
+    "winclient/WinClient.Core/Client/ISessionSource.cs",
+    "winclient/WinClient.Core/Client/TunnelTransport.cs",
+    "winclient/WinClient.Core/Firewall/**",
+    "winclient/WinClient.Core/Ipc/**",
+    "winclient/WinClient.Core/Auth/**",
+    "winclient/WinClient.Core/State/**",
+    "winclient/WinClient.Core/Update/**",
+    "winclient/WinClient.Core/Hosting/**",
+    "winclient/WinClient.Core/Storage/**",
+    "winclient/WinClient.Core/Process/**",
+    "winclient/WinClient.Core/Kernel/**",
+    "winclient/WinClient.Core/Logging/**",
+    "winclient/WinClient.Core/Pairing/**",
+    "winclient/WinClient.Tests/PairingTests.cs",
+    "winclient/WinClient.Tests/PairingCertificateTests.cs",
+    "winclient/WinClient.Tests/AuthTests.cs",
+    "winclient/WinClient.Tests/StateTests.cs",
+    "winclient/WinClient.Tests/IpcTests.cs",
+    "winclient/WinClient.Tests/HostingTests.cs",
+    "winclient/WinClient.Tests/Fixtures/**",
+    "winclient/**/*.csproj",
+    "winclient/WinClient.sln",
+    "winclient/third_party/**"
+  ],
+  "expectArtifacts": [
+    "winclient/WinClient.Core/Client/ClientController.cs",
+    "winclient/WinClient.Tests/ControllerTests.cs",
+    "docs/winclient/架构说明.md"
+  ],
+  "acceptance": [
+    {
+      "id": "BUILD",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "build",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 900
+    },
+    {
+      "id": "TEST",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "test",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--no-build",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 900
+    },
+    {
+      "id": "SHAPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda p:pathlib.Path(p).read_text(encoding='utf-8');c=r('winclient/WinClient.Core/Client/ClientController.cs');t=r('winclient/WinClient.Tests/ControllerTests.cs');bad=[k for k,ok in (('fraction','RenewAtFraction = 0.8' in c),('retry','RenewRetryInterval = TimeSpan.FromMinutes(5)' in c),('lead','RenewMinLead = TimeSpan.FromMinutes(1)' in c),('schedule','ScheduleRenewal(' in c),('renew','RenewAsync(' in c),('same','SameSession(' in c),('pairing-skip','AuthServerSessionSource' in c),('tests',t.count('Renew') >= 6),('test-same','SameSession' in t)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "NOWINDOW",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;norm=lambda p:str(p).replace(chr(92),'/');files=[p for root in ('winclient/WinClient.Core','winclient/WinClient.App') for p in pathlib.Path(root).rglob('*.cs') if '/obj/' not in norm(p) and '/bin/' not in norm(p)];bad=[norm(p) for p in files if 'ProcessStartInfo' in p.read_text(encoding='utf-8') and p.parent.name!='Process' and 'CreateNoWindow = true' not in p.read_text(encoding='utf-8')];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;a=pathlib.Path('docs/winclient/架构说明.md').read_text(encoding='utf-8');bad=[k for k in ('会话续期','八成','不重启','五分钟','YuanC-KS-Auth','自用模式不续期','真机待验证') if k not in a];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "NOBIN",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess,sys;out=subprocess.run(['git','ls-files','winclient','build'],capture_output=True,text=True).stdout.split();bad=[f for f in out if f.endswith(('.exe','.dll','.zip','.pdb'))];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "model": "claude-opus-5-5",
+  "timeoutSec": 5400,
+  "repoRoot": "E:/yuanc",
+  "engine": "claude",
+  "reasoningEffort": "high",
+  "steps": [
+    "读 ClientController.cs、ConnectionStateMachine.cs(只读)、ControllerTests.cs、PairingTests.cs 的假件与 TestData;先写 (1)(2)(4)(5) 四条红测试。",
+    "实现 SameSession / ScheduleRenewal / RenewAsync / ApplySessionAsync 抽取;跑 BUILD/TEST。",
+    "补齐其余测试与文档;交活说明列真机待验证项。"
+  ]
+}

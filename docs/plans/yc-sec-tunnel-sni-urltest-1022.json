@@ -1,0 +1,243 @@
+{
+  "schemaVersion": 1,
+  "taskId": "SEC-TUNNEL-URLTEST-TOLERANCE-1022",
+  "slug": "yc-sec-tunnel-sni-urltest-1022",
+  "title": "隧道配置收紧:伪装目标 sni/handshake_server 必填且必须相同;线路自动选择加 300 毫秒容差(节点/鉴权服务/Windows 客户端三端同形);节点布局路径固定为 /opt/exitnode 与 /var/lib/exitnode",
+  "goal": "以主干 afb583c 之后的 main 为基点。做完后:\n\n① 线路选择容差(卡 SEC-TUNNEL-URLTEST-TOLERANCE-1022):\n  (a) node/exitnode/proxy/context.py:ProxyContext 新增字段 `urltest_tolerance_ms: int = 300`(放在 urltest_interval 之后);validate_context 增加:`type(ctx.urltest_tolerance_ms) is not int`(bool 也算不合法)或不在 0~10000 之间 → raise ValueError(\"线路选择容差须为 0 至 10000 毫秒的整数\")。\n  (b) node/exitnode/proxy/client_config.py:urltest 出站在 \"interval\" 之后追加 `\"tolerance\": ctx.urltest_tolerance_ms`;键顺序固定为 type, tag, outbounds, url, interval, tolerance。安卓订阅(subscription.py 复用 render_client_windows)自动带上,不改 subscription.py。\n  (c) node/tests/golden/proxy/client-windows.json 的 urltest 出站加 `\"tolerance\": 300`(放在 interval 之后)。\n  (d) winclient/WinClient.Core/Pairing/LocalConfigRenderer.cs:urltest 出站在 interval 之后加 `tolerance = 300`(匿名对象属性顺序同上)。注意 winclient 测试 PairingCertificateTests 直接拿节点黄金 client-windows.json 做整体比对,黄金改了它就必须同步通过。\n  (e) authserver/authserver/clientconfig.py:urltest 的 tolerance 由 50 改为 300(三端一致)。\n  (f) 测试:node/tests/test_proxy_client_render.py 断言 urltest 出站键顺序为 [type, tag, outbounds, url, interval, tolerance] 且 tolerance == 300,并断言 replace(ctx, urltest_tolerance_ms=True) 与 =-1、=10001、=\"300\" 均被 validate_context 拒绝(匹配 \"容差\");node/tests/test_renderer_parity.py 在既有 parity 用例里加断言:客户端 urltest 出站与鉴权服务 urltest 出站的 url、interval、tolerance 三项相等;authserver/tests 里加断言会话下发配置的 urltest tolerance == 300;winclient/WinClient.Tests/PairingCertificateTests.cs 加一条用例断言 LocalConfigRenderer 渲染的 urltest 出站 tolerance == 300。\n\n② 伪装目标一致性(合单卡 SEC-TUNNEL-SNI-CONSISTENCY-1022):\n  (a) node/exitnode/config.py:Proxy 的 `sni` 与 `handshake_server` 去掉默认值,改为必填字段(dataclass 必填字段须排在有默认值的字段之前;load() 用 model(**section) 构造,顺序不影响配置文件);load() 在既有主机名格式校验之后新增:`config.proxy.sni != config.proxy.handshake_server` → invalid(\"proxy.handshake_server\", \"必须与 proxy.sni 相同:伪装目标与握手名称不一致是 Reality 配错的典型特征\")。缺 sni 或缺 handshake_server 走既有「缺少必填字段」报错。\n  (b) node/exitnode/proxy/context.py:ProxyContext 的 sni/handshake_server 默认值保留(测试与渲染器大量直接构造上下文),但 validate_context 新增:两者不相等 → raise ValueError(\"伪装目标与握手名称必须相同\")。\n  (c) node/examples/config.example.toml:sni 与 handshake_server 都改为 `\"www.abc.net.au\"`(澳洲广播公司,澳洲本地大站;示例必须仍可被 load() 加载,因为 node/tests/test_cli.py 与 test_config.py、authserver/tests/test_security.py 都直接读这个示例文件),注释改为「两项必须相同;示例给的是澳洲本地大站,装机前由维护人员实测该站支持 TLS 1.3 与 HTTP/2 后确认或更换;不要用微软等与澳洲家庭宽带不相称的站点」。\n  (d) 测试:node/tests/test_config.py——缺 sni 或缺 handshake_server 报「缺少必填字段」;两者不同报「必须与 proxy.sni 相同」;两者相同(非微软域名)通过;既有「默认 www.microsoft.com」的断言改掉。node/tests/test_cli.py 不用改(它的 TEXT 直接读示例文件,示例改好即通过);本单不碰 test_cli.py、test_updater.py、test_rescue.py。node/tests/test_proxy_server_render.py 第 43 行附近把 sni 与 handshake_server 改成相同值,并加一条:validate_context 对不相同的组合报「必须相同」。\n\n③ 布局路径固定(卡 SEC-NODE-CWD-HIJACK-1022 的「锁死两项」部分;救援程序写死 /opt/exitnode 与 /var/lib/exitnode,配置改了救援会误判):node/exitnode/config.py load() 新增:`config.updater.releases_dir != \"/opt/exitnode\"` → invalid(\"updater.releases_dir\", \"救援程序按固定布局工作,当前只支持 /opt/exitnode\");`config.node.data_dir != \"/var/lib/exitnode\"` → invalid(\"node.data_dir\", \"救援程序按固定布局工作,当前只支持 /var/lib/exitnode\")。放在既有 data_dir/releases_dir 格式校验之后(格式错仍先报格式)。测试:test_config.py 加 `/srv/exitnode` 与 `/var/lib/other` 两例被拒(匹配 \"固定布局\"),默认值通过。\n\n④ 文档:docs/node/隧道配置说明.md——「伪装目标」表行改为「必填,无默认;sni 与 handshake_server 必须相同;推荐澳洲本地大站,由维护人员实测支持 TLS 1.3 与 HTTP/2 后填入」并新增小节「线路选择容差」:主备两条线路由 urltest 按延迟自动选,备用线路(Hysteria2,QUIC)握手少、测出来常比主线路快,不设容差会长期走备用线路,与「Hysteria2 只当备胎」口径矛盾且持续境外 UDP 大流量易被限速;现设 300 毫秒容差:主线路不比备用慢 300 毫秒以上就不切;三端(节点导出、鉴权服务下发、客户端本地渲染)同值;真机待验证:主线路正常时抓包确认流量走 TCP 443 而非 UDP。docs/node/配置说明.md——proxy.sni / proxy.handshake_server 两行改为必填、必须相同;node.data_dir 与 updater.releases_dir 两行注明「当前固定,改了拒绝启动(救援程序按固定布局工作)」。\n\n⑤ 全程中文;不新增依赖;不改 server_config.py 的渲染;不碰 docs/口径速查表.md(派单方收官自己补一行)。",
+  "background": "项目:外包,澳洲 Debian 软路由 node/exitnode(Python 3.11 目标、本机 3.14 跑测试)+ 鉴权服务 authserver(FastAPI,pytest 本机 20 秒)+ Windows 客户端 winclient(.NET 9,xunit)。三端各有一份客户端 sing-box 配置渲染器:node/exitnode/proxy/client_config.py(自用配对导出)、authserver/authserver/clientconfig.py(邀请码模式下发)、winclient/WinClient.Core/Pairing/LocalConfigRenderer.cs(客户端拿配对文件本地渲染);node/tests/test_renderer_parity.py 断言前两者同形,winclient 的 PairingCertificateTests 直接读节点黄金 node/tests/golden/proxy/client-windows.json 整体比对第三者。当前 urltest 出站:node 与 winclient 没写 tolerance(sing-box 默认 50 毫秒),authserver 写 50。对抗审查 C-M3:Hysteria2 握手少测得延迟低,结果长期走备用 UDP 线路。对抗审查 C-L3:config.py 的 sni/handshake_server 默认 www.microsoft.com 且不校验两者一致,大陆客户端带微软 SNI 连澳洲家宽段本身异常、两字段配错一个探测者拿到的证书属另一域名。对抗审查 A14 的一半:rescue/probes.py 写死 /opt/exitnode 与 /var/lib/exitnode/updater.lock,而 config 允许改 releases_dir/data_dir,改了救援会误判损坏重装到错位置——拍板用「配置锁死两项」(与既有 secrets_dir 必须为固定路径的做法一致)。config.py 既有校验风格:invalid(key, reason) 抛 ConfigError;test_config.py 用参数化表测拒绝项。另一张并行单 yc-sec-node-cwd-hijack-p-1022 只改 upgrade.py / cli.py / rescue/probes.py / test_updater / test_rescue / test_cli 的子进程参数(加 -P)与两份文档,本单不碰那些文件——本单不碰 test_cli.py(它读示例文件);还有一张并行单只改 winclient/WinClient.Core/Client/ClientController.cs 与 ControllerTests.cs,本单不碰。工位沙箱无外网;派单方已把 winclient/third_party/cache/ 两个第三方 zip 放进工位,构建不会联网。",
+  "nonGoals": [
+    "不改 server_config.py 的服务端渲染,不改 subscription.py",
+    "不做在线核验「握手目标证书覆盖 sni」(拍板用强制相等)",
+    "不改救援程序读配置(拍板用配置锁死)",
+    "不改 docs/口径速查表.md、docs/开工须知.md",
+    "不在真机实测;真机项写进文档待验证清单"
+  ],
+  "allowedPaths": [
+    "node/exitnode/config.py",
+    "node/exitnode/proxy/context.py",
+    "node/exitnode/proxy/client_config.py",
+    "node/examples/config.example.toml",
+    "node/tests/golden/proxy/**",
+    "node/tests/test_config.py",
+    "node/tests/test_proxy_client_render.py",
+    "node/tests/test_proxy_server_render.py",
+    "node/tests/test_renderer_parity.py",
+    "node/tests/test_service.py",
+    "node/tests/test_device.py",
+    "winclient/WinClient.Core/Pairing/LocalConfigRenderer.cs",
+    "winclient/WinClient.Tests/PairingCertificateTests.cs",
+    "authserver/authserver/clientconfig.py",
+    "authserver/tests/**",
+    "docs/node/隧道配置说明.md",
+    "docs/node/配置说明.md"
+  ],
+  "forbiddenPaths": [
+    "docs/开工须知.md",
+    "docs/口径速查表.md",
+    "docs/design/**",
+    "docs/交接/**",
+    "docs/plans/**",
+    "docs/acceptance/**",
+    ".github/**",
+    ".codex/**",
+    ".gitignore",
+    "pyproject.toml",
+    "scripts/**",
+    "node/tests/test_cli.py",
+    "node/tests/test_updater.py",
+    "node/tests/test_rescue.py",
+    "node/tests/test_watchdog.py",
+    "node/tests/test_systemd_render.py",
+    "node/tests/test_nft_render.py",
+    "node/tests/test_manifest.py",
+    "node/exitnode/cli.py",
+    "node/exitnode/service.py",
+    "node/exitnode/device.py",
+    "node/exitnode/runner.py",
+    "node/exitnode/manifest.py",
+    "node/exitnode/systemd.py",
+    "node/exitnode/nft.py",
+    "node/exitnode/netinfo.py",
+    "node/exitnode/status.py",
+    "node/exitnode/log.py",
+    "node/exitnode/updater/**",
+    "node/exitnode/rescue/**",
+    "node/exitnode/watchdog/**",
+    "node/exitnode/admin/**",
+    "node/exitnode/templates/**",
+    "node/exitnode/proxy/server_config.py",
+    "node/exitnode/proxy/subscription.py",
+    "node/exitnode/proxy/keys.py",
+    "node/exitnode/proxy/registry.py",
+    "node/exitnode/proxy/reload.py",
+    "authserver/authserver/app.py",
+    "authserver/authserver/service.py",
+    "authserver/authserver/config.py",
+    "authserver/authserver/db.py",
+    "authserver/examples/**",
+    "winclient/WinClient.App/**",
+    "winclient/WinClient.Core/Client/**",
+    "winclient/WinClient.Core/Firewall/**",
+    "winclient/WinClient.Core/Ipc/**",
+    "winclient/WinClient.Core/Auth/**",
+    "winclient/WinClient.Core/State/**",
+    "winclient/WinClient.Core/Update/**",
+    "winclient/WinClient.Core/Hosting/**",
+    "winclient/WinClient.Core/Storage/**",
+    "winclient/WinClient.Core/Process/**",
+    "winclient/WinClient.Core/Kernel/**",
+    "winclient/WinClient.Core/Logging/**",
+    "winclient/WinClient.Core/Pairing/PairingFile.cs",
+    "winclient/WinClient.Core/Pairing/PairingStore.cs",
+    "winclient/WinClient.Tests/ControllerTests.cs",
+    "winclient/WinClient.Tests/PairingTests.cs",
+    "winclient/WinClient.Tests/AuthTests.cs",
+    "winclient/WinClient.Tests/StateTests.cs",
+    "winclient/WinClient.Tests/IpcTests.cs",
+    "winclient/WinClient.Tests/HostingTests.cs",
+    "winclient/WinClient.Tests/TestData.cs",
+    "winclient/WinClient.Tests/Fixtures/**",
+    "winclient/**/*.csproj",
+    "winclient/WinClient.sln",
+    "winclient/third_party/**",
+    "docs/node/更新与回退说明.md",
+    "docs/node/救援单元说明.md",
+    "docs/node/看门狗说明.md",
+    "docs/node/客户端包托管说明.md",
+    "docs/node/自用配对说明.md",
+    "docs/winclient/**",
+    "docs/authserver/**"
+  ],
+  "expectArtifacts": [
+    "node/exitnode/config.py",
+    "node/exitnode/proxy/context.py",
+    "node/exitnode/proxy/client_config.py",
+    "node/examples/config.example.toml",
+    "node/tests/golden/proxy/client-windows.json",
+    "node/tests/test_config.py",
+    "node/tests/test_proxy_client_render.py",
+    "node/tests/test_renderer_parity.py",
+    "winclient/WinClient.Core/Pairing/LocalConfigRenderer.cs",
+    "winclient/WinClient.Tests/PairingCertificateTests.cs",
+    "authserver/authserver/clientconfig.py",
+    "docs/node/隧道配置说明.md",
+    "docs/node/配置说明.md"
+  ],
+  "acceptance": [
+    {
+      "id": "RUFF",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "ruff",
+        "check",
+        "node",
+        "scripts",
+        "authserver"
+      ],
+      "required": true,
+      "timeoutSec": 300
+    },
+    {
+      "id": "PYTEST",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+        "node/tests",
+        "authserver/tests"
+      ],
+      "required": true,
+      "timeoutSec": 900
+    },
+    {
+      "id": "BUILD",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "build",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 900
+    },
+    {
+      "id": "TEST",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "test",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--no-build",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 900
+    },
+    {
+      "id": "SHAPE-TOL",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda p:pathlib.Path(p).read_text(encoding='utf-8');cc=r('node/exitnode/proxy/client_config.py');cx=r('node/exitnode/proxy/context.py');lr=r('winclient/WinClient.Core/Pairing/LocalConfigRenderer.cs');au=r('authserver/authserver/clientconfig.py');g=r('node/tests/golden/proxy/client-windows.json');bad=[k for k,ok in (('ctx.field','urltest_tolerance_ms: int = 300' in cx),('ctx.validate','10000' in cx and '容差' in cx),('ctx.same','必须相同' in cx),('cc.tol','ctx.urltest_tolerance_ms' in cc),('golden','\"tolerance\": 300' in g),('lr.tol','tolerance = 300' in lr),('au.tol','\"tolerance\": 300' in au),('au.no50','\"tolerance\": 50' not in au)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "SHAPE-CFG",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,re,sys;r=lambda p:pathlib.Path(p).read_text(encoding='utf-8');cf=r('node/exitnode/config.py');ex=r('node/examples/config.example.toml');bad=[k for k,ok in (('cf.sni.required',re.search(r'^    sni: str$',cf,re.M) is not None),('cf.hs.required',re.search(r'^    handshake_server: str$',cf,re.M) is not None),('cf.same','必须与 proxy.sni 相同' in cf),('cf.lock.rel','只支持 /opt/exitnode' in cf),('cf.lock.data','只支持 /var/lib/exitnode' in cf),('ex.nomicrosoft','microsoft' not in ex.lower()),('ex.abc',ex.count('\"www.abc.net.au\"')==2),('ex.note','实测' in ex)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda p:pathlib.Path(p).read_text(encoding='utf-8');a=r('docs/node/隧道配置说明.md');b=r('docs/node/配置说明.md');bad=[k for k in ('线路选择容差','300 毫秒','必填','必须相同','澳洲本地','TLS 1.3','抓包') if k not in a]+['配置说明:'+k for k in ('必须相同','固定布局','/opt/exitnode','/var/lib/exitnode') if k not in b];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "NOBIN",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess,sys;out=subprocess.run(['git','ls-files','winclient','build','node','authserver'],capture_output=True,text=True).stdout.split();bad=[f for f in out if f.endswith(('.exe','.dll','.zip','.pdb','.pyc'))];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "model": "claude-sonnet-5-5",
+  "timeoutSec": 5400,
+  "repoRoot": "E:/yuanc",
+  "engine": "claude",
+  "reasoningEffort": "medium",
+  "steps": [
+    "读 config.py / context.py / client_config.py / LocalConfigRenderer.cs / authserver clientconfig.py 与三端测试;先写红测试:容差键与数值、sni 必填与相同、布局路径锁。",
+    "改三端渲染与黄金;改 config.py 与 context.py 校验;改 example toml;修 test_cli CONFIG 文本与 test_proxy_server_render 的 sni/handshake 取值。",
+    "跑 RUFF/PYTEST(node+authserver)/BUILD/TEST;改两份文档;交活说明列真机待验证项。"
+  ]
+}
