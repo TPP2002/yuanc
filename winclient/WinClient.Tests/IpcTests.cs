@@ -215,6 +215,88 @@ public sealed class IpcTests
     }
 
     [Fact]
+    public async Task UntrustedCallerCannotChangeStateButCanRead()
+    {
+        using var temp = new TempDirectory();
+        using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var facade = new FakeFacade();
+        var desired = new DesiredStateStore(temp.Path);
+        var server = new ControlServer(facade, desired);
+        var (peer, host) = DuplexStream.Pair();
+        var serving = server.ServeAsync(host, stop.Token, callerTrusted: false);
+        using (var client = new ControlClient(peer))
+        {
+            // 五个会改变连接状态的指令一律被拒：不调门面、不写期望状态。
+            foreach (var (op, code, pairing) in new (string, string?, string?)[] { ("connect", null, null), ("disconnect", null, null), ("redeem", "邀请码", null), ("import_pairing", null, "配对正文"), ("clear_pairing", null, null) })
+            {
+                var rejected = await client.SendAsync(op, code: code, pairingJson: pairing, cancellationToken: stop.Token);
+                Assert.False(rejected.Ok);
+                Assert.Equal(ControlServer.UntrustedCallerError, rejected.Error);
+                Assert.Null(rejected.Snapshot);
+            }
+            Assert.Empty(facade.Actions);
+            Assert.Null(desired.Read());
+            Assert.False(File.Exists(Path.Combine(temp.Path, "desired.json")));
+            // 同一连接上的只读指令照常可用。
+            foreach (var op in new[] { "status", "subscribe", "check_update" })
+            {
+                var reply = await client.SendAsync(op, cancellationToken: stop.Token);
+                Assert.True(reply.Ok); Assert.NotNull(reply.Snapshot);
+            }
+            var audit = await client.SendAsync("read_audit", cancellationToken: stop.Token);
+            Assert.True(audit.Ok); Assert.Equal("完整审计", audit.Audit);
+            Assert.Empty(facade.Actions);
+        }
+        await serving.WaitAsync(stop.Token);
+    }
+
+    [Fact]
+    public async Task DefaultCallerTrustKeepsExistingBehavior()
+    {
+        using var temp = new TempDirectory();
+        using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var facade = new FakeFacade();
+        var desired = new DesiredStateStore(temp.Path);
+        var server = new ControlServer(facade, desired);
+        var (peer, host) = DuplexStream.Pair();
+        var serving = server.ServeAsync(host, stop.Token);
+        using (var client = new ControlClient(peer))
+        {
+            var reply = await client.SendAsync("connect", cancellationToken: stop.Token);
+            Assert.True(reply.Ok); Assert.Null(reply.Error);
+            Assert.Equal(new[] { "connect" }, facade.Actions);
+            Assert.True(desired.Read());
+        }
+        await serving.WaitAsync(stop.Token);
+    }
+
+    // {root} 为安装目录，{ROOT} 为其大写，{parent} 为安装目录的父目录。
+    [Theory]
+    [InlineData("{root}/1.0.0/YuanC-Client.exe", true)]
+    [InlineData("{root}/1.0.0/sub/YuanC-Updater.exe", true)]
+    [InlineData("{ROOT}/1.0.0/YUANC-CLIENT.EXE", true)]
+    [InlineData("{root}", false)]
+    [InlineData("{root}/", false)]
+    [InlineData("{parent}/YuanC-Client.exe", false)]
+    [InlineData("{parent}", false)]
+    [InlineData("{root}/1.0.0/../../Evil/YuanC-Client.exe", false)]
+    [InlineData("{root}/1.0.0/../2.0.0/YuanC-Client.exe", false)]
+    [InlineData("YuanC/app/1.0.0/YuanC-Client.exe", false)]
+    [InlineData("{parent}-evil/x.exe", false)]
+    [InlineData("{root}-evil/YuanC-Client.exe", false)]
+    [InlineData("", false)]
+    [InlineData(null, false)]
+    public void CallerIdentityTrustsOnlyImagesUnderAppRoot(string? template, bool expected)
+    {
+        var root = Path.GetFullPath("Program Files/YuanC/app");
+        var parent = Path.GetDirectoryName(root)!;
+        var image = template?.Replace("{root}", root).Replace("{ROOT}", root.ToUpperInvariant()).Replace("{parent}", parent);
+        Assert.Equal(expected, CallerIdentity.IsTrusted(image, root));
+        // appRoot 尾部带斜杠或大小写不同，判定结果不变。
+        Assert.Equal(expected, CallerIdentity.IsTrusted(image, root.ToLowerInvariant() + Path.DirectorySeparatorChar));
+    }
+
+    [Fact]
     public void DesiredStateMissingCorruptAndAtomicRoundTrip()
     {
         using var temp = new TempDirectory();

@@ -25,6 +25,7 @@ public sealed class ControlService : ServiceBase
     private static readonly TimeSpan RejectLogInterval = TimeSpan.FromMinutes(5);
     private readonly ConnectionBudget budget = new(MaxInstances, MaxPerClient);
     private readonly Dictionary<uint, DateTime> rejectLogged = [];
+    private readonly Dictionary<uint, DateTime> untrustedLogged = [];
     private readonly CancellationTokenSource lifetime = new();
     private readonly ConcurrentDictionary<NamedPipeServerStream, byte> pipes = new();
     private static readonly RedactingLog Log = new(new RollingFileLog(Path.Combine(ClientSettings.DataDirectory, "run", "service.log")));
@@ -132,7 +133,14 @@ public sealed class ControlService : ServiceBase
                         LogRejected(clientProcessId);
                         continue;
                     }
-                    try { await server.ServeAsync(pipe, lifetime.Token).ConfigureAwait(false); }
+                    try
+                    {
+                        // 调用者核验：程序位于本产品安装目录之下才可执行会改变连接状态的指令；
+                        // 不可信连接照常服务（只读指令可用），首次出现时记一行日志。只查询，不起进程。
+                        var trusted = CallerIdentity.IsTrusted(PipePeer.ProcessImage(admitted), UpdatePlanner.DefaultAppRoot);
+                        if (!trusted) LogUntrusted(admitted);
+                        await server.ServeAsync(pipe, lifetime.Token, trusted).ConfigureAwait(false);
+                    }
                     finally { budget.Release(admitted); }
                 }
                 catch (IOException) { /* A client may disappear before completing its connection. */ }
@@ -146,18 +154,30 @@ public sealed class ControlService : ServiceBase
 
     private void LogRejected(uint? clientProcessId)
     {
-        // 同一进程五分钟内只记一次，防止恶意程序反复连接刷满日志。
-        var key = clientProcessId ?? 0;
-        var now = DateTime.UtcNow;
-        lock (rejectLogged)
-        {
-            if (rejectLogged.TryGetValue(key, out var last) && now - last < RejectLogInterval) return;
-            foreach (var stale in rejectLogged.Where(item => now - item.Value >= RejectLogInterval).Select(item => item.Key).ToList())
-                rejectLogged.Remove(stale);
-            rejectLogged[key] = now;
-        }
+        if (!ShouldLog(rejectLogged, clientProcessId ?? 0)) return;
         try { Log.Write($"同一程序的管道连接数超限，已拒绝（进程 {(clientProcessId is { } id ? id.ToString(System.Globalization.CultureInfo.InvariantCulture) : "未知")}）"); }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { /* 日志写不进不能让监听循环退出。 */ }
+    }
+
+    private void LogUntrusted(uint clientProcessId)
+    {
+        if (!ShouldLog(untrustedLogged, clientProcessId)) return;
+        try { Log.Write($"来自安装目录之外的程序连接了后台服务，只允许查询（进程 {clientProcessId.ToString(System.Globalization.CultureInfo.InvariantCulture)}）"); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { /* 日志写不进不能让监听循环退出。 */ }
+    }
+
+    // 同一进程五分钟内只记一次，防止恶意程序反复连接刷满日志；顺带清掉过期的记录。
+    private static bool ShouldLog(Dictionary<uint, DateTime> logged, uint key)
+    {
+        var now = DateTime.UtcNow;
+        lock (logged)
+        {
+            if (logged.TryGetValue(key, out var last) && now - last < RejectLogInterval) return false;
+            foreach (var stale in logged.Where(item => now - item.Value >= RejectLogInterval).Select(item => item.Key).ToList())
+                logged.Remove(stale);
+            logged[key] = now;
+            return true;
+        }
     }
 
     protected override void OnStop() { RequestAdditionalTime(30000); StopRuntime(); }
