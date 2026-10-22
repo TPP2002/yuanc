@@ -1,0 +1,249 @@
+{
+  "schemaVersion": 1,
+  "taskId": "WINCLIENT-UI-DASHBOARD-STYLE-1022",
+  "slug": "yc-ui-dashboard-style-1022",
+  "title": "客户端窗口改版:借鉴看板的 880×600 侧栏五页界面(浅深主题跟随系统、状态瓦片灯条语言、动效门随系统动画设置)、按状态换托盘图标、新增 net9.0-windows 界面测试工程(映射用例 + 浅深 28 张渲染截图 + 主按钮位置不动断言)、界面说明文档",
+  "goal": "以主干 main(头 1b4a283 之后,已含设计产物)为基点,把 Windows 客户端界面程序从「480×900 单列默认样式」改成「借鉴看板的 880×600 侧栏五页界面」。设计正本三份,开工先读完:docs/design/2026-10-22-客户端界面/DESIGN.md(token、组件规则、状态表、动效清单、WPF 资源键映射、底线核对)、docs/design/2026-10-22-客户端界面/样张-主窗口.html(施工靶子:CSS 是 token 与组件样式的正本,页尾 GLYPH 是记号 path、STATES 是八种状态的文案,搬运而不是看图重画)、01-事实卡与走查.md 与 02-取材与方向.md(为什么这么做、必须保留什么)。负责人原话:「Windows 要的是可视化的界面 .exe 程序,UI 借鉴看板」「记得要有动画动效啥的」。\n\n① 资源字典与主题(winclient/WinClient.App/Themes/)\n- Tokens.Light.xaml / Tokens.Dark.xaml:只放颜色与阴影,键名按 DESIGN.md §7(Yc.Color.* 为 Color,Yc.* 为 SolidColorBrush,Yc.Spec.Info/Warn/Ok/Bad/N 为 LinearGradientBrush:StartPoint 0,0、EndPoint 1,0、SpreadMethod Repeat、四个色站 0/.333/.667/1、首尾同色,Yc.Shadow 浅色为 DropShadowEffect(BlurRadius 3、ShadowDepth 1、Opacity .08)、深色为 x:Null);两份字典的 x:Key 集合必须完全相同。数值逐字取 DESIGN.md §2.1 / 样张 :root 与 [data-theme=dark]。\n- Base.xaml:字体(Yc.Font.Cn = \"Microsoft YaHei UI, Microsoft YaHei, Segoe UI\";Yc.Font.Mono = \"Cascadia Mono, Consolas\")、字号 Yc.FontSize.Xs/Sm/Base/Md/Lg/Xl/Xxl = 12/14/16/18/20/24/28、圆角 Yc.Radius.Sm/Md/Lg/Tile/Hero = 4/6/8/7/14、间距 Yc.Space.1..7 = 4/8/12/16/24/32/48、时长 Yc.Dur.Press/Small/Panel/Draw/Number/Flow/FlowFast = 120ms/180ms/240ms/600ms/300ms/3.4s/2.4s。\n- Controls.xaml:按钮三种(主 / 次 / 安静,外加 sm 尺寸)六态(默认、悬停、聚焦、按下、禁用 55% 不透明、忙碌)、输入框、选择卡(ChoiceCard:整块可点的 RadioButton 模板)、开关(ToggleButton 模板,40×22,滑块 180ms)、状态行、徽章、导航项(RadioButton 模板,高 36)、卡片、FocusVisualStyle(2px Yc.Focus 描边外扩 2px)。全部用 DynamicResource 引用 token;XAML 与 .cs 里不许出现裸色值(#rrggbb 只许在 Tokens.*.xaml)、不许 Brushes.* / Colors.*(Transparent 除外)、不许裸 FontSize 数字(只许在 Base.xaml)。悬停样式只在鼠标触发器里。\n- Glyphs.xaml:记号与导航图标 Geometry(x:Key Yc.Glyph.Ring/Dots/Bars/Check/Spin/Ask/Bang/X/Plug,Yc.Icon.Plug/Layers/Sun/Key/Download),path 数据从样张的 GLYPH 与 <symbol> 原样搬(24 视框)。\n- ThemeManager(Themes/ThemeManager.cs):enum ThemeKind { Light, Dark };Detect() 读注册表 HKCU 的 Software/Microsoft/Windows/CurrentVersion/Themes/Personalize 下 AppsUseLightTheme(DWORD 0 = Dark;读不到按 Light);Apply(ResourceDictionary target, ThemeKind kind) 把对应 Tokens 字典换进 target.MergedDictionaries(先移除旧的那份);Start() 订阅 Microsoft.Win32.SystemEvents.UserPreferenceChanged,变化时在 UI 线程重新 Detect + Apply(Application.Current.Resources)并通知 ThemeChanged 事件;Stop() 退订。\n- MotionSettings(Themes/MotionSettings.cs):静态;Enabled = Override ?? SystemParameters.ClientAreaAnimation;Override 供测试;Refresh() 在 UserPreferenceChanged 时重读并触发 Changed 事件。关闭时任何 Storyboard 都不启动(不是跑完再停)。\n\n② 状态瓦片控件 winclient/WinClient.App/Controls/StatusTile.xaml(.cs)\n依赖属性:Tone(枚举 N/Info/Warn/Ok/Bad)、Glyph(Ring/Dots/Bars/Check/Spin/Ask/Bang/X/Plug)、Flow(None/Forward/Reverse/Fast)、Filled(bool)、Dim(bool)、TileSize(20 或 56)。结构:外层 Border(边框层:Flow=None 时底色 Yc.Line;Flow≠None 且 MotionSettings.Enabled 时底色为对应 Yc.Spec.* 渐变并用 RelativeTransform 的 TranslateTransform X 从 0 到 1(Reverse 为 0 到 -1)线性循环,Forward/Reverse 3.4s、Fast 2.4s;Flow≠None 但动画关闭时底色为实色 tone)→ 内层 Border(tone-bg;Filled 时为 tone)→ Path 记号(stroke tone;Filled 时 stroke Yc.Bg;20 号 stroke 2.2、56 号 stroke 2,圆头)。20 号:外框 1.5px、圆角 6/4.5;56 号:外框 3px、圆角 14/11。记号动效(只在 MotionSettings.Enabled 且 Flow≠None 时):Bars 三根柱子 ScaleY .25→1→.25 各错开 .25s、2.4s 循环,RenderTransformOrigin 底部;Spin 回旋箭头 RotateTransform 0→-360 3.2s;Ask 问号 Opacity 1→.45 + Scale 1→.9 2.4s;Dots 三点 TranslateY 与 Opacity 错开 1.6s。Filled 变为 true 的那一次:Check 记号用 StrokeDashArray/StrokeDashOffset 从整段隐藏画到 0,600ms,只播一次(动画关闭时直接显示)。Tone 变化时内层底色 180ms 过渡(动画关闭时瞬时)。公开只读属性 IsFlowing(= Flow≠None && MotionSettings.Enabled)供测试。Dim 时整体 Opacity .5。\n\n③ 纯函数映射 winclient/WinClient.App/Presentation/StatusPresentation.cs\npublic enum Tone/Glyph/Flow/TrayIcon(N, Info, Ok, Warn, Bad)/ServiceAvailability(Unavailable, NeedInstall, NeedRepair, Ready)/PageKind(Connect, Routing, Environment, Account, Update);record TileSpec(Tone, Glyph, Flow, bool Filled=false, bool Dim=false);record StatusRow(string Label, TileSpec Tile, string Text, Tone TextTone, string Right=\"\");record HeroPresentation(TileSpec Tile, string Title, string Subtitle, Tone SubtitleTone, string PrimaryLabel, string BusyLabel, bool ShowGoToAccount, TrayIcon Tray, string TrayText, IReadOnlyList<StatusRow> Rows);static HeroPresentation Build(ControlSnapshot snapshot, ServiceAvailability availability, bool shouldDisconnect)。映射逐行按 DESIGN.md §4.1 / §4.2(含出口 IP 六种 ExitStatus、断网保护五种、环境自检四种、环境一致性四种;Disconnected 副标题按 RoutingMode 与 RoutingApps.Length 分两句;BusyLabel:连接→正在连接、断开→正在断开、其余→正在处理;TrayText = \"澳洲出口客户端 · \" + Title,≤63 字符)。不依赖 WPF 类型,纯 C#。\n\n④ 窗口与五页(winclient/WinClient.App/MainWindow.xaml(.cs)、Views/)\n- MainWindow:Title 不变,Width 880 Height 600 MinWidth 760 MinHeight 540,居中启动,Icon 用 Assets/app.ico,背景 Yc.Bg;内容只放一个 Views/MainShell.xaml;OnSourceInitialized 与 ThemeManager.ThemeChanged 时调 ApplyTitleBar():P/Invoke dwmapi.dll 的 DwmSetWindowAttribute(hwnd, 20, ref int(1=深 0=浅), 4),返回失败再试属性 19,仍失败忽略;OnClosing 隐藏逻辑、两个选文件对话框、Export_Click 的行为保持不变(可以搬到 MainShell 的命令绑定,语义不变)。\n- MainShell(UserControl 880×600 可拉伸):左侧 200 侧栏(五个导航项 RadioButton 绑定 CurrentPage,图标 20 线性图标 + 文字,选中态按样张;底部服务状态块:圆点 + ServiceStateText + 第二行等宽 ServiceVersionText,空时隐藏)+ 右侧 ContentControl 按 CurrentPage 切换五个 UserControl(DataContext 共用 MainViewModel);切页时内容淡入 + 上移 6px 180ms(仅 MotionSettings.Enabled)。\n- Views/ConnectPage.xaml:页头(h1「连接」+ Mode 徽章)→ 英雄卡(Grid 三列 56 / * / 144:StatusTile 56 绑定 Hero.Tile、Title 24 粗、Subtitle 14 按 SubtitleTone 着色、主按钮绑定 ConnectCommand 文字 ConnectLabel,列宽固定、文字不换行)→ 主消息槽(TextBlock 绑定 Message,MinHeight 42,AutomationProperties.LiveSetting=Polite,按 Hero 的语义着色:Subtitle 为 Bad 时红)→ 四行状态 ItemsControl 绑定 Hero.Rows(每行 StatusTile 20 + 标签 88 + 正文 + 右侧标注;首次显示时四行错开 0/30/60/90ms 淡入 140ms,仅动画开启且只一次)→ ShowGoToAccount 时在四行下方放次级按钮「去兑换邀请码」(GoToAccountCommand)→ 底部提示「关闭窗口只是缩到托盘;隧道与断网保护由后台服务管理,窗口关了不受影响。」。出口 IP 行文字变化时 300ms 淡入上移 4px(仅动画开启)。\n- Views/RoutingPage.xaml:页头 + 两张 ChoiceCard(绑定 RoutingIsGlobal / RoutingIsApps,文案按样张)+「指定的程序」段(ItemsControl 绑定 RoutingApps:每行 StatusTile 20 Info/Check + 等宽路径(TextTrimming CharacterEllipsis)+ 安静按钮「移除」执行 RemoveRoutingAppCommand 且把该行路径设为 SelectedRoutingApp 后执行;空清单显示虚线空态「还没有指定程序;点「添加程序…」选一个 .exe」)+「添加程序…」按钮(AddRoutingAppCommand)+ CanChangeRouting 为假时整段 Opacity .6 并显示 warn 提示「连接中不能改代理范围,请先在「连接」页断开。」。旧的常驻警示「全部流量模式下,部分程序自带防火墙放行规则…」删除。\n- Views/EnvironmentPage.xaml:页头(徽章绑定 EnvironmentEnabled:已应用/未启用)+ 开关卡(ToggleButton 绑定 EnvironmentEnabled,IsEnabled 绑定 CanUseConnection,禁用时下方写「后台服务未就绪,暂时不能改」)+「环境自检」段(徽章 SelfCheckStatus;说明一句;ItemsControl 绑定 SelfCheckItems:序号作标签、名称 + detail(text-2)、右侧 result;result 映射 通过 Ok/Check、未通过 Bad/X、跳过 N/Ring/Dim、无法核验 Warn/Ask;没有明细时空态「连上一次后才有自检明细」)。\n- Views/AccountPage.xaml:页头 + Mode 徽章;卡一「自用:导入配对文件」(说明 + 主按钮「导入配对文件」ImportPairingCommand);卡二「分发版:输入邀请码」(标签「邀请码」+ 等宽输入框绑定 Code(UpdateSourceTrigger PropertyChanged,AutomationProperties.Name=邀请码)+ 按钮「兑换邀请码」RedeemCommand);右下安静红字按钮「清除本机配对文件」ClearPairingCommand;底部提示「清除后要重新导入才能连接;连接中不能清除。」。\n- Views/UpdatePage.xaml:页头;版本卡(后台服务 ServiceVersionText 或「等待连接」、界面程序 ControlSnapshot.CurrentVersion、上次检查 UpdateCheckedAtText、UpdateMessage)+「检查更新」CheckUpdateCommand;诊断段(说明「把防火墙审计和环境自检报告合成一个文件(不含出口 IP),发给管理员排查。」+「导出诊断…」按钮,行为同旧 Export_Click);更新进行中(Update.Stage 不是 idle 且 UpdateMessage 非空)显示一行 Info/Dots 状态行。\n- 所有文案中文;不出现「⚠」「✓」「✗」等符号当图标;禁用处都有一句原因;每个可点元素有 FocusVisualStyle;Tab 顺序侧栏→页内自上而下。\n\n⑤ ViewModel 增量(winclient/WinClient.App/MainViewModel.cs;命令、IPC 指令、InitializeCoreAsync 的重试与身份核验、ExportAuditAsync 一字不改语义)\n- Availability 私有枚举换成 Presentation 的 ServiceAvailability;新增 public HeroPresentation Hero(Refresh 时用 StatusPresentation.Build(snapshot, availability, ShouldDisconnect) 重算并 Notify);ConnectLabel 改为:IsBusy ? Hero.BusyLabel : Hero.PrimaryLabel;新增 PageKind CurrentPage(默认 Connect;set 时 Notify,切到 Environment 时触发 LoadSelfCheckAsync)、ICommand GoToAccountCommand(CurrentPage = Account);ServiceStateText(「后台服务 · 运行中 / 未运行 / 未安装 / 已中断 / 身份核验失败」按 availability 与 snapshot.Status)、ServiceStateTone、ServiceVersionText(有版本时「版本 x.y.z」否则空)、ModeText(= snapshot.Mode,去掉「当前模式:」前缀)、UpdateCheckedAtText、SelfCheckItems(IReadOnlyList<SelfCheckItemView(int Index, string Name, string Result, string Detail)>)与 LoadSelfCheckAsync():client 存在时发 read_selfcheck,解析 snake_case JSON(checked_at / summary / items[{id,name,result,detail}]),失败或为空时清空;SelfCheckStatus 变化时也重载(只在 CurrentPage==Environment 时)。\n- 新增 public void ApplyPreview(ControlSnapshot snapshot, ServiceAvailability availability):不经 IPC 直接设置 availability 与 snapshot 并 Refresh,供界面测试与渲染;Update/UpdateProtocol/OnConnectionClosed 在 Application.Current 为 null 时直接在当前线程更新(不碰 Dispatcher)。\n- 旧的 Mode / ServiceVersion / ExitLine / GuardLine / SelfCheckLine / EnvironmentLine / RoutingLine 属性可以删除或保留,视图不再绑定它们;Message 的拼接逻辑不变。\n\n⑥ 托盘与程序图标(winclient/WinClient.App/App.xaml(.cs)、WinClient.App.csproj)\n- App.xaml 的 Application.Resources 合并 Themes/Base.xaml、Glyphs.xaml、Controls.xaml,并在 OnStartup 里 ThemeManager.Apply(Resources, ThemeManager.Detect()) 后 ThemeManager.Start();OnExit 时 Stop()。\n- 托盘:Assets/tray-n/info/ok/warn/bad.ico 作 Resource 一次性加载为 System.Drawing.Icon 字典(Application.GetResourceStream 的 pack URI);订阅 window.Model.PropertyChanged,Hero 变化时切换 tray.Icon 与 tray.Text(= Hero.TrayText);启动前默认 tray-n;OnExit 释放全部 Icon。菜单四项与单实例逻辑不变。\n- csproj:加 <ApplicationIcon>Assets/app.ico</ApplicationIcon>、<Resource Include=\"Assets/*.ico\" />、<InternalsVisibleTo Include=\"WinClient.UiTests\" />(如用到 internal);FetchPinnedKernel 目标、三条 EmbeddedResource、StartupObject、UseWindowsForms 等既有内容一字不改;不新增 PackageReference。\n\n⑦ 界面测试工程 winclient/WinClient.UiTests/(新建并加进 winclient/WinClient.sln)\n- csproj:net9.0-windows、UseWPF true、UseWindowsForms true、IsTestProject、只用 WinClient.Tests 已用的三个包与相同版本(Microsoft.NET.Test.Sdk 17.12.0、xunit 2.9.2、xunit.runner.visualstudio 2.8.2),ProjectReference ../WinClient.App/WinClient.App.csproj。\n- StatusPresentationTests.cs:至少十条用例覆盖 DESIGN.md §4.1 的十行(NeedInstall / NeedRepair / Unavailable / Disconnected 全部流量与仅指定程序两句 / Connecting / Connected 正常 / Connected 告警(GuardStatus 含「断网保护未能重新套用」→ Subtitle 为告警原文且 SubtitleTone=Bad、Tray=Warn)/ Reconnecting / NeedsLogin(ShowGoToAccount)/ NeedsManual)与 §4.2 四行的每个分支(用 [Theory] 列 ExitStatus 六种、GuardStatus 五种、SelfCheckStatus 四种、EnvironmentStatus 四种)。\n- ThemeAndMotionTests.cs:Tokens.Light 与 Tokens.Dark 的键集合相同且含 DESIGN.md §7 全部键;ThemeManager.Apply 换字典后 target 里 Yc.Bg 的颜色分别是 #FBFBFA / #0D0D0E;MotionSettings.Override=false 时 StatusTile(Flow=Forward).IsFlowing 为 false,Override=true 时为 true。\n- RenderTests.cs:共享一个 STA 线程夹具(ICollectionFixture:起一条 ApartmentState.STA 线程,线程上 Application.ResourceAssembly = typeof(MainWindow).Assembly,若 Application.Current 为 null 则 new Application { ShutdownMode = OnExplicitShutdown } 并 Dispatcher.Run;测试用 Dispatcher.Invoke 进去);MotionSettings.Override=false;对浅深两套主题各渲染:连接页十种状态(need-install / need-repair / unavailable / disconnected / connecting / connected / connected-warning / reconnecting / needs-login / needs-manual,用 ApplyPreview 喂 ControlSnapshot)与另外四页(routing(两个演示路径)/ environment(喂一份八项自检明细)/ account / update),MainShell 以 880×600 Measure/Arrange 后 RenderTargetBitmap(96dpi)经 PngBitmapEncoder 写到 <仓根>/build/ui-shots/connect-<state>.png、page-<name>.png,深色加 -dark 后缀(共 28 张;仓根 = 从 AppContext.BaseDirectory 向上找到含 winclient/WinClient.sln 的目录);十种连接状态下主按钮相对 MainShell 的左上角坐标与宽高写进 build/ui-shots/primary-button.json({state:{x,y,w,h}}),断言十组完全相同;另断言每张 PNG 非纯色(至少两种像素值)。Environment.UserInteractive 为 false 时直接返回并在输出写明跳过原因。\n- 测试只写 build/ 目录,不写仓库其他位置、不碰注册表、不弹窗、不起后台服务。\n\n⑧ 文档 docs/winclient/界面说明.md(新建)\n写:布局与五页、状态瓦片语法(与看板一致)、状态表指向 DESIGN.md、主题跟随系统(AppsUseLightTheme、标题栏 DwmSetWindowAttribute 在 Win10 1903 以下无效即忽略)、动效清单与门(ClientAreaAnimation,系统关掉「动画效果」则全停)、托盘图标五态、界面测试怎么跑与 build/ui-shots 截图在哪、真机待验证清单(150% 缩放、深色标题栏、关动画后瓦片静止、浅深任务栏托盘图标、连接→断开→重连主按钮不跳)。\n\n⑨ 边界:全程中文;不新增 NuGet;WinClient.Core、WinClient.Tests、App 的 Hosting/、Program.cs、EmbeddedKernelSource.cs、app.manifest、Properties/ 一字不动;IPC 指令集与语义不变;不在工位机器上执行任何防火墙 / 环境脚本、不装服务、不碰注册表写入;Windows 子进程(如有)一律 CreateNoWindow;样张里的演示值(203.0.113.9、1.3.0、Discord 路径)只许出现在测试与截图喂的数据里,不进产品代码;App 的 .cs 与 .xaml(含注释)里不出现 ⚠ ✓ ✗ → ■ ● 这类符号字符,图标一律用 Geometry;拿不准停下交 blocked + forks,不猜。",
+  "background": "项目:外包,中国 Windows 客户端(.NET 9 WPF 后台服务 SYSTEM + 托盘界面,sing-box TUN)+ 澳洲出口节点。负责人指定界面借鉴项目看板(浅暖灰底、白卡、小圆角、四档语义色、等宽数字、状态瓦片灯条语言),要有动效但克制。跑法 dotnet build/test winclient/WinClient.sln(编译产物在仓根 build/winclient/,UseArtifactsOutput);工位无外网,第三方件缓存由派单方放进 winclient/third_party/cache/,App 的 FetchPinnedKernel 目标会从缓存解包,不要碰它。 现状:MainWindow.xaml 480×900 单列默认样式,裸色值、11px 字、「⚠」当图标、无深色主题、无动效、托盘用系统默认图标(见 01-事实卡与走查.md)。MainViewModel 属性:Status / ExitLine / GuardLine / SelfCheckLine / EnvironmentLine / RoutingLine / RoutingIsGlobal / RoutingIsApps / RoutingApps / SelectedRoutingApp / CanChangeRouting / EnvironmentEnabled / Message / ServiceVersion / UpdateMessage / Mode / IsBusy / CanUseConnection / ConnectLabel / Code,命令 Redeem / Connect / ImportPairing / ClearPairing / CheckUpdate / AddRoutingApp / RemoveRoutingApp,ExportAuditAsync(path),ConnectFromTrayAsync / DisconnectFromTrayAsync;私有 Availability { Unavailable, NeedInstall, NeedRepair, Ready };ShouldDisconnect = ProtectionActive || State in Connected/Connecting/Reconnecting;Update/UpdateProtocol 经 Application.Current.Dispatcher。 ControlSnapshot(WinClient.Core.Ipc):State(ConnectionState: Disconnected/Connecting/Connected/Reconnecting/NeedsLogin/NeedsManual)、Status、Message、ProtectionActive、Mode(未配置/自用模式/分发模式)、ExitStatus(未检测/核验中/已核验/不一致/已核验(后台服务出口)/不一致(后台服务出口)/无法核验)、ExitIp、GuardStatus(空/正常/巡检失败,下一轮重试/「系统防火墙已被关闭或被策略覆盖,断网保护可能失效…」/「断网保护未能重新套用:…」)、EnvironmentEnabled、EnvironmentStatus(未应用/未启用/已切换到澳洲时区与浏览器策略/设置失败…/恢复失败…)、SelfCheckStatus(未检测/检测中/「N 项通过」/「N 项通过,M 项未能检查」/「N 项未通过:…」)、RoutingMode(global/apps)、RoutingApps、ServiceVersion、Update(UpdateStatus:Stage/Version/Message/CheckedAt,Stage 默认 idle);静态 ControlSnapshot.CurrentVersion。read_selfcheck 返回 ControlResponse.SelfCheck 字符串 = 落盘的 JSON {checked_at, summary, items:[{id,name,result,detail}]}(snake_case),result ∈ 通过/未通过/跳过/无法核验。 App.xaml.cs:单实例 EventWaitHandle Local/YuanC-ShowWindow、NotifyIcon 菜单(打开窗口 / 连接 / 断开 / 退出界面(隧道不受影响))、DispatcherUnhandledException 弹框、关窗隐藏;Program.cs 按参数分角色(--tray/--service/--apply-update/--install/--uninstall/--repair),不动。csproj:net9.0-windows、UseWPF + UseWindowsForms、EnableDefaultApplicationDefinition=false、StartupObject WinClient.App.Program、ApplicationManifest app.manifest、Using Remove System.Windows.Forms 与 System.Drawing(托盘代码用 Forms. 前缀与 System.Drawing 全名)。现有测试工程 WinClient.Tests 是 net9.0、只引用 Core、链接了 App 的 Hosting/UpdateApplier.cs 与 UpdateRecovery.cs,不能引用 WPF,所以界面测试要新开 net9.0-windows 工程。CI:自托管 Windows runner 跑 dotnet test winclient --nologo。 图标已在主干:winclient/WinClient.App/Assets/app.ico(16~256)与 tray-n/info/ok/warn/bad.ico(16~48)。红线:凭据不入库不入日志;隧道断了不静默回落(界面红字常驻);Windows 子进程一律隐藏窗口;真机未测不标通过;全程中文。",
+  "nonGoals": [
+    "不改 WinClient.Core(控制器、状态机、协议、防火墙、环境)与 WinClient.Tests",
+    "不改 App 的 Hosting/、Program.cs、EmbeddedKernelSource.cs、app.manifest、Properties/",
+    "不改 IPC 指令集与语义;不新增 NuGet;不改第三方件与打包脚本",
+    "不做托盘气泡通知、不做开机自启设置页、不做多语言",
+    "不在真机实测;真机项写进文档待验证清单"
+  ],
+  "allowedPaths": [
+    "winclient/WinClient.App/App.xaml",
+    "winclient/WinClient.App/App.xaml.cs",
+    "winclient/WinClient.App/MainWindow.xaml",
+    "winclient/WinClient.App/MainWindow.xaml.cs",
+    "winclient/WinClient.App/MainViewModel.cs",
+    "winclient/WinClient.App/WinClient.App.csproj",
+    "winclient/WinClient.App/Themes/**",
+    "winclient/WinClient.App/Views/**",
+    "winclient/WinClient.App/Controls/**",
+    "winclient/WinClient.App/Presentation/**",
+    "winclient/WinClient.App/Assets/**",
+    "winclient/WinClient.UiTests/**",
+    "winclient/WinClient.sln",
+    "docs/winclient/界面说明.md"
+  ],
+  "forbiddenPaths": [
+    "docs/开工须知.md",
+    "docs/口径速查表.md",
+    "docs/design/**",
+    "docs/交接/**",
+    "docs/plans/**",
+    "docs/acceptance/**",
+    "docs/node/**",
+    "docs/authserver/**",
+    "docs/winclient/自动更新说明.md",
+    "docs/winclient/打包与发布说明.md",
+    "docs/winclient/分应用代理说明.md",
+    "docs/winclient/架构说明.md",
+    "docs/winclient/服务化与自启说明.md",
+    "docs/winclient/环境一致性说明.md",
+    "docs/winclient/断网保护加固说明.md",
+    ".github/**",
+    ".codex/**",
+    ".gitignore",
+    "pyproject.toml",
+    "scripts/**",
+    "node/**",
+    "authserver/**",
+    "winclient/third_party/**",
+    "winclient/Directory.Build.props",
+    "winclient/NuGet.Config",
+    "winclient/.gitignore",
+    "winclient/WinClient.Core/**",
+    "winclient/WinClient.Tests/**",
+    "winclient/WinClient.App/Hosting/**",
+    "winclient/WinClient.App/Program.cs",
+    "winclient/WinClient.App/EmbeddedKernelSource.cs",
+    "winclient/WinClient.App/app.manifest",
+    "winclient/WinClient.App/Properties/**"
+  ],
+  "expectArtifacts": [
+    "winclient/WinClient.App/MainWindow.xaml",
+    "winclient/WinClient.App/Themes/Tokens.Light.xaml",
+    "winclient/WinClient.App/Themes/Tokens.Dark.xaml",
+    "winclient/WinClient.App/Controls/StatusTile.xaml",
+    "winclient/WinClient.App/Presentation/StatusPresentation.cs",
+    "winclient/WinClient.App/Views/ConnectPage.xaml",
+    "winclient/WinClient.UiTests/WinClient.UiTests.csproj",
+    "docs/winclient/界面说明.md"
+  ],
+  "acceptance": [
+    {
+      "id": "BUILD",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "build",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1200
+    },
+    {
+      "id": "TEST",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "test",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--no-build",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1200
+    },
+    {
+      "id": "UI-TOKENS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,re,sys;fs=[p for p in pathlib.Path('winclient/WinClient.App').rglob('*') if p.suffix in ('.cs','.xaml') and '/obj/' not in p.as_posix() and '/bin/' not in p.as_posix()];bad=[p.as_posix()+':'+k for p in fs for s in [p.read_text(encoding='utf-8')] for k,rx in (('color','#[0-9A-Fa-f]{6}'),('fontsize','FontSize=.[0-9]'),('fontsize','Property=.FontSize. Value=.[0-9]'),('brush','(Brushes|Colors)[.](?!Transparent)')) if re.search(rx,s) and not (k=='color' and 'Themes/Tokens.' in p.as_posix()) and not (k=='fontsize' and p.as_posix().endswith('Themes/Base.xaml'))];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "UI-NO-EMOJI",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,re,sys;rx=re.compile('['+chr(0x2600)+'-'+chr(0x27bf)+chr(0x1F300)+'-'+chr(0x1FAFF)+chr(0x2190)+'-'+chr(0x21ff)+chr(0x25a0)+'-'+chr(0x25ff)+chr(0x2b00)+'-'+chr(0x2bff)+']');fs=[p for p in pathlib.Path('winclient/WinClient.App').rglob('*') if p.suffix in ('.cs','.xaml') and '/obj/' not in p.as_posix() and '/bin/' not in p.as_posix()];bad=[p.as_posix() for p in fs if rx.search(p.read_text(encoding='utf-8'))];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "UI-MOTION-THEME-GUARD",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;fs=[p for p in pathlib.Path('winclient/WinClient.App').rglob('*') if p.suffix in ('.cs','.xaml') and '/obj/' not in p.as_posix() and '/bin/' not in p.as_posix()];s=''.join(p.read_text(encoding='utf-8') for p in fs);bad=[k for k in ('ClientAreaAnimation','UserPreferenceChanged','AppsUseLightTheme','DwmSetWindowAttribute','DynamicResource','FocusVisualStyle','Yc.Focus','IsFlowing','ApplyPreview','StatusPresentation','read_selfcheck') if k not in s];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "UI-LABELS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;fs=[p for p in pathlib.Path('winclient/WinClient.App').rglob('*') if p.suffix in ('.cs','.xaml') and '/obj/' not in p.as_posix() and '/bin/' not in p.as_posix()];s=''.join(p.read_text(encoding='utf-8') for p in fs);need=['安装后台服务','修复后台服务','重新连接后台服务','兑换邀请码','清除本机配对文件','去兑换邀请码','导入配对文件','添加程序','检查更新','导出诊断','连接中不能改代理范围','隧道不受影响','正在连接','正在断开','后台服务 · '];ban=['部分程序自带防火墙放行规则','当前模式：','后台版本：'];bad=[k for k in need if k not in s]+['禁:'+k for k in ban if k in s];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "UI-THEME-KEYS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,re,sys;r=lambda n:pathlib.Path('winclient/WinClient.App/Themes/'+n).read_text(encoding='utf-8');L=r('Tokens.Light.xaml');D=r('Tokens.Dark.xaml');k=lambda s:set(re.findall('x:Key=.([A-Za-z0-9.]+)',s));need={'Yc.Bg','Yc.Surface','Yc.Surface2','Yc.Surface3','Yc.Line','Yc.LineStrong','Yc.CtrlBorder','Yc.Text','Yc.Text2','Yc.Text3','Yc.Ok','Yc.OkBg','Yc.Warn','Yc.WarnBg','Yc.Bad','Yc.BadBg','Yc.Info','Yc.InfoBg','Yc.N','Yc.NBg','Yc.Action','Yc.ActionText','Yc.ActionHover','Yc.ActionPress','Yc.Focus','Yc.Spec.Info','Yc.Spec.Warn','Yc.Shadow'};bad=['keys-differ']*(k(L)!=k(D))+sorted(need-k(L))+['light:'+c for c in ('fbfbfa','7d5609','6b6b66','8a8a85') if c not in L.lower()]+['dark:'+c for c in ('0d0d0e','8d8d92','6a6a6f','d9a441') if c not in D.lower()];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "UI-RENDER",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,json,sys;d=pathlib.Path('build/ui-shots');st=['need-install','need-repair','unavailable','disconnected','connecting','connected','connected-warning','reconnecting','needs-login','needs-manual'];pg=['routing','environment','account','update'];names=['connect-'+s for s in st]+['page-'+p for p in pg];names=names+[n+'-dark' for n in names];bad=[n for n in names if not (d/(n+'.png')).exists() or (d/(n+'.png')).stat().st_size<2000];j=json.loads((d/'primary-button.json').read_text(encoding='utf-8')) if (d/'primary-button.json').exists() else {};vals={json.dumps(v,sort_keys=True) for v in j.values()};bad+=['button-json:%d entries %d distinct'%(len(j),len(vals))] if len(j)<10 or len(vals)!=1 else [];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "UI-TESTS-EXIST",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;fs=list(pathlib.Path('winclient/WinClient.UiTests').rglob('*.cs'));s=''.join(p.read_text(encoding='utf-8') for p in fs);n=s.count('[Fact')+s.count('[Theory')+s.count('[InlineData');bad=[k for k in ('StatusPresentation','MotionSettings','ThemeManager','RenderTargetBitmap','ApartmentState.STA','ApplyPreview','primary-button.json','ui-shots','UserInteractive') if k not in s]+['cases:%d'%n]*(n<30)+['files:%d'%len(fs)]*(len(fs)<3);print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "SLN-CSPROJ",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda p:pathlib.Path(p).read_text(encoding='utf-8');sln=r('winclient/WinClient.sln');app=r('winclient/WinClient.App/WinClient.App.csproj');ui=r('winclient/WinClient.UiTests/WinClient.UiTests.csproj');bad=[k for k,ok in (('sln','WinClient.UiTests' in sln),('icon','ApplicationIcon' in app and 'Assets' in app),('kernel','FetchPinnedKernel' in app and 'YuanC.Kernel.sing-box.exe' in app and 'YuanC.Kernel.wintun.dll' in app),('startup','WinClient.App.Program' in app),('ui-tfm','net9.0-windows' in ui and 'UseWPF' in ui and 'WinClient.App.csproj' in ui and 'xunit' in ui),('nuget',app.count('PackageReference')==1)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "OLD-UNCHANGED",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess,sys;b=subprocess.run(['git','merge-base','origin/main','HEAD'],capture_output=True,text=True).stdout.strip();out=subprocess.run(['git','diff','--name-only',b,'--','winclient/WinClient.Core','winclient/WinClient.Tests','winclient/WinClient.App/Hosting','winclient/WinClient.App/Program.cs','winclient/WinClient.App/EmbeddedKernelSource.cs','winclient/WinClient.App/app.manifest','winclient/WinClient.App/Properties','winclient/Directory.Build.props','winclient/NuGet.Config','winclient/third_party'],capture_output=True,text=True).stdout.split();print(out);sys.exit(1 if out else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "NOWINDOW",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;norm=lambda p:str(p).replace(chr(92),'/');files=[p for root in ('winclient/WinClient.Core','winclient/WinClient.App') for p in pathlib.Path(root).rglob('*.cs') if '/obj/' not in norm(p) and '/bin/' not in norm(p)];bad=[norm(p) for p in files if 'ProcessStartInfo' in p.read_text(encoding='utf-8') and p.parent.name!='Process' and 'CreateNoWindow = true' not in p.read_text(encoding='utf-8')];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "NOBIN",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess,sys;out=subprocess.run(['git','ls-files','winclient','build'],capture_output=True,text=True).stdout.split();bad=[f for f in out if f.endswith(('.exe','.dll','.zip','.pdb','.png'))];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;b=pathlib.Path('docs/winclient/界面说明.md').read_text(encoding='utf-8');bad=[k for k in ('状态瓦片','ClientAreaAnimation','AppsUseLightTheme','DwmSetWindowAttribute','托盘','ui-shots','DESIGN.md','真机','150%') if k not in b];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    }
+  ],
+  "steps": [
+    "读完三份设计正本与样张(含页尾 GLYPH / STATES / PAGES 脚本),读 MainViewModel.cs / App.xaml.cs / MainWindow.xaml(.cs) / WinClient.App.csproj / WinClient.Tests.csproj / WinClient.sln 与 ControlProtocol.cs(只读)。先建 UiTests 工程并写红:StatusPresentationTests(映射表)、ThemeAndMotionTests;再写 Presentation 与 Themes 让它们转绿。",
+    "实现 StatusTile → MainShell 与五页 → ViewModel 增量 → App 托盘与 csproj → RenderTests(28 张截图 + primary-button.json);每一步跑 BUILD / TEST(dotnet build/test winclient/WinClient.sln -c Release),最后跑全部形状断言。渲染测试要在同一条 STA 线程夹具上跑,截图只写仓根 build/ui-shots/。",
+    "写 docs/winclient/界面说明.md;交活说明逐条列出:资源键清单、状态表实现位置、动效清单与门、测试怎么跑、真机待验证项。除 dotnet build/test/restore 外不跑别的命令、不改环境、不写注册表、不起后台服务、不在工位机器上执行任何防火墙 / 环境脚本。"
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "timeoutSec": 14400,
+  "repoRoot": "E:/yuanc"
+}
