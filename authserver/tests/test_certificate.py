@@ -84,8 +84,5 @@ def test_session_has_eleven_node_keys_and_explicit_backup_trust(client, enrolled
     assert node["time_zone"] == ""
     assert node["country"] == ""
     assert node["hy2_certificate"] == settings.node.hy2_certificate
-    backup = next(o for o in body["singbox_config"]["outbounds"] if o["type"] == "hysteria2")
-    assert backup["tls"] == {"enabled": True, "server_name": "backup.example.test",
-                              "certificate": settings.node.hy2_certificate}
     assert "hy2_certificate_path" not in response.text
     assert "hy2_obfs_password_path" not in response.text

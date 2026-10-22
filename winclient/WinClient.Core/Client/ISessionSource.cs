@@ -46,7 +46,7 @@ public sealed class PairingSessionSource : ISessionSource
         return Task.FromResult(new AuthResponse<SessionResponse>(AuthResult.Ok, new SessionResponse
         {
             SessionToken = "", SessionExpiresAt = DateTimeOffset.MaxValue, AccountExpiresAt = DateTimeOffset.MaxValue,
-            Node = pairing.Node, SingboxConfig = LocalConfigRenderer.Render(pairing.Node)
+            Node = pairing.Node
         }));
     }
 }

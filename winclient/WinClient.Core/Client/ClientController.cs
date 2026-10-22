@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Sockets;
 using WinClient.Core.Auth;
+using WinClient.Core.Pairing;
 using WinClient.Core.Firewall;
 using WinClient.Core.State;
 using WinClient.Core.Storage;
@@ -360,8 +361,7 @@ public sealed class ClientController : IDisposable
     private async Task ApplySessionAsync(SessionResponse next)
     {
         var nextIps = NodeIps(next);
-        _ = TunnelTransport.RenderConfiguration(RoutingRenderer.Render(next.SingboxConfig, activeRouting, serviceProcessPath,
-            sessionSource is AuthServerSessionSource ? authEndpoint : null)); // 安装规则前校验渲染后的配置。
+        _ = TunnelTransport.RenderConfiguration(RenderedConfiguration(next)); // 安装规则前校验渲染后的配置。
         var previous = session;
         session = next;
         if (environmentApplied)
@@ -446,9 +446,12 @@ public sealed class ClientController : IDisposable
             x.Sni == y.Sni && x.RealityPublicKey == y.RealityPublicKey && x.ShortId == y.ShortId &&
             x.Uuid == y.Uuid && x.Hy2Password == y.Hy2Password && x.Hy2ServerName == y.Hy2ServerName &&
             x.Hy2ObfsPassword == y.Hy2ObfsPassword &&
-            (x.Hy2Certificate ?? []).SequenceEqual(y.Hy2Certificate ?? [], StringComparer.Ordinal) &&
-            a.SingboxConfig.GetRawText() == b.SingboxConfig.GetRawText();
+            (x.Hy2Certificate ?? []).SequenceEqual(y.Hy2Certificate ?? [], StringComparer.Ordinal);
     }
+
+    private System.Text.Json.JsonElement RenderedConfiguration(SessionResponse value) =>
+        RoutingRenderer.Render(LocalConfigRenderer.Render(value.Node), activeRouting, serviceProcessPath,
+            sessionSource is AuthServerSessionSource ? authEndpoint : null);
 
     private static DateTimeOffset Expiry(SessionResponse value) =>
         value.SessionExpiresAt < value.AccountExpiresAt ? value.SessionExpiresAt : value.AccountExpiresAt;
@@ -501,8 +504,7 @@ public sealed class ClientController : IDisposable
                     { await ExecuteAsync(machine.Handle(new(ConnectionEventKind.SessionExpired))); break; }
                     try
                     {
-                        await tunnel.StartAsync(RoutingRenderer.Render(session.SingboxConfig, activeRouting, serviceProcessPath,
-                            sessionSource is AuthServerSessionSource ? authEndpoint : null), lifetime.Token);
+                        await tunnel.StartAsync(RenderedConfiguration(session), lifetime.Token);
                         lifetime.Token.ThrowIfCancellationRequested();
                         await ExecuteAsync(machine.Handle(new(ConnectionEventKind.TunnelUp)));
                         message = firewallWarning ?? "虚拟网卡已就绪。";
@@ -619,7 +621,7 @@ public sealed class ClientController : IDisposable
         if (lifetime.IsCancellationRequested || disposed) return;
         var report = EnvironmentSelfCheck.Evaluate(new(exit, session!.Node.Host, policy.ExpectedCountry,
             policy.Enabled, environmentApplied, policy.Target, inspection, ipv6,
-            RoutingRenderer.Render(session.SingboxConfig, activeRouting, serviceProcessPath, sessionSource is AuthServerSessionSource ? authEndpoint : null),
+            RenderedConfiguration(session),
             DateTimeOffset.UtcNow) { Routing = activeRouting });
         selfCheckStatus = report.Summary;
         try { reportSink?.Invoke(report); }

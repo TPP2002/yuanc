@@ -9,7 +9,6 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 
-from .clientconfig import render
 from .config import load_config
 from .db import Database
 from .security import hash_token, now
@@ -175,7 +174,6 @@ def create_app(settings=None, db_path=None, clock=now):
     @app.post("/client/session", dependencies=[Depends(session_limit)])
     def session(body: SessionInput, request: Request):
         result = service.session(body.refresh_token.get_secret_value(), ip(request))
-        result["singbox_config"] = render(result["node"], result["node"])
         return result
 
     @app.post("/client/logout")

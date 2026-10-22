@@ -1,5 +1,4 @@
 using System.Net;
-using System.Text.Json;
 using System.Text.Json.Serialization;
 
 namespace WinClient.Core.Auth;
@@ -46,7 +45,6 @@ public sealed class SessionResponse
     public required DateTimeOffset SessionExpiresAt { get; init; }
     public required DateTimeOffset AccountExpiresAt { get; init; }
     public required NodeInfo Node { get; init; }
-    public required JsonElement SingboxConfig { get; init; }
 }
 
 public sealed class NodeInfo
