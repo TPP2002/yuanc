@@ -27,12 +27,30 @@ public sealed class EnvironmentSelfCheckTests
          "dns":{"servers":[{"detour":"proxy"}]},"outbounds":[{"type":"vless","tag":"proxy"}]}
         """;
     internal static EnvironmentInspection GoodInspection => new("AUS Eastern Standard Time", 4,
-        new Dictionary<string, string?> { ["WebRtcIPHandling"] = "default_public_interface_only", ["DefaultGeolocationSetting"] = "2" },
-        new Dictionary<string, string?> { ["DefinePreferredLanguages"] = "en-AU,en", ["WebRtcLocalhostIpHandling"] = "default_public_interface_only", ["DefaultGeolocationSetting"] = "2" },
+        new Dictionary<string, string?> { ["WebRtcIPHandling"] = "default_public_interface_only", ["DefaultGeolocationSetting"] = "2", ["DnsOverHttpsMode"] = "secure", ["DnsOverHttpsTemplates"] = "https://1.1.1.1/dns-query" },
+        new Dictionary<string, string?> { ["DefinePreferredLanguages"] = "en-AU,en", ["WebRtcLocalhostIpHandling"] = "default_public_interface_only", ["DefaultGeolocationSetting"] = "2", ["DnsOverHttpsMode"] = "secure", ["DnsOverHttpsTemplates"] = "https://1.1.1.1/dns-query" },
         ["en-AU", "en"]);
     private static SelfCheckInput Good => new(new(IPAddress.Parse("192.0.2.5"), "AU"), "192.0.2.5", "AU",
         true, true, EnvironmentSettingsStore.Default.Target, GoodInspection, false,
         JsonSerializer.Deserialize<JsonElement>(GoodConfig), DateTimeOffset.Parse("2026-10-22T00:00:00Z"));
+
+    [Fact]
+    public void DohPolicyMismatchNamesOnlyTheValueName()
+    {
+        var inspection = GoodInspection;
+        var chrome = inspection.Chrome.ToDictionary(pair => pair.Key, pair => pair.Value);
+        var edge = inspection.Edge.ToDictionary(pair => pair.Key, pair => pair.Value);
+        chrome["DnsOverHttpsMode"] = "automatic";
+        edge["DnsOverHttpsTemplates"] = "https://resolver.example/dns-query";
+        var report = EnvironmentSelfCheck.Evaluate(Good with { Inspection = inspection with { Chrome = chrome, Edge = edge } });
+        Assert.Equal("未通过", report.Items[4].Result);
+        Assert.Contains("DnsOverHttpsMode", report.Items[4].Detail);
+        Assert.DoesNotContain("automatic", report.Items[4].Detail);
+        Assert.Equal("未通过", report.Items[5].Result);
+        Assert.Contains("DnsOverHttpsTemplates", report.Items[5].Detail);
+        Assert.DoesNotContain("https://resolver.example/dns-query", report.Items[5].Detail);
+        Assert.All(report.Items.Where((_, index) => index != 4 && index != 5), item => Assert.Equal("通过", item.Result));
+    }
 
     [Fact]
     public void ReportWritesAtomicallyWithContractFieldsAndNoAddress()
