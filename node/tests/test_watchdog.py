@@ -622,3 +622,121 @@ def test_sanitize_clock_without_future_is_silent():
     config, runner = setup()
     assert run_at(config, runner) == 0
     assert not any(a["action"] == "clock_adjusted" for a in state.read(config, runner)["actions"])
+
+
+def test_sanitize_clock_keeps_cooldown_within_backoff():
+    from exitnode.watchdog.ladder import sanitize_clock
+
+    value = state.fresh()
+    deadline = (NOW + timedelta(seconds=600)).isoformat()
+    value["next_action_at"] = deadline
+    assert sanitize_clock(value, NOW, 900) == 0
+    assert value["next_action_at"] == deadline
+    assert value["actions"] == []
+    assert sanitize_clock(value, NOW) == 1
+    assert value["next_action_at"] is None
+    assert value["actions"][-1]["action"] == "clock_adjusted"
+
+
+def test_cooldown_beyond_backoff_is_still_future():
+    from exitnode.watchdog.ladder import sanitize_clock
+
+    value = state.fresh()
+    deadline = (NOW + timedelta(seconds=1200)).isoformat()
+    value["next_action_at"] = deadline
+    assert sanitize_clock(value, NOW, 900) == 0
+    assert value["next_action_at"] == deadline
+    assert value["actions"] == []
+    value["last_ok_at"] = (NOW + timedelta(seconds=301)).isoformat()
+    assert sanitize_clock(value, NOW, 900) == 1
+    assert value["last_ok_at"] is None
+    assert value["next_action_at"] == deadline
+    assert value["actions"][-1]["action"] == "clock_adjusted"
+    value["next_action_at"] = (NOW + timedelta(seconds=1201)).isoformat()
+    assert sanitize_clock(value, NOW, 900) == 1
+    assert value["next_action_at"] is None
+    assert value["actions"][-1]["action"] == "clock_adjusted"
+
+
+def test_long_backoff_cooldown_is_respected_by_tick():
+    runner = fake(pairing=True)
+    original = runner.files[CONFIG]
+    retry_changed = original.replace("retry_interval_seconds = 60", "retry_interval_seconds = 240")
+    assert retry_changed != original
+    runner.files[CONFIG] = retry_changed.replace("max_backoff_seconds = 300",
+                                                "max_backoff_seconds = 900")
+    assert runner.files[CONFIG] != retry_changed
+    config = load(CONFIG, runner)
+    runner.responses[("systemctl", "is-active", "exitnode-proxy.service")] = CompletedResult(out="active\n")
+    runner.responses[("ss", "-ltnH")] = CompletedResult(out="LISTEN 0 128 *:443 *:*\n")
+    runner.responses[("ss", "-lunH")] = CompletedResult(out="UNCONN 0 0 [::]:24443 [::]:*\n")
+    runner.files[LIVE] = '{"password":"SECRET-PASSWORD","uuid":"test-identity"}'
+    broken(runner)
+    value = state.fresh()
+    deadline = (NOW + timedelta(seconds=420)).isoformat()
+    value.update(state="degraded", consecutive_failures=9,
+                 first_failure_at=(NOW - timedelta(minutes=10)).isoformat(),
+                 restart_times=[(NOW - timedelta(minutes=8)).isoformat(),
+                                (NOW - timedelta(minutes=4)).isoformat()],
+                 restart_count_window=2, next_action_at=deadline)
+    state.save(config, runner, value, NOW)
+    assert run_at(config, runner) == 1
+    assert RESTART not in commands(runner)
+    assert clock_actions(config, runner) == []
+    saved = state.read(config, runner)
+    assert saved["next_action_at"] == deadline
+    assert saved["actions"][-1]["action"] == "wait"
+    assert "冷却中" in saved["actions"][-1]["reason"]
+    assert run_at(config, runner, 6) == 1
+    assert RESTART not in commands(runner)
+    assert run_at(config, runner, 7) == 1
+    assert commands(runner).count(RESTART) == 1
+    assert clock_actions(config, runner) == []
+
+
+def test_default_backoff_keeps_cooldown_tolerance_at_600():
+    for seconds in (600, 601):
+        config, runner = setup()
+        broken(runner)
+        value = state.fresh()
+        deadline = (NOW + timedelta(seconds=seconds)).isoformat()
+        value.update(state="degraded", consecutive_failures=9,
+                     first_failure_at=(NOW - timedelta(minutes=10)).isoformat(),
+                     restart_times=[(NOW - timedelta(minutes=8)).isoformat(),
+                                    (NOW - timedelta(minutes=4)).isoformat()],
+                     restart_count_window=2, next_action_at=deadline)
+        state.save(config, runner, value, NOW)
+        assert run_at(config, runner) == 1
+        if seconds == 600:
+            assert clock_actions(config, runner) == []
+            assert RESTART not in commands(runner)
+            saved = state.read(config, runner)
+            assert saved["next_action_at"] == deadline
+            assert saved["actions"][-1]["action"] == "wait"
+        else:
+            assert len(clock_actions(config, runner)) == 1
+            assert commands(runner).count(RESTART) == 1
+
+
+def test_decide_respects_cooldown_within_backoff_without_sanitize():
+    runner = fake(pairing=True)
+    original = runner.files[CONFIG]
+    retry_changed = original.replace("retry_interval_seconds = 60", "retry_interval_seconds = 240")
+    assert retry_changed != original
+    runner.files[CONFIG] = retry_changed.replace("max_backoff_seconds = 300",
+                                                "max_backoff_seconds = 900")
+    assert runner.files[CONFIG] != retry_changed
+    config = load(CONFIG, runner)
+    value = state.fresh()
+    value.update(state="degraded", consecutive_failures=9,
+                 first_failure_at=(NOW - timedelta(minutes=10)).isoformat(),
+                 restart_times=[(NOW - timedelta(minutes=8)).isoformat(),
+                                (NOW - timedelta(minutes=4)).isoformat()],
+                 restart_count_window=2,
+                 next_action_at=(NOW + timedelta(seconds=420)).isoformat())
+    rows = [{"layer": "L-proxy", "result": "失败", "reason": "测试"}]
+    action = decide(value, rows, NOW, config)
+    assert action.name == "wait"
+    assert "冷却中" in action.reason
+    value["next_action_at"] = (NOW + timedelta(seconds=1201)).isoformat()
+    assert decide(value, rows, NOW, config).name == "restart_service"
