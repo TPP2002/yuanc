@@ -22,7 +22,8 @@
     <Button Grid.Row="2" Content="{Binding ConnectLabel}" Command="{Binding ConnectCommand}" Height="68" FontSize="23" Margin="0,24,0,18"/>
     <StackPanel Grid.Row="3">
       <TextBlock Text="{Binding Status}" FontSize="20" FontWeight="SemiBold" HorizontalAlignment="Center"/>
-      <TextBlock Text="当前出口 IP：待检测" HorizontalAlignment="Center" Margin="0,12,0,0" Foreground="#536174"/>
+      <TextBlock Text="{Binding ExitLine}" TextWrapping="Wrap" HorizontalAlignment="Center" Margin="0,12,0,0" Foreground="#536174"/>
+      <TextBlock Text="{Binding GuardLine}" TextWrapping="Wrap" HorizontalAlignment="Center" Margin="0,8,0,0" Foreground="#8A2E2E" AutomationProperties.LiveSetting="Polite"/>
       <TextBlock Text="{Binding ServiceVersion}" HorizontalAlignment="Center" Margin="0,12,0,0"/>
       <TextBlock Text="{Binding UpdateMessage}" TextWrapping="Wrap" Margin="0,8,0,0" AutomationProperties.LiveSetting="Polite"/>
       <Button Content="检查更新" Command="{Binding CheckUpdateCommand}" HorizontalAlignment="Center" Padding="16,6" Margin="0,8,0,0"/>

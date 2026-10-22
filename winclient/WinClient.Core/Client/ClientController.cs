@@ -19,11 +19,28 @@ internal interface IRenewableSessionSource : ISessionSource { }
 public sealed record ClientSnapshot(ConnectionState State, string Status, string Message, bool ProtectionActive)
 {
     public string Mode { get; init; } = "未配置";
+    public string ExitStatus { get; init; } = "未检测";
+    public string ExitIp { get; init; } = "";
+    public string GuardStatus { get; init; } = "";
 }
 
 /// <summary>Owns the serialized user flow, effects and session lifetime; no UI dependencies.</summary>
 public sealed class ClientController : IDisposable
 {
+    internal static readonly TimeSpan ExitCheckDelay = TimeSpan.FromSeconds(3);
+    internal static readonly TimeSpan ExitCheckRetry = TimeSpan.FromSeconds(5);
+    internal const int ExitCheckAttempts = 5;
+    internal static readonly TimeSpan ExitRecheckInterval = TimeSpan.FromMinutes(5);
+    internal static readonly TimeSpan PatrolInterval = TimeSpan.FromSeconds(60);
+    // 测试可同时记录所有用途；未注入时仍使用原有 delayAsync，不改变调度行为。
+    internal Func<TimeSpan, CancellationToken, string, Task>? DelayWithPurposeAsync { get; set; }
+    private readonly IExitProbe? exitProbe;
+    private string exitStatus = "未检测";
+    private string exitIp = "";
+    private string guardStatus = "";
+    private object? exitCycle;
+    private bool patrolScheduled;
+    private object? patrolCycle;
     // 会话续期（邀请码模式）：有效期走到八成时续期；网络类失败每五分钟重试，直到到期前一分钟为止。
     internal const double RenewAtFraction = 0.8;
     internal static readonly TimeSpan RenewRetryInterval = TimeSpan.FromMinutes(5);
@@ -43,16 +60,17 @@ public sealed class ClientController : IDisposable
     private bool disposed;
     private long generation;
     private string message = "";
-    public ClientSnapshot Snapshot => new(machine.State, machine.StatusText, message, protection) { Mode = sessionSource?.Mode ?? "未配置" };
+    public ClientSnapshot Snapshot => new(machine.State, machine.StatusText, message, protection)
+    { Mode = sessionSource?.Mode ?? "未配置", ExitStatus = exitStatus, ExitIp = exitIp, GuardStatus = guardStatus };
     public event Action<ClientSnapshot>? Changed;
 
     public ClientController(AuthApiClient? auth, ICredentialStore credentials, IKillSwitch firewall,
-        ITunnelTransport tunnel, string program, DeviceInfo device, AuthEndpoint? authEndpoint = null)
-        : this(auth is null ? null : new AuthServerSessionSource(auth, credentials), firewall, tunnel, program, device, authEndpoint: authEndpoint) { }
+        ITunnelTransport tunnel, string program, DeviceInfo device, AuthEndpoint? authEndpoint = null, IExitProbe? exitProbe = null)
+        : this(auth is null ? null : new AuthServerSessionSource(auth, credentials), firewall, tunnel, program, device, authEndpoint: authEndpoint, exitProbe: exitProbe) { }
 
     public ClientController(ISessionSource? sessionSource, IKillSwitch firewall,
         ITunnelTransport tunnel, string program, DeviceInfo device, Func<TimeSpan, CancellationToken, Task>? delayAsync = null,
-        AuthEndpoint? authEndpoint = null)
+        AuthEndpoint? authEndpoint = null, IExitProbe? exitProbe = null)
     {
         this.sessionSource = sessionSource;
         this.delayAsync = delayAsync ?? ((delay, token) => Task.Delay(delay, token));
@@ -61,6 +79,7 @@ public sealed class ClientController : IDisposable
         this.program = program;
         this.authEndpoint = authEndpoint;
         this.device = device;
+        this.exitProbe = exitProbe;
         tunnel.TunnelDown += OnTunnelDown;
     }
 
@@ -161,6 +180,7 @@ public sealed class ClientController : IDisposable
         await gate.WaitAsync();
         try
         {
+            guardStatus = "";
             // Execution is ordered: a failure to stop the tunnel must not proceed to Remove.
             await ExecuteAsync(machine.Handle(new(ConnectionEventKind.UserDisconnect)));
             session = null;
@@ -226,7 +246,7 @@ public sealed class ClientController : IDisposable
         if (sessionSource is not (AuthServerSessionSource or IRenewableSessionSource)) return;
         var remaining = Expiry(value) - DateTimeOffset.UtcNow;
         if (remaining <= RenewMinLead) return;
-        Schedule(remaining * RenewAtFraction, () => RenewAsync(value));
+        Schedule(remaining * RenewAtFraction, () => RenewAsync(value), "续期");
     }
 
     /// <summary>
@@ -261,7 +281,7 @@ public sealed class ClientController : IDisposable
         if (remaining > RenewMinLead)
         {
             var wait = remaining - RenewMinLead;
-            Schedule(wait < RenewRetryInterval ? wait : RenewRetryInterval, () => RenewAsync(value));
+            Schedule(wait < RenewRetryInterval ? wait : RenewRetryInterval, () => RenewAsync(value), "续期");
         }
     }
 
@@ -282,6 +302,12 @@ public sealed class ClientController : IDisposable
         value.SessionExpiresAt < value.AccountExpiresAt ? value.SessionExpiresAt : value.AccountExpiresAt;
 
     private async Task ExecuteAsync(Transition transition)
+    {
+        try { await ExecuteEffectsAsync(transition); }
+        finally { UpdateMonitoring(); }
+    }
+
+    private async Task ExecuteEffectsAsync(Transition transition)
     {
         Publish();
         foreach (var effect in transition.Effects)
@@ -329,9 +355,110 @@ public sealed class ClientController : IDisposable
                         await ExecuteAsync(next);
                         if (machine.State == ConnectionState.Reconnecting && !next.Effects.Any(e => e.Kind == EffectKind.StartTunnel))
                             await FetchSessionAsync();
-                    });
+                    }, "退避");
                     break;
             }
+        }
+    }
+
+    /// <summary>在迁移处理完成后统一更新监测；所有回调沿用串行锁、代数与生命周期。</summary>
+    private void UpdateMonitoring()
+    {
+        if (machine.State != ConnectionState.Connected)
+        {
+            exitStatus = "未检测";
+            exitIp = "";
+            exitCycle = null;
+        }
+        else if (session is not null && exitProbe is not null && exitCycle is null)
+        {
+            exitCycle = new object();
+            exitStatus = "核验中";
+            ScheduleExitCheck(ExitCheckDelay, exitCycle, 1);
+        }
+        if (!ShouldPatrol)
+        {
+            patrolScheduled = false;
+            patrolCycle = null;
+        }
+        else if (!patrolScheduled)
+        {
+            patrolCycle = new object();
+            SchedulePatrol(patrolCycle);
+        }
+    }
+
+    private bool ShouldPatrol => protection && machine.State is ConnectionState.Connected or ConnectionState.Reconnecting;
+
+    private void ScheduleExitCheck(TimeSpan wait, object cycle, int attempt)
+        => Schedule(wait, () => CheckExitAsync(cycle, attempt), "出口核验");
+
+    private async Task CheckExitAsync(object cycle, int attempt)
+    {
+        // 同一生命周期内也可能先断线后重连；连接轮次防止旧探测重复续排。
+        if (!ReferenceEquals(cycle, exitCycle) || machine.State != ConnectionState.Connected || session is null) return;
+        exitStatus = "核验中";
+        Publish();
+        IPAddress? address;
+        try { address = await exitProbe!.ProbeAsync(lifetime.Token); }
+        catch (Exception ex) when (IsOperational(ex) || ex is HttpRequestException) { address = null; }
+        if (lifetime.IsCancellationRequested || disposed) return;
+        if (address is not null)
+        {
+            exitIp = address.ToString();
+            var matches = IPAddress.TryParse(session.Node.Host, out var expected) && address.Equals(expected);
+            exitStatus = matches ? "已核验" : "不一致";
+            if (!matches) message = "出口地址与澳洲节点不一致,请联系管理员;断网保护保持,未自动断开。";
+        }
+        else if (attempt < ExitCheckAttempts)
+        {
+            ScheduleExitCheck(ExitCheckRetry, cycle, attempt + 1);
+            return;
+        }
+        else
+        {
+            exitStatus = "无法核验";
+            exitIp = "";
+        }
+        ScheduleExitCheck(ExitRecheckInterval, cycle, 1);
+    }
+
+    private void SchedulePatrol(object cycle)
+    {
+        patrolScheduled = true;
+        Schedule(PatrolInterval, () => PatrolAsync(cycle), "巡检");
+    }
+
+    private async Task PatrolAsync(object cycle)
+    {
+        if (!ReferenceEquals(cycle, patrolCycle) || !ShouldPatrol) return;
+        try
+        {
+            var report = await firewall.PatrolAsync(KillSwitchPlanner.ExpectedRuleNames(sessionSource is AuthServerSessionSource));
+            if (lifetime.IsCancellationRequested || disposed) return;
+            if (report.MissingRules.Count > 0)
+            {
+                if (session is not null)
+                {
+                    await firewall.ApplyAsync(NodeIps(session), program, session.Node.Hy2Port, session.Node.RealityPort,
+                        sessionSource is AuthServerSessionSource ? authEndpoint : null);
+                    guardStatus = $"已重建 {report.MissingRules.Count} 条本项目规则";
+                }
+                else guardStatus = "巡检失败,下一轮重试";
+            }
+            else if (!report.Clean) guardStatus = $"已重新收紧 {report.Reenforced.Count + report.NewlyDisabled.Count} 条规则";
+            else guardStatus = "正常";
+        }
+        catch (FirewallIneffectiveException)
+        {
+            guardStatus = "系统防火墙已被关闭或被策略覆盖,断网保护可能失效,请立即在 Windows 安全中心开启防火墙或联系管理员";
+            message = guardStatus;
+        }
+        catch (Exception ex) when (IsOperational(ex)) { guardStatus = "巡检失败,下一轮重试"; }
+        finally
+        {
+            Publish();
+            if (!disposed && !lifetime.IsCancellationRequested && ShouldPatrol && ReferenceEquals(cycle, patrolCycle)) SchedulePatrol(cycle);
         }
     }
 
@@ -340,25 +467,25 @@ public sealed class ClientController : IDisposable
         Schedule(Expiry(value) - DateTimeOffset.UtcNow, async () =>
         {
             if (ReferenceEquals(value, session)) await ExecuteAsync(machine.Handle(new(ConnectionEventKind.SessionExpired)));
-        });
+        }, "到期");
     }
-    private void Schedule(TimeSpan delay, Func<Task> action)
+    private void Schedule(TimeSpan delay, Func<Task> action, string purpose = "")
     {
         var expected = Interlocked.Read(ref generation);
         var token = lifetime.Token;
-        _ = RunScheduledAsync(delay < TimeSpan.Zero ? TimeSpan.Zero : delay, expected, token, action);
+        _ = RunScheduledAsync(delay < TimeSpan.Zero ? TimeSpan.Zero : delay, expected, token, action, purpose);
     }
-    private async Task RunScheduledAsync(TimeSpan delay, long expected, CancellationToken token, Func<Task> action)
+    private async Task RunScheduledAsync(TimeSpan delay, long expected, CancellationToken token, Func<Task> action, string purpose)
     {
         try
         {
             // Task.Delay cannot accept a year-9999 session lifetime. Recheck in bounded chunks.
             while (delay > TimeSpan.FromDays(1))
             {
-                await delayAsync(TimeSpan.FromDays(1), token);
+                await DelayForPurposeAsync(TimeSpan.FromDays(1), token, purpose);
                 delay -= TimeSpan.FromDays(1);
             }
-            await delayAsync(delay, token);
+            await DelayForPurposeAsync(delay, token, purpose);
             await gate.WaitAsync(token);
             try
             {
@@ -370,6 +497,8 @@ public sealed class ClientController : IDisposable
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested) { }
     }
+    private Task DelayForPurposeAsync(TimeSpan delay, CancellationToken token, string purpose)
+        => DelayWithPurposeAsync?.Invoke(delay, token, purpose) ?? delayAsync(delay, token);
     private void OnTunnelDown(object? sender, EventArgs e) => Schedule(TimeSpan.Zero,
         () => ExecuteAsync(machine.Handle(new(ConnectionEventKind.TunnelDown))));
 
@@ -425,6 +554,7 @@ public sealed class ClientController : IDisposable
         Interlocked.Increment(ref generation);
         tunnel.TunnelDown -= OnTunnelDown;
         tunnel.Dispose();
+        if (exitProbe is IDisposable disposableProbe) disposableProbe.Dispose();
         // Closing the UI is not UserDisconnect. Leave the firewall snapshot for next-start recovery.
     }
 }

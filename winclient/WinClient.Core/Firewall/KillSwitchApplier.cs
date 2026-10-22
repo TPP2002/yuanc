@@ -1,10 +1,18 @@
 using System.Diagnostics;
 using System.Net;
+using System.Text.Json;
 
 namespace WinClient.Core.Firewall;
 
+public sealed record PatrolReport(IReadOnlyList<string> Reenforced, IReadOnlyList<string> NewlyDisabled, IReadOnlyList<string> MissingRules)
+{
+    public static PatrolReport Empty => new([], [], []);
+    public bool Clean => Reenforced.Count == 0 && NewlyDisabled.Count == 0 && MissingRules.Count == 0;
+}
+
 public interface IKillSwitch
 {
+    Task<PatrolReport> PatrolAsync(IReadOnlyList<string> expectedRules) => Task.FromResult(PatrolReport.Empty);
     bool HasPendingState { get; }
     Task ApplyAsync(IReadOnlyList<IPAddress> ips, string program, int hy2Port, AuthEndpoint? auth = null);
     Task UpdateNodeAsync(IReadOnlyList<IPAddress> ips, string program, int hy2Port);
@@ -43,6 +51,34 @@ public sealed class KillSwitchApplier : IKillSwitch
     public Task UpdateNodeAsync(IReadOnlyList<IPAddress> ips, string program, int hy2Port, int realityPort) =>
         ExecuteAsync(KillSwitchPlanner.UpdateNode(ips, program, hy2Port, realityPort));
     public Task RemoveAsync() => ExecuteAsync([new RemoveRulesByPrefix(KillSwitchPlanner.Prefix), new RestoreProfileDefault()]);
+
+    public async Task<PatrolReport> PatrolAsync(IReadOnlyList<string> expectedRules)
+    {
+        await gate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(180));
+            var script = KillSwitchPlanner.ToPowerShellScript([new Patrol(expectedRules.ToArray())], StatePath, AuditPath);
+            var result = await runner.RunAsync(CreateStartInfo(script), timeout.Token).ConfigureAwait(false);
+            if (result.ExitCode == VerifyFailedExitCode)
+                throw new FirewallIneffectiveException("系统防火墙已被关闭或被策略覆盖，断网保护无法生效，已拒绝连接。请点击断开，在 Windows 安全中心开启防火墙（或联系管理员解除策略）后重新连接。");
+            if (result.ExitCode != 0) throw new InvalidOperationException("断网保护巡检失败,请联系管理员。");
+            try
+            {
+                var line = result.Output.Split('\n').LastOrDefault(value => !string.IsNullOrWhiteSpace(value));
+                using var json = JsonDocument.Parse(line ?? "");
+                return new(ReadNames(json.RootElement, "reenforced"), ReadNames(json.RootElement, "newly_disabled"),
+                    ReadNames(json.RootElement, "missing_rules"));
+            }
+            catch (Exception ex) when (ex is JsonException or InvalidOperationException or KeyNotFoundException)
+            { throw new InvalidOperationException("断网保护巡检失败,请联系管理员。"); }
+        }
+        finally { gate.Release(); }
+    }
+
+    private static string[] ReadNames(JsonElement value, string name)
+        => value.GetProperty(name).EnumerateArray().Select(item => item.GetString() ?? throw new JsonException()).ToArray();
+
     // A snapshot with applied=false also needs recovery: the process may have died partway through Apply.
     public async Task<string?> RecoverAsync()
     {

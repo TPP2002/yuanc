@@ -16,10 +16,15 @@ public sealed record ControlSnapshot(ConnectionState State, string Status, strin
 {
     public static string CurrentVersion => ServiceInstaller.ReleaseVersion(typeof(ControlProtocol).Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()!.InformationalVersion);
     public string Mode { get; init; } = "未配置";
+    public string ExitStatus { get; init; } = "未检测";
+    public string ExitIp { get; init; } = "";
+    public string GuardStatus { get; init; } = "";
     public string ServiceVersion { get; init; } = CurrentVersion;
     public UpdateStatus Update { get; init; } = new();
-    public static implicit operator ControlSnapshot(ClientSnapshot value) => new(value.State, value.Status, value.Message, value.ProtectionActive) { Mode = value.Mode };
-    public static implicit operator ClientSnapshot(ControlSnapshot value) => new(value.State, value.Status, value.Message, value.ProtectionActive) { Mode = value.Mode };
+    public static implicit operator ControlSnapshot(ClientSnapshot value) => new(value.State, value.Status, value.Message, value.ProtectionActive)
+    { Mode = value.Mode, ExitStatus = value.ExitStatus, ExitIp = value.ExitIp, GuardStatus = value.GuardStatus };
+    public static implicit operator ClientSnapshot(ControlSnapshot value) => new(value.State, value.Status, value.Message, value.ProtectionActive)
+    { Mode = value.Mode, ExitStatus = value.ExitStatus, ExitIp = value.ExitIp, GuardStatus = value.GuardStatus };
 }
 
 public static class ControlProtocol

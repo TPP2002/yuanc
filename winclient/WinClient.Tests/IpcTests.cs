@@ -14,6 +14,28 @@ namespace WinClient.Tests;
 public sealed class IpcTests
 {
     [Fact]
+    public void ExitAndGuardFieldsRoundTripThroughBothSnapshotConversions()
+    {
+        var snapshot = new ClientSnapshot(ConnectionState.Connected, "已连接", "", true)
+        { ExitStatus = "已核验", ExitIp = "192.0.2.5", GuardStatus = "正常" };
+        ControlSnapshot control = snapshot;
+        var encoded = ControlProtocol.Encode(new ControlResponse(7, true, Snapshot: control));
+        Assert.Contains("exit_status", encoded);
+        Assert.Contains("exit_ip", encoded);
+        Assert.Contains("guard_status", encoded);
+        var decoded = ControlProtocol.DecodeResponse(encoded).Snapshot!;
+        Assert.Equal(snapshot.ExitStatus, decoded.ExitStatus);
+        Assert.Equal(snapshot.ExitIp, decoded.ExitIp);
+        Assert.Equal(snapshot.GuardStatus, decoded.GuardStatus);
+        ClientSnapshot restored = decoded;
+        Assert.Equal(snapshot, restored);
+        var legacy = ControlProtocol.DecodeResponse("{\"id\":1,\"ok\":true,\"snapshot\":{\"state\":\"Disconnected\",\"status\":\"\",\"message\":\"\",\"protection_active\":false}}").Snapshot!;
+        Assert.Equal("未检测", legacy.ExitStatus);
+        Assert.Equal("", legacy.ExitIp);
+        Assert.Equal("", legacy.GuardStatus);
+    }
+
+    [Fact]
     public void ProtocolRoundTripsAndUsesContractNames()
     {
         var request = new ControlRequest(42, "import_pairing", PairingJson: "中文\n配对内容");
