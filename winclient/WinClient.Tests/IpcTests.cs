@@ -7,6 +7,7 @@ using WinClient.Core.Ipc;
 using WinClient.Core.Pairing;
 using WinClient.Core.State;
 using WinClient.Core.Storage;
+using WinClient.Core.Update;
 using Xunit;
 
 namespace WinClient.Tests;
@@ -69,7 +70,7 @@ public sealed class IpcTests
     [Theory]
     [InlineData(true)]
     [InlineData(false)]
-    public async Task ReadSelfCheckAllowsUntrustedCallersAndPreservesContent(bool trusted)
+    public async Task ReadSelfCheckRequiresTrustedCallerAndPreservesContent(bool trusted)
     {
         using var temp = new TempDirectory();
         using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(5));
@@ -81,7 +82,15 @@ public sealed class IpcTests
         using (var client = new ControlClient(peer))
         {
             var response = await client.SendAsync("read_selfcheck", cancellationToken: stop.Token);
-            Assert.True(response.Ok); Assert.Equal(facade.ReadSelfCheck(), response.SelfCheck);
+            if (trusted)
+            {
+                Assert.True(response.Ok); Assert.Equal(facade.ReadSelfCheck(), response.SelfCheck);
+            }
+            else
+            {
+                Assert.False(response.Ok); Assert.Equal(ControlServer.UntrustedCallerError, response.Error);
+                Assert.Null(response.SelfCheck); Assert.Null(response.Snapshot);
+            }
             Assert.Empty(facade.Actions); Assert.Null(desired.Read());
         }
         await serving.WaitAsync(stop.Token);
@@ -362,7 +371,7 @@ public sealed class IpcTests
     }
 
     [Fact]
-    public async Task UntrustedCallerCannotChangeStateButCanRead()
+    public async Task UntrustedCallerCanOnlyQueryStatusAndSubscribe()
     {
         using var temp = new TempDirectory();
         using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(5));
@@ -373,25 +382,24 @@ public sealed class IpcTests
         var serving = server.ServeAsync(host, stop.Token, callerTrusted: false);
         using (var client = new ControlClient(peer))
         {
-            // 五个会改变连接状态的指令一律被拒：不调门面、不写期望状态。
-            foreach (var (op, code, pairing) in new (string, string?, string?)[] { ("connect", null, null), ("disconnect", null, null), ("redeem", "邀请码", null), ("import_pairing", null, "配对正文"), ("clear_pairing", null, null) })
+            // 改状态与受限的只读指令一律被拒：不调门面、不写期望状态。
+            foreach (var (op, code, pairing) in new (string, string?, string?)[] { ("connect", null, null), ("disconnect", null, null), ("redeem", "邀请码", null), ("import_pairing", null, "配对正文"), ("clear_pairing", null, null), ("check_update", null, null), ("read_audit", null, null), ("read_selfcheck", null, null) })
             {
                 var rejected = await client.SendAsync(op, code: code, pairingJson: pairing, cancellationToken: stop.Token);
                 Assert.False(rejected.Ok);
                 Assert.Equal(ControlServer.UntrustedCallerError, rejected.Error);
                 Assert.Null(rejected.Snapshot);
+                Assert.Null(rejected.Audit); Assert.Null(rejected.SelfCheck);
             }
             Assert.Empty(facade.Actions);
             Assert.Null(desired.Read());
             Assert.False(File.Exists(Path.Combine(temp.Path, "desired.json")));
-            // 同一连接上的只读指令照常可用。
-            foreach (var op in new[] { "status", "subscribe", "check_update" })
+            // 同一连接上只有状态查询与订阅照常可用。
+            foreach (var op in new[] { "status", "subscribe" })
             {
                 var reply = await client.SendAsync(op, cancellationToken: stop.Token);
                 Assert.True(reply.Ok); Assert.NotNull(reply.Snapshot);
             }
-            var audit = await client.SendAsync("read_audit", cancellationToken: stop.Token);
-            Assert.True(audit.Ok); Assert.Equal("完整审计", audit.Audit);
             Assert.Empty(facade.Actions);
         }
         await serving.WaitAsync(stop.Token);
@@ -512,6 +520,66 @@ public sealed class IpcTests
         var bytes = File.ReadAllBytes(Path.Combine(temp.Path, "device-id"));
         Assert.DoesNotContain(fingerprint, Encoding.UTF8.GetString(bytes));
         Assert.Equal(fingerprint, Encoding.UTF8.GetString(ProtectedData.Unprotect(bytes, null, DataProtectionScope.LocalMachine)));
+    }
+
+    [Fact]
+    public async Task TrustedCallerStillReadsAuditSelfCheckAndChecksUpdate()
+    {
+        using var temp = new TempDirectory();
+        using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var facade = new FakeFacade();
+        var desired = new DesiredStateStore(temp.Path);
+        var updates = new FakeUpdates();
+        var server = new ControlServer(facade, desired, updates);
+        var (peer, host) = DuplexStream.Pair();
+        var serving = server.ServeAsync(host, stop.Token);
+        using (var client = new ControlClient(peer))
+        {
+            var audit = await client.SendAsync("read_audit", cancellationToken: stop.Token);
+            Assert.True(audit.Ok); Assert.Equal("完整审计", audit.Audit);
+            var selfCheck = await client.SendAsync("read_selfcheck", cancellationToken: stop.Token);
+            Assert.True(selfCheck.Ok); Assert.Equal(facade.ReadSelfCheck(), selfCheck.SelfCheck);
+            var update = await client.SendAsync("check_update", cancellationToken: stop.Token);
+            Assert.True(update.Ok); Assert.NotNull(update.Snapshot);
+            Assert.Equal(1, updates.CheckCount);
+            Assert.Empty(facade.Actions);
+        }
+        await serving.WaitAsync(stop.Token);
+    }
+
+    [Fact]
+    public async Task UntrustedCheckUpdateDoesNotTriggerNetworkCheck()
+    {
+        using var temp = new TempDirectory();
+        using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var facade = new FakeFacade();
+        var desired = new DesiredStateStore(temp.Path);
+        var updates = new FakeUpdates();
+        var server = new ControlServer(facade, desired, updates);
+        var (peer, host) = DuplexStream.Pair();
+        var serving = server.ServeAsync(host, stop.Token, callerTrusted: false);
+        using (var client = new ControlClient(peer))
+        {
+            var update = await client.SendAsync("check_update", cancellationToken: stop.Token);
+            Assert.False(update.Ok); Assert.Equal(ControlServer.UntrustedCallerError, update.Error);
+            Assert.Null(update.Snapshot); Assert.Equal(0, updates.CheckCount);
+            var status = await client.SendAsync("status", cancellationToken: stop.Token);
+            Assert.True(status.Ok); Assert.NotNull(status.Snapshot);
+            Assert.Empty(facade.Actions);
+        }
+        await serving.WaitAsync(stop.Token);
+    }
+
+    private sealed class FakeUpdates : IUpdateCoordinator
+    {
+        public UpdateStatus Status => new UpdateStatus();
+        public event Action<UpdateStatus>? Changed;
+        public int CheckCount { get; private set; }
+        public Task<UpdateStatus> CheckNowAsync()
+        {
+            CheckCount++;
+            return Task.FromResult(new UpdateStatus("checking"));
+        }
     }
 
     private sealed class FakeFacade : IClientFacade
