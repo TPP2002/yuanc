@@ -135,7 +135,7 @@
       "argv": [
         "python",
         "-c",
-        "import ast,pathlib,sys;bad=[];\nfor p in pathlib.Path('node/exitnode/rescue').glob('*.py'):\n  for n in ast.walk(ast.parse(p.read_text(encoding='utf-8'))):\n    names=[a.name for a in n.names] if isinstance(n,ast.Import) else ([n.module or ''] if isinstance(n,ast.ImportFrom) and n.level==0 else [])\n    bad+=[p.name+':'+x for x in names if x.startswith('exitnode')]\nprint(bad);sys.exit(1 if bad else 0)"
+        "import ast,pathlib,sys;bad=[p.name+':'+x for p in pathlib.Path('node/exitnode/rescue').glob('*.py') for n in ast.walk(ast.parse(p.read_text(encoding='utf-8'))) for x in (([a.name for a in n.names] if isinstance(n,ast.Import) else ([n.module or ''] if isinstance(n,ast.ImportFrom) and n.level==0 else []))) if x.startswith('exitnode')];print(bad);sys.exit(1 if bad else 0)"
       ],
       "required": true,
       "timeoutSec": 60,
