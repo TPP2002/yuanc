@@ -31,10 +31,10 @@ class Network:
 @dataclass
 class Proxy:
     hy2_port: int
+    # 伪装目标必填无默认,sni 与 handshake_server 必须相同,推荐澳洲本地大站。
+    sni: str
+    handshake_server: str
     reality_port: int = 443
-    # 可改为澳洲本地大站，客户端须使用相同的握手名称。
-    sni: str = "www.microsoft.com"
-    handshake_server: str = "www.microsoft.com"
     hy2_server_name: str = "exitnode"
     binary: str = "/opt/exitnode/current/bin/sing-box"
     maintenance_device_ids: list[str] = field(default_factory=list)
@@ -164,6 +164,9 @@ def load(path: str, runner: Runner | None = None) -> Config:
             r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*", hostname
         ):
             invalid(f"proxy.{name}", "主机名格式不正确")
+    if config.proxy.sni != config.proxy.handshake_server:
+        invalid("proxy.handshake_server",
+                "必须与 proxy.sni 相同:伪装目标与握手名称不一致是 Reality 配错的典型特征")
     binary = PurePosixPath(config.proxy.binary)
     if (not re.fullmatch(r"/[A-Za-z0-9_./-]+", config.proxy.binary)
             or ".." in binary.parts or str(binary) == "/"):
@@ -207,4 +210,8 @@ def load(path: str, runner: Runner | None = None) -> Config:
     if (not re.fullmatch(r"/[A-Za-z0-9_./-]+", directory)
             or ".." in PurePosixPath(directory).parts or str(PurePosixPath(directory)) == "/"):
         invalid("updater.releases_dir", "须为安全的非根目录绝对路径")
+    if config.updater.releases_dir != "/opt/exitnode":
+        invalid("updater.releases_dir", "救援程序按固定布局工作,当前只支持 /opt/exitnode")
+    if config.node.data_dir != "/var/lib/exitnode":
+        invalid("node.data_dir", "救援程序按固定布局工作,当前只支持 /var/lib/exitnode")
     return config

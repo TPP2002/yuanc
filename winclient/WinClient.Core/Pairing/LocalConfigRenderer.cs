@@ -45,7 +45,7 @@ public static class LocalConfigRenderer
                     reality = new { enabled = true, public_key = node.RealityPublicKey, short_id = node.ShortId } } },
             Backup(node),
             new { type = "urltest", tag = "proxy", outbounds = new[] { "main", "backup" },
-                url = "https://www.gstatic.com/generate_204", interval = "1m" },
+                url = "https://www.gstatic.com/generate_204", interval = "1m", tolerance = 300 },
             new { type = "block", tag = "block" }, new { type = "dns", tag = "dns-out" }
         },
         route = new { final = "proxy", rules = new object[] {

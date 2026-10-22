@@ -33,6 +33,8 @@ class ProxyContext:
     masquerade: str = ""
     urltest_url: str = "https://www.gstatic.com/generate_204"
     urltest_interval: str = "1m"
+    # 主线路不比备用线路慢超过此毫秒数就不切换,避免长期走备用 UDP 线路。
+    urltest_tolerance_ms: int = 300
     admin_bind: str = "127.0.0.1"
     admin_port: int = 8443
     maintenance_device_ids: tuple[str, ...] = ()
@@ -64,5 +66,9 @@ def validate_context(ctx: ProxyContext) -> None:
         raise ValueError("备用通道端口无效")
     if not ctx.sni or not ctx.handshake_server or not ctx.hy2_server_name:
         raise ValueError("证书名称与伪装目标不能为空")
+    if ctx.sni != ctx.handshake_server:
+        raise ValueError("伪装目标与握手名称必须相同")
+    if type(ctx.urltest_tolerance_ms) is not int or not 0 <= ctx.urltest_tolerance_ms <= 10000:
+        raise ValueError("线路选择容差须为 0 至 10000 毫秒的整数")
     if ctx.hy2_obfs_password != "" and not valid_hy2_obfs_password(ctx.hy2_obfs_password):
         raise ValueError(HY2_OBFS_ERROR)

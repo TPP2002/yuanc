@@ -32,6 +32,7 @@ def test_session_credentials_and_config(client, enrolled, settings, app):
     assert outbounds["backup"]["password"] == node["hy2_password"]
     assert outbounds["main"]["tls"]["reality"]["public_key"] == node["reality_public_key"]
     assert outbounds["urltest"]["outbounds"] == ["main", "backup"]
+    assert outbounds["urltest"]["tolerance"] == 300
     assert outbounds["block"]["type"] == "block"
     assert config["inbounds"][0]["type"] == "tun"
     assert config["inbounds"][0]["strict_route"] is True

@@ -46,14 +46,49 @@ def test_invalid_toml_does_not_echo_secret():
 
 def test_proxy_defaults():
     text = EXAMPLE.read_text(encoding="utf-8")
-    for name, value in (("sni", "www.microsoft.com"),
-                        ("handshake_server", "www.microsoft.com"),
-                        ("hy2_server_name", "exitnode"), ("binary", "/usr/bin/sing-box")):
+    for name, value in (("hy2_server_name", "exitnode"), ("binary", "/usr/bin/sing-box")):
         text = text.replace(f'{name} = "{value}"\n', "")
     proxy = load("/config", FakeRunner(files={"/config": text})).proxy
-    assert proxy.sni == proxy.handshake_server == "www.microsoft.com"
+    assert proxy.sni == proxy.handshake_server == "www.abc.net.au"
     assert proxy.hy2_server_name == "exitnode"
     assert proxy.binary == "/opt/exitnode/current/bin/sing-box"
+
+
+@pytest.mark.parametrize("field", ["sni", "handshake_server"])
+def test_camouflage_target_is_required_without_default(field):
+    text = EXAMPLE.read_text(encoding="utf-8")
+    text = "\n".join(line for line in text.splitlines() if not line.startswith(field + " ="))
+    with pytest.raises(ConfigError, match=f"proxy.{field}.*缺少必填字段"):
+        load("/config", FakeRunner(files={"/config": text}))
+
+
+def test_camouflage_target_must_match():
+    text = EXAMPLE.read_text(encoding="utf-8").replace(
+        'handshake_server = "www.abc.net.au"', 'handshake_server = "www.example.com.au"')
+    with pytest.raises(ConfigError, match="必须与 proxy.sni 相同"):
+        load("/config", FakeRunner(files={"/config": text}))
+
+
+def test_camouflage_target_accepts_matching_non_microsoft_name():
+    text = EXAMPLE.read_text(encoding="utf-8").replace("www.abc.net.au", "www.example.com.au")
+    proxy = load("/config", FakeRunner(files={"/config": text})).proxy
+    assert proxy.sni == proxy.handshake_server == "www.example.com.au"
+
+
+@pytest.mark.parametrize("old,new,key", [
+    ('releases_dir = "/opt/exitnode"', 'releases_dir = "/srv/exitnode"', "updater.releases_dir"),
+    ('data_dir = "/var/lib/exitnode"', 'data_dir = "/var/lib/other"', "node.data_dir"),
+])
+def test_layout_paths_are_locked(old, new, key):
+    text = EXAMPLE.read_text(encoding="utf-8").replace(old, new)
+    with pytest.raises(ConfigError, match=f"{key}.*固定布局"):
+        load("/config", FakeRunner(files={"/config": text}))
+
+
+def test_layout_defaults_pass():
+    config = load("/config", FakeRunner(files={"/config": EXAMPLE.read_text(encoding="utf-8")}))
+    assert config.node.data_dir == "/var/lib/exitnode"
+    assert config.updater.releases_dir == "/opt/exitnode"
 
 
 @pytest.mark.parametrize("field,value", [

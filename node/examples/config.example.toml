@@ -14,9 +14,9 @@ probe_targets = ["1.1.1.1", "8.8.8.8"]
 [proxy]
 reality_port = 443
 hy2_port = 24443
-# 下面两个名称可改为澳洲本地大站，客户端握手名称须一致。
-sni = "www.microsoft.com"
-handshake_server = "www.microsoft.com"
+# 两项必须相同;示例给的是澳洲本地大站,装机前由维护人员实测该站支持 TLS 1.3 与 HTTP/2 后确认或更换;不要用微软等与澳洲家庭宽带不相称的站点
+sni = "www.abc.net.au"
+handshake_server = "www.abc.net.au"
 hy2_server_name = "exitnode"
 binary = "/usr/bin/sing-box"
 
