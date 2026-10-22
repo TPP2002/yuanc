@@ -1,0 +1,249 @@
+{
+  "schemaVersion": 1,
+  "taskId": "SEC-WIN-ENV-BROWSER-DOH-POLICY-1022",
+  "slug": "yc-env-doh-policy-restore-besteffort-1022",
+  "title": "环境一致层两处加固(一单覆盖 SEC-WIN-ENV-BROWSER-DOH-POLICY-1022 与 SEC-WIN-ENV-RESTORE-PARTIAL-1022 的脚本部分):①套用时给 Chrome/Edge 写安全 DNS 策略(secure + https://1.1.1.1/dns-query,与隧道同一上游),自检第 5/6 项核对,恢复时回滚;②恢复脚本改成六步尽力而为,失败步骤记进 restore_failed 并保留记录,旧记录缺 DoH 值名不算失败",
+  "goal": "以派单时 origin/main 头为基点。一单做两件事(两张看板卡):【甲】环境套用时给 Chrome 与 Edge 加上安全 DNS 策略,让浏览器的域名解析与隧道同一上游;【乙】环境恢复脚本改成尽力而为——一步失败不拦住后面各步,全部跑完后统一报失败清单并保留记录。做完后:\n\n【甲】浏览器 DoH 策略(卡 SEC-WIN-ENV-BROWSER-DOH-POLICY-1022)\n① winclient/WinClient.Core/Environment/EnvironmentPlanner.cs:\n  - 新增公开常量 `public const string DohMode = \"secure\";` 与 `public const string DohTemplate = \"https://1.1.1.1/dns-query\";`(与节点下发给客户端的 sing-box `dns-remote` 上游完全相同;node/exitnode/proxy/client_config.py 第 27 行)。\n  - Header 里 `$chromeNames` 改为 @('WebRtcIPHandling', 'DefaultGeolocationSetting', 'DnsOverHttpsMode', 'DnsOverHttpsTemplates'),`$edgeNames` 改为 @('DefinePreferredLanguages', 'WebRtcLocalhostIpHandling', 'DefaultGeolocationSetting', 'DnsOverHttpsMode', 'DnsOverHttpsTemplates')——原值记录(Read-Values)、恢复循环自动覆盖新值名。\n  - ApplyScript 在既有五条 Set-ItemProperty 之后、`$state.applied = $true` 之前,追加四条:Chrome 与 Edge 各写 `DnsOverHttpsMode` = 'secure'(REG_SZ)、`DnsOverHttpsTemplates` = 'https://1.1.1.1/dns-query'(REG_SZ),值从两个常量拼进脚本;输出行改为 `policies_written=10`。\n  - InspectScript 的 chrome 与 edge 两个哈希各加 `DnsOverHttpsMode=(Current-Value $… 'DnsOverHttpsMode'); DnsOverHttpsTemplates=(Current-Value $… 'DnsOverHttpsTemplates')`。\n② winclient/WinClient.Core/Environment/EnvironmentApplier.cs 的 InspectAsync:Chrome 与 Edge 两个字典各加 `[\"DnsOverHttpsMode\"]`、`[\"DnsOverHttpsTemplates\"]` 两个键(缺失为 null),Chrome 字典 5 个键、Edge 字典 5 个键;其余不动。\n③ winclient/WinClient.Core/Environment/EnvironmentSelfCheck.cs:第 5 项 chrome_policy 与第 6 项 edge_policy 各加两个条件 (\"DnsOverHttpsMode\", 值 == EnvironmentPlanner.DohMode)、(\"DnsOverHttpsTemplates\", 值 == EnvironmentPlanner.DohTemplate);不符时照旧只列值名;八项编号、名称、顺序、四种结果字面、汇总文案全部不变。\n\n【乙】恢复尽力而为(卡 SEC-WIN-ENV-RESTORE-PARTIAL-1022 的脚本部分;「强制恢复默认环境」命令行动作另单)\n④ EnvironmentPlanner.RestoreScript:\n  - 顶部「状态文件不存在 exit 0」与「记录无效(schema / original / chrome / edge / forced_languages 缺)则 throw」两段不变。\n  - 之后声明 `$failed = @()`,把恢复拆成六步,每步独立 `try { … } catch { $failed += '<步名>' }`,一步失败继续下一步:'time_zone'(tzutil /s + 读回复核)、'tzautoupdate'(Start 写回、原值 3 时尽力启动服务)、'chrome'、'edge'(各自的值循环;**记录里没有该值名(旧版本记录没有 DoH 两项)时跳过该值,不算失败**;kind 不是 String/DWord 才算失败)、'forced_languages'(语言子键)、'cleanup'(原本不存在的两个策略根键在空时删除)。\n  - 六步跑完:`if ($failed.Count -gt 0)` → 状态文件加/更新 `restore_failed = @($failed)`(没有该属性先 Add-Member)并 Write-State,然后 `throw ('环境未能完全恢复:' + ($failed -join ','))`(不带任何系统信息),脚本退出码非 0;没有失败 → 清掉 restore_failed 的必要性不存在,直接 `Remove-Item -LiteralPath $statePath` 并 exit 0。\n  - 保持既有断言成立:脚本里 `Remove-Item` 后接空白的出现次数仍为 3(语言子键、空根键、状态文件),不出现 `-Recurse`,`Remove-Item -LiteralPath $statePath` 仍在最后一个 Set-ItemProperty 之后,仍含 `$LASTEXITCODE`。\n  - 再次断开或下次启动再跑恢复时按同一记录重试全部六步(已恢复的步骤重做是幂等的)。\n⑤ EnvironmentApplier 不改恢复的错误映射(退出码非 0 仍抛「时区与浏览器设置未能恢复,原值记录已保留,请联系管理员。」)。\n\n⑥ 测试(既有断言只在下面点名处改,其余一字不改):\n  - EnvironmentPlannerTests.ApplyRecordsOriginalBeforeAnySystemWriteAndUsesOnlyApprovedPolicies:`policies_written=6` 改 `policies_written=10`;Contains 清单加 \"DnsOverHttpsMode\"、\"DnsOverHttpsTemplates\"、\"'secure'\"、\"'https://1.1.1.1/dns-query'\";并断言四条 DoH 写入都在 `$state.applied = $true` 之前、在第一处 `Write-State $state` 之后。\n  - EnvironmentPlannerTests.InspectIsReadOnlyAndContainsAllCurrentEnvironmentFields:字段清单加 \"DnsOverHttpsMode\"、\"DnsOverHttpsTemplates\"。\n  - 新增 EnvironmentPlannerTests.RestoreContinuesAfterStepFailureAndKeepsRecordOnFailure:RestoreScript 含 `$failed = @()`、至少 6 处 `$failed +=`、`restore_failed`、`$failed -join`;`if ($failed.Count -gt 0)` 在 `Remove-Item -LiteralPath $statePath` 之前;`Remove-Item` 后接空白仍恰好 3 处;`-Recurse` 不出现;时区恢复的 `tzutil /s` 与 tzautoupdate 的 `-Name Start` 分别位于不同的 try 块(用 IndexOf 核 `tzutil /s` 之后、`-Name Start` 之前存在 `catch {`)。\n  - 新增 EnvironmentPlannerTests.RestoreSkipsValuesAbsentFromLegacyRecord:脚本含对 `$null -eq $entry` 的 continue(旧记录缺 DoH 值名不算失败),且仍含 '浏览器策略恢复记录无效' 之类对 kind 不合法的失败处理(具体文案由施工方定,但记录无效仍要进 $failed)。\n  - EnvironmentApplierTests.InspectReadsLastNonemptyJsonLineAndNormalizesValues:输入 JSON 的 chrome 加 \"DnsOverHttpsMode\":\"secure\",\"DnsOverHttpsTemplates\":\"https://1.1.1.1/dns-query\",edge 只加 \"DnsOverHttpsMode\":\"secure\";断言 Chrome[\"DnsOverHttpsTemplates\"] == \"https://1.1.1.1/dns-query\"、Edge[\"DnsOverHttpsTemplates\"] 为 null、`Assert.Equal(5, inspection.Chrome.Count); Assert.Equal(5, inspection.Edge.Count);`。\n  - EnvironmentSelfCheckTests.GoodInspection:Chrome 与 Edge 字典各加两项 DoH 目标值;既有 8 项全通过等测试照旧通过。新增 EnvironmentSelfCheckTests.DohPolicyMismatchNamesOnlyTheValueName:Chrome 的 DnsOverHttpsMode 改为 \"automatic\" → 第 5 项未通过且明细含 \"DnsOverHttpsMode\"、不含 \"automatic\";Edge 的 DnsOverHttpsTemplates 改为别的地址 → 第 6 项未通过且明细含 \"DnsOverHttpsTemplates\"、不含那个地址;两者都不影响其他项。\n  - 三份测试文件 [Fact]+[Theory] 总数比基点多 3。\n\n⑦ docs/winclient/环境一致性说明.md:\n  - 「目的与承诺边界」能做到那段补「给 Chrome 与 Edge 打开安全 DNS 并指定与隧道同一上游」;承诺边界清单加一条:浏览器安全 DNS 策略只覆盖 Chrome/Edge,且升级后由旧版本套用的环境要重新连接一次才会写入 DoH 两项。\n  - 「浏览器六项策略」改名「浏览器十项策略」,表格加四行(Chrome / Edge 各 DnsOverHttpsMode = secure、DnsOverHttpsTemplates = https://1.1.1.1/dns-query,REG_SZ,原值记录与恢复方式同其他单值),正文「六项」相应改「十项」,并说明为什么选这个上游(与 sing-box dns-remote 相同,全部流量模式下经隧道解析;仅指定程序模式下名单外浏览器直连 1.1.1.1,不再把域名交给国内 DoH)。\n  - 「先记录再修改与生命周期」主动断开那条改写:恢复按六步尽力而为,任一步失败不拦住其余步骤,全部跑完后记录 `restore_failed` 并保留记录、界面仍显示「恢复失败,请联系管理员」,下次断开或启动按同一记录重试全部步骤;旧版本记录没有 DoH 两项时跳过不算失败。\n  - 「环境自检」表第 5、6 行判定加 DnsOverHttpsMode 为 secure、DnsOverHttpsTemplates 为 https://1.1.1.1/dns-query。\n  - 「真机待验证清单」加三条:连接后 chrome://policy 与 edge://policy 各显示 DnsOverHttpsMode=secure 与 DnsOverHttpsTemplates;浏览器访问任一显示解析器的页面应显示 Cloudflare 且归属澳洲出口;用组策略锁定时区后断开,核对自动时区与十项策略仍被恢复、记录保留且含 restore_failed=time_zone,解除锁定后再断开一次记录被删除。\n\n⑧ 全程中文;不新增 NuGet;不动控制器、协议、界面、EnvironmentSettings;不在真机实测。",
+  "background": "项目:外包,Windows 客户端 .NET 9(Core 类库 + WPF App + xunit Tests)。环境一致层:EnvironmentPlanner 只生成 PowerShell 脚本文本(ApplyScript / RestoreScript / InspectScript),EnvironmentApplier 经隐藏窗口的 ICommandRunner 执行并解析,EnvironmentSelfCheck.Evaluate 是纯函数,控制器 ClientController 在连接后套用、主动断开时恢复、出口核验终局后巡查并自检。\nEnvironmentPlanner.cs 现状(231 行):Header 定义 $chromeKey / $edgeKey / $tzServiceKey / $forcedKey、$chromeNames = @('WebRtcIPHandling', 'DefaultGeolocationSetting')、$edgeNames = @('DefinePreferredLanguages', 'WebRtcLocalhostIpHandling', 'DefaultGeolocationSetting');ReadHelpers 里 Read-Value 按值名记录 present/kind/value,Read-Values 对一组值名循环;ApplyScript:状态文件存在则沿用 previous.original,否则读 tzutil /g、tzautoupdate Start、两个根键的值与 ForcedLanguages,先 Write-State($state 含 schema=1、applied=$false、original、target、written_at、verify_failed),再 Start=4、停服务、tzutil /s、复核(不符 verify_failed='time_zone' 并 exit 4),建键、清 ForcedLanguages 后按序号写语言,再写五条策略值,$state.applied=$true,Write-State,输出 ConvertTo-Json @{ time_zone_before; time_zone_after; policies_written=6 },exit 0;RestoreScript:状态文件不存在 exit 0,记录无效 throw,然后顺序:时区(tzutil /s + 读回核对,失败 throw)→ tzautoupdate Start 写回(原值 3 时 Start-Service)→ 两个浏览器按 $names 循环($entry = $saved.values.$name;$null 或 kind 不合法 throw '浏览器策略恢复记录无效。';present 则写回否则删值)→ ForcedLanguages 子键(原不存在:有子键则 throw,否则 Remove-Item;原存在:清空后写回)→ 原不存在的根键空时 Remove-Item → Remove-Item 状态文件 → exit 0;InspectScript 输出 time_zone / tzautoupdate_start / chrome{forced_languages, WebRtcIPHandling, DefaultGeolocationSetting} / edge{DefinePreferredLanguages, WebRtcLocalhostIpHandling, DefaultGeolocationSetting} 的紧凑 JSON。\nEnvironmentApplier.cs(85 行):InspectAsync 解析最后一行 JSON,Chrome 字典固定三键(ForcedLanguages 占位 null、WebRtcIPHandling、DefaultGeolocationSetting),Edge 字典三键;ExecuteAsync 退出码 4 抛 EnvironmentVerifyException,其他非 0 抛 InvalidOperationException(恢复:「时区与浏览器设置未能恢复,原值记录已保留,请联系管理员。」)。\nEnvironmentSelfCheck.cs(139 行):八项固定顺序 exit_country / exit_node / time_zone / auto_time_zone / chrome_policy / edge_policy / no_direct_path / ipv6_direct;Policy(id, name, params (Name, Matches)[]) 不符时明细「不符项:名1、名2」,chrome_policy / edge_policy 明细末尾追加「;策略只覆盖 Chrome 与 Edge,360、QQ、搜狗、夸克等浏览器不受约束」;Value(dict, key) 取值。\n测试现状:EnvironmentPlannerTests(72 行,5 个测试;ApplyRecords… 断言 Contains 清单与 policies_written=6;RestoreIsBounded… 断言 Regex `\\bRemove-Item\\s` 恰好 3 处、无 -Recurse、状态文件删除在最后一个 Set-ItemProperty 之后、含 $LASTEXITCODE;InspectIsReadOnly… 断言字段清单与不含写命令)、EnvironmentApplierTests(142 行,7 个测试;InspectReads… 用 InspectionRunner 喂 JSON 并断言 Chrome.Count == 3、Edge.Count == 3)、EnvironmentSelfCheckTests(204 行,14 个测试;GoodInspection 是共享夹具,ReportWritesAtomically… 与 AllEightPass… 断言 8 项全通过、汇总「8 项通过」;UnsafeConfiguration… 等不涉及浏览器策略)。ControllerTests 用假的 IEnvironmentEnforcer,不受本单影响,不许改。\n现象:【甲】Chrome/Edge 的安全 DNS 若被用户或厂商预设为国内 DoH(阿里/腾讯),全部流量模式下该 DoH 请求虽经隧道但解析视角与出口不一致、且国内 DoH 看到澳洲来源;仅指定程序模式下名单外浏览器更会直连国内 DoH 泄漏域名。【乙】RestoreScript 顺序为时区→tzautoupdate→浏览器→语言,任一步失败即 throw:时区复核失败时 tzautoupdate 仍 Start=4、策略未回滚,状态文件保留等下次断开重试,组策略锁定时区就一直卡着。\nCI 跑 `dotnet test winclient --nologo`;本单验收跑整个 sln 的 Release 构建与测试。看板卡 SEC-WIN-ENV-BROWSER-DOH-POLICY-1022(主)与 SEC-WIN-ENV-RESTORE-PARTIAL-1022(脚本部分),来源会审·浏览器指纹 中7、渗透测试 3。",
+  "nonGoals": [
+    "不做「强制恢复默认环境」命令行动作(状态文件丢失时的兜底),另单做(SEC-WIN-ENV-RESTORE-PARTIAL-1022 剩余部分)",
+    "不做虚拟网卡网段自检(另卡 SEC-WIN-TUN-SUBNET-CONFLICT-SELFCHECK-1022)",
+    "不改控制器、协议、界面、EnvironmentSettings、自检项编号与汇总文案",
+    "不改 ControllerTests / EnvironmentPolicyTests 等其他测试文件",
+    "不在真机实测;真机项写进文档待验证清单"
+  ],
+  "allowedPaths": [
+    "winclient/WinClient.Core/Environment/EnvironmentPlanner.cs",
+    "winclient/WinClient.Core/Environment/EnvironmentApplier.cs",
+    "winclient/WinClient.Core/Environment/EnvironmentSelfCheck.cs",
+    "winclient/WinClient.Tests/EnvironmentPlannerTests.cs",
+    "winclient/WinClient.Tests/EnvironmentApplierTests.cs",
+    "winclient/WinClient.Tests/EnvironmentSelfCheckTests.cs",
+    "docs/winclient/环境一致性说明.md"
+  ],
+  "forbiddenPaths": [
+    "docs/开工须知.md",
+    "docs/口径速查表.md",
+    "docs/design/**",
+    "docs/交接/**",
+    "docs/plans/**",
+    "docs/acceptance/**",
+    "docs/node/**",
+    "docs/authserver/**",
+    "docs/winclient/自动更新说明.md",
+    "docs/winclient/打包与发布说明.md",
+    "docs/winclient/分应用代理说明.md",
+    "docs/winclient/架构说明.md",
+    "docs/winclient/服务化与自启说明.md",
+    "docs/winclient/界面说明.md",
+    ".github/**",
+    ".codex/**",
+    ".gitignore",
+    "pyproject.toml",
+    "scripts/**",
+    "node/**",
+    "authserver/**",
+    "winclient/third_party/**",
+    "winclient/*.sln",
+    "winclient/Directory.Build.props",
+    "winclient/NuGet.Config",
+    "winclient/WinClient.Core/WinClient.Core.csproj",
+    "winclient/WinClient.Tests/WinClient.Tests.csproj",
+    "winclient/WinClient.App/**",
+    "winclient/WinClient.UiTests/**",
+    "winclient/WinClient.Core/Auth/**",
+    "winclient/WinClient.Core/Client/**",
+    "winclient/WinClient.Core/Hosting/**",
+    "winclient/WinClient.Core/Ipc/**",
+    "winclient/WinClient.Core/Kernel/**",
+    "winclient/WinClient.Core/Logging/**",
+    "winclient/WinClient.Core/Pairing/**",
+    "winclient/WinClient.Core/Process/**",
+    "winclient/WinClient.Core/State/**",
+    "winclient/WinClient.Core/Storage/**",
+    "winclient/WinClient.Core/Update/**",
+    "winclient/WinClient.Tests/AuthTests.cs",
+    "winclient/WinClient.Tests/ControllerTests.cs",
+    "winclient/WinClient.Tests/DataDirectorySecurityTests.cs",
+    "winclient/WinClient.Tests/EnvironmentPolicyTests.cs",
+    "winclient/WinClient.Tests/FirewallTests.cs",
+    "winclient/WinClient.Tests/HostingTests.cs",
+    "winclient/WinClient.Tests/IpcTests.cs",
+    "winclient/WinClient.Tests/KernelInstallerTests.cs",
+    "winclient/WinClient.Tests/KillSwitchAppsModeTests.cs",
+    "winclient/WinClient.Tests/KillSwitchAuthRuleTests.cs",
+    "winclient/WinClient.Tests/KillSwitchHardenTests.cs",
+    "winclient/WinClient.Tests/KillSwitchNarrowRuleTests.cs",
+    "winclient/WinClient.Tests/KillSwitchProfileTests.cs",
+    "winclient/WinClient.Tests/KillSwitchRecoveryTests.cs",
+    "winclient/WinClient.Tests/PairingCertificateTests.cs",
+    "winclient/WinClient.Tests/PairingTests.cs",
+    "winclient/WinClient.Tests/ProcessStorageTests.cs",
+    "winclient/WinClient.Tests/RoutingTests.cs",
+    "winclient/WinClient.Tests/StateTests.cs",
+    "winclient/WinClient.Tests/TestData.cs",
+    "winclient/WinClient.Tests/UpdateApplierTests.cs",
+    "winclient/WinClient.Tests/UpdateCoordinatorTests.cs",
+    "winclient/WinClient.Tests/UpdateHttpTests.cs",
+    "winclient/WinClient.Tests/UpdateIpcTests.cs",
+    "winclient/WinClient.Tests/UpdateTests.cs",
+    "winclient/WinClient.Tests/Fixtures/**",
+    "winclient/WinClient.Core/Environment/EnvironmentSettings.cs",
+    "winclient/WinClient.Core/Firewall/**",
+    "winclient/WinClient.Tests/EnvironmentPolicyTests.cs",
+    "winclient/WinClient.Tests/KillSwitchPatrolTests.cs",
+    "docs/winclient/断网保护加固说明.md"
+  ],
+  "expectArtifacts": [
+    "winclient/WinClient.Core/Environment/EnvironmentPlanner.cs",
+    "winclient/WinClient.Core/Environment/EnvironmentApplier.cs",
+    "winclient/WinClient.Core/Environment/EnvironmentSelfCheck.cs",
+    "winclient/WinClient.Tests/EnvironmentPlannerTests.cs",
+    "winclient/WinClient.Tests/EnvironmentApplierTests.cs",
+    "winclient/WinClient.Tests/EnvironmentSelfCheckTests.cs",
+    "docs/winclient/环境一致性说明.md"
+  ],
+  "acceptance": [
+    {
+      "id": "BUILD",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "build",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1200
+    },
+    {
+      "id": "TEST",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "test",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--no-build",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1200
+    },
+    {
+      "id": "SHAPE-DOH",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;p=pathlib.Path('winclient/WinClient.Core/Environment/EnvironmentPlanner.cs').read_text(encoding='utf-8');cn=[l for l in p.splitlines() if '$chromeNames = @(' in l];en=[l for l in p.splitlines() if '$edgeNames = @(' in l];bad=[k for k,ok in (('consts','public const string DohMode = \"secure\";' in p and 'public const string DohTemplate = \"https://1.1.1.1/dns-query\";' in p),('chrome-names',len(cn)==1 and 'DnsOverHttpsMode' in cn[0] and 'DnsOverHttpsTemplates' in cn[0]),('edge-names',len(en)==1 and 'DnsOverHttpsMode' in en[0] and 'DnsOverHttpsTemplates' in en[0]),('written','policies_written=10' in p and 'policies_written=6' not in p),('inspect',p.count('DnsOverHttpsTemplates=(Current-Value')==2)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "SHAPE-RESTORE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;p=pathlib.Path('winclient/WinClient.Core/Environment/EnvironmentPlanner.cs').read_text(encoding='utf-8');bad=[k for k,ok in (('failed',p.count('$failed +=')>=6 and '$failed = @()' in p and 'restore_failed' in p and '$failed -join' in p),('order',p.find('if ($failed.Count -gt 0)')>0 and p.find('if ($failed.Count -gt 0)')<p.find('Remove-Item -LiteralPath $statePath')),('legacy',p.find('$null -eq $entry')>0 and 'continue' in p[p.find('$null -eq $entry'):p.find('$null -eq $entry')+160]),('no-recurse','-Recurse' not in p)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "SHAPE-OTHERS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda f:pathlib.Path(f).read_text(encoding='utf-8');a=r('winclient/WinClient.Core/Environment/EnvironmentApplier.cs');s=r('winclient/WinClient.Core/Environment/EnvironmentSelfCheck.cs');bad=[k for k,ok in (('applier-mode',a.count('[\"DnsOverHttpsMode\"]')==2),('applier-tpl',a.count('[\"DnsOverHttpsTemplates\"]')==2),('selfcheck-mode',s.count('\"DnsOverHttpsMode\"')==2),('selfcheck-tpl',s.count('\"DnsOverHttpsTemplates\"')==2),('selfcheck-consts','EnvironmentPlanner.DohMode' in s and 'EnvironmentPlanner.DohTemplate' in s)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "TESTS-COUNT",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess as sp,pathlib,sys;mb=sp.check_output(['git','merge-base','origin/main','HEAD'],text=True).strip();fs=['winclient/WinClient.Tests/EnvironmentPlannerTests.cs','winclient/WinClient.Tests/EnvironmentApplierTests.cs','winclient/WinClient.Tests/EnvironmentSelfCheckTests.cs'];c=lambda s:s.count('[Fact]')+s.count('[Theory]');old=sum(c(sp.check_output(['git','show',mb+':'+f]).decode('utf-8')) for f in fs);new=sum(c(pathlib.Path(f).read_text(encoding='utf-8')) for f in fs);print('old',old,'new',new);sys.exit(0 if new-old==3 else 1)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "TESTS-CONTENT",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda f:pathlib.Path(f).read_text(encoding='utf-8');a=r('winclient/WinClient.Tests/EnvironmentPlannerTests.cs');b=r('winclient/WinClient.Tests/EnvironmentApplierTests.cs');c=r('winclient/WinClient.Tests/EnvironmentSelfCheckTests.cs');bad=[k for k,ok in (('planner-10','policies_written=10' in a and 'policies_written=6' not in a),('planner-restore','restore_failed' in a and 'RestoreContinuesAfterStepFailureAndKeepsRecordOnFailure' in a and 'RestoreSkipsValuesAbsentFromLegacyRecord' in a),('applier','DnsOverHttpsTemplates' in b and 'Assert.Equal(5, inspection.Chrome.Count)' in b),('selfcheck','DohPolicyMismatchNamesOnlyTheValueName' in c and 'DnsOverHttpsMode' in c)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "SCOPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess as sp,sys;g=lambda *a:sp.check_output(['git','-c','core.quotepath=false']+list(a)).decode('utf-8').split(chr(10));mb=g('merge-base','origin/main','HEAD')[0].strip();ch={p.strip() for p in g('diff','--name-only',mb)+g('ls-files','--others','--exclude-standard') if p.strip()};ok=[\"winclient/WinClient.Core/Environment/EnvironmentPlanner.cs\", \"winclient/WinClient.Core/Environment/EnvironmentApplier.cs\", \"winclient/WinClient.Core/Environment/EnvironmentSelfCheck.cs\", \"winclient/WinClient.Tests/EnvironmentPlannerTests.cs\", \"winclient/WinClient.Tests/EnvironmentApplierTests.cs\", \"winclient/WinClient.Tests/EnvironmentSelfCheckTests.cs\", \"docs/winclient/环境一致性说明.md\"];bad=sorted(ch-set(ok));print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;d=pathlib.Path('docs/winclient/环境一致性说明.md').read_text(encoding='utf-8');i=d.find('真机待验证清单');tail=d[i:] if i>=0 else '';bad=[k for k,ok in (('doh',d.count('DnsOverHttpsMode')>=4 and d.count('DnsOverHttpsTemplates')>=4),('ten','十项' in d and '六项策略' not in d),('tpl','https://1.1.1.1/dns-query' in d),('restore','restore_failed' in d and '尽力' in d),('legacy','旧版本' in d),('verify','DnsOverHttps' in tail and 'restore_failed' in tail)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "NOWINDOW",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;norm=lambda p:str(p).replace(chr(92),'/');files=[p for root in ('winclient/WinClient.Core','winclient/WinClient.App') for p in pathlib.Path(root).rglob('*.cs') if '/obj/' not in norm(p) and '/bin/' not in norm(p)];bad=[norm(p) for p in files if 'ProcessStartInfo' in p.read_text(encoding='utf-8') and p.parent.name!='Process' and 'CreateNoWindow = true' not in p.read_text(encoding='utf-8')];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "NOBIN",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess,sys;out=subprocess.run(['git','ls-files','winclient','build'],capture_output=True,text=True).stdout.split();bad=[f for f in out if f.endswith(('.exe','.dll','.zip','.pdb'))];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "model": null,
+  "timeoutSec": 7200,
+  "repoRoot": "E:/yuanc",
+  "engine": "codex",
+  "reasoningEffort": "medium",
+  "steps": [
+    "读 EnvironmentPlanner.cs / EnvironmentApplier.cs / EnvironmentSelfCheck.cs 与三份测试;先按 ⑥ 改既有断言、加三条新测试,跑红。",
+    "改 Planner(常量、值名数组、四条 DoH 写入、policies_written=10、Inspect 两项、Restore 六步尽力而为 + restore_failed + 旧记录跳过)、Applier 字典、SelfCheck 条件;BUILD / TEST / SHAPE-PLANNER / SHAPE-OTHERS / TESTS-ENV / SCOPE / NOWINDOW / NOBIN 全绿。",
+    "改文档五处;DOCS 绿;交活说明写真机待验证项与「升级后首次重连才写入 DoH」口径。"
+  ]
+}
