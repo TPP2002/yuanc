@@ -50,7 +50,7 @@ public static class KillSwitchPlanner
 
     public static string[] ExpectedRuleNames(bool withAuth) =>
         [NodePrefix + "Tcp", NodePrefix + "Udp", .. (withAuth ? new[] { Prefix + "Auth" } : []),
-            Prefix + "Tun", Prefix + "Loopback", Prefix + "Dhcp"];
+            Prefix + "Tun", Prefix + "Loopback", Prefix + "Dhcp", Prefix + "Lan"];
 
     public static IReadOnlyList<FirewallAction> Plan(IReadOnlyList<IPAddress> nodeIps,
         string tunInterfaceName /* 接口保留并校验非空;隧道规则改按本地地址匹配,不再使用网卡名 */, string programPath, int hy2Port, KillSwitchMode mode, int realityPort = 443, AuthEndpoint? auth = null)
@@ -81,6 +81,7 @@ public static class KillSwitchPlanner
         actions.Add(new AddRule(Prefix + "Tun", "Outbound", "Allow", LocalAddress: [TunAddress]));
         actions.Add(new AddRule(Prefix + "Loopback", "Outbound", "Allow", RemoteAddress: ["127.0.0.0/8", "::1"]));
         actions.Add(new AddRule(Prefix + "Dhcp", "Outbound", "Allow", Program: DhcpProgram, Service: "Dhcp", RemoteAddress: ["255.255.255.255", "LocalSubnet"], Protocol: "UDP", LocalPort: "68", RemotePort: "67"));
+        actions.Add(new AddRule(Prefix + "Lan", "Outbound", "Allow", RemoteAddress: ["LocalSubnet"]));
         actions.Add(new VerifyProfiles());
         actions.Add(new Audit());
         return actions.AsReadOnly();

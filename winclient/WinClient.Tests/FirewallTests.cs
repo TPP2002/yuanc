@@ -16,7 +16,7 @@ public sealed class FirewallTests
         Assert.Equal(new[] { "Domain", "Private", "Public" }, plan.OfType<SetProfileDefault>().Select(p => p.Profile));
         Assert.All(plan.OfType<SetProfileDefault>(), p => Assert.Equal("Block", p.Action));
         var rules = plan.OfType<AddRule>().ToArray();
-        Assert.Equal(5, rules.Length);
+        Assert.Equal(6, rules.Length);
         Assert.All(rules, r => { Assert.Equal("Allow", r.Action); Assert.Equal("Outbound", r.Direction); Assert.StartsWith("YuanC-KS-", r.Name); });
         var tcp = rules.Single(r => r.Name == "YuanC-KS-Node-Tcp");
         Assert.Equal(ProgramPath, tcp.Program); Assert.Equal(new[] { "192.0.2.5" }, tcp.RemoteAddress);
@@ -29,9 +29,15 @@ public sealed class FirewallTests
         Assert.Equal(KillSwitchPlanner.DhcpProgram, dhcp.Program); Assert.Equal("Dhcp", dhcp.Service);
         Assert.Equal(new[] { "255.255.255.255", "LocalSubnet" }, dhcp.RemoteAddress);
         Assert.Equal("UDP", dhcp.Protocol); Assert.Equal("68", dhcp.LocalPort); Assert.Equal("67", dhcp.RemotePort);
+        var lan = rules.Single(r => r.Name == "YuanC-KS-Lan");
+        Assert.Equal(new[] { "LocalSubnet" }, lan.RemoteAddress);
+        Assert.Null(lan.Program); Assert.Null(lan.Service); Assert.Null(lan.Protocol);
+        Assert.Null(lan.LocalPort); Assert.Null(lan.RemotePort); Assert.Null(lan.LocalAddress);
         Assert.Single(plan.OfType<Audit>());
         Assert.DoesNotContain(rules, r => r.RemotePort == "53");
         var script = KillSwitchPlanner.ToPowerShellScript(plan, "state.json", "audit.json");
+        var lanLine = Assert.Single(script.Split('\n').Where(line => line.StartsWith("New-NetFirewallRule -Name 'YuanC-KS-Lan'", StringComparison.Ordinal)));
+        Assert.Contains("-RemoteAddress @('LocalSubnet')", lanLine);
         Assert.Contains("Set-NetFirewallProfile -Enabled True -DefaultOutboundAction Block", script);
         Assert.Contains("$_.Name -notlike 'YuanC-KS-*'", script);
         Assert.Contains("Get-NetFirewallApplicationFilter", script);
