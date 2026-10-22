@@ -62,6 +62,10 @@
       "server": "203.0.113.10",
       "server_port": 24443,
       "password": "TEST-ONLY-hy2-password",
+      "obfs": {
+        "type": "salamander",
+        "password": "TEST-ONLY-hy2-obfs-0123456789abcdef"
+      },
       "tls": {
         "enabled": true,
         "server_name": "exitnode",

@@ -3,11 +3,11 @@
 import json
 import re
 from dataclasses import replace
-from typing import TypedDict
+from typing import NotRequired, TypedDict
 
 from . import service
 from .netinfo import public_ipv4
-from .proxy.context import ipv4_host
+from .proxy.context import ipv4_host, validate_context
 from .proxy.keys import ensure_reality_keys
 from .proxy.registry import DeviceRegistry, now, validate_devices
 from .proxy.subscription import vless_link
@@ -24,6 +24,8 @@ class PairNode(TypedDict):
     hy2_password: str
     hy2_server_name: str
     hy2_certificate: list[str]
+    # ycpair/2 没有这个键；ycpair/3 多一个节点级混淆密码，绝不写空串。
+    hy2_obfs_password: NotRequired[str]
 
 
 class PairFile(TypedDict):
@@ -46,12 +48,17 @@ def render_pair(ctx, device, host, exported_at) -> PairFile:
         raise ValueError("设备已吊销，不能导出配对文件")
     validate_devices([device])
     host = ipv4_host(replace(ctx, server_host=host))
-    return PairFile(format="ycpair/2", exported_at=exported_at, node=PairNode(
+    validate_context(ctx)
+    node = PairNode(
         host=host, reality_port=ctx.reality_port, hy2_port=ctx.hy2_port, sni=ctx.sni,
         reality_public_key=ctx.reality.public_key, short_id=ctx.reality.short_id,
         uuid=device.uuid, hy2_password=device.hy2_password,
         hy2_server_name=ctx.hy2_server_name, hy2_certificate=list(ctx.hy2_certificate),
-    ))
+    )
+    if not ctx.hy2_obfs_password:
+        return PairFile(format="ycpair/2", exported_at=exported_at, node=node)
+    node["hy2_obfs_password"] = ctx.hy2_obfs_password
+    return PairFile(format="ycpair/3", exported_at=exported_at, node=node)
 
 
 def registry(config, runner):

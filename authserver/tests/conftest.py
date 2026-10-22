@@ -25,12 +25,16 @@ def settings(tmp_path):
                         .read_text(encoding="utf-8"))
     certificate = tmp_path / "hy2.crt"
     certificate.write_text("\n".join(vector["context"]["hy2_certificate"]), encoding="utf-8")
+    # 节点 secrets/hy2.obfs 的测试副本；与节点黄金输入同一个测试向量。
+    obfs = tmp_path / "hy2.obfs"
+    obfs.write_text(vector["context"]["hy2_obfs_password"] + "\n", encoding="utf-8")
     return Settings.model_validate({
         "security": {"admin_key": "test-admin-only", "node_key": "test-node-only",
                      "token_salt": "test-salt-only"},
         "node": {"host": "192.0.2.23", "reality_port": 443, "hy2_port": 24443,
                  "reality_public_key": "test-public-key", "short_id": "abcd1234",
-                 "sni": "example.test", "hy2_certificate_path": str(certificate)},
+                 "sni": "example.test", "hy2_certificate_path": str(certificate),
+                 "hy2_obfs_password_path": str(obfs)},
     })
 
 

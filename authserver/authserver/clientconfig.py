@@ -10,6 +10,13 @@ def render(node_ctx, device) -> dict:
         "reality": {"enabled": True, "public_key": node_ctx["reality_public_key"],
                     "short_id": node_ctx["short_id"]},
     }
+    backup = {"type": "hysteria2", "tag": "backup", "server": node_ctx["host"],
+              "server_port": node_ctx["hy2_port"], "password": device["hy2_password"]}
+    obfs_password = node_ctx.get("hy2_obfs_password") or ""
+    if obfs_password:
+        backup["obfs"] = {"type": "salamander", "password": obfs_password}
+    backup["tls"] = {"enabled": True, "server_name": node_ctx["hy2_server_name"],
+                     "certificate": list(node_ctx["hy2_certificate"])}
     return {
         "log": {"level": "warn", "timestamp": True},
         "dns": {
@@ -26,10 +33,7 @@ def render(node_ctx, device) -> dict:
             {"type": "vless", "tag": "main", "server": node_ctx["host"],
              "server_port": node_ctx["reality_port"], "uuid": device["uuid"],
              "flow": "xtls-rprx-vision", "tls": reality_tls},
-            {"type": "hysteria2", "tag": "backup", "server": node_ctx["host"],
-             "server_port": node_ctx["hy2_port"], "password": device["hy2_password"],
-             "tls": {"enabled": True, "server_name": node_ctx["hy2_server_name"],
-                     "certificate": list(node_ctx["hy2_certificate"])}},
+            backup,
             {"type": "urltest", "tag": "urltest", "outbounds": ["main", "backup"],
              "url": "https://www.gstatic.com/generate_204", "interval": "1m",
              "tolerance": 50},

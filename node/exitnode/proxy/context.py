@@ -1,9 +1,17 @@
 """Explicit render inputs; this module does not resolve names or fetch credentials."""
 
 import ipaddress
+import re
 from dataclasses import dataclass, field
 
 from .keys import RealityKeys
+
+HY2_OBFS_PATTERN = re.compile(r"[A-Za-z0-9_-]{16,128}")
+HY2_OBFS_ERROR = "备用通道混淆密码格式不正确"
+
+
+def valid_hy2_obfs_password(value) -> bool:
+    return isinstance(value, str) and HY2_OBFS_PATTERN.fullmatch(value) is not None
 
 
 @dataclass(frozen=True)
@@ -20,6 +28,8 @@ class ProxyContext:
     hy2_key_path: str = "/var/lib/exitnode/secrets/hy2.key"
     # A self-signed certificate can be explicitly trusted by the client here.
     hy2_certificate: tuple[str, ...] = ()
+    # Node-level salamander obfuscation password; empty string disables obfuscation.
+    hy2_obfs_password: str = field(default="", repr=False)
     masquerade: str = ""
     urltest_url: str = "https://www.gstatic.com/generate_204"
     urltest_interval: str = "1m"
@@ -54,3 +64,5 @@ def validate_context(ctx: ProxyContext) -> None:
         raise ValueError("备用通道端口无效")
     if not ctx.sni or not ctx.handshake_server or not ctx.hy2_server_name:
         raise ValueError("证书名称与伪装目标不能为空")
+    if ctx.hy2_obfs_password != "" and not valid_hy2_obfs_password(ctx.hy2_obfs_password):
+        raise ValueError(HY2_OBFS_ERROR)

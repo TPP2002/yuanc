@@ -3,6 +3,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from exitnode.proxy.client_config import render_client_windows
 from exitnode.proxy.context import ProxyContext, validate_context
 from exitnode.proxy.keys import RealityKeys
 from exitnode.proxy.registry import Device
@@ -132,3 +133,43 @@ def test_context_rejects_invalid_maintenance_ids(inputs, ids):
     ctx, _ = inputs
     with pytest.raises(ValueError, match="维护设备"):
         validate_context(replace(ctx, maintenance_device_ids=ids))
+
+
+def test_obfs_key_order_and_shared_password(inputs):
+    ctx, device = inputs
+    backup = render_server(ctx, [device])["inbounds"][1]
+    assert list(backup) == ["type", "tag", "listen", "listen_port", "users", "obfs", "tls"]
+    assert backup["obfs"] == {"type": "salamander", "password": ctx.hy2_obfs_password}
+    client = render_client_windows(ctx, device)["outbounds"][1]
+    assert list(client) == ["type", "tag", "server", "server_port", "password", "obfs", "tls"]
+    assert client["obfs"] == backup["obfs"]
+
+
+def test_empty_obfs_password_renders_without_obfs(inputs):
+    ctx, device = inputs
+    ctx = replace(ctx, hy2_obfs_password="")
+    validate_context(ctx)
+    assert "obfs" not in render_server(ctx, [device])["inbounds"][1]
+    assert "obfs" not in render_client_windows(ctx, device)["outbounds"][1]
+
+
+@pytest.mark.parametrize("password", [
+    "contains space 0123456789", "a" * 15, "a" * 129, "has=equals-0123456789", None, 123,
+])
+def test_context_rejects_invalid_obfs_password(inputs, password):
+    ctx, device = inputs
+    with pytest.raises(ValueError, match="备用通道混淆密码格式不正确"):
+        validate_context(replace(ctx, hy2_obfs_password=password))
+    with pytest.raises(ValueError, match="混淆"):
+        render_server(replace(ctx, hy2_obfs_password=password), [device])
+
+
+@pytest.mark.parametrize("password", ["a" * 16, "A-z_9" * 25 + "abc"])
+def test_context_accepts_boundary_obfs_password(inputs, password):
+    ctx, _ = inputs
+    validate_context(replace(ctx, hy2_obfs_password=password))
+
+
+def test_obfs_password_not_in_context_repr(inputs):
+    ctx, _ = inputs
+    assert ctx.hy2_obfs_password not in repr(ctx)

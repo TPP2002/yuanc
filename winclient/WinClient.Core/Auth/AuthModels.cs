@@ -61,4 +61,6 @@ public sealed class NodeInfo
     public required string Hy2Password { get; init; }
     public string Hy2ServerName { get; init; } = "exitnode";
     public string[] Hy2Certificate { get; init; } = [];
+    // Node-level salamander obfuscation password; empty means the node has not enabled obfuscation.
+    public string Hy2ObfsPassword { get; init; } = "";
 }

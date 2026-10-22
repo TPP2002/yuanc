@@ -2,10 +2,11 @@
 
 import json
 import re
+import secrets
 from pathlib import PurePosixPath
 
 from .manifest import Manifest
-from .proxy.context import ProxyContext
+from .proxy.context import HY2_OBFS_ERROR, ProxyContext, valid_hy2_obfs_password
 from .proxy.keys import ensure_reality_keys
 from .proxy.registry import DeviceRegistry
 from .proxy.reload import reload
@@ -15,6 +16,8 @@ SECRETS = "/var/lib/exitnode/secrets"
 LIVE = SECRETS + "/sing-box.json"
 LAST_GOOD = LIVE.replace(".json", ".last-good.json")
 UNIT = "exitnode-proxy.service"
+HY2_OBFS = SECRETS + "/hy2.obfs"
+HY2_OBFS_CORRUPT = "备用通道混淆密码文件损坏，请联系维护人员；已有文件未覆盖"
 
 
 class ProxyRunner:
@@ -134,6 +137,25 @@ def ensure_credentials(config, runner):
         manifest.apply(name, install_certificate, preserve(target))
     registry = DeviceRegistry(SECRETS + "/devices.json", adapter)
 
+    def obfuscation():
+        if runner.exists(HY2_OBFS):
+            if not valid_hy2_obfs_password(runner.read_file(HY2_OBFS).strip()):
+                raise ValueError(HY2_OBFS_CORRUPT)
+            return
+        upgraded = adapter.exists(registry.path) and bool(registry.all())
+        temporary = HY2_OBFS + ".tmp"
+        try:
+            runner.write_file(temporary, secrets.token_urlsafe(32), 0o600)
+            runner.replace(temporary, HY2_OBFS)
+        finally:
+            if runner.exists(temporary):
+                runner.write_file(temporary, "", 0o600)
+                runner.remove(temporary)
+        if upgraded:
+            print("备用通道已启用混淆,旧配对文件的备用线路将不可用,请重新导出")
+
+    manifest.apply("生成备用通道混淆密码", obfuscation, preserve(HY2_OBFS))
+
     def create_registry():
         if adapter.exists(registry.path):
             registry.all()
@@ -142,6 +164,16 @@ def ensure_credentials(config, runner):
 
     manifest.apply("准备设备登记表", create_registry, preserve(SECRETS + "/devices.json"))
     return ensure_reality_keys(config.node.secrets_dir, adapter)
+
+
+def read_hy2_obfs_password(runner):
+    """未生成时返回空串(按不混淆发布);文件存在但格式不对时拒绝发布。"""
+    if not runner.exists(HY2_OBFS):
+        return ""
+    value = runner.read_file(HY2_OBFS).strip()
+    if not valid_hy2_obfs_password(value):
+        raise ValueError(HY2_OBFS_ERROR)
+    return value
 
 
 def build_context(config, keys, runner):
@@ -155,6 +187,7 @@ def build_context(config, keys, runner):
         hy2_certificate=tuple(line for line in
                               runner.read_file(SECRETS + "/hy2.crt").splitlines()
                               if line.strip()),
+        hy2_obfs_password=read_hy2_obfs_password(runner),
     )
 
 

@@ -17,6 +17,7 @@ short_id = "<十六进制短标识>"
 sni = "<服务端证书与Reality使用的域名>"
 hy2_server_name = "exitnode"
 hy2_certificate_path = "<节点备用通道证书的本地文件路径，不是私钥>"
+hy2_obfs_password_path = "<节点 /var/lib/exitnode/secrets/hy2.obfs 的本地副本路径>"
 
 [limits]
 session_hours = "<会话小时数，默认6>"

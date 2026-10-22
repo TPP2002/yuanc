@@ -74,6 +74,7 @@ def test_exact_pair_golden_and_session_node_keys(installed, monkeypatch):
     vector = json.loads((GOLDEN / "proxy" / "inputs.json").read_text(encoding="utf-8"))
     runner.files[service.SECRETS + "/reality.json"] = json.dumps(vector["context"]["reality"])
     runner.files[service.SECRETS + "/hy2.crt"] = "\n".join(vector["context"]["hy2_certificate"])
+    runner.files[service.SECRETS + "/hy2.obfs"] = vector["context"]["hy2_obfs_password"] + "\n"
     monkeypatch.setattr(registry_module, "uuid4", lambda: UUID(vector["device"]["uuid"]))
     monkeypatch.setattr(registry_module.secrets, "token_urlsafe", lambda _: "TEST-ONLY-hy2-password")
     monkeypatch.setattr(registry_module, "now", lambda: AT)
@@ -86,13 +87,46 @@ def test_exact_pair_golden_and_session_node_keys(installed, monkeypatch):
         GOLDEN / "device" / "pair.ycpair.json"
     ).read_text(encoding="utf-8")
     # authserver/authserver/service.py Service.session(): Node.model_dump()
-    # Node 导出的八个字段 + node.update 的两个凭据字段。
+    # Node 导出的九个字段 + node.update 的两个凭据字段。
     assert set(pair["node"]) == {
         "host", "reality_port", "hy2_port", "sni", "reality_public_key", "short_id",
-        "uuid", "hy2_password", "hy2_server_name", "hy2_certificate",
+        "uuid", "hy2_password", "hy2_server_name", "hy2_certificate", "hy2_obfs_password",
     }
     assert set(pair) == {"format", "exported_at", "node"}
+    assert pair["format"] == "ycpair/3"
     assert "private_key" not in runner.files[path]
+
+
+def test_export_without_obfs_file_is_v2_without_key(installed, capsys):
+    config, runner = installed
+    del runner.files[service.SECRETS + "/hy2.obfs"]
+    first = device.add(config, runner, name="电脑", host=HOST)
+    pair = json.loads(runner.files[config.node.data_dir + "/export/电脑.ycpair"])
+    assert pair["format"] == "ycpair/2"
+    assert "hy2_obfs_password" not in pair["node"]
+    assert pair["node"]["uuid"] == first.uuid
+    live = json.loads(runner.files[service.LIVE])
+    assert "obfs" not in live["inbounds"][1]
+
+
+def test_obfs_password_exported_but_never_printed(installed, capsys):
+    config, runner = installed
+    password = runner.files[service.SECRETS + "/hy2.obfs"].strip()
+    device.add(config, runner, name="电脑", host=HOST)
+    pair = json.loads(runner.files[config.node.data_dir + "/export/电脑.ycpair"])
+    assert pair["format"] == "ycpair/3" and pair["node"]["hy2_obfs_password"] == password
+    assert password not in capsys.readouterr().out
+    for file, text in runner.files.items():
+        if password in text:
+            assert "/secrets/" in file or file.endswith(".ycpair")
+
+
+def test_corrupt_obfs_file_blocks_export(installed):
+    config, runner = installed
+    device.add(config, runner, name="电脑", host=HOST)
+    runner.files[service.SECRETS + "/hy2.obfs"] = "bad password"
+    with pytest.raises(ValueError, match="备用通道混淆密码格式不正确"):
+        device.export(config, runner, name="电脑", host=HOST)
 
 
 def test_same_name_is_idempotent_and_list_never_prints_credentials(installed, capsys):

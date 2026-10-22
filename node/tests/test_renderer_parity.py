@@ -30,11 +30,13 @@ def test_pair_session_and_tls_parity(tmp_path):
     pair = render_pair(ctx, device, ctx.server_host, device.created_at)
     cert = tmp_path / "hy2.crt"
     cert.write_text("\n".join(ctx.hy2_certificate), encoding="utf-8")
+    obfs = tmp_path / "hy2.obfs"
+    obfs.write_text(ctx.hy2_obfs_password + "\n", encoding="utf-8")
     settings = Settings.model_validate({
         "security": {"admin_key": "test-admin", "node_key": "test-node", "token_salt": "test-salt"},
         "node": {k: v for k, v in pair["node"].items()
-                 if k not in {"uuid", "hy2_password", "hy2_certificate"}}
-                | {"hy2_certificate_path": str(cert)},
+                 if k not in {"uuid", "hy2_password", "hy2_certificate", "hy2_obfs_password"}}
+                | {"hy2_certificate_path": str(cert), "hy2_obfs_password_path": str(obfs)},
     })
     db = Database(tmp_path / "auth.sqlite3")
     db.initialize()
@@ -45,11 +47,16 @@ def test_pair_session_and_tls_parity(tmp_path):
     ))
     session = service.session(enrolled["refresh_token"])
     expected = {"host", "reality_port", "hy2_port", "sni", "reality_public_key", "short_id",
-                "uuid", "hy2_password", "hy2_server_name", "hy2_certificate"}
+                "uuid", "hy2_password", "hy2_server_name", "hy2_certificate",
+                "hy2_obfs_password"}
     assert set(pair["node"]) == set(session["node"]) == expected
-    assert pair["format"] == "ycpair/2"
+    assert pair["format"] == "ycpair/3"
     client = render_client_windows(ctx, device)
     auth = render(session["node"], session["node"])
+    assert client["outbounds"][1]["obfs"] == auth["outbounds"][1]["obfs"] == {
+        "type": "salamander", "password": ctx.hy2_obfs_password,
+    }
+    assert pair["node"]["hy2_obfs_password"] == session["node"]["hy2_obfs_password"]
     assert client["outbounds"][1]["tls"] == auth["outbounds"][1]["tls"] == {
         "enabled": True, "server_name": ctx.hy2_server_name,
         "certificate": list(ctx.hy2_certificate),

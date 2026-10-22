@@ -1,5 +1,6 @@
 """配置必须由部署方提供；无内置密钥。"""
 
+import re
 import tomllib
 from pathlib import Path
 
@@ -13,6 +14,8 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+
+HY2_OBFS_PATTERN = re.compile(r"[A-Za-z0-9_-]{16,128}")
 
 
 class Section(BaseModel):
@@ -47,7 +50,10 @@ class Node(Section):
     sni: str = Field(min_length=1)
     hy2_server_name: str = Field(default="exitnode", min_length=1)
     hy2_certificate_path: str = Field(min_length=1, exclude=True, repr=False)
+    # 节点 secrets/hy2.obfs 的本地副本；留空表示节点未启用混淆。
+    hy2_obfs_password_path: str = Field(default="", exclude=True, repr=False)
     _certificate: list[str] = PrivateAttr(default_factory=list)
+    _obfs_password: str = PrivateAttr(default="")
 
     @model_validator(mode="after")
     def read_certificate(self):
@@ -60,10 +66,30 @@ class Node(Section):
             raise ValueError("备用通道证书为空：" + self.hy2_certificate_path)
         return self
 
+    @model_validator(mode="after")
+    def read_obfs_password(self):
+        path = self.hy2_obfs_password_path
+        if not path:
+            self._obfs_password = ""
+            return self
+        try:
+            value = Path(path).read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError):
+            raise ValueError("无法读取备用通道混淆密码：" + path) from None
+        if not HY2_OBFS_PATTERN.fullmatch(value):
+            raise ValueError("备用通道混淆密码格式不正确：" + path)
+        self._obfs_password = value
+        return self
+
     @computed_field
     @property
     def hy2_certificate(self) -> list[str]:
         return list(self._certificate)
+
+    @computed_field(repr=False)
+    @property
+    def hy2_obfs_password(self) -> str:
+        return self._obfs_password
 
 
 class Limits(Section):
@@ -87,4 +113,5 @@ def load_config(path: str | Path) -> Settings:
         return Settings.model_validate(data)
     except ValueError:
         raise ValueError("鉴权服务器配置无效：请检查安全密钥、节点参数及限制，"
-                         "备用通道证书路径必填且文件必须可读取") from None
+                         "备用通道证书路径必填且文件必须可读取；"
+                         "如配置了备用通道混淆密码路径，文件必须可读取且格式正确") from None

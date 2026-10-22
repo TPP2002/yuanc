@@ -52,6 +52,10 @@
           "password": "TEST-ONLY-hy2-password"
         }
       ],
+      "obfs": {
+        "type": "salamander",
+        "password": "TEST-ONLY-hy2-obfs-0123456789abcdef"
+      },
       "tls": {
         "enabled": true,
         "server_name": "exitnode",
