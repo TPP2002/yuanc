@@ -1,0 +1,177 @@
+{
+  "schemaVersion": 1,
+  "taskId": "SEC-WIN-PAIRING-TRUST-1022",
+  "slug": "yc-sec-win-pairing-trust-1022",
+  "title": "Windows 后台服务对会改变连接状态的管道指令核验调用者:只有程序位于本产品安装目录之下的进程才能连接/断开/兑换/导入配对/清除配对,别的程序只能查状态;文档写明同机多用户与界面自动化的局限",
+  "goal": "以主干 4fbd666 之后的 main 为基点(已含 PR #34 管道加固:PipePeer.ClientProcessId / ProcessImage、ServerIdentity.IsTrusted、ConnectionBudget)。做完后:\n\n① 纯判定(新文件 winclient/WinClient.Core/Ipc/CallerIdentity.cs):`public static class CallerIdentity { public static bool IsTrusted(string? imagePath, string appRoot) }`——imagePath 非空、是完整路径、原始与规范化后都不含 \"..\" 段,规范化后严格位于 appRoot 之下(不等于 appRoot 本身,比较不分大小写,规则与 ServerIdentity 的路径部分一致,但不看会话号:界面在用户会话、卸载与更新助手在管理员会话,都允许)。可以把 ServerIdentity 里的路径判定抽成 internal 共用函数,ServerIdentity 行为不变。\n\n② 协议层(winclient/WinClient.Core/Ipc/ControlServer.cs):ServeAsync 增加可选参数 `bool callerTrusted = true`(默认 true 保证既有调用与测试不变)。ExecuteAsync 对 op 为 connect / disconnect / redeem / import_pairing / clear_pairing 且 !callerTrusted 时,不进指令信号量、不调门面,直接返回 `new(request.Id, false, \"只有本产品的界面程序可以执行此操作\")`;status / subscribe / check_update / read_audit 不受限(只读)。新增公开常量 `ControlServer.UntrustedCallerError` 保存这句文案供测试与文档引用。\n\n③ 服务宿主(winclient/WinClient.App/Hosting/ControlService.cs):接受连接并通过 budget.TryAdmit 后,取 `PipePeer.ProcessImage(admitted)`,算 `trusted = CallerIdentity.IsTrusted(image, UpdatePlanner.DefaultAppRoot)`(与 PipePeer.VerifyServer 用的同一个安装根,即 %ProgramFiles%\\YuanC\\app),把 trusted 传给 server.ServeAsync。不可信的连接照常服务(只读指令可用),但首次出现时在 run/service.log 记一行「来自安装目录之外的程序连接了后台服务,只允许查询(进程 <进程号>)」,同一进程五分钟内只记一次——复用 LogRejected 的节流结构(可以把 rejectLogged 的节流抽成小方法给两处用),不要让日志写失败影响监听循环。PipePeer 若需要新增只读查询帮助方法可以加,但不新增任何系统进程启动。\n\n④ 管道 ACL 不改(BUILTIN\\Users 仍 ReadWrite,界面以普通用户运行);ControlClient 不改;PairingFile 不加签名(拍板:配对文件签名作为待拍板项另行登记,本单不做)。\n\n⑤ 测试(winclient/WinClient.Tests/IpcTests.cs 既有用例不改断言,新增):(1) callerTrusted=false 时五个会改状态的 op 各返回 ok=false、error 等于 ControlServer.UntrustedCallerError,且假门面的对应方法一次都没被调、desired 未写;(2) 同一连接上 status、subscribe、check_update、read_audit 仍正常返回 ok=true;(3) callerTrusted 默认值时行为与改前一致(connect 走通);(4) CallerIdentity.IsTrusted 的参数化用例:安装目录下的子目录 exe 为真;等于安装目录本身、父目录、带 .. 段、相对路径、空、null、大小写不同但同目录(真)、同前缀但不同目录(如 C:\\Program Files\\YuanC-evil\\x.exe 为假)。HostingTests.cs 可加一条:ControlService 源码里 ServeAsync 调用处传入了 CallerIdentity 的判定结果(用源码文本断言即可,与既有 AllSystemCommandsAreHidden 的写法一致)。\n\n⑥ 文档 docs/winclient/服务化与自启说明.md:「本机管道协议」节的「防占满与防冒名」清单加一条「调用者核验:服务端取客户端进程的程序完整路径,只有位于 %ProgramFiles%\\YuanC\\app 之下的程序才能执行 connect / disconnect / redeem / import_pairing / clear_pairing,其他程序只能用 status / subscribe / check_update / read_audit,被拒时返回 ok=false、error=「只有本产品的界面程序可以执行此操作」,service.log 记一行并五分钟内不重复」;新增小节「同机其他账户与程序的边界(已知局限)」:①安装目录只有管理员能写,普通用户进程不能把自己放进去,所以换出口、撤保护只能由本产品程序发起;②但同一台电脑上任何能登录的账户都能运行本产品界面,也能用界面自动化(模拟点击)驱动本产品界面——本产品不区分同机账户,这是多用户电脑上的已知局限,需要隔离的场景应给每个账户单独的电脑或由管理员限制谁能登录;③配对文件目前只做格式校验、没有签名,替换配对文件需要能发 import_pairing(即运行本产品界面),签名方案待拍板;④管理员进程可以做任何事,不在防护目标内。「真机待验证清单」加:用安装目录之外的任意程序连管道发 connect/disconnect 应被拒并记日志、发 status 应成功;正常界面、卸载、更新助手的流程不受影响。\n\n⑦ 全程中文注释与文案;不改 Pairing/、Client/、Firewall/、Update/;不新增依赖;不启动新进程;Windows 子进程规则不涉及(本单不起子进程)。",
+  "background": "项目:外包,Windows 客户端 winclient(.NET 9,xunit)。后台服务 YuanCService 以 LocalSystem 跑,界面(普通用户)经命名管道 \\\\.\\pipe\\YuanC-Control 下指令;管道 ACL 给 BUILTIN\\Users ReadWrite。对抗审查 B4:同机别的账户或同账户下的恶意普通进程都能连管道发 disconnect(撤销断网保护)或 import_pairing(把流量引到攻击者节点);配对文件无签名。卡上二选一:①配对文件由节点私钥签名、客户端内置公钥校验;②限制调用者。派单方拍板先做②的「程序路径限安装目录」版本(不要求会话号:卸载与更新助手在管理员会话里也要能发指令),①登记为待拍板项交负责人。现有可复用件(PR #34):WinClient.App/Hosting/PipePeer.cs 有 ClientProcessId(pipe)、ProcessImage(pid)(QueryFullProcessImageNameW,只查询不起进程)、VerifyServer/IsTrustedServer;WinClient.Core/Ipc/ServerIdentity.IsTrusted(serverSessionId, clientSessionId, imagePath, appRoot) 做会话号+路径纯判定;ControlService.ListenAsync 接连接后 PipePeer.ClientProcessId → budget.TryAdmit → server.ServeAsync(pipe, token),LogRejected 有「同一进程五分钟只记一次」的节流;UpdatePlanner.DefaultAppRoot 是 %ProgramFiles%\\YuanC\\app。ControlServer(Core)只收 Stream,ExecuteAsync 用 switch 分发 op,status/check_update 不进信号量。IpcTests 用内存双向流与假门面。另一张并行单 yc-sec-node-systemd-harden-nft-1022 只改 node/ 与 docs/node/,与本单无交集。工位沙箱无外网;派单方已把 winclient/third_party/cache/ 两个 zip 放进工位,构建不会联网。",
+  "nonGoals": [
+    "不做配对文件签名(待拍板)",
+    "不改管道 ACL、不要求调用者会话号",
+    "不改 ControlClient、Pairing、Client、Firewall、Update",
+    "不区分同机不同账户(文档写明局限)",
+    "不在真机实测"
+  ],
+  "allowedPaths": [
+    "winclient/WinClient.Core/Ipc/CallerIdentity.cs",
+    "winclient/WinClient.Core/Ipc/ControlServer.cs",
+    "winclient/WinClient.Core/Ipc/ServerIdentity.cs",
+    "winclient/WinClient.App/Hosting/ControlService.cs",
+    "winclient/WinClient.App/Hosting/PipePeer.cs",
+    "winclient/WinClient.Tests/IpcTests.cs",
+    "winclient/WinClient.Tests/HostingTests.cs",
+    "docs/winclient/服务化与自启说明.md"
+  ],
+  "forbiddenPaths": [
+    "docs/开工须知.md",
+    "docs/口径速查表.md",
+    "docs/design/**",
+    "docs/交接/**",
+    "docs/plans/**",
+    "docs/acceptance/**",
+    ".github/**",
+    ".codex/**",
+    ".gitignore",
+    "pyproject.toml",
+    "scripts/**",
+    "node/**",
+    "authserver/**",
+    "docs/node/**",
+    "docs/authserver/**",
+    "docs/winclient/架构说明.md",
+    "docs/winclient/自动更新说明.md",
+    "docs/winclient/断网保护加固说明.md",
+    "winclient/WinClient.App/App.xaml*",
+    "winclient/WinClient.App/Views/**",
+    "winclient/WinClient.App/Program.cs",
+    "winclient/WinClient.App/Hosting/InstallerRunner.cs",
+    "winclient/WinClient.App/Hosting/UpdateApplier.cs",
+    "winclient/WinClient.App/Hosting/UpdateRecovery.cs",
+    "winclient/WinClient.App/Hosting/UpdateWindowsHost.cs",
+    "winclient/WinClient.Core/Ipc/ControlClient.cs",
+    "winclient/WinClient.Core/Ipc/ControlProtocol.cs",
+    "winclient/WinClient.Core/Ipc/ConnectionBudget.cs",
+    "winclient/WinClient.Core/Client/**",
+    "winclient/WinClient.Core/Firewall/**",
+    "winclient/WinClient.Core/Auth/**",
+    "winclient/WinClient.Core/State/**",
+    "winclient/WinClient.Core/Update/**",
+    "winclient/WinClient.Core/Hosting/**",
+    "winclient/WinClient.Core/Storage/**",
+    "winclient/WinClient.Core/Process/**",
+    "winclient/WinClient.Core/Kernel/**",
+    "winclient/WinClient.Core/Logging/**",
+    "winclient/WinClient.Core/Pairing/**",
+    "winclient/WinClient.Tests/ControllerTests.cs",
+    "winclient/WinClient.Tests/PairingTests.cs",
+    "winclient/WinClient.Tests/PairingCertificateTests.cs",
+    "winclient/WinClient.Tests/AuthTests.cs",
+    "winclient/WinClient.Tests/StateTests.cs",
+    "winclient/WinClient.Tests/TestData.cs",
+    "winclient/WinClient.Tests/Firewall*.cs",
+    "winclient/WinClient.Tests/KillSwitch*.cs",
+    "winclient/WinClient.Tests/Update*.cs",
+    "winclient/WinClient.Tests/Kernel*.cs",
+    "winclient/WinClient.Tests/DataDirectory*.cs",
+    "winclient/WinClient.Tests/ProcessStorageTests.cs",
+    "winclient/WinClient.Tests/Fixtures/**",
+    "winclient/**/*.csproj",
+    "winclient/WinClient.sln",
+    "winclient/third_party/**"
+  ],
+  "expectArtifacts": [
+    "winclient/WinClient.Core/Ipc/CallerIdentity.cs",
+    "winclient/WinClient.Core/Ipc/ControlServer.cs",
+    "winclient/WinClient.App/Hosting/ControlService.cs",
+    "winclient/WinClient.Tests/IpcTests.cs",
+    "docs/winclient/服务化与自启说明.md"
+  ],
+  "acceptance": [
+    {
+      "id": "BUILD",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "build",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 900
+    },
+    {
+      "id": "TEST",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "test",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--no-build",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 900
+    },
+    {
+      "id": "SHAPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda p:pathlib.Path(p).read_text(encoding='utf-8');ci=r('winclient/WinClient.Core/Ipc/CallerIdentity.cs');cs=r('winclient/WinClient.Core/Ipc/ControlServer.cs');sv=r('winclient/WinClient.App/Hosting/ControlService.cs');t=r('winclient/WinClient.Tests/IpcTests.cs');bad=[k for k,ok in (('caller.class','static class CallerIdentity' in ci and 'IsTrusted(' in ci),('server.param','callerTrusted' in cs),('server.error','UntrustedCallerError' in cs and '只有本产品的界面程序可以执行此操作' in cs),('service.uses','CallerIdentity.IsTrusted(' in sv and 'UpdatePlanner.DefaultAppRoot' in sv and 'ProcessImage(' in sv),('service.log','安装目录之外' in sv),('tests',t.count('UntrustedCallerError') >= 1 and 'CallerIdentity' in t),('no-process-start','Process.Start' not in sv and 'Process.Start' not in ci)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "NOWINDOW",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;norm=lambda p:str(p).replace(chr(92),'/');files=[p for root in ('winclient/WinClient.Core','winclient/WinClient.App') for p in pathlib.Path(root).rglob('*.cs') if '/obj/' not in norm(p) and '/bin/' not in norm(p)];bad=[norm(p) for p in files if 'ProcessStartInfo' in p.read_text(encoding='utf-8') and p.parent.name!='Process' and 'CreateNoWindow = true' not in p.read_text(encoding='utf-8')];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;a=pathlib.Path('docs/winclient/服务化与自启说明.md').read_text(encoding='utf-8');bad=[k for k in ('调用者核验','只有本产品的界面程序可以执行此操作','已知局限','界面自动化','签名','待拍板','安装目录之外') if k not in a];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "NOBIN",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess,sys;out=subprocess.run(['git','ls-files','winclient','build'],capture_output=True,text=True).stdout.split();bad=[f for f in out if f.endswith(('.exe','.dll','.zip','.pdb'))];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "model": "claude-opus-5-5",
+  "timeoutSec": 5400,
+  "repoRoot": "E:/yuanc",
+  "engine": "claude",
+  "reasoningEffort": "high",
+  "steps": [
+    "读 ControlServer.cs / ControlService.cs / PipePeer.cs / ServerIdentity.cs / IpcTests.cs / HostingTests.cs;先写红测试(不可信调用者五个 op 被拒、只读 op 照常、CallerIdentity 参数化)。",
+    "实现 CallerIdentity、ServeAsync 参数、ControlService 取路径判定与节流日志;跑 BUILD/TEST。",
+    "改文档;交活说明列真机待验证项。"
+  ]
+}

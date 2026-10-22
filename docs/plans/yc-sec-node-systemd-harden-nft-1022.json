@@ -1,0 +1,222 @@
+{
+  "schemaVersion": 1,
+  "taskId": "SEC-NODE-SYSTEMD-HARDEN-1022",
+  "slug": "yc-sec-node-systemd-harden-nft-1022",
+  "title": "节点服务降权与加固:隧道服务以系统账户 exitnode 运行(只保留绑定低端口能力)、托管服务用动态账户并只收本机连接、其余 root 单元加沙箱;凭据文件按属组给隧道服务读权;防火墙规则表写成文件由开机单元重新加载并改掉误导注释;check 新增「服务加固」层",
+  "goal": "以主干 4fbd666 之后的 main 为基点(已含 PR #35 子进程 -P、PR #37 布局路径锁死)。做完后:\n\n① 执行器扩接口(node/exitnode/runner.py):Runner 协议新增 `chown(path: str, user: str, group: str) -> None` 与 `chmod(path: str, mode: int) -> None`;RealRunner 用 shutil.chown / os.chmod 实现(不跟随符号链接:chmod 前 `Path(path).is_symlink()` 为真就 raise RunnerError(\"不能修改链接的权限\"));FakeRunner 新增 `self.owners = {}`,chown 记 `self.calls.append((\"chown\", path, user, group))` 并 `self.owners[path] = (user, group)`,chmod 记 calls 并写 `self.modes[path] = mode`;FakeRunner.replace(source, target) 同时把 owners 从 source 搬到 target。救援包 node/exitnode/rescue/runner.py 的 Runner 协议同样新增 `chown(path, user, group)`,RealRunner 用 shutil.chown,FakeRunner 记 calls 与 owners(救援包仍只许标准库)。\n\n② 服务账户(node/exitnode/service.py 新增常量 `SERVICE_USER = \"exitnode\"`、`SERVICE_GROUP = \"exitnode\"`):cli._install 在「凭据目录」步骤之后新增步骤 \"创建服务账户\":do() 先 `runner.run([\"getent\", \"passwd\", \"exitnode\"], check=False)`,退出码非 0 才 `runner.run([\"useradd\", \"--system\", \"--no-create-home\", \"--home-dir\", \"/nonexistent\", \"--shell\", \"/usr/sbin/nologin\", \"--user-group\", \"exitnode\"])`;undo 为新类型 `{\"kind\": \"user\", \"name\": \"exitnode\"}`。manifest.py:_validate_undo 允许 kind \"user\" 且 name 只能是 \"exitnode\"(其他名字 raise ValueError(\"只允许撤回本项目的服务账户\"));_undo 对 kind user 执行 `runner.run([\"userdel\", \"exitnode\"], check=False)`(账户不存在也算成功)。apply() 的 target 取值对 kind user 用 name。\n\n③ 凭据与目录权限(service.py 新增函数 `apply_permissions(runner)`,幂等,供安装步骤与发布路径复用):`runner.chmod(\"/var/lib/exitnode\", 0o711)`(root 持有,其他账户只能穿越不能列目录,托管服务与隧道服务都要穿过它);`runner.chmod(SECRETS, 0o710)` 与 `runner.chown(SECRETS, \"root\", \"exitnode\")`(隧道服务能穿越凭据目录、不能列目录);对 LIVE(sing-box.json)、SECRETS + \"/hy2.crt\"、SECRETS + \"/hy2.key\" 三个文件(存在的才处理)`chmod 0o640` + `chown root exitnode`;reality.json、devices.json、hy2.obfs、sing-box.last-good.json 保持 0600 root 不动。cli._install 在「渲染隧道配置」(service.publish)之后、「写入 exitnode-proxy.service」之前新增步骤 \"设置凭据文件权限\":do() 调 apply_permissions(runner),undo `{\"kind\": \"remove_file\", \"path\": SECRETS, \"preserve\": True}`。老节点再跑一次 init 时这一步会把旧的 0600 修成新权限。\n\n④ 每次改写线上配置都保持新权限:(a) service._publish_checked 写临时文件改 `runner.write_file(temporary, text, 0o640)` 后紧跟 `runner.chown(temporary, \"root\", \"exitnode\")` 再 replace;登记表写失败回退那条 `adapter.write_file(LIVE, old_text, 0o600)` 改 0o640 并随后 `runner.chown(LIVE, \"root\", \"exitnode\")`;LAST_GOOD 仍 0600。(b) node/exitnode/watchdog/ladder.py rollback_config:`runner.write_file(temporary, text, 0o600)` 改 0o640 并在 check 通过后、replace 之前 `runner.chown(temporary, \"root\", \"exitnode\")`。(c) node/exitnode/rescue/actions.py restore:`runner.write(temporary, content, 0o600)` 改 0o640 并在第二次 check 通过后、replace 之前 `runner.chown(temporary, \"root\", \"exitnode\")`;candidate 校验副本保持 0600。\n\n⑤ 服务单元模板(node/exitnode/templates/,黄金 node/tests/golden/ 同步):\n  (a) exitnode-proxy.service [Service] 段改为(保留 Environment=PYTHONPATH、Type、ExecStart、ExecReload、Restart、RestartSec 不变):`User=exitnode`、`Group=exitnode`、`AmbientCapabilities=CAP_NET_BIND_SERVICE`、`CapabilityBoundingSet=CAP_NET_BIND_SERVICE`、`NoNewPrivileges=true`、`UMask=0077`、`ProtectSystem=strict`、`ProtectHome=true`、`PrivateTmp=true`、`PrivateDevices=true`、`ProtectKernelTunables=true`、`ProtectKernelModules=true`、`ProtectKernelLogs=true`、`ProtectControlGroups=true`、`ProtectClock=true`、`ProtectHostname=true`、`ProtectProc=invisible`、`RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK`、`RestrictNamespaces=true`、`RestrictRealtime=true`、`RestrictSUIDSGID=true`、`LockPersonality=true`、`SystemCallArchitectures=native`、`SystemCallFilter=@system-service`、`ReadOnlyPaths=/var/lib/exitnode/secrets`。[Unit] 加 `After=exitnode-nft.service`(保留 network-online.target)。\n  (b) exitnode-admin.service:ExecStart 改 `/usr/bin/python3 -P -m exitnode --config \"$config_path\" admin serve`;加 `DynamicUser=true`、`CapabilityBoundingSet=`(空,去掉全部能力)、`ProtectSystem=strict`、`ProtectHome=true`、`PrivateTmp=true`、`PrivateDevices=true`、`ProtectKernelTunables=true`、`ProtectKernelModules=true`、`ProtectKernelLogs=true`、`ProtectControlGroups=true`、`ProtectProc=invisible`、`RestrictAddressFamilies=AF_INET AF_INET6`、`RestrictNamespaces=true`、`RestrictRealtime=true`、`RestrictSUIDSGID=true`、`LockPersonality=true`、`SystemCallArchitectures=native`、`SystemCallFilter=@system-service`、`IPAddressDeny=any`、`IPAddressAllow=localhost`、`ReadOnlyPaths=/var/lib/exitnode/winclient`;TasksMax/LimitNOFILE/MemoryMax/StartLimit 保留。托管服务只读 /etc/exitnode/config.toml 与 /var/lib/exitnode/winclient/releases/(0755/0644),日志走标准错误进 journal(cli 的 admin 分支 configure 不传目录,本来就是 StreamHandler),不写数据目录。\n  (c) exitnode-watchdog.service、exitnode-recover.service、exitnode-rescue.service(仍以 root 运行,要重启服务、写 /opt 与 /var/lib):ExecStart 的 python3 后加 `-P`;各加 `ProtectSystem=full`、`ProtectHome=true`、`PrivateTmp=true`、`ProtectKernelModules=true`、`ProtectKernelLogs=true`、`ProtectControlGroups=true`、`RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK`、`RestrictNamespaces=true`、`RestrictRealtime=true`、`RestrictSUIDSGID=true`、`LockPersonality=true`、`SystemCallArchitectures=native`;不加 CapabilityBoundingSet(它们要 chown、kill、重启服务)。两个 timer 不改。\n  (d) 新模板 exitnode-nft.service(新黄金同名):[Unit] `Description=出口节点防火墙规则表(开机重新加载)`、`DefaultDependencies=no`、`After=local-fs.target`、`Before=network-pre.target exitnode-proxy.service`、`Wants=network-pre.target`、`ConditionPathExists=/var/lib/exitnode/exitnode.nft`;[Service] `Type=oneshot`、`RemainAfterExit=yes`、`ExecStart=/usr/sbin/nft -f /var/lib/exitnode/exitnode.nft`;[Install] `WantedBy=multi-user.target`。不含 Environment=PYTHONPATH、Restart、StartLimit。manifest.UNITS 加入 \"exitnode-nft.service\"(systemd.render 与 systemctl 撤回白名单随之认它);cli._install 的通用单元写入循环自然会写它(排在 admin 之后、重载服务定义之前)。\n\n⑥ 防火墙规则表(node/exitnode/nft.py):新增常量 `RULES = \"/var/lib/exitnode/exitnode.nft\"`;apply(runner, ctx) 改为:text = \"table inet exitnode\\ndelete table inet exitnode\\n\" + render_ruleset(ctx)(先声明再删除的写法在 Debian 12 的 nft 1.0.6 上幂等,表不存在也不报错;不再查 _exists、不再写 /run 临时文件),用 RULES + \".tmp\" 写 0o600 后 runner.replace 到 RULES,再 `runner.run([\"nft\", \"-f\", RULES])`。remove(runner):表存在就 `nft delete table inet exitnode`,RULES 文件存在就 runner.remove(RULES)。render_ruleset 的首行注释改为 `# 占位规则表:policy accept,只放行本项目端口,不限制其他流量;开机由 exitnode-nft.service 重新加载。管理入口只收本机连接由 exitnode-admin.service 的 IPAddressAllow 保证,不靠本表。`(删掉「管理入口限配置的监听地址」这句误导),其余规则文本不变;黄金 node/tests/golden/exitnode.nft 同步。cli._install 在「安装网络规则」之后新增步骤 \"启用防火墙规则单元\":`systemctl enable exitnode-nft.service`(不加 --now,规则已由 apply 加载),undo `{\"kind\": \"systemctl\", \"unit\": \"exitnode-nft.service\"}`。_install 里原有「已有同名规则表未在本安装清单中」的 _exists 前置检查保留。\n\n⑦ 安装前置校验(cli._install,放在「未找到 sing-box」检查之后、任何写入之前):`config.admin.port < 1024` → raise ValueError(\"托管服务已降权运行,admin.port 须不小于 1024\");`not ipaddress.ip_address(config.admin.bind).is_loopback` → raise ValueError(\"托管服务只允许监听回环地址(IPAddressAllow=localhost 只放本机连接)\")。另加步骤 \"配置文件权限\"(紧跟「创建服务账户」之后):`runner.chmod(config_path, 0o644)`(配置文件按设计不含任何凭据,凭据只在 secrets 目录;托管服务以动态账户读它),undo `{\"kind\": \"remove_file\", \"path\": config_path, \"preserve\": True}`。\n\n⑧ check 新增一层(service.py 新增 `harden_check(runner)`):`systemctl show exitnode-proxy.service -p User --value` 输出去空白 == \"exitnode\" 且 `systemctl is-active exitnode-nft.service` 退出码 0 且输出去空白 == \"active\" → 通过;返回 `{\"layer\": \"hardening\", \"name\": \"服务加固\", \"result\": \"通过\"/\"失败\", \"reason\": \"隧道服务以 exitnode 账户运行且防火墙规则单元已加载\" / \"隧道服务未降权或防火墙规则单元未加载\"}`;cli.main 的 check 分支在插入「救援单元」之后再 `result[\"layers\"].insert(-1, service.harden_check(runner))`,使顺序为 … 看门狗、救援单元、服务加固、隧道服务、客户端托管服务。status 不变。\n\n⑨ 测试(node/tests/):test_systemd_render.py——UNITS 元组加 exitnode-nft.service,黄金逐字比对;对非 python 的 nft 单元放开 `Environment=PYTHONPATH` 与 `Restart=` 的统一断言;ExecStart 断言改成带 -P;新增断言:proxy 单元含 User=exitnode、AmbientCapabilities=CAP_NET_BIND_SERVICE、CapabilityBoundingSet=CAP_NET_BIND_SERVICE、ProtectSystem=strict、ReadOnlyPaths=/var/lib/exitnode/secrets,且不含 DynamicUser;admin 单元含 DynamicUser=true、IPAddressDeny=any、IPAddressAllow=localhost、CapabilityBoundingSet=(空值行)且不含 User=;watchdog/recover/rescue 含 ProtectSystem=full 且不含 User=/DynamicUser;nft 单元含 RemainAfterExit=yes、ConditionPathExists 与 Before=…exitnode-proxy.service。test_nft_render.py——apply 写的是 RULES 文件(内容 = 声明+删除两行 + render_ruleset)、权限 0o600、.tmp 已替换、随后 `nft -f RULES`;remove 删表并删文件;表不存在时 remove 不发 delete;黄金比对;新断言 render_ruleset 文本不含「管理入口限配置的监听地址」。test_manifest.py——kind user 只许 exitnode、撤回执行 userdel(check=False)。test_cli.py——安装步骤顺序断言加:创建服务账户 < 配置文件权限 < 安装程序目录;安装网络规则 < 启用防火墙规则单元 < 检查 sing-box 二进制;渲染隧道配置 < 设置凭据文件权限 < 写入exitnode-proxy.service;`getent` 返回非 0 时发 useradd、返回 0 时不发;admin.port 999 或 admin.bind 192.0.2.2 时 init 返回 1、不写任何单元;check 层列表加「服务加固」(fake 的 systemctl 应答补 `(\"systemctl\",\"show\",\"exitnode-proxy.service\",\"-p\",\"User\")` → out=\"exitnode\\n\" 与 `(\"systemctl\",\"is-active\",\"exitnode-nft.service\")` → out=\"active\",并各写一条失败例);uninstall 的 undo 里有 userdel 且在删单元之后;重复 init 不新增 run 调用的既有断言保持。test_service.py——test_install_manifest_order_permissions_and_repeat 的六个凭据文件权限断言改为:reality.json/hy2.obfs/devices.json 0o600,hy2.crt/hy2.key/sing-box.json 0o640 且 owners == (\"root\",\"exitnode\");SECRETS 目录 modes 0o710 且 owners root:exitnode;/var/lib/exitnode 0o711;发布成功后 LIVE 0o640 且 chown 发生在 replace 之前;LAST_GOOD 仍 0o600;登记表写失败回退后 LIVE 仍 0o640 root:exitnode。test_watchdog.py(只加断言不改既有语义)——rollback_config 后 LIVE 0o640 且 owners root:exitnode。test_rescue.py——restore 后 LIVE 0o640 且 owners root:exitnode,candidate 仍 0o600;test_rescue_package_only_imports_stdlib 继续通过;既有 `runner.modes[p.LIVE] == 0o600` 的断言改为 0o640。\n\n⑩ 文档:新建 docs/node/服务加固说明.md(账户 exitnode 的来历与撤回;五个 service 的加固项逐条表格、为什么隧道服务只留 CAP_NET_BIND_SERVICE、为什么托管服务用 DynamicUser 并只收本机、为什么 watchdog/recover/rescue 仍 root;文件与目录权限表:/var/lib/exitnode 0711 root、secrets 0710 root:exitnode、sing-box.json/hy2.crt/hy2.key 0640 root:exitnode、其余凭据 0600 root、/etc/exitnode/config.toml 0644(不含凭据);每条改写线上配置的路径(发布、看门狗回滚、救援恢复)都保持 0640 root:exitnode;admin.bind 必须回环、admin.port 不小于 1024;防火墙规则表是占位、文件 /var/lib/exitnode/exitnode.nft 由 exitnode-nft.service 开机重新加载;真机待验证清单:sing-box 以 exitnode 账户启动并监听 443/24443、`systemd-analyze security exitnode-proxy.service` 分数、重启后 `nft list table inet exitnode` 存在且在 proxy 之前加载、托管服务以动态账户能下发 latest.json、救援恢复与看门狗回滚后隧道服务重启仍能读配置、老节点再跑 init 后权限被修正、SystemCallFilter 若导致 sing-box 起不来(journal 出现 SIGSYS)如何放宽)。docs/node/客户端包托管说明.md「服务与检查」「安全边界」两节补 DynamicUser、只收本机连接、监听必须回环且端口 ≥1024、配置文件 0644 的理由。docs/node/配置说明.md 的 admin.bind 行加「必须是回环地址」、admin.port 行加「不小于 1024」。docs/node/看门狗说明.md 第 15 行附近「副本与状态文件权限均为仅管理员可读写」改为「线上配置 0640 root:exitnode,副本与状态文件 0600」。\n\n⑪ 全程中文;不新增依赖;救援包只用标准库;不改 config.py、proxy/、updater/、admin/;不在真机实测。",
+  "background": "项目:外包,澳洲 Debian 12 软路由 node/exitnode(Python 3.11 目标、本机 3.14 跑测试;systemd 252、nft 1.0.6)。对抗审查 A5:proxy/admin/watchdog/rescue/recover 五个单元无 User=,只有 NoNewPrivileges 与 UMask;sing-box 以 root 监听公网,协议栈任一漏洞即整机沦陷、Reality 私钥与全部 UUID 泄漏。对抗审查 A13:nft.py 的表 policy accept 只有 accept 规则(占位),只在 init 时加载一次、重启即消失,首行注释「管理入口限配置的监听地址」与实际不符。现状要点:所有主机操作经 node/exitnode/runner.py 的 Runner 协议(RealRunner/FakeRunner,FakeRunner 记 calls/files/modes;run 按 argv 前缀匹配 responses,未配置返回 127);安装流程在 cli._install,用 manifest.apply(step, do, undo) 登记可撤回步骤,undo kind 只有 remove_file/restore_file/systemctl/nft,systemctl 撤回单元名限 manifest.UNITS;systemd.render(name, ctx, binary) 用 string.Template 填 config_path/program_path/binary,校验字符;单元模板在 node/exitnode/templates/,黄金在 node/tests/golden/ 同名,test_systemd_render 逐字比对并统一断言「每个 .service 含 Restart= 与 Environment=PYTHONPATH=/opt/exitnode/current」「只有 admin/proxy 有 StartLimit」。service.py:SECRETS=/var/lib/exitnode/secrets,LIVE=secrets/sing-box.json,_publish_checked 写 .check.tmp 0o600 → sing-box check → replace 到 LIVE → 写 LAST_GOOD 0o600;ensure_credentials 生成 reality.json/hy2.crt/hy2.key/hy2.obfs/devices.json(全 0600);数据目录与凭据目录由 runner.mkdir 默认 0o700 建。sing-box 服务端配置里 log disabled、无 cache_file,只读 secrets/sing-box.json 与 hy2.crt/hy2.key(路径在配置里)。托管服务 admin/server.py 只读 <data_dir>/winclient/releases/(0755/0644),cli 的 admin 分支 configure(runner, level=…) 不传目录即 StreamHandler;admin.check 从 CLI(root)发 GET。看门狗 ladder.py rollback_config 与救援 rescue/actions.py restore 都会把 LAST_GOOD 写回 LIVE(0o600);救援包 rescue/ 只许标准库(test_rescue_package_only_imports_stdlib),有自己的 Runner 协议(run/read/write/exists/list/is_dir/symlink/readlink/replace/remove_tree/copy_tree/mkdir/now/lock_busy)。rescue/actions._reinstall 重启 proxy/admin/watchdog.timer,updater/upgrade.py 重启 proxy/admin,这些以 root 跑不受影响。config.py 已锁 data_dir=/var/lib/exitnode、releases_dir=/opt/exitnode、secrets_dir 固定,所以模板里可写死路径。test_cli.fake() 的 responses 有 (\"systemctl\",)→成功、(\"nft\",\"-j\")→空表、(\"nft\",\"-f\")→成功;test_check_unintegrated_layers_are_not_passed 断言 check 层顺序列表。PR #35 已把 upgrade/cli/rescue 的 python3 子进程加 -P,单元模板 ExecStart 当时未动,本单补上。另一张并行单 yc-sec-win-pairing-trust-1022 只改 winclient/ 与 docs/winclient/,与本单无交集。",
+  "nonGoals": [
+    "不改 config.py(布局与端口校验已由 PR #37 完成;admin 端口/回环只在安装时校验)",
+    "不改 proxy/、updater/、admin/ 的代码",
+    "不给 nft 表加真正的限制规则(仍是占位,只修注释与开机加载)",
+    "不做 MemoryDenyWriteExecute、不给 root 单元收能力集",
+    "不在真机实测;真机项写进文档待验证清单"
+  ],
+  "allowedPaths": [
+    "node/exitnode/runner.py",
+    "node/exitnode/service.py",
+    "node/exitnode/cli.py",
+    "node/exitnode/manifest.py",
+    "node/exitnode/systemd.py",
+    "node/exitnode/nft.py",
+    "node/exitnode/templates/**",
+    "node/exitnode/watchdog/ladder.py",
+    "node/exitnode/rescue/actions.py",
+    "node/exitnode/rescue/runner.py",
+    "node/tests/golden/exitnode-admin.service",
+    "node/tests/golden/exitnode-proxy.service",
+    "node/tests/golden/exitnode-recover.service",
+    "node/tests/golden/exitnode-rescue.service",
+    "node/tests/golden/exitnode-watchdog.service",
+    "node/tests/golden/exitnode-nft.service",
+    "node/tests/golden/exitnode.nft",
+    "node/tests/test_systemd_render.py",
+    "node/tests/test_nft_render.py",
+    "node/tests/test_manifest.py",
+    "node/tests/test_cli.py",
+    "node/tests/test_service.py",
+    "node/tests/test_watchdog.py",
+    "node/tests/test_rescue.py",
+    "docs/node/服务加固说明.md",
+    "docs/node/客户端包托管说明.md",
+    "docs/node/配置说明.md",
+    "docs/node/看门狗说明.md"
+  ],
+  "forbiddenPaths": [
+    "docs/开工须知.md",
+    "docs/口径速查表.md",
+    "docs/design/**",
+    "docs/交接/**",
+    "docs/plans/**",
+    "docs/acceptance/**",
+    ".github/**",
+    ".codex/**",
+    ".gitignore",
+    "pyproject.toml",
+    "scripts/**",
+    "winclient/**",
+    "authserver/**",
+    "node/exitnode/config.py",
+    "node/exitnode/device.py",
+    "node/exitnode/netinfo.py",
+    "node/exitnode/status.py",
+    "node/exitnode/log.py",
+    "node/exitnode/proxy/**",
+    "node/exitnode/updater/**",
+    "node/exitnode/admin/**",
+    "node/exitnode/watchdog/__init__.py",
+    "node/exitnode/watchdog/probes.py",
+    "node/exitnode/watchdog/state.py",
+    "node/exitnode/rescue/probes.py",
+    "node/exitnode/rescue/state.py",
+    "node/exitnode/rescue/lastgood.py",
+    "node/exitnode/rescue/__main__.py",
+    "node/exitnode/rescue/__init__.py",
+    "node/examples/**",
+    "node/tests/golden/device/**",
+    "node/tests/golden/proxy/**",
+    "node/tests/golden/exitnode-rescue.timer",
+    "node/tests/golden/exitnode-watchdog.timer",
+    "node/tests/test_config.py",
+    "node/tests/test_proxy_*.py",
+    "node/tests/test_renderer_parity.py",
+    "node/tests/test_updater.py",
+    "node/tests/test_device.py",
+    "node/tests/test_admin_*.py",
+    "docs/node/更新与回退说明.md",
+    "docs/node/救援单元说明.md",
+    "docs/node/自用配对说明.md",
+    "docs/node/隧道配置说明.md",
+    "docs/winclient/**",
+    "docs/authserver/**"
+  ],
+  "expectArtifacts": [
+    "node/exitnode/runner.py",
+    "node/exitnode/service.py",
+    "node/exitnode/cli.py",
+    "node/exitnode/manifest.py",
+    "node/exitnode/nft.py",
+    "node/exitnode/templates/exitnode-proxy.service",
+    "node/exitnode/templates/exitnode-admin.service",
+    "node/exitnode/templates/exitnode-nft.service",
+    "node/exitnode/watchdog/ladder.py",
+    "node/exitnode/rescue/actions.py",
+    "node/exitnode/rescue/runner.py",
+    "node/tests/golden/exitnode-nft.service",
+    "node/tests/golden/exitnode.nft",
+    "node/tests/test_systemd_render.py",
+    "node/tests/test_nft_render.py",
+    "node/tests/test_cli.py",
+    "node/tests/test_service.py",
+    "docs/node/服务加固说明.md"
+  ],
+  "acceptance": [
+    {
+      "id": "RUFF",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "ruff",
+        "check",
+        "node",
+        "scripts",
+        "authserver"
+      ],
+      "required": true,
+      "timeoutSec": 300
+    },
+    {
+      "id": "PYTEST",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+        "node/tests"
+      ],
+      "required": true,
+      "timeoutSec": 900
+    },
+    {
+      "id": "SHAPE-PROXY-ADMIN",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;n=chr(10);r=lambda p:pathlib.Path('node/exitnode/templates/'+p).read_text(encoding='utf-8');px=r('exitnode-proxy.service');ad=r('exitnode-admin.service');bad=[k for k,ok in (('proxy.user','User=exitnode'+n in px and 'Group=exitnode'+n in px),('proxy.cap','AmbientCapabilities=CAP_NET_BIND_SERVICE'+n in px and 'CapabilityBoundingSet=CAP_NET_BIND_SERVICE'+n in px),('proxy.strict','ProtectSystem=strict'+n in px and 'ReadOnlyPaths=/var/lib/exitnode/secrets'+n in px),('proxy.after','exitnode-nft.service' in px),('admin.dyn','DynamicUser=true'+n in ad and n+'User=' not in ad),('admin.ip','IPAddressDeny=any'+n in ad and 'IPAddressAllow=localhost'+n in ad),('admin.cap','CapabilityBoundingSet='+n in ad),('admin.P','python3 -P -m exitnode' in ad)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "SHAPE-ROOT-NFT",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;n=chr(10);r=lambda p:pathlib.Path('node/exitnode/templates/'+p).read_text(encoding='utf-8');nf=r('exitnode-nft.service');ts=[r(x) for x in ('exitnode-watchdog.service','exitnode-recover.service','exitnode-rescue.service')];bad=[k for k,ok in (('nft.exec','ExecStart=/usr/sbin/nft -f /var/lib/exitnode/exitnode.nft'+n in nf and 'RemainAfterExit=yes'+n in nf and 'ConditionPathExists=/var/lib/exitnode/exitnode.nft'+n in nf),('nft.before','exitnode-proxy.service' in nf),('root.P',all('python3 -P -m' in t for t in ts)),('root.full',all('ProtectSystem=full'+n in t for t in ts)),('root.nouser',all(n+'User=' not in t and 'DynamicUser' not in t for t in ts))) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "SHAPE-CODE-A",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda p:pathlib.Path(p).read_text(encoding='utf-8');rn=r('node/exitnode/runner.py');sv=r('node/exitnode/service.py');cl=r('node/exitnode/cli.py');bad=[k for k,ok in (('runner.chown','def chown(' in rn and 'def chmod(' in rn),('service.perm','def apply_permissions(' in sv and 'def harden_check(' in sv and '0o640' in sv),('cli.steps',all(x in cl for x in ('创建服务账户','配置文件权限','设置凭据文件权限','启用防火墙规则单元','不小于 1024','回环'))),('cli.useradd','useradd' in cl and 'getent' in cl)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "SHAPE-CODE-B",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda p:pathlib.Path(p).read_text(encoding='utf-8');mf=r('node/exitnode/manifest.py');nf=r('node/exitnode/nft.py');ld=r('node/exitnode/watchdog/ladder.py');ra=r('node/exitnode/rescue/actions.py');rr=r('node/exitnode/rescue/runner.py');g=r('node/tests/golden/exitnode.nft');bad=[k for k,ok in (('manifest.user','\"user\"' in mf and 'userdel' in mf and 'exitnode-nft.service' in mf),('nft.rules','RULES = \"/var/lib/exitnode/exitnode.nft\"' in nf and 'delete table inet exitnode' in nf and '/run/exitnode-' not in nf),('ladder.640','0o640' in ld and 'chown' in ld),('rescue.640','0o640' in ra and 'chown' in ra and 'def chown(' in rr),('golden.comment','管理入口限配置的监听地址' not in g and 'exitnode-nft.service' in g)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "RESCUE-STDLIB",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,re,sys;bad=[(p.name,m.group(1)) for p in pathlib.Path('node/exitnode/rescue').glob('*.py') for m in re.finditer('^(?:from|import)[ ]+([A-Za-z0-9_.]+)',p.read_text(encoding='utf-8'),re.M) if not m.group(1).startswith('.') and m.group(1).split('.')[0] not in sys.stdlib_module_names];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda p:pathlib.Path(p).read_text(encoding='utf-8');a=r('docs/node/服务加固说明.md');b=r('docs/node/客户端包托管说明.md');c=r('docs/node/配置说明.md');bad=[k for k in ('exitnode','CAP_NET_BIND_SERVICE','DynamicUser','IPAddressAllow','0640','0711','0710','config.toml','exitnode-nft.service','真机待验证','systemd-analyze security','SIGSYS') if k not in a]+['托管:'+k for k in ('DynamicUser','1024','回环') if k not in b]+['配置:'+k for k in ('回环','1024') if k not in c];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "model": "claude-opus-5-5",
+  "timeoutSec": 7200,
+  "repoRoot": "E:/yuanc",
+  "engine": "claude",
+  "reasoningEffort": "high",
+  "steps": [
+    "读 runner.py / service.py / cli.py / manifest.py / nft.py / 模板与黄金 / ladder.py / rescue actions+runner 与六个测试文件;先改黄金与测试让它们红。",
+    "按 ①~⑧ 改实现:执行器接口、服务账户与权限步骤、发布/回滚/救援三条写路径、五个模板与新 nft 单元、nft 文件化加载、check 新层。",
+    "跑 RUFF / PYTEST / 形状断言;写服务加固说明与三处文档改动;交活说明列真机待验证项。"
+  ]
+}
