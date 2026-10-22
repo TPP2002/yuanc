@@ -32,8 +32,8 @@ public sealed class EnvironmentApplierTests
         using var temp = new TempDirectory();
         var runner = new InspectionRunner(0, "提示\n" + """
             {"time_zone":"AUS Eastern Standard Time","tzautoupdate_start":4,
-            "chrome":{"forced_languages":["en-AU","en"],"WebRtcIPHandling":"default_public_interface_only","DefaultGeolocationSetting":2},
-            "edge":{"DefinePreferredLanguages":"en-AU,en","DefaultGeolocationSetting":2}}
+            "chrome":{"forced_languages":["en-AU","en"],"WebRtcIPHandling":"default_public_interface_only","DefaultGeolocationSetting":2,"DnsOverHttpsMode":"secure","DnsOverHttpsTemplates":"https://1.1.1.1/dns-query"},
+            "edge":{"DefinePreferredLanguages":"en-AU,en","DefaultGeolocationSetting":2,"DnsOverHttpsMode":"secure"}}
             """.Replace("\n", "") + "\n\n");
         var inspection = await new EnvironmentApplier(temp.Path, runner).InspectAsync();
         Assert.NotNull(inspection);
@@ -43,7 +43,9 @@ public sealed class EnvironmentApplierTests
         Assert.Equal("2", inspection.Chrome["DefaultGeolocationSetting"]);
         Assert.Equal("2", inspection.Edge["DefaultGeolocationSetting"]);
         Assert.Null(inspection.Edge["WebRtcLocalhostIpHandling"]);
-        Assert.Equal(3, inspection.Chrome.Count); Assert.Equal(3, inspection.Edge.Count);
+        Assert.Equal("https://1.1.1.1/dns-query", inspection.Chrome["DnsOverHttpsTemplates"]);
+        Assert.Null(inspection.Edge["DnsOverHttpsTemplates"]);
+        Assert.Equal(5, inspection.Chrome.Count); Assert.Equal(5, inspection.Edge.Count);
         Assert.True(runner.Start!.CreateNoWindow);
     }
 

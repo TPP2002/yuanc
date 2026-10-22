@@ -28,6 +28,8 @@ public static class EnvironmentPlanner
     public const string ChromeKey = @"HKLM:\SOFTWARE\Policies\Google\Chrome";
     public const string EdgeKey = @"HKLM:\SOFTWARE\Policies\Microsoft\Edge";
     public const string TzServiceKey = @"HKLM:\SYSTEM\CurrentControlSet\Services\tzautoupdate";
+    public const string DohMode = "secure";
+    public const string DohTemplate = "https://1.1.1.1/dns-query";
 
     private static StringBuilder Header(string? statePath = null)
     {
@@ -41,8 +43,8 @@ public static class EnvironmentPlanner
         script.AppendLine("$edgeKey = " + Quote(EdgeKey));
         script.AppendLine("$tzServiceKey = " + Quote(TzServiceKey));
         script.AppendLine(@"$forcedKey = $chromeKey + '\ForcedLanguages'");
-        script.AppendLine("$chromeNames = @('WebRtcIPHandling', 'DefaultGeolocationSetting')");
-        script.AppendLine("$edgeNames = @('DefinePreferredLanguages', 'WebRtcLocalhostIpHandling', 'DefaultGeolocationSetting')");
+        script.AppendLine("$chromeNames = @('WebRtcIPHandling', 'DefaultGeolocationSetting', 'DnsOverHttpsMode', 'DnsOverHttpsTemplates')");
+        script.AppendLine("$edgeNames = @('DefinePreferredLanguages', 'WebRtcLocalhostIpHandling', 'DefaultGeolocationSetting', 'DnsOverHttpsMode', 'DnsOverHttpsTemplates')");
         return script;
     }
 
@@ -129,9 +131,13 @@ public static class EnvironmentPlanner
             Set-ItemProperty -LiteralPath $edgeKey -Name DefinePreferredLanguages -Value {{Quote(string.Join(",", languages))}} -Type String
             Set-ItemProperty -LiteralPath $edgeKey -Name WebRtcLocalhostIpHandling -Value 'default_public_interface_only' -Type String
             Set-ItemProperty -LiteralPath $edgeKey -Name DefaultGeolocationSetting -Value 2 -Type DWord
+            Set-ItemProperty -LiteralPath $chromeKey -Name DnsOverHttpsMode -Value {{Quote(DohMode)}} -Type String
+            Set-ItemProperty -LiteralPath $chromeKey -Name DnsOverHttpsTemplates -Value {{Quote(DohTemplate)}} -Type String
+            Set-ItemProperty -LiteralPath $edgeKey -Name DnsOverHttpsMode -Value {{Quote(DohMode)}} -Type String
+            Set-ItemProperty -LiteralPath $edgeKey -Name DnsOverHttpsTemplates -Value {{Quote(DohTemplate)}} -Type String
             $state.applied = $true
             Write-State $state
-            ConvertTo-Json -Compress @{ time_zone_before=$tzBefore; time_zone_after=$tzAfter; policies_written=6 }
+            ConvertTo-Json -Compress @{ time_zone_before=$tzBefore; time_zone_after=$tzAfter; policies_written=10 }
             exit 0
             """);
         return script.ToString();
@@ -147,22 +153,26 @@ public static class EnvironmentPlanner
             if ($state.schema -ne 1 -or $null -eq $original -or $null -eq $original.chrome -or $null -eq $original.edge -or $null -eq $original.forced_languages) {
               throw '环境恢复记录无效，原值记录已保留。'
             }
-            if ($original.time_zone) {
-              & tzutil /s $original.time_zone
-              if ($LASTEXITCODE -ne 0) { throw '时区未能恢复。' }
-              $restoredZone = (& tzutil /g).Trim()
-              if ($LASTEXITCODE -ne 0 -or $restoredZone -ne $original.time_zone) { throw '时区恢复复核失败。' }
-            }
-            if ($null -ne $original.tzautoupdate_start) {
-              Set-ItemProperty -LiteralPath $tzServiceKey -Name Start -Value $original.tzautoupdate_start -Type DWord
-              if ($original.tzautoupdate_start -eq 3) { Start-Service tzautoupdate -ErrorAction SilentlyContinue }
-            }
-            foreach ($browser in @('chrome', 'edge')) {
-              if ($browser -eq 'chrome') { $path=$chromeKey; $names=$chromeNames } else { $path=$edgeKey; $names=$edgeNames }
-              $saved = $original.$browser
+            $failed = @()
+            try {
+              if ($original.time_zone) {
+                & tzutil /s $original.time_zone
+                if ($LASTEXITCODE -ne 0) { throw '时区未能恢复。' }
+                $restoredZone = (& tzutil /g).Trim()
+                if ($LASTEXITCODE -ne 0 -or $restoredZone -ne $original.time_zone) { throw '时区恢复复核失败。' }
+              }
+            } catch { $failed += 'time_zone' }
+            try {
+              if ($null -ne $original.tzautoupdate_start) {
+                Set-ItemProperty -LiteralPath $tzServiceKey -Name Start -Value $original.tzautoupdate_start -Type DWord
+                if ($original.tzautoupdate_start -eq 3) { Start-Service tzautoupdate -ErrorAction SilentlyContinue }
+              }
+            } catch { $failed += 'tzautoupdate' }
+            function Restore-BrowserValues($path, $names, $saved) {
               foreach ($name in $names) {
                 $entry = $saved.values.$name
-                if ($null -eq $entry -or $entry.kind -notin @('String','DWord')) { throw '浏览器策略恢复记录无效。' }
+                if ($null -eq $entry) { continue }
+                if ($entry.kind -notin @('String','DWord')) { throw '浏览器策略恢复记录无效。' }
                 if ($entry.present) {
                   if (-not (Test-Path -LiteralPath $path)) { New-Item -Path $path -Force | Out-Null }
                   Set-ItemProperty -LiteralPath $path -Name $name -Value $entry.value -Type $entry.kind
@@ -172,27 +182,46 @@ public static class EnvironmentPlanner
                 }
               }
             }
-            $forced = $original.forced_languages
-            if (-not $forced.present) {
-              if (Test-Path -LiteralPath $forcedKey) {
-                if ((Get-Item -LiteralPath $forcedKey).SubKeyCount -ne 0) { throw '语言策略子键发生变化，恢复记录已保留。' }
-                Remove-Item -LiteralPath $forcedKey -Force
+            try {
+              Restore-BrowserValues $chromeKey $chromeNames $original.chrome
+            } catch { $failed += 'chrome' }
+            try {
+              Restore-BrowserValues $edgeKey $edgeNames $original.edge
+            } catch { $failed += 'edge' }
+            try {
+              $forced = $original.forced_languages
+              if (-not $forced.present) {
+                if (Test-Path -LiteralPath $forcedKey) {
+                  if ((Get-Item -LiteralPath $forcedKey).SubKeyCount -ne 0) { throw '语言策略子键发生变化，恢复记录已保留。' }
+                  Remove-Item -LiteralPath $forcedKey -Force
+                }
+              } else {
+                if (-not (Test-Path -LiteralPath $forcedKey)) { New-Item -Path $forcedKey -Force | Out-Null }
+                foreach ($name in (Get-Item -LiteralPath $forcedKey).GetValueNames()) {
+                  Remove-ItemProperty -LiteralPath $forcedKey -Name $name
+                }
+                foreach ($property in $forced.values.PSObject.Properties) {
+                  Set-ItemProperty -LiteralPath $forcedKey -Name $property.Name -Value $property.Value -Type String
+                }
               }
-            } else {
-              if (-not (Test-Path -LiteralPath $forcedKey)) { New-Item -Path $forcedKey -Force | Out-Null }
-              foreach ($name in (Get-Item -LiteralPath $forcedKey).GetValueNames()) {
-                Remove-ItemProperty -LiteralPath $forcedKey -Name $name
+            } catch { $failed += 'forced_languages' }
+            try {
+              foreach ($browser in @('chrome', 'edge')) {
+                if ($browser -eq 'chrome') { $path=$chromeKey } else { $path=$edgeKey }
+                if (-not $original.$browser.present -and (Test-Path -LiteralPath $path)) {
+                  $key = Get-Item -LiteralPath $path
+                  if ($key.ValueCount -eq 0 -and $key.SubKeyCount -eq 0) { Remove-Item -LiteralPath $path }
+                }
               }
-              foreach ($property in $forced.values.PSObject.Properties) {
-                Set-ItemProperty -LiteralPath $forcedKey -Name $property.Name -Value $property.Value -Type String
+            } catch { $failed += 'cleanup' }
+            if ($failed.Count -gt 0) {
+              if ($null -eq $state.PSObject.Properties['restore_failed']) {
+                $state | Add-Member -NotePropertyName restore_failed -NotePropertyValue @($failed)
+              } else {
+                $state.restore_failed = @($failed)
               }
-            }
-            foreach ($browser in @('chrome', 'edge')) {
-              if ($browser -eq 'chrome') { $path=$chromeKey } else { $path=$edgeKey }
-              if (-not $original.$browser.present -and (Test-Path -LiteralPath $path)) {
-                $key = Get-Item -LiteralPath $path
-                if ($key.ValueCount -eq 0 -and $key.SubKeyCount -eq 0) { Remove-Item -LiteralPath $path }
-              }
+              Write-State $state
+              throw ('环境未能完全恢复:' + ($failed -join ','))
             }
             Remove-Item -LiteralPath $statePath
             exit 0
@@ -219,8 +248,8 @@ public static class EnvironmentPlanner
             $current = @{
               time_zone=$timeZone
               tzautoupdate_start=(Current-Value $tzServiceKey 'Start')
-              chrome=@{ forced_languages=$languages; WebRtcIPHandling=(Current-Value $chromeKey 'WebRtcIPHandling'); DefaultGeolocationSetting=(Current-Value $chromeKey 'DefaultGeolocationSetting') }
-              edge=@{ DefinePreferredLanguages=(Current-Value $edgeKey 'DefinePreferredLanguages'); WebRtcLocalhostIpHandling=(Current-Value $edgeKey 'WebRtcLocalhostIpHandling'); DefaultGeolocationSetting=(Current-Value $edgeKey 'DefaultGeolocationSetting') }
+              chrome=@{ forced_languages=$languages; WebRtcIPHandling=(Current-Value $chromeKey 'WebRtcIPHandling'); DefaultGeolocationSetting=(Current-Value $chromeKey 'DefaultGeolocationSetting'); DnsOverHttpsMode=(Current-Value $chromeKey 'DnsOverHttpsMode'); DnsOverHttpsTemplates=(Current-Value $chromeKey 'DnsOverHttpsTemplates') }
+              edge=@{ DefinePreferredLanguages=(Current-Value $edgeKey 'DefinePreferredLanguages'); WebRtcLocalhostIpHandling=(Current-Value $edgeKey 'WebRtcLocalhostIpHandling'); DefaultGeolocationSetting=(Current-Value $edgeKey 'DefaultGeolocationSetting'); DnsOverHttpsMode=(Current-Value $edgeKey 'DnsOverHttpsMode'); DnsOverHttpsTemplates=(Current-Value $edgeKey 'DnsOverHttpsTemplates') }
             }
             ConvertTo-Json -Compress -Depth 5 -InputObject $current
             """);

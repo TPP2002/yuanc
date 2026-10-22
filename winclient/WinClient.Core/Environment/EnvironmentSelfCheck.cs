@@ -80,11 +80,15 @@ public static class EnvironmentSelfCheck
         Inspect("chrome_policy", "Chrome 策略", inspection => Policy("chrome_policy", "Chrome 策略",
             ("ForcedLanguages", inspection.ChromeForcedLanguages.SequenceEqual(input.Target.Languages, StringComparer.Ordinal)),
             ("WebRtcIPHandling", Value(inspection.Chrome, "WebRtcIPHandling") == "default_public_interface_only"),
-            ("DefaultGeolocationSetting", Value(inspection.Chrome, "DefaultGeolocationSetting") == "2")));
+            ("DefaultGeolocationSetting", Value(inspection.Chrome, "DefaultGeolocationSetting") == "2"),
+            PolicyValue(inspection.Chrome, "DnsOverHttpsMode", EnvironmentPlanner.DohMode),
+            PolicyValue(inspection.Chrome, "DnsOverHttpsTemplates", EnvironmentPlanner.DohTemplate)));
         Inspect("edge_policy", "Edge 策略", inspection => Policy("edge_policy", "Edge 策略",
             ("DefinePreferredLanguages", Value(inspection.Edge, "DefinePreferredLanguages") == string.Join(",", input.Target.Languages)),
             ("WebRtcLocalhostIpHandling", Value(inspection.Edge, "WebRtcLocalhostIpHandling") == "default_public_interface_only"),
-            ("DefaultGeolocationSetting", Value(inspection.Edge, "DefaultGeolocationSetting") == "2")));
+            ("DefaultGeolocationSetting", Value(inspection.Edge, "DefaultGeolocationSetting") == "2"),
+            PolicyValue(inspection.Edge, "DnsOverHttpsMode", EnvironmentPlanner.DohMode),
+            PolicyValue(inspection.Edge, "DnsOverHttpsTemplates", EnvironmentPlanner.DohTemplate)));
 
         var config = input.SingboxConfig;
         var route = Property(config, "route");
@@ -126,6 +130,8 @@ public static class EnvironmentSelfCheck
     }
 
     private static string? Value(IReadOnlyDictionary<string, string?> values, string key) => values.TryGetValue(key, out var value) ? value : null;
+    private static (string Name, bool Matches) PolicyValue(IReadOnlyDictionary<string, string?> values, string name, string expected)
+        => (name, Value(values, name) == expected);
     private static JsonElement Property(JsonElement element, string key) => element.ValueKind == JsonValueKind.Object && element.TryGetProperty(key, out var value) ? value : default;
     private static string? Text(JsonElement element) => element.ValueKind == JsonValueKind.String ? element.GetString() : null;
     private static CheckItem Policy(string id, string name, params (string Name, bool Matches)[] conditions)

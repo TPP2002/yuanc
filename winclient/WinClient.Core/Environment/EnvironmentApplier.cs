@@ -49,13 +49,17 @@ public sealed class EnvironmentApplier(string runDirectory, ICommandRunner? runn
                 new Dictionary<string, string?>
                 {
                     ["ForcedLanguages"] = null, ["WebRtcIPHandling"] = Value(chrome, "WebRtcIPHandling"),
-                    ["DefaultGeolocationSetting"] = Value(chrome, "DefaultGeolocationSetting")
+                    ["DefaultGeolocationSetting"] = Value(chrome, "DefaultGeolocationSetting"),
+                    ["DnsOverHttpsMode"] = Value(chrome, "DnsOverHttpsMode"),
+                    ["DnsOverHttpsTemplates"] = Value(chrome, "DnsOverHttpsTemplates")
                 },
                 new Dictionary<string, string?>
                 {
                     ["DefinePreferredLanguages"] = Value(edge, "DefinePreferredLanguages"),
                     ["WebRtcLocalhostIpHandling"] = Value(edge, "WebRtcLocalhostIpHandling"),
-                    ["DefaultGeolocationSetting"] = Value(edge, "DefaultGeolocationSetting")
+                    ["DefaultGeolocationSetting"] = Value(edge, "DefaultGeolocationSetting"),
+                    ["DnsOverHttpsMode"] = Value(edge, "DnsOverHttpsMode"),
+                    ["DnsOverHttpsTemplates"] = Value(edge, "DnsOverHttpsTemplates")
                 }, languages);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException or
