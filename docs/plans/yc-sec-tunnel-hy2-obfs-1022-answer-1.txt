@@ -1,0 +1,8 @@
+岔路答复 1(派单方,2026-10-22):
+
+同意第一项:把 node/tests/test_renderer_parity.py 加进施工面(本答复已授权该路径),按新契约更新:
+- 构造鉴权服务 Settings 时从 render_pair 的 node 字段里再去掉 hy2_obfs_password,另写一个临时文件存混淆密码,配到 hy2_obfs_password_path;
+- 期望键集合在十键基础上加 hy2_obfs_password(共十一键);format 断言改为 ycpair/3;
+- 新增断言:节点侧客户端配置与鉴权服务渲染出的 backup 出站 obfs 块逐字段一致(type=salamander、password 相同);
+- 其余既有断言不改、不删。
+然后跑到 RUFF/PYTEST-NODE/PYTEST-AUTH/BUILD/TEST 全绿,交活 status=completed;交活说明写明该文件是圈外授权改动与改了哪几行。不许放宽断言,再遇岔路照旧停下。

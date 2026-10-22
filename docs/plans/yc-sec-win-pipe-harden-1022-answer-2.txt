@@ -1,0 +1,9 @@
+岔路答复 2(派单方,2026-10-22;答复 1 的 A 方案因 WinClient.Tests.csproj 是禁区、派单器不许授权,作废改走 B):
+
+1. 选 B。新建 winclient/WinClient.Core/Ipc/ServerIdentity.cs(本答复已授权该路径),放纯判定:
+   public static class ServerIdentity { public static bool IsTrusted(uint serverSessionId, uint clientSessionId, string? imagePath, string appRoot) ... }
+   判定规则与契约 ④ 完全一致(会话号相等、镜像路径规范化后落在 appRoot 之下、原始路径含 ".." 段判不可信、空/取不到判不可信)。只依赖 System.IO,不含 P/Invoke。
+2. PipePeer.IsTrustedServer 保留签名,内部只做取会话号/取镜像路径(P/Invoke)后转调 ServerIdentity.IsTrusted;VerifyServer 不变。
+3. ⑦f 的测试改写为对 ServerIdentity.IsTrusted 的用例,放进 IpcTests.cs(测试工程引用 Core,无需链接 App 文件);HostingTests 里已写的 IsTrustedServer 用例删掉或改成调用 ServerIdentity,不留编不过的代码。测试用例集合不减少:同会话+appRoot 下→可信;不同会话→不可信;路径在 appRoot 外→不可信;含 ".."→不可信;null/空→不可信;大小写与尾部斜杠差异→可信。
+4. WinClient.Tests.csproj 一字不动;其他已确认事项(UpdateApplierTests 按允许名单改、空闲计时暂停、".." 判不可信)照答复 1。
+5. 接着用自测通道跑 BUILD/TEST 到全绿,交活 status=completed。不许放宽断言或闸门,再遇岔路照旧停下。
