@@ -342,6 +342,37 @@ def test_check_verifies_without_installing(signing):
     assert_clean(runner)
 
 
+@pytest.mark.parametrize("output", [None, INCOMING + "/package.tar.gz"])
+def test_github_token_only_passed_via_stdin(signing, output):
+    config, runner = prepared(signing)
+    token = "GHTOKEN-STDIN-ONLY"
+    runner.files[config.node.secrets_dir + "/github-token"] = token
+    runner.responses[("curl",)] = CompletedResult(out="body\n200")
+    assert _request(config, runner, "https://api.github.com/repos/owner/repo/releases/latest",
+                    output) == "body"
+    calls = [call for call in runner.calls if call[0] == "run"]
+    assert len(calls) == 1
+    _, argv, check, input = calls[0]
+    assert all("Bearer" not in arg and token not in arg for arg in argv)
+    assert any(argv[i:i + 2] == ("-H", "@-") for i in range(len(argv) - 1))
+    assert input == "Authorization: Bearer " + token + "\n"
+    assert check is False
+
+
+def test_github_without_token_has_no_stdin_header(signing):
+    config, runner = prepared(signing)
+    assert not runner.exists(config.node.secrets_dir + "/github-token")
+    runner.responses[("curl",)] = CompletedResult(out="body\n200")
+    assert _request(config, runner,
+                    "https://api.github.com/repos/owner/repo/releases/latest") == "body"
+    calls = [call for call in runner.calls if call[0] == "run"]
+    assert len(calls) == 1
+    _, argv, check, input = calls[0]
+    assert "@-" not in argv
+    assert input is None
+    assert check is False
+
+
 @pytest.mark.parametrize("failure", ["401", "connect"])
 def test_github_token_never_in_output_logs_exceptions_or_state(signing, failure, capsys, caplog):
     config, runner = prepared(signing)
