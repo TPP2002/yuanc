@@ -79,7 +79,7 @@ def sync_allowed(registry: DeviceRegistry, allowed_list: list[dict]) -> Diff:
 
 def apply_sync(
     registry: DeviceRegistry, ctx: ProxyContext, allowed_list: list[dict],
-    runner: Runner, live_path: str,
+    runner: Runner, live_path: str, *, last_good_path: str | None = None,
 ) -> Diff:
     """Validate before either durable state changes; then publish and reload.
 
@@ -91,6 +91,12 @@ def apply_sync(
     live_path = secret_path(live_path)
     if live_path == registry.path:
         raise ValueError("线上配置不能覆盖设备登记表")
+    if last_good_path is None:
+        last_good_path = (live_path[:-5] + ".last-good.json" if live_path.endswith(".json")
+                          else live_path + ".last-good")
+    last_good_path = secret_path(last_good_path)
+    if last_good_path in {registry.path, live_path}:
+        raise ValueError("上次可用配置不能覆盖设备登记表或线上配置")
     temporary = live_path + ".check.tmp"
     if temporary == registry.path:
         raise ValueError("校验文件不能覆盖设备登记表")
@@ -117,6 +123,7 @@ def apply_sync(
             runner.write_file(live_path, rollback, 0o600)
             raise RuntimeError("登记表写入失败，线上配置已回退，未重载") from None
         reload(runner)
+        runner.write_file(last_good_path, text, 0o600)
         logger.info("放行名单已应用；凭据字段 uuid/password/private_key=[已打码]")
         return diff
     finally:

@@ -133,3 +133,63 @@ def test_registry_write_failure_rolls_back_live_without_reload(state):
         apply_sync(registry, ctx, [], runner, live)
     assert (runner.files[live], runner.files[registry.path]) == before
     assert runner.commands == [["sing-box", "check", "-c", live + ".check.tmp"]]
+
+
+@pytest.mark.parametrize("custom", [False, True])
+def test_sync_publishes_private_last_good_after_reload(state, monkeypatch, custom):
+    runner, registry, ctx, _, live = state
+    backup = str(Path(live).with_name("自定义.json")) if custom else live[:-5] + ".last-good.json"
+    write = runner.write_file
+
+    def checked_write(path, text, mode):
+        if path == backup:
+            assert runner.commands[-1] == ["systemctl", "reload", "sing-box"]
+        write(path, text, mode)
+
+    monkeypatch.setattr(runner, "write_file", checked_write)
+    kwargs = {"last_good_path": backup} if custom else {}
+    apply_sync(registry, ctx, [], runner, live, **kwargs)
+    assert runner.files[backup] == runner.files[live]
+    assert runner.modes[backup] == 0o600
+
+
+@pytest.mark.parametrize("failure", ["check", "registry", "reload"])
+@pytest.mark.parametrize("existing", [False, True])
+def test_sync_failure_never_writes_last_good(state, monkeypatch, failure, existing):
+    runner, registry, ctx, _, live = state
+    backup = live[:-5] + ".last-good.json"
+    if existing:
+        runner.files[backup] = "原副本"
+    if failure == "check":
+        runner.responses[("sing-box", "check", "-c", live + ".check.tmp")] = (1, "", "")
+    elif failure == "registry":
+        def fail(_):
+            raise OSError("模拟写入失败")
+        monkeypatch.setattr(registry, "save", fail)
+    else:
+        runner.responses[("systemctl", "reload", "sing-box")] = (1, "", "")
+        runner.responses[("systemctl", "restart", "sing-box")] = (1, "", "")
+    with pytest.raises((ValueError, RuntimeError)):
+        apply_sync(registry, ctx, [], runner, live)
+    assert runner.files.get(backup) == ("原副本" if existing else None)
+    assert not any(path == backup for path, _ in runner.writes)
+
+
+@pytest.mark.parametrize("target", ["registry", "live", "outside"])
+def test_sync_last_good_path_must_be_separate_secret(state, target):
+    runner, registry, ctx, _, live = state
+    path = {"registry": registry.path, "live": live,
+            "outside": str(Path(live).parent.parent / "副本.json")}[target]
+    before = dict(runner.files)
+    with pytest.raises(ValueError):
+        apply_sync(registry, ctx, [], runner, live, last_good_path=path)
+    assert runner.files == before
+    assert not runner.commands
+
+
+def test_sync_last_good_default_without_json_suffix(state):
+    runner, registry, ctx, _, live = state
+    live = live[:-5]
+    runner.responses[("sing-box", "check", "-c", live + ".check.tmp")] = (0, "", "")
+    apply_sync(registry, ctx, [], runner, live)
+    assert runner.files[live + ".last-good"] == runner.files[live]

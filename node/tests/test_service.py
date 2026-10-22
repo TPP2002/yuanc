@@ -273,3 +273,63 @@ def test_tunnel_check_requires_active_service_and_valid_config(active, valid, ca
     assert main(["check", "--json"], runner) == 1
     layer = json.loads(capsys.readouterr().out)["layers"][-2]
     assert layer["name"] == "隧道服务" and layer["result"] == "失败"
+
+
+@pytest.mark.parametrize("registered", [False, True])
+def test_publication_updates_last_good_after_success(registered):
+    from exitnode import service
+    from exitnode.proxy.registry import DeviceRegistry
+
+    runner = fake()
+    config = load(CONFIG, runner)
+    service.ensure_credentials(config, runner)
+    runner.files[LIVE] = "原配置"
+    registry = DeviceRegistry(SECRETS + "/devices.json", ProxyRunner(runner))
+    runner.calls.clear()
+    service._publish_checked(config, runner, [], registry if registered else None)
+    backup = LIVE.replace(".json", ".last-good.json")
+    assert runner.files[backup] == runner.files[LIVE]
+    assert runner.modes[backup] == 0o600
+    write = next(i for i, c in enumerate(runner.calls)
+                 if c[:2] == ("write_file", backup + ".tmp"))
+    replaced = runner.calls.index(("replace", LIVE + ".check.tmp", LIVE))
+    assert replaced < write
+    assert ("replace", backup + ".tmp", backup) in runner.calls
+    if registered:
+        reloaded = next(i for i, c in enumerate(runner.calls)
+                        if c[:2] == ("run", ("systemctl", "reload", UNIT)))
+        assert reloaded < write
+    else:
+        assert write == replaced + 1
+
+
+@pytest.mark.parametrize("failure", ["check", "registry", "reload"])
+@pytest.mark.parametrize("existing", [False, True])
+def test_failed_publication_never_writes_last_good(monkeypatch, failure, existing):
+    from exitnode import service
+    from exitnode.proxy.registry import DeviceRegistry
+
+    runner = fake()
+    config = load(CONFIG, runner)
+    service.ensure_credentials(config, runner)
+    runner.files[LIVE] = "原配置"
+    backup = LIVE.replace(".json", ".last-good.json")
+    if existing:
+        runner.files[backup] = "原副本"
+    registry = DeviceRegistry(SECRETS + "/devices.json", ProxyRunner(runner))
+    if failure == "check":
+        runner.responses[CHECK] = CompletedResult(1)
+    elif failure == "registry":
+        def fail(_):
+            raise OSError("模拟写入失败")
+        monkeypatch.setattr(registry, "save", fail)
+    else:
+        runner.responses[("systemctl", "reload", UNIT)] = CompletedResult(1)
+        runner.responses[("systemctl", "restart", UNIT)] = CompletedResult(1)
+    runner.calls.clear()
+    with pytest.raises(ValueError):
+        service._publish_checked(config, runner, [], registry)
+    assert runner.files.get(backup) == ("原副本" if existing else None)
+    assert not any(c[0] == "write_file" and c[1].startswith(backup) for c in runner.calls)
+    if failure != "reload":
+        assert runner.files[LIVE] == "原配置"

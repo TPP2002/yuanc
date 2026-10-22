@@ -144,7 +144,7 @@ def test_bad_live_restores_only_checked_last_good(good):
     if good is None:
         del runner.files[p.LAST_GOOD]
     elif not good:
-        runner.responses[(p.BINARY, "check", "-c", p.LAST_GOOD)] = Result(1)
+        runner.responses[(p.BINARY, "check", "-c", p.LAST_GOOD + ".rescue.check.tmp")] = Result(1)
     assert actions.tick(runner) == 1
     assert runner.files[p.LIVE] == b"private-live-content"
     runner.clock += 300
@@ -440,3 +440,114 @@ def test_real_flock_probe_is_nonblocking_and_released_immediately(monkeypatch, b
     assert real.lock_busy(p.LOCK) is busy
     assert calls == ([("flock", 123, 6), ("close", 123)] if busy else [
         ("flock", 123, 6), ("flock", 123, 8), ("close", 123)])
+
+
+@pytest.mark.parametrize("reinstall", [False, True])
+def test_rescue_prunes_both_checks_and_reports_record_count(monkeypatch, reinstall):
+    from test_watchdog import last_good_fixture
+
+    runner = ready()
+    text, devices = last_good_fixture()
+    runner.files[p.LAST_GOOD] = text.encode()
+    runner.files["/var/lib/exitnode/secrets/devices.json"] = devices.encode()
+    if reinstall:
+        damage(runner, "P1")
+    else:
+        runner.responses[(p.BINARY, "check", "-c", p.LIVE)] = Result(1)
+    checked_contents = []
+    run = runner.run
+
+    def capture(argv, timeout=30):
+        if argv[:3] == [p.BINARY, "check", "-c"] and argv[-1] != p.LIVE:
+            checked_contents.append(runner.read(argv[-1]))
+        return run(argv, timeout=timeout)
+
+    monkeypatch.setattr(runner, "run", capture)
+    assert actions.tick(runner) == 1
+    runner.clock += 300
+    assert actions.tick(runner) == (0 if reinstall else 1)
+    live = runner.files[p.LIVE]
+    assert len(checked_contents) == 2
+    assert checked_contents == [live, live]
+    users = [row["users"] for row in json.loads(live)["inbounds"]]
+    assert users == [[{"uuid": "保留凭据"}], [{"name": "保留设备", "password": "测试密码"}]]
+    assert "已剔除 2 条不在登记表上的用户记录" in s.read(runner)["reason"]
+    assert ("systemctl", "restart", "exitnode-proxy.service") in service_actions(runner)
+    assert runner.modes[p.LIVE] == 0o600
+    for path in (s.STATE, s.HISTORY):
+        for secret in ("保留设备", "保留凭据", "吊销设备", "吊销凭据", "测试密码"):
+            assert secret.encode() not in runner.files[path]
+
+
+@pytest.mark.parametrize("devices", [b"broken", b"\xff"])
+def test_rescue_corrupt_devices_refuses_restore_without_service_action(devices):
+    runner = ready()
+    runner.files["/var/lib/exitnode/secrets/devices.json"] = devices
+    runner.responses[(p.BINARY, "check", "-c", p.LIVE)] = Result(1)
+    original = runner.files[p.LIVE]
+    assert actions.tick(runner) == 1
+    runner.clock += 300
+    assert actions.tick(runner) == 2
+    assert s.read(runner)["reason"] == "设备登记表损坏，无法核对上次可用配置"
+    assert runner.files[p.LIVE] == original
+    assert not service_actions(runner)
+
+
+@pytest.mark.parametrize("failed_path", [p.LAST_GOOD + ".rescue.check.tmp", p.LIVE + ".rescue.tmp"])
+def test_pruned_rescue_still_requires_both_checks(failed_path):
+    from test_watchdog import last_good_fixture
+
+    runner = ready()
+    text, devices = last_good_fixture()
+    runner.files[p.LAST_GOOD] = text.encode()
+    runner.files["/var/lib/exitnode/secrets/devices.json"] = devices.encode()
+    runner.responses[(p.BINARY, "check", "-c", p.LIVE)] = Result(1)
+    runner.responses[(p.BINARY, "check", "-c", failed_path)] = Result(1)
+    original = runner.files[p.LIVE]
+    assert actions.tick(runner) == 1
+    runner.clock += 300
+    assert actions.tick(runner) == 2
+    assert runner.files[p.LIVE] == original
+    assert runner.files[p.LAST_GOOD] == text.encode()
+    assert not service_actions(runner)
+    assert ("replace", p.LIVE + ".rescue.tmp", p.LIVE) not in runner.calls
+    assert not runner.exists(p.LAST_GOOD + ".rescue.check.tmp")
+    assert not runner.exists(p.LIVE + ".rescue.tmp")
+
+
+def test_reinstall_with_corrupt_devices_keeps_live_and_completes():
+    runner = ready()
+    damage(runner, "P1")
+    runner.files["/var/lib/exitnode/secrets/devices.json"] = b"broken"
+    original = runner.files[p.LIVE]
+    assert actions.tick(runner) == 1
+    assert not service_actions(runner)
+    assert not any(c[0] == "copy_tree" for c in runner.calls)
+    runner.clock += 300
+    assert actions.tick(runner) == 0
+    assert runner.files[p.LIVE] == original
+    assert runner.links[p.CURRENT] == p.RELEASES + "/0.1.0"
+    assert p.release(runner, runner.links[p.CURRENT]) == "0.1.0"
+    assert ("replace", p.CURRENT + ".new", p.CURRENT) in runner.calls
+    assert service_actions(runner) == [
+        ("systemctl", "daemon-reload"), ("systemctl", "restart", "exitnode-proxy.service"),
+        ("systemctl", "restart", "exitnode-admin.service"),
+        ("systemctl", "restart", "exitnode-watchdog.timer")]
+    assert json.loads(runner.files[s.HISTORY].splitlines()[-1])["status"] == "ok"
+    assert all(c[2] == 30 for c in runner.calls if c[0] == "run")
+
+
+def test_rescue_package_only_imports_stdlib_and_itself():
+    import ast
+    import sys
+    from pathlib import Path
+
+    for source in Path(actions.__file__).parent.glob("*.py"):
+        for node in ast.walk(ast.parse(source.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.level == 0:
+                names = [node.module]
+            else:
+                continue
+            assert all(name.split(".")[0] in sys.stdlib_module_names for name in names)

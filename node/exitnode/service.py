@@ -13,6 +13,7 @@ from .proxy.server_config import render_server
 
 SECRETS = "/var/lib/exitnode/secrets"
 LIVE = SECRETS + "/sing-box.json"
+LAST_GOOD = LIVE.replace(".json", ".last-good.json")
 UNIT = "exitnode-proxy.service"
 
 
@@ -189,6 +190,8 @@ def _publish_checked(config, runner, devices, registry=None):
                 reload(ReloadRunner(runner))
             except (OSError, RuntimeError):
                 raise ValueError("设备已登记但服务重载未成功，请联系维护人员") from None
+        runner.write_file(LAST_GOOD + ".tmp", text, 0o600)
+        runner.replace(LAST_GOOD + ".tmp", LAST_GOOD)
     finally:
         runner.write_file(temporary, "", 0o600)
 

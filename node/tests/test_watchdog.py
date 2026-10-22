@@ -374,3 +374,128 @@ def test_listener_uses_configured_reality_port():
     assert next(p for p in probes.probe(config, runner) if p["layer"] == "L-listen")["result"] == "失败"
     runner.responses[("ss", "-ltnH")] = CompletedResult(out="LISTEN 0 128 *:14443 *:*\n")
     assert next(p for p in probes.probe(config, runner) if p["layer"] == "L-listen")["result"] == "通过"
+
+
+def last_good_fixture():
+    devices = [{"device_id": "保留设备", "uuid": "保留凭据", "revoked_at": None},
+               {"device_id": "吊销设备", "uuid": "吊销凭据", "revoked_at": "已吊销"}]
+    config = {"inbounds": [
+        {"users": [{"uuid": d["uuid"]} for d in devices]},
+        {"users": [{"name": d["device_id"], "password": "测试密码"} for d in devices]},
+    ]}
+    return json.dumps(config, ensure_ascii=False), json.dumps(devices, ensure_ascii=False)
+
+
+@pytest.mark.parametrize("missing", [False, True])
+def test_rollback_prunes_before_check_replace_and_restart(missing):
+    from exitnode.service import SECRETS
+
+    config, runner = setup()
+    broken(runner)
+    exhausted(config, runner)
+    text, devices = last_good_fixture()
+    runner.files[LAST_GOOD] = text
+    if not missing:
+        runner.files[SECRETS + "/devices.json"] = devices
+    assert run_at(config, runner) == 1
+    written = next(c[2] for c in runner.calls
+                   if c[:2] == ("write_file", LIVE + ".watchdog.tmp"))
+    assert written == runner.files[LIVE]
+    users = [row["users"] for row in json.loads(written)["inbounds"]]
+    assert users == ([[], []] if missing else [
+        [{"uuid": "保留凭据"}], [{"name": "保留设备", "password": "测试密码"}]])
+    check_cmd = (config.proxy.binary, "check", "-c", LIVE + ".watchdog.tmp")
+    checked = next(i for i, c in enumerate(runner.calls) if c[:2] == ("run", check_cmd))
+    replaced = runner.calls.index(("replace", LIVE + ".watchdog.tmp", LIVE))
+    restarted = next(i for i, c in enumerate(runner.calls) if c[:2] == ("run", RESTART))
+    assert checked < replaced < restarted
+    assert f"已剔除 {4 if missing else 2} 条" in state.read(config, runner)["reason"]
+    for secret in ("保留设备", "保留凭据", "吊销设备", "吊销凭据", "测试密码"):
+        assert secret not in runner.files[state.path(config)]
+
+
+@pytest.mark.parametrize("devices", ["损坏登记表", b"\xff"])
+def test_rollback_corrupt_registry_refuses_without_touching_live(devices):
+    from exitnode.service import SECRETS
+
+    config, runner = setup()
+    broken(runner)
+    exhausted(config, runner)
+    runner.files[LAST_GOOD], _ = last_good_fixture()
+    runner.files[SECRETS + "/devices.json"] = devices
+    original = runner.files[LIVE]
+    assert run_at(config, runner) == 2
+    saved = state.read(config, runner)
+    assert saved["state"] == "manual"
+    assert saved["reason"] == "设备登记表损坏，无法核对上次可用配置，请联系维护人员"
+    assert runner.files[LIVE] == original
+    assert RESTART not in commands(runner)
+    assert not any(c[:2] == ("write_file", LIVE + ".watchdog.tmp") for c in runner.calls)
+
+
+def test_pruned_rollback_still_requires_check_before_changing_live():
+    from exitnode.service import SECRETS
+
+    config, runner = setup()
+    broken(runner)
+    exhausted(config, runner)
+    runner.files[LAST_GOOD], runner.files[SECRETS + "/devices.json"] = last_good_fixture()
+    runner.responses[(config.proxy.binary, "check", "-c", LIVE + ".watchdog.tmp")] = (
+        CompletedResult(1))
+    original = runner.files[LIVE]
+    assert run_at(config, runner) == 2
+    assert runner.files[LIVE] == original
+    assert RESTART not in commands(runner)
+    written = next(c[2] for c in runner.calls
+                   if c[:2] == ("write_file", LIVE + ".watchdog.tmp"))
+    assert "吊销凭据" not in written and "吊销设备" not in written
+    assert ("replace", LIVE + ".watchdog.tmp", LIVE) not in runner.calls
+
+
+@pytest.mark.parametrize("package", ["proxy", "rescue"])
+def test_prune_rules_and_unchanged_text(package):
+    from importlib import import_module
+
+    prune = import_module(f"exitnode.{package}.lastgood").prune_revoked
+    # 两个独立包采用相同的字符串接口，救援边界自行转换字节。
+    text, devices = last_good_fixture()
+    for unchanged in ("非 JSON 占位", "[]", "{}", '{"inbounds":[{}]}',
+                      '{"inbounds":[{"users":[]}]}'):
+        result, count = prune(unchanged, devices)
+        assert result is unchanged and count == 0
+    active = '[{"device_id":"保留设备","uuid":"保留凭据","revoked_at":null}]'
+    original = '{ "inbounds": [ {"users": [{"uuid":"保留凭据"}]} ] }'
+    assert prune(original, active)[0] is original
+    result, count = prune(text, devices)
+    assert count == 2
+    assert json.loads(result)["inbounds"] == [
+        {"users": [{"uuid": "保留凭据"}]},
+        {"users": [{"name": "保留设备", "password": "测试密码"}]},
+    ]
+    assert result.endswith("\n")
+    mixed = json.dumps({"inbounds": [{"users": [
+        {"uuid": "吊销凭据", "name": "保留设备"},
+        {"uuid": "保留凭据", "name": "吊销设备"},
+        {"name": "保留设备"}, {"name": "未知设备"},
+    ]}]})
+    result, count = prune(mixed, devices)
+    assert count == 2
+    assert json.loads(result)["inbounds"][0]["users"] == [
+        {"uuid": "保留凭据", "name": "吊销设备"}, {"name": "保留设备"}]
+    result, count = prune(text, None)
+    assert count == 4
+    assert all(not inbound["users"] for inbound in json.loads(result)["inbounds"])
+
+
+@pytest.mark.parametrize("package", ["proxy", "rescue"])
+@pytest.mark.parametrize("devices", ["损坏", "{}", "[{}]", "[null]",
+    '[{"device_id":"设备","revoked_at":null}]',
+    '[{"uuid":"凭据","revoked_at":null}]',
+    '[{"device_id":"设备","uuid":"凭据"}]',
+    '[{"device_id":"设备","uuid":"凭据","revoked_at":false}]'])
+def test_prune_corrupt_registry_is_always_rejected(package, devices):
+    from importlib import import_module
+
+    prune = import_module(f"exitnode.{package}.lastgood").prune_revoked
+    with pytest.raises(ValueError, match="^设备登记表损坏，无法核对上次可用配置$"):
+        prune("非 JSON 占位", devices)

@@ -5,6 +5,7 @@ import subprocess
 
 from . import probes as p
 from . import state as s
+from .lastgood import prune_revoked
 
 
 def cleanup(runner):
@@ -31,22 +32,46 @@ def checked(runner, argv):
 
 
 def restore(runner, *, required):
-    if not runner.exists(p.LAST_GOOD) or not p.command(
-            runner, [p.BINARY, "check", "-c", p.LAST_GOOD]):
+    if not runner.exists(p.LAST_GOOD):
         if required:
             raise ValueError("没有可校验通过的上次可用配置")
-        return False
+        return False, 0
+    content = runner.read(p.LAST_GOOD)
+    try:
+        devices = runner.read(p.DEVICES).decode("utf-8") if runner.exists(p.DEVICES) else None
+        text, removed = prune_revoked(content.decode("utf-8", errors="surrogateescape"), devices)
+    except ValueError:
+        if required:
+            raise ValueError("设备登记表损坏，无法核对上次可用配置") from None
+        return False, 0
+    content = text.encode("utf-8", errors="surrogateescape")
+    # 原副本留作追查；两次检查均针对本次过滤后的同一份内容。
+    candidate = p.LAST_GOOD + ".rescue.check.tmp"
     temporary = p.LIVE + ".rescue.tmp"
-    runner.write(temporary, runner.read(p.LAST_GOOD), 0o600)
-    # 再查实际发布的副本，避免上次可用配置被并发改变。
-    if not p.command(runner, [p.BINARY, "check", "-c", temporary]):
-        runner.remove_tree(temporary)
-        raise ValueError("上次可用配置校验失败")
-    runner.replace(temporary, p.LIVE)
-    return True
+    try:
+        runner.write(candidate, content, 0o600)
+        if not p.command(runner, [p.BINARY, "check", "-c", candidate]):
+            if required:
+                raise ValueError("没有可校验通过的上次可用配置")
+            return False, 0
+        runner.write(temporary, content, 0o600)
+        if not p.command(runner, [p.BINARY, "check", "-c", temporary]):
+            raise ValueError("上次可用配置校验失败")
+        runner.replace(temporary, p.LIVE)
+        return True, removed
+    finally:
+        for path in (candidate, temporary):
+            if runner.exists(path):
+                runner.remove_tree(path)
 
 
 def reinstall(runner):
+    """保留对外返回版本号的接口。"""
+    version, _ = _reinstall(runner)
+    return version
+
+
+def _reinstall(runner):
     version = p.release(runner, p.FACTORY)
     if version is None:
         raise ValueError("出厂包损坏")
@@ -65,14 +90,14 @@ def reinstall(runner):
     runner.remove_tree(temporary)
     runner.symlink(target, temporary)
     runner.replace(temporary, p.CURRENT)
-    restore(runner, required=False)
+    _, removed = restore(runner, required=False)
     checked(runner, ["systemctl", "daemon-reload"])
     for unit in ("exitnode-proxy.service", "exitnode-admin.service", "exitnode-watchdog.timer"):
         checked(runner, ["systemctl", "restart", unit])
     after = p.probe(runner)
     if not all(after[key] for key in ("P1", "P2", "P3", "P4")):
         raise ValueError("重装后程序检查未通过")
-    return version
+    return version, removed
 
 
 def promote(runner):
@@ -156,16 +181,20 @@ def tick(runner):
                 raise ValueError("重装频率超限：六小时最多一次，二十四小时最多两次")
             value["reinstall_times"].append(runner.now())
             s.save(runner, value)  # 先占额度，失败或中断也计入。
-            version = reinstall(runner)
+            version, removed = _reinstall(runner)
             s.history(runner, action, "ok", version)
             value.update(state="normal", reason="已恢复出厂程序，复查通过")
+            if removed:
+                value["reason"] += f"；已剔除 {removed} 条不在登记表上的用户记录"
             value["counts"] = s.fresh()["counts"]
         elif all(result[key] for key in ("P1", "P2", "P3")) and counts["P4"] >= 2:
             action = "restore"
-            restore(runner, required=True)
+            _, removed = restore(runner, required=True)
             checked(runner, ["systemctl", "restart", "exitnode-proxy.service"])
             s.history(runner, action, "ok")
             value["reason"] = "已恢复上次可用配置，等待下轮检查"
+            if removed:
+                value["reason"] += f"；已剔除 {removed} 条不在登记表上的用户记录"
         elif all(result[key] for key in ("P1", "P2", "P3", "P4")) and counts["P5"] >= 2:
             action = "restart"
             if limit(value["restart_times"], runner.now(), 3600, 1):
