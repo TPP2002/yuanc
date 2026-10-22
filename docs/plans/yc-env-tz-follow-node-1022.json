@@ -1,0 +1,292 @@
+{
+  "schemaVersion": 1,
+  "taskId": "SEC-WIN-ENV-TZ-FOLLOW-NODE-1022",
+  "slug": "yc-env-tz-follow-node-1022",
+  "title": "环境一致性:时区与期望国家码随节点下发(配对文件/鉴权会话可选字段 time_zone、country),客户端优先采用节点值、IANA 名自动转 Windows ID、识别不了回落本机配置;续期换时区只重套用环境不重启隧道;节点配置与鉴权服务配置加对应可选字段",
+  "goal": "以主干 main(含 PR #42 环境自检合并后的头 a2b8d6f 之后)为基点。背景:增值包「环境一致性」现在把要切到的 Windows 时区和自检用的期望国家码写死在客户端本机 run/environment.json(默认 AUS Eastern Standard Time / AU);节点以后搬到珀斯、布里斯班或换到别的国家时客户端不会自动跟,系统时区反而会成为新的不一致点,而自检时区项仍显示通过。本单让**时区与国家码随节点下发**:自用版写在配对文件里,分发版由鉴权服务器会话下发;客户端优先采用节点给的值,没给才用本机配置,本机配置再没有才用默认值。三个部件都要改,全部可选字段、全部向后兼容(老配对文件、老服务器一字不改照常工作)。\n\n① Windows 客户端——节点字段(winclient/WinClient.Core/Auth/AuthModels.cs、Pairing/PairingFile.cs)\nNodeInfo 加两个可选属性 `public string TimeZone { get; init; } = \"\";`(JSON `time_zone`;IANA 名如 Australia/Sydney 或 Windows 时区 ID)与 `public string Country { get; init; } = \"\";`(JSON `country`;两位大写国家码)。空串 = 未下发。PairingFile.Parse:node 里若出现 `time_zone`,必须是字符串且匹配 `\\A[A-Za-z0-9 ._+/()-]{1,64}\\z`,否则抛 InvalidDataException「配对文件的时区标识格式不正确,请重新导出。」;若出现 `country`,必须匹配 `\\A[A-Z]{2}\\z`,否则抛「配对文件的国家码格式不正确,请重新导出。」。配对文件版本号不变(ycpair/2、ycpair/3 都可带这两个可选键),缺键按空串处理。ClientController.SameSession **不比较**这两个字段(时区变化不该重启隧道,见 ③)。\n\n② 客户端——按节点解析生效策略(winclient/WinClient.Core/Environment/EnvironmentSettings.cs)\n加纯函数 `public static EnvironmentPolicy ForNode(this EnvironmentPolicy policy, NodeInfo? node)`(扩展方法,放在同文件的静态类里,或 EnvironmentPolicy 的实例方法,任选其一但形状断言要能搜到 `ForNode`):node 为 null 或两个字段都为空 → 原样返回;`country` 非空 → ExpectedCountry 用它;`time_zone` 非空 → 先 `TimeZoneInfo.TryConvertIanaIdToWindowsId(tz, out var windowsId)`,成功用 windowsId;否则若 `TimeZoneInfo.TryFindSystemTimeZoneById(tz, out _)` 成功(本身就是 Windows ID)用 tz;两者都不成 → **时区回落本机配置的 Target.TimeZoneId**(不抛、不改国家码的解析结果)。解析出的 Windows ID 必须能通过 EnvironmentTarget 的构造校验(正则 `\\A[A-Za-z0-9 .()+/-]{1,64}\\z`),不通过同样回落。Languages 不变。EnvironmentPolicy 记录本身不加字段;ForNode 返回新实例。\n\n③ 客户端——控制器接线(winclient/WinClient.Core/Client/ClientController.cs)\nApplyEnvironmentAsync 与 CheckEnvironmentAsync 都改用 `policy.ForNode(session?.Node)` 的结果(Target 与 ExpectedCountry)。ApplySessionAsync 里在 `session = next` 之后、状态机事件之前加一步:若 `environmentApplied` 为 true 且 `(environmentSettings?.Read() ?? Default).ForNode(previous?.Node).Target.TimeZoneId != (...).ForNode(next.Node).Target.TimeZoneId`,则**不动隧道**,先 RestoreEnvironmentAsync 再 ApplyEnvironmentAsync(两步任一失败只改 environmentStatus,沿用既有失败文案,不进入连接失败路径、不改 message)。environmentStatus 成功文案保持「已切换到澳洲时区与浏览器策略」不变(既有测试断言它)。\n\n④ 节点程序(node/exitnode/config.py、node/exitnode/device.py、node/examples/config.example.toml)\nconfig.py 的 Node 数据类加 `time_zone: str = \"\"` 与 `country: str = \"\"`;load() 校验:time_zone 非空时须匹配 `[A-Za-z0-9 ._+/()-]{1,64}`(全匹配),否则 invalid(\"node.time_zone\", \"须为 IANA 时区名(如 Australia/Sydney)或 Windows 时区标识\");country 非空时须匹配 `[A-Z]{2}`,否则 invalid(\"node.country\", \"须为两位大写国家码(如 AU)\")。注意 load() 现有规则「字符串不能为空」对这两个字段要放开(空串表示未设置;参照 updater.github_repo 的例外写法)。device.py 的 PairNode 加 `time_zone: NotRequired[str]`、`country: NotRequired[str]`;render_pair 仅在 ctx 对应值非空时写入这两个键(绝不写空串),ycpair 版本号不变;service.build_context 若需要把这两个值带进 ctx,按既有 context 字段方式加(node/exitnode/proxy/context.py 可改,只加字段不改既有校验)。config.example.toml 的 `[node]` 段加两行带中文注释的示例:`time_zone = \"Australia/Sydney\"`、`country = \"AU\"`(注释写明:节点所在城市的 IANA 时区名;客户端连上后会把电脑时区切到这里;留空则客户端用自己的本机配置)。黄金文件 node/tests/golden/device/pair.ycpair.json 保持原样(其测试配置不设这两个字段);新加一个设了字段的用例断言两个键出现且值正确、未设时两个键不出现。\n\n⑤ 鉴权服务器(authserver/authserver/config.py、authserver/examples/config.example.toml)\nconfig.py 的 Node 模型加 `time_zone: str = \"\"`、`country: str = \"\"`,field_validator:非空时分别匹配上面两个正则,否则 ValueError(中文)。service.session 现用 `self.settings.node.model_dump()` 组 node,新字段自然带出(空串也带出,客户端把空串当未下发);不要改 clientconfig.render 的既有输出(它只读自己需要的键;若它对未知键报错则在 render 入口忽略这两个键)。示例配置 `[node]` 段加两行占位:`time_zone = \"<节点所在城市的 IANA 时区名,如 Australia/Sydney;留空则客户端用本机配置>\"`、`country = \"<两位大写国家码,如 AU;留空则客户端按 AU>\"`。注意示例文件所有值都是占位符,新加的两行同样用占位符写法。\n\n⑥ 测试(先写红)\nwinclient/WinClient.Tests/PairingTests.cs:配对文件带 `\"time_zone\":\"Australia/Perth\",\"country\":\"AU\"` 解析后 Node.TimeZone/Country 正确;不带两键时为空串;`\"time_zone\":\"bad;zone\"` 与 `\"country\":\"au\"` 各抛 InvalidDataException 且消息为上面两句。EnvironmentApplierTests.cs(或新建 EnvironmentPolicyTests.cs):ForNode——node 为 null 原样;Country=\"NZ\" → ExpectedCountry NZ;TimeZone=\"W. Australia Standard Time\"(Windows ID)→ Target.TimeZoneId 等于它;TimeZone=\"Australia/Perth\" → 若本机 `TimeZoneInfo.TryConvertIanaIdToWindowsId(\"Australia/Perth\", out _)` 为 true 则断言得到 \"W. Australia Standard Time\",否则断言回落到配置值(测试里按这个条件分支写,不得 skip 整个测试);TimeZone=\"Mars/Olympus\" → 回落配置值且 Country 仍按 node;Languages 不变。ControllerTests.cs:①自用会话节点带 time_zone(用 Windows ID 以免依赖 ICU)与 country 时,FakeEnvironment 收到的 ApplyAsync(target) 的 TimeZoneId 等于节点给的,且自检报告 exit_country 以节点 country 为期望(节点 country=\"NZ\"、探测返回 \"NZ\" → 通过);②续期拿到的新会话只改了 time_zone(其他字段同)→ order 里出现 env-restore、env-apply 且**不出现 stop/start**(隧道未重启),environmentStatus 仍为成功文案;③既有测试不改断言(新字段默认空串时行为与改前完全一致)。node/tests/test_config.py:两个字段缺省为空串;非法值各报对应中文错误;合法值通过。node/tests/test_device.py:设字段时配对文件含两键,未设时不含;黄金对比用例不改。authserver/tests/test_sessions.py:配置了 time_zone/country 时 /client/session 返回的 node 含两键且值正确;conftest 的测试配置若需加字段只加可选项。\n\n⑦ 文档\ndocs/winclient/环境一致性说明.md「总开关与管理员配置」节加一段「时区与国家码随节点下发」:优先级(节点下发 > 本机 environment.json > 默认值)、IANA 名与 Windows ID 都接受、无法识别时回落本机配置、续期换了时区不重启隧道只重套用环境、配对文件未签名所以这两个字段同样可被篡改(只影响时区与自检期望国家,不影响出口,与待拍板 d 口径一致);真机待验证加两条(配对文件带 Australia/Perth 导入后连上,电脑时区变为珀斯;换导入不带字段的配对文件后回到本机配置)。docs/node/配置说明.md `[node]` 字段表加两行;docs/node/自用配对说明.md 配对文件字段说明加两个可选键;docs/authserver/接口说明.md 的 session 响应 node 字段加两个可选键。\n\n⑧ 边界:全程中文;不新增 NuGet 与 pip 依赖;不改 ycpair 版本号;不改 SameSession;不改既有测试断言与黄金文件;不改 EnvironmentPlanner 脚本;不在工位机器上执行 Apply/Restore/Inspect 脚本;客户端对下发值只做格式校验与时区名解析,不信任其他内容;所有新字段默认空串、缺省行为与改前逐字节一致(全局模式配置渲染不受影响)。",
+  "background": "项目:外包,中国 Windows 客户端(.NET 9 WPF,后台服务 SYSTEM + 托盘界面,sing-box TUN strict_route)+ 澳洲出口节点(Debian 12,Python 包 node/exitnode)+ 分发版鉴权服务(authserver,FastAPI+pydantic)。环境一致性与自检见 PR #41/#42 与 docs/winclient/环境一致性说明.md:EnvironmentPolicy(Enabled, Target(TimeZoneId, Languages), ExpectedCountry) 由 EnvironmentSettingsStore 读 run/environment.json;ClientController.ApplyEnvironmentAsync 在 TunnelUp 后套用,CheckEnvironmentAsync 在出口核验终局后跑八项自检;ApplySessionAsync/RenewAsync 处理会话续期,SameSession 比较节点字段决定是否重启隧道。配对文件:PairingFile.Parse 校验 node 字段,PairNode 由节点 device.render_pair 导出(node/exitnode/device.py),鉴权服务 service.session 用 settings.node.model_dump() 组 node。节点配置 load() 在 node/exitnode/config.py,逐字段类型校验且字符串默认不许空(updater.github_repo 有例外写法可照抄)。跑法:dotnet build/test winclient/WinClient.sln;python -m pytest -q node/tests authserver/tests;python -m ruff check node scripts authserver。工位无外网;第三方件缓存由派单方放进 winclient/third_party/cache/。",
+  "nonGoals": [
+    "不改配对文件版本号,不加签名(待拍板 d 已选暂不签名)",
+    "不下发语言列表(languages 仍由本机配置决定)",
+    "不改 SameSession 的比较集合,不因时区变化重启隧道",
+    "不在真机实测;真机项写进文档待验证清单"
+  ],
+  "allowedPaths": [
+    "winclient/WinClient.Core/Auth/AuthModels.cs",
+    "winclient/WinClient.Core/Pairing/PairingFile.cs",
+    "winclient/WinClient.Core/Environment/EnvironmentSettings.cs",
+    "winclient/WinClient.Core/Client/ClientController.cs",
+    "winclient/WinClient.Tests/PairingTests.cs",
+    "winclient/WinClient.Tests/EnvironmentApplierTests.cs",
+    "winclient/WinClient.Tests/EnvironmentPolicyTests.cs",
+    "winclient/WinClient.Tests/ControllerTests.cs",
+    "winclient/WinClient.Tests/TestData.cs",
+    "node/exitnode/config.py",
+    "node/exitnode/device.py",
+    "node/exitnode/service.py",
+    "node/exitnode/proxy/context.py",
+    "node/examples/config.example.toml",
+    "node/tests/test_config.py",
+    "node/tests/test_device.py",
+    "node/tests/test_service.py",
+    "authserver/authserver/config.py",
+    "authserver/examples/config.example.toml",
+    "authserver/tests/test_sessions.py",
+    "authserver/tests/conftest.py",
+    "docs/winclient/环境一致性说明.md",
+    "docs/node/配置说明.md",
+    "docs/node/自用配对说明.md",
+    "docs/authserver/接口说明.md"
+  ],
+  "forbiddenPaths": [
+    "docs/开工须知.md",
+    "docs/口径速查表.md",
+    "docs/design/**",
+    "docs/交接/**",
+    "docs/plans/**",
+    "docs/acceptance/**",
+    "docs/winclient/自动更新说明.md",
+    "docs/winclient/打包与发布说明.md",
+    "docs/winclient/断网保护加固说明.md",
+    "docs/winclient/架构说明.md",
+    "docs/winclient/服务化与自启说明.md",
+    "docs/node/客户端包托管说明.md",
+    "docs/node/救援单元说明.md",
+    "docs/node/更新与回退说明.md",
+    "docs/node/服务加固说明.md",
+    "docs/node/看门狗说明.md",
+    "docs/node/隧道配置说明.md",
+    ".github/**",
+    ".codex/**",
+    ".gitignore",
+    "pyproject.toml",
+    "scripts/**",
+    "node/exitnode/admin/**",
+    "node/exitnode/rescue/**",
+    "node/exitnode/updater/**",
+    "node/exitnode/watchdog/**",
+    "node/exitnode/templates/**",
+    "node/exitnode/proxy/server_config.py",
+    "node/exitnode/proxy/registry.py",
+    "node/exitnode/proxy/keys.py",
+    "node/exitnode/proxy/subscription.py",
+    "node/exitnode/proxy/client_config.py",
+    "node/exitnode/cli.py",
+    "node/exitnode/nft.py",
+    "node/exitnode/netinfo.py",
+    "node/exitnode/systemd.py",
+    "node/exitnode/manifest.py",
+    "node/exitnode/status.py",
+    "node/exitnode/log.py",
+    "node/exitnode/runner.py",
+    "node/tests/golden/**",
+    "authserver/authserver/app.py",
+    "authserver/authserver/service.py",
+    "authserver/authserver/clientconfig.py",
+    "authserver/authserver/db.py",
+    "authserver/authserver/models.py",
+    "authserver/authserver/security.py",
+    "authserver/authserver/admin_cli.py",
+    "winclient/third_party/**",
+    "winclient/*.sln",
+    "winclient/*/*.csproj",
+    "winclient/WinClient.Core/Hosting/**",
+    "winclient/WinClient.Core/Kernel/**",
+    "winclient/WinClient.Core/Logging/**",
+    "winclient/WinClient.Core/Process/**",
+    "winclient/WinClient.Core/State/**",
+    "winclient/WinClient.Core/Storage/**",
+    "winclient/WinClient.Core/Update/**",
+    "winclient/WinClient.Core/Firewall/**",
+    "winclient/WinClient.Core/Ipc/**",
+    "winclient/WinClient.Core/Environment/EnvironmentPlanner.cs",
+    "winclient/WinClient.Core/Environment/EnvironmentApplier.cs",
+    "winclient/WinClient.Core/Environment/EnvironmentSelfCheck.cs",
+    "winclient/WinClient.Core/Pairing/PairingStore.cs",
+    "winclient/WinClient.Core/Pairing/LocalConfigRenderer.cs",
+    "winclient/WinClient.Core/Auth/AuthApiClient.cs",
+    "winclient/WinClient.Core/Client/ClientSettings.cs",
+    "winclient/WinClient.Core/Client/DesiredStateStore.cs",
+    "winclient/WinClient.Core/Client/ISessionSource.cs",
+    "winclient/WinClient.Core/Client/TunnelTransport.cs",
+    "winclient/WinClient.Core/Client/ClientRuntime.cs",
+    "winclient/WinClient.Core/Client/IClientFacade.cs",
+    "winclient/WinClient.Core/Client/ExitProbe.cs",
+    "winclient/WinClient.App/**",
+    "winclient/WinClient.Tests/AuthTests.cs",
+    "winclient/WinClient.Tests/DataDirectorySecurityTests.cs",
+    "winclient/WinClient.Tests/FirewallTests.cs",
+    "winclient/WinClient.Tests/HostingTests.cs",
+    "winclient/WinClient.Tests/KernelInstallerTests.cs",
+    "winclient/WinClient.Tests/KillSwitch*.cs",
+    "winclient/WinClient.Tests/PairingCertificateTests.cs",
+    "winclient/WinClient.Tests/IpcTests.cs",
+    "winclient/WinClient.Tests/UpdateIpcTests.cs",
+    "winclient/WinClient.Tests/EnvironmentPlannerTests.cs",
+    "winclient/WinClient.Tests/EnvironmentSelfCheckTests.cs",
+    "winclient/WinClient.Tests/ProcessStorageTests.cs",
+    "winclient/WinClient.Tests/StateTests.cs",
+    "winclient/WinClient.Tests/UpdateApplierTests.cs",
+    "winclient/WinClient.Tests/UpdateCoordinatorTests.cs",
+    "winclient/WinClient.Tests/UpdateHttpTests.cs",
+    "winclient/WinClient.Tests/UpdateTests.cs",
+    "winclient/WinClient.Tests/Fixtures/**"
+  ],
+  "expectArtifacts": [
+    "winclient/WinClient.Core/Auth/AuthModels.cs",
+    "winclient/WinClient.Core/Pairing/PairingFile.cs",
+    "winclient/WinClient.Core/Environment/EnvironmentSettings.cs",
+    "winclient/WinClient.Core/Client/ClientController.cs",
+    "node/exitnode/config.py",
+    "node/exitnode/device.py",
+    "authserver/authserver/config.py",
+    "docs/winclient/环境一致性说明.md"
+  ],
+  "acceptance": [
+    {
+      "id": "BUILD",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "build",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 900
+    },
+    {
+      "id": "TEST",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "test",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--no-build",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 900
+    },
+    {
+      "id": "RUFF",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "ruff",
+        "check",
+        "node",
+        "scripts",
+        "authserver"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "PYTEST",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+        "node/tests",
+        "authserver/tests"
+      ],
+      "required": true,
+      "timeoutSec": 600
+    },
+    {
+      "id": "SHAPE-A",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda p:pathlib.Path(p).read_text(encoding='utf-8');am=r('winclient/WinClient.Core/Auth/AuthModels.cs');pf=r('winclient/WinClient.Core/Pairing/PairingFile.cs');es=r('winclient/WinClient.Core/Environment/EnvironmentSettings.cs');cc=r('winclient/WinClient.Core/Client/ClientController.cs');bad=[k for k,ok in (('node','string TimeZone' in am and 'string Country' in am),('pair','time_zone' in pf and 'country' in pf and '时区标识格式不正确' in pf and '国家码格式不正确' in pf),('policy','ForNode' in es and 'TryConvertIanaIdToWindowsId' in es),('ctrl','ForNode(' in cc)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "SHAPE-B",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda p:pathlib.Path(p).read_text(encoding='utf-8');cf=r('node/exitnode/config.py');dv=r('node/exitnode/device.py');ex=r('node/examples/config.example.toml');ac=r('authserver/authserver/config.py');ae=r('authserver/examples/config.example.toml');bad=[k for k,ok in (('nodecfg','time_zone' in cf and 'country' in cf and 'node.time_zone' in cf and 'node.country' in cf),('pair','time_zone' in dv and 'country' in dv),('nodeex','time_zone' in ex and 'country' in ex),('authcfg','time_zone' in ac and 'country' in ac),('authex','time_zone' in ae and 'country' in ae)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "TESTS-EXIST",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda p:pathlib.Path(p).read_text(encoding='utf-8');t='winclient/WinClient.Tests/';bad=[k for k in ('time_zone','国家码格式不正确') if k not in r(t+'PairingTests.cs')]+['ctrl:'+k for k in ('env-restore',) if k not in r(t+'ControllerTests.cs')]+['node:'+k for k in ('time_zone',) if k not in r('node/tests/test_device.py') or k not in r('node/tests/test_config.py')]+['auth:'+k for k in ('time_zone',) if k not in r('authserver/tests/test_sessions.py')];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "GOLDEN-UNCHANGED",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess,sys;out=subprocess.run(['git','diff','--name-only','origin/main','--','node/tests/golden'],capture_output=True,text=True).stdout.split();print(out);sys.exit(1 if out else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "NOWINDOW",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;norm=lambda p:str(p).replace(chr(92),'/');files=[p for root in ('winclient/WinClient.Core','winclient/WinClient.App') for p in pathlib.Path(root).rglob('*.cs') if '/obj/' not in norm(p) and '/bin/' not in norm(p)];bad=[norm(p) for p in files if 'ProcessStartInfo' in p.read_text(encoding='utf-8') and p.parent.name!='Process' and 'CreateNoWindow = true' not in p.read_text(encoding='utf-8')];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda p:pathlib.Path(p).read_text(encoding='utf-8');a=r('docs/winclient/环境一致性说明.md');b=r('docs/node/配置说明.md');c=r('docs/node/自用配对说明.md');d=r('docs/authserver/接口说明.md');bad=[k for k in ('随节点下发','time_zone','country','回落') if k not in a]+['nodecfg:'+k for k in ('time_zone','country') if k not in b]+['pair:'+k for k in ('time_zone','country') if k not in c]+['auth:'+k for k in ('time_zone','country') if k not in d];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "NOBIN",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess,sys;out=subprocess.run(['git','ls-files','winclient','build'],capture_output=True,text=True).stdout.split();bad=[f for f in out if f.endswith(('.exe','.dll','.zip','.pdb'))];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    }
+  ],
+  "steps": [
+    "读 AuthModels.cs / PairingFile.cs / EnvironmentSettings.cs / ClientController.cs(ApplyEnvironmentAsync、CheckEnvironmentAsync、ApplySessionAsync、SameSession)/ PairingTests.cs / ControllerTests.cs(FakeEnvironment、续期用例)/ node/exitnode/{config,device,service}.py 与 proxy/context.py / node/tests/{test_config,test_device}.py / authserver/authserver/config.py / authserver/tests/{conftest,test_sessions}.py 与四份文档;先写 ⑥ 的红测试。",
+    "实现 ①②③(客户端)与 ④⑤(节点、鉴权服务);跑 BUILD / TEST / RUFF / PYTEST / 形状断言;确认黄金文件未动。",
+    "写文档 ⑦;交活说明列真机待验证项。不许自己跑 dotnet build/test/restore、python -m pytest/ruff 以外的命令改环境;不许在工位机器上执行 Apply/Restore/Inspect 脚本。"
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "timeoutSec": 7200,
+  "repoRoot": "E:/yuanc"
+}
