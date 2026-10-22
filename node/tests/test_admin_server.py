@@ -1,9 +1,12 @@
+import contextlib
 import http.client
+import socket
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
-from exitnode.admin.server import check, create_server
+from exitnode.admin.server import PackageHandler, PackageServer, check, create_server
 
 
 @pytest.fixture
@@ -88,3 +91,102 @@ def test_check_accepts_200_and_404_but_not_unreachable(hosted):
     hosted[0].shutdown()
     hosted[0].server_close()
     assert check(config)["result"] == "失败"
+
+
+@contextlib.contextmanager
+def running(tmp_path, **options):
+    root = tmp_path / "winclient" / "releases"
+    root.mkdir(parents=True)
+    (root / "latest.json").write_bytes(b'{"version":"1.2.3"}')
+    server = create_server("127.0.0.1", 0, root, **options)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def raw_connect(server):
+    sock = socket.create_connection(server.server_address, timeout=3)
+    return sock
+
+
+def latest_status(server):
+    connection = http.client.HTTPConnection(*server.server_address, timeout=3)
+    try:
+        connection.request("GET", "/winclient/latest.json")
+        return connection.getresponse().status
+    finally:
+        connection.close()
+
+
+def test_slow_client_is_disconnected_without_blocking_others(tmp_path):
+    with running(tmp_path, timeout=0.5) as server:
+        slow = raw_connect(server)
+        try:
+            # 另一条正常连接不受慢客户端影响。
+            assert latest_status(server) in {200, 404}
+            slow.settimeout(3)
+            started = time.monotonic()
+            assert slow.recv(1024) == b""
+            assert time.monotonic() - started < 2
+        finally:
+            slow.close()
+
+
+def test_timeout_is_per_server_not_global(tmp_path):
+    before = PackageHandler.timeout
+    with running(tmp_path, timeout=0.5):
+        assert PackageHandler.timeout == before == 15
+
+
+def test_connection_limit_closes_extra_connection_and_recovers(tmp_path):
+    with running(tmp_path, max_connections=2) as server:
+        first, second = raw_connect(server), raw_connect(server)
+        third = raw_connect(server)
+        try:
+            third.settimeout(1)
+            started = time.monotonic()
+            data = third.recv(1024)
+            assert data == b"" and b"HTTP/" not in data
+            assert time.monotonic() - started < 1
+            first.close()
+            deadline = time.monotonic() + 5
+            status = None
+            while time.monotonic() < deadline:
+                try:
+                    status = latest_status(server)
+                    break
+                except (OSError, http.client.HTTPException):
+                    time.sleep(0.1)
+            assert status in {200, 404}
+        finally:
+            for sock in (first, second, third):
+                sock.close()
+
+
+def test_rejected_connection_does_not_start_thread(tmp_path, monkeypatch):
+    started = []
+    original = PackageServer.process_request_thread
+
+    def counting(self, request, client_address):
+        started.append(1)
+        return original(self, request, client_address)
+
+    monkeypatch.setattr(PackageServer, "process_request_thread", counting)
+    with running(tmp_path, max_connections=2) as server:
+        first, second = raw_connect(server), raw_connect(server)
+        third = raw_connect(server)
+        try:
+            third.settimeout(1)
+            assert third.recv(1024) == b""
+            deadline = time.monotonic() + 2
+            while len(started) < 2 and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert len(started) == 2
+        finally:
+            for sock in (first, second, third):
+                sock.close()

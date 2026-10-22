@@ -13,6 +13,9 @@ Restart=on-failure
 RestartSec=30
 NoNewPrivileges=true
 UMask=0077
+TasksMax=64
+LimitNOFILE=1024
+MemoryMax=256M
 
 [Install]
 WantedBy=multi-user.target
