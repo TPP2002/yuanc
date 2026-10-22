@@ -1,0 +1,172 @@
+{
+  "schemaVersion": 1,
+  "taskId": "SEC-NODE-UPGRADE-HEALTH-1022",
+  "slug": "yc-sec-node-upgrade-health-recover-1022",
+  "title": "节点侧升级事务两处加固(一单覆盖看板卡 SEC-NODE-UPGRADE-HEALTH-1022 与 SEC-NODE-UPGRADE-RECOVER-BOOT-1022):①健康检查在首次通过后再守一段稳定窗(默认 30 秒,is-active / NRestarts 不变 / 端口在监听 / check --json 仍通过),跑几秒就崩的新版会被回退标坏;②pending.json 记阶段,新增开机 oneshot 单元 exitnode-recover.service 跑 `upgrade --recover`,断电或被杀后按实际链接收尾(未切换的清理不标坏、已切换的现场健康检查通过则转正、不过则回退),更新锁早于本次开机的视为陈旧可接管",
+  "goal": "以主干 05dce36 为基点(含 PR #26 的 _switch / highest.json / _check_release / _record_highest 与 PR #28)。做完后:\n\n① node/exitnode/config.py:Updater 新增字段 `health_stable_sec: int = 30`;校验:必须是 int 且 ≥ 0,否则 invalid(\"updater.health_stable_sec\", \"须为非负整数秒数\")(0 表示关闭稳定窗)。test_config.py 加:默认 30;显式 0 可通过;-1 与 true 被拒。\n\n② node/exitnode/updater/upgrade.py 的 `_healthy(config, runner, config_path)` 改成两段:\n  第一段(不变):每 ≤5 秒跑一次 check --json,直到「隧道服务」层通过;超过 health_timeout_sec 返回 False。既有用例 test_health_timeout_bounds_even_the_last_system_command 的行为必须原样保住(第一段一直没过,第二段根本不跑)。\n  第二段(稳定窗,仅 health_stable_sec > 0 时):从第一次通过那一刻起算 `stable_deadline = runner.now() + config.updater.health_stable_sec`,先取基线 `base = _restarts(runner)`,然后循环:每一轮按顺序跑 (a) `systemctl is-active exitnode-proxy.service`(check=False;退出码 0 = 活着,非 0 = 失败→整个 _healthy 返回 False;不看 stdout,这样 FakeRunner 空输出也能判);(b) `systemctl show exitnode-proxy.service -p NRestarts --value`(check=False;stdout 去空白后能 int() 的才算有值;退出码非 0 或解析不出 = 「未知」,未知不算失败也不参与比较;有值且 != base → 失败;base 本身未知则跳过本项);(c) 监听探测:复用 node/exitnode/watchdog/probes.py 现有的监听判定(_listen 及其取端口口径:主入口 443/配置的 reality 端口与 hy2 端口),「失败」→ 失败,「未知」不算失败;probes.py 本身不改,若签名不便直接复用,可在 upgrade.py 内写等价判定但 ss 命令行与「未知不算失败」语义必须一致;(d) 最后一条命令仍是 check --json(与第一段同一条 env PYTHONPATH=... python3 -m exitnode --config ... check --json 命令,timeout=min(30, 剩余)),「隧道服务」层不通过 → 失败。四项都过且 runner.now() ≥ stable_deadline → 返回 True;否则 runner.sleep(min(5, stable_deadline - now)) 进下一轮。稳定窗内任何一轮失败立即返回 False,不重试(抖一下就是不健康)。总耗时上限 = health_timeout_sec + health_stable_sec,任何一次 runner.run 的 timeout 不得超过各自段的剩余时间与 30 的较小者。health_stable_sec = 0 时行为与改前完全一致(一条 is-active / show / ss 都不发)。\n  因为 FakeRunner 对未配置的命令返回 127,既有测试里健康检查要通过的用例需要在 test_updater.py 的公共夹具(prepared() 或它构造 responses 的地方)加一条 `(\"systemctl\",\"is-active\",\"exitnode-proxy.service\"): CompletedResult(0, \"active\\n\")`(NRestarts 与 ss 不配就是「未知」,不影响通过);test_cli.py 若有跑 upgrade 并期望健康通过的用例同样加。这是「旧测试夹具适配」的持续授权范围,改了在交活说明里列出文件与条数。\n\n③ pending.json 增加字段 \"stage\":_install 与 _switch 在写 pending 时写 \"staged\"(目标目录就位、链接还没切),layout.switch 成功之后、_restart 之前,把 pending 原子重写成 \"switched\"(同样 .tmp + replace)。读的时候:没有 stage 字段按 \"switched\" 处理(旧记录保守按已切换);stage 不是这两个值之一按记录损坏。\n\n④ `_recover(config, runner, config_path)` 加 config_path 参数(upgrade() 调用处传入),逻辑改成按实际链接收尾:读 pending 并沿用现有校验(old 在已安装版本里、target == releases/version),再读 `current = layout.current_target(config, runner)`(抛错按下面「两者都不是」处理):\n  (a) stage == \"staged\" 且 current == old:切换从未发生,`runner.remove_tree(target)` 删掉没验证过的目标目录(也删同名 .staging 若在),**不标 .bad**,_history(version, \"aborted\"),删 pending;不重启服务。\n  (b) current == target(不论 stage):现场跑 `_healthy(config, runner, config_path)`(不先 _restart,服务是 systemd 开机拉起的);通过 → _history(version, \"ok\")、删 pending、_record_highest(config, runner, old, version);不通过 → 既有 `_rollback(config, runner, old, target, version)` 再删 pending。\n  (c) stage == \"switched\" 且 current == old:链接已被别处切回,目标仍没验证过 → 走既有 `_rollback`(标 .bad、history rolled_back)再删 pending(与改前行为一致)。\n  (d) 两者都不是:沿用既有 UpdateError(\"未完成更新的记录损坏，请联系维护人员\")。\n  **显式授权修改既有用例 test_killed_after_switch_rolls_back_before_next_package 的期望**:它构造的是 stage 缺省(=switched)、current==NEW 的场景,改后应为:健康通过(夹具 is-active 返回 0)→ 链接保持 NEW、无 NEW.bad、pending 删除、history 最后一行 status \"ok\"、highest.json 记到 0.2.0;随后 run() 对同一个 0.2.0 包返回 1(「同版本程序已经安装」)。可以改名为 test_killed_after_switch_completes_when_healthy。另加用例见 ⑧。\n\n⑤ CLI:`upgrade` 子命令新增 `--recover`(action=store_true,help「只收尾上次未完成的更新,不检查网络、不下载」)。与 --file / --signature / --switch / --check / --allow-downgrade 任一同时给出 → stderr 打「--recover 不能与其他升级参数同时使用」,返回 2(与现有 --switch 互斥检查同一位置、同一风格)。实现:upgrade.py 新增公开函数 `recover(config, runner, *, config_path)`,返回退出码:lock_busy → 打「已有更新任务正在执行，请稍后重试」返回 4;runner.mkdir(data_dir, 0o700) + acquire_lock(拿不到同样返回 4)+ mkdir updater 状态目录;没有 pending.json → 打「没有未完成的更新。」返回 0(仍跑 layout.repair 与 layout.cleanup);有 → `_recover(config, runner, config_path)` 后跑 layout.repair、layout.cleanup,打「未完成的更新已收尾。」返回 0;UpdateError → 打 redact(str(exc)) 返回 exc.code;其他异常 → 打「更新失败：程序或文件操作异常，请联系维护人员。」返回 1;finally 删 incoming 目录、释放锁(与 upgrade() 的 finally 同样写法)。**不做网络探测、不取包**(断网也必须能收尾)。cli.py 在 args.command == \"upgrade\" 且 args.recover 时调用 recover(...) 而不是 upgrade(...)。\n\n⑥ 开机收尾单元:新增模板 node/exitnode/templates/exitnode-recover.service,内容(占位符与其他模板同一套,render(name, {}) 的默认值须与黄金完全一致):\n  [Unit]\\nDescription=出口节点未完成更新收尾\\nAfter=network-online.target exitnode-proxy.service\\nWants=network-online.target\\n\\n[Service]\\nEnvironment=PYTHONPATH=$program_path\\nType=oneshot\\nExecStart=/usr/bin/python3 -m exitnode --config \"$config_path\" upgrade --recover\\nRestart=no\\nNoNewPrivileges=true\\nUMask=0077\\n\\n[Install]\\nWantedBy=multi-user.target\\n\n  (After 里带 exitnode-proxy.service 是为了让 systemd 先按链接拉起隧道服务,收尾只做健康检查不重启。)黄金文件 node/tests/golden/exitnode-recover.service = render(\"exitnode-recover.service\", {}) 的输出。node/exitnode/manifest.py 的 UNITS 加入 \"exitnode-recover.service\"。node/tests/test_systemd_render.py 的 UNITS 元组加入 \"exitnode-recover.service\"(既有统一断言:没有 StartLimit、有 Restart=、有 PYTHONPATH 行——新模板都满足)。\n  cli._install:在「写入exitnode-proxy.service」之后、既有「重载隧道服务定义」之前插一步「写入exitnode-recover.service」(写法与 proxy 单元同一套:已存在且内容不同 → ValueError「已有服务文件与安装内容不同，请先由维护人员确认」;undo {\"kind\":\"systemctl\",\"unit\":\"exitnode-recover.service\"});在「启用隧道服务」之后插一步「启用更新收尾服务」= `systemctl enable exitnode-recover.service`(**不加 --now**,开机才跑;undo 同上)。test_cli 里因多了这两步而要调整的顺序/计数断言允许改,交活说明列出;既有的相对顺序断言(启用隧道服务 < 启用看门狗定时器 < 硬件看门狗;启用看门狗定时器 < 安装救援单元 < 启用救援定时器)必须仍成立。\n\n⑦ node/exitnode/runner.py:Runner 协议新增 `def uptime_seconds(self) -> float`;RealRunner 读 /proc/uptime 第一个字段转 float,读不到或解析失败返回 float(\"inf\")(= 永不按开机规则判陈旧,宁可保守);FakeRunner 新增属性 `self.uptime = 10 ** 9`(默认开机时刻远在所有测试时钟之前,既有锁测试不受影响),`uptime_seconds()` 返回它。acquire_lock 与 lock_busy(RealRunner 与 FakeRunner 两边)在读到锁内容 {pid, at} 之后、现有 7200 秒 + pid 存活判定之前,先判 `at < self.now() - self.uptime_seconds()`(锁写于本次开机之前)→ 视为陈旧:acquire_lock 直接接管(照常截断重写),lock_busy 返回 False。rescue 包的 lock_busy 不动。\n\n⑧ 测试(新增,既有断言除 ④ 明说的那条和夹具适配外只加不改):\n  test_updater.py:(a) stage=switched、current==NEW、健康通过 → 转正(见 ④);(b) stage=switched、current==NEW、is-active 返回 3 → 回退:链接 OLD、NEW.bad 存在、history rolled_back、pending 删除;(c) stage=staged、current==OLD → NEW 目录被删、无 NEW.bad、history \"aborted\"、pending 删除,随后同一个 0.2.0 包能正常安装(run 返回 0);(d) stage 为别的字串 → 退出 1 且打印「未完成更新的记录损坏」;(e) 稳定窗:health_stable_sec=30 时,第一次 check 通过后 is-active 第二轮返回非 0 → 回退;NRestarts 基线 \"0\" 后变 \"1\" → 回退;ss 探测明确失败(端口没在监听)→ 回退;全通过 → 成功且时钟前进 ≥ 30 秒、runner.commands[-1] 是 check --json 那条、is-active 至少跑了 2 次;health_stable_sec=0 → 成功且命令里没有任何 is-active / show;(f) 时间上限:health_timeout_sec=7、health_stable_sec=5,第一段恰在第 6 秒通过,则整个 _healthy 结束时钟前进 ≤ 12 秒;(g) recover():无 pending → 0、不调用 tcp_connect、不取包;有 switched+健康 pending → 0 且转正;锁被活进程占着 → 4;(h) 陈旧锁:FakeRunner 的 uptime=50、锁 at=clock-100、pid 在 live_pids 里 → acquire_lock 成功、lock_busy False;uptime=1000 同一把锁 → 仍 busy;RealRunner.uptime_seconds 用 monkeypatch 替换读取函数测两种情形(正常数字、读取失败返回 inf)。\n  test_cli.py:(i) `upgrade --recover --file x` 返回 2 并打互斥提示;`upgrade --recover` 正常走 recover;(j) install 的 steps 含「写入exitnode-recover.service」与「启用更新收尾服务」,enable 命令不含 --now,单元文件内容 == render 输出;rollback 后单元文件被删且跑过 disable --now。\n  test_config.py:见 ①。test_systemd_render.py:见 ⑥。\n  测试只许写 tmp_path 或 FakeRunner 内存,不得向受测目录写产物。\n\n⑨ 文档:docs/node/更新与回退说明.md 新增小节「健康检查的稳定窗」(两段、四项、未知不算失败、总耗时上限、health_stable_sec=0 关闭)、「断电或被杀后的开机收尾」(pending.json 的 stage 两个值、四种收尾分支、exitnode-recover.service 开机跑 `upgrade --recover`、不探网不下载、锁早于开机视为陈旧)、「真机待验证」追加:升级等待健康检查时拔电重启,开机后 pending.json 消失且 history 多一行 ok/aborted/rolled_back;docs/node/配置说明.md 加 updater.health_stable_sec 字段说明(默认 30,0 关闭)。",
+  "background": "项目:外包,澳洲家宽 Debian 12 软路由跑 node/exitnode(Python,主机操作全部经 Runner 协议,测试用 FakeRunner:未配置命令返回 127 且空输出、responses 按 argv 元组精确或前缀匹配、sleep 推进 clock、read_file 缺失抛 FileNotFoundError、有 live_pids 与 pid 做锁存活判定)。升级事务在 node/exitnode/updater/upgrade.py:upgrade() = 锁探测 → 网络探测 → acquire_lock → _recover → layout.repair → layout.cleanup → 取包/校验/版本闸门 → _install(解包到 .staging → replace 成 target → 写 pending.json {old,target,version} → layout.switch → _restart → _healthy → history ok → 删 pending → _record_highest)或 _switch(同样写 pending 后切换)。_healthy 现在只轮询 check --json 的「隧道服务」层,首轮约 0.5 秒必过(服务 Type=simple fork 即 active),所以跑几秒才崩的新版会被当成成功(看板卡 HEALTH 的现象);_recover 现在只在下一次 upgrade() 里被调、一律 _rollback 标 .bad,没有开机单元读 pending.json(看板卡 RECOVER-BOOT 的现象),遗留锁 7200 秒内拒绝新升级。相关源码:node/exitnode/updater/layout.py(root/releases/current_target/switch/repair/cleanup/valid_release/versions)、runner.py(Runner 协议、RealRunner flock 锁实现、FakeRunner)、cli.py(_install 的 manifest.apply(step, action, undo) 步骤序列,undo kind systemctl 撤回时 disable --now + 删单元文件;upgrade 子命令参数与互斥检查在 main() 里)、manifest.py(UNITS 集合,undo 的 unit 必须在集合里)、systemd.py 的 render(name, ctx, binary)(模板在 templates/,占位符 $config_path / $program_path 有默认值)、config.py 的 Updater 数据类与 validate、watchdog/probes.py 的监听探测(ss -ltnH,返回 通过/失败/未知)、tests/test_updater.py(archive_bytes/put_release/prepared/run/HEALTH 常量等辅助)、tests/test_cli.py(install 步骤顺序断言在 183-188、304-307 行附近)、tests/test_systemd_render.py(UNITS 元组 + 黄金比对 + 统一断言)、tests/golden/。工人不许自己 git 写操作;验收由派单器在工位跑。全程中文:代码注释、报错文案、文档、交活说明都用简体中文。",
+  "nonGoals": [
+    "不改 watchdog/、rescue/ 任何文件(rescue 的 lock_busy 不识别开机前陈旧锁,记观察项不在本单)",
+    "不改 service.py 的 check 层定义,不加 Reality 握手回环自检(卡面写的「可选」,本单不做)",
+    "不改 layout.py 的 repair 优先级逻辑;不改 _restart、_rollback、_record_highest、_check_downgrade 的语义",
+    "不改既有单元模板与黄金(只新增 exitnode-recover.service 一对)",
+    "不在真机实测;真机项写进文档待验证清单"
+  ],
+  "allowedPaths": [
+    "node/exitnode/updater/upgrade.py",
+    "node/exitnode/cli.py",
+    "node/exitnode/config.py",
+    "node/exitnode/runner.py",
+    "node/exitnode/manifest.py",
+    "node/exitnode/templates/exitnode-recover.service",
+    "node/tests/test_updater.py",
+    "node/tests/test_cli.py",
+    "node/tests/test_config.py",
+    "node/tests/test_systemd_render.py",
+    "node/tests/golden/exitnode-recover.service",
+    "docs/node/更新与回退说明.md",
+    "docs/node/配置说明.md"
+  ],
+  "forbiddenPaths": [
+    "winclient/**",
+    "authserver/**",
+    "scripts/**",
+    "docs/开工须知.md",
+    "docs/口径速查表.md",
+    "docs/design/**",
+    "docs/交接/**",
+    "docs/plans/**",
+    "docs/acceptance/**",
+    "docs/authserver/**",
+    "docs/winclient/**",
+    "docs/node/看门狗说明.md",
+    "docs/node/救援单元说明.md",
+    "docs/node/隧道配置说明.md",
+    "docs/node/客户端包托管说明.md",
+    "docs/node/自用配对说明.md",
+    ".github/**",
+    ".codex/**",
+    ".gitignore",
+    "pyproject.toml",
+    "node/exitnode/service.py",
+    "node/exitnode/device.py",
+    "node/exitnode/systemd.py",
+    "node/exitnode/updater/layout.py",
+    "node/exitnode/updater/package.py",
+    "node/exitnode/updater/trust.py",
+    "node/exitnode/updater/version.py",
+    "node/exitnode/templates/exitnode-admin.service",
+    "node/exitnode/templates/exitnode-proxy.service",
+    "node/exitnode/templates/exitnode-rescue.service",
+    "node/exitnode/templates/exitnode-rescue.timer",
+    "node/exitnode/templates/exitnode-watchdog.service",
+    "node/exitnode/templates/exitnode-watchdog.timer",
+    "node/exitnode/admin/**",
+    "node/exitnode/proxy/**",
+    "node/exitnode/rescue/**",
+    "node/exitnode/watchdog/**",
+    "node/tests/golden/exitnode-admin.service",
+    "node/tests/golden/exitnode-proxy.service",
+    "node/tests/golden/exitnode-rescue.service",
+    "node/tests/golden/exitnode-rescue.timer",
+    "node/tests/golden/exitnode-watchdog.service",
+    "node/tests/golden/exitnode-watchdog.timer",
+    "node/tests/golden/device/**",
+    "node/tests/golden/proxy/**",
+    "node/tests/golden/exitnode.nft",
+    "node/tests/test_service.py",
+    "node/tests/test_device.py",
+    "node/tests/test_watchdog.py",
+    "node/tests/test_rescue.py",
+    "node/tests/test_proxy_sync.py",
+    "node/tests/test_proxy_server_render.py"
+  ],
+  "expectArtifacts": [
+    "node/exitnode/updater/upgrade.py",
+    "node/exitnode/cli.py",
+    "node/exitnode/config.py",
+    "node/exitnode/runner.py",
+    "node/exitnode/manifest.py",
+    "node/exitnode/templates/exitnode-recover.service",
+    "node/tests/golden/exitnode-recover.service",
+    "node/tests/test_updater.py",
+    "docs/node/更新与回退说明.md"
+  ],
+  "acceptance": [
+    {
+      "id": "RUFF",
+      "kind": "command",
+      "argv": ["python", "-m", "ruff", "check", "node", "scripts", "authserver"],
+      "required": true,
+      "timeoutSec": 300
+    },
+    {
+      "id": "PYTEST",
+      "kind": "command",
+      "argv": ["python", "-m", "pytest", "-q", "node/tests"],
+      "required": true,
+      "timeoutSec": 900,
+      "note": "既有断言只加不改(④ 明说的那条与夹具适配除外);新增用例见 goal ⑧"
+    },
+    {
+      "id": "SHAPE-UPGRADE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;u=pathlib.Path('node/exitnode/updater/upgrade.py').read_text(encoding='utf-8');bad=[k for k in ('health_stable_sec','is-active','NRestarts','\"stage\"','staged','switched','def recover','aborted','def _recover(config, runner, config_path)') if k not in u];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60,
+      "note": "稳定窗四项、pending 阶段、recover 入口、按链接收尾都在 upgrade.py 里"
+    },
+    {
+      "id": "SHAPE-WIRE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda p:pathlib.Path(p).read_text(encoding='utf-8');c=r('node/exitnode/cli.py');f=r('node/exitnode/config.py');n=r('node/exitnode/runner.py');m=r('node/exitnode/manifest.py');bad=[k for k,ok in (('cli.recover','--recover' in c),('cli.step.write','写入exitnode-recover.service' in c),('cli.step.enable','启用更新收尾服务' in c),('config.field','health_stable_sec' in f),('runner.uptime',n.count('def uptime_seconds')>=3),('manifest.unit','exitnode-recover.service' in m)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60,
+      "note": "CLI 参数与安装两步、配置字段、三处 uptime_seconds(协议/真/假)、UNITS 登记"
+    },
+    {
+      "id": "UNITS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;sys.path.insert(0,'node');from exitnode.systemd import render;from exitnode.manifest import UNITS;t=render('exitnode-recover.service',{});g=pathlib.Path('node/tests/golden/exitnode-recover.service').read_text(encoding='utf-8');bad=[k for k,ok in (('golden',t==g),('units','exitnode-recover.service' in UNITS),('oneshot','Type=oneshot' in t),('exec','upgrade --recover' in t),('after','After=network-online.target exitnode-proxy.service' in t),('install','WantedBy=multi-user.target' in t),('nostartlimit','StartLimit' not in t)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60,
+      "note": "新单元渲染等于黄金、登记进 UNITS、oneshot、排在隧道服务之后、可 enable"
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda p:pathlib.Path(p).read_text(encoding='utf-8');a=r('docs/node/更新与回退说明.md');b=r('docs/node/配置说明.md');bad=[k for k in ('稳定窗','health_stable_sec','--recover','stage','exitnode-recover.service','开机','陈旧','NRestarts','aborted') if k not in a]+[k for k in ('health_stable_sec',) if k not in b];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "model": null,
+  "timeoutSec": 5400,
+  "repoRoot": "E:/yuanc",
+  "engine": "codex",
+  "reasoningEffort": "high",
+  "steps": [
+    "读 background 列的源文件与测试;先在 test_updater 里把 ⑧(a)~(f) 写成红测试(需要的夹具 is-active 响应一起加),再改 _healthy / pending stage / _recover。",
+    "加 recover() 与 CLI --recover、新单元模板+黄金+UNITS+安装两步、runner 的 uptime_seconds 与陈旧锁;补 ⑧(g)~(j) 与 test_config / test_systemd_render 用例。",
+    "本机跑 RUFF/PYTEST 与五条断言;改两份文档;交活说明列出:夹具适配改了哪些文件几条、④ 那条既有用例改成了什么、test_cli 调整了哪些顺序/计数断言、真机待验证项。"
+  ]
+}
