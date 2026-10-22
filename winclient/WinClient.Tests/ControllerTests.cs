@@ -12,6 +12,119 @@ namespace WinClient.Tests;
 
 public sealed class ControllerTests
 {
+    [Theory]
+    [InlineData("192.0.2.5", false)]
+    [InlineData("198.51.100.9", false)]
+    [InlineData("192.0.2.5", true)]
+    [InlineData(null, false)]
+    public async Task ExitTerminalRunsEightChecksWithoutChangingConnection(string? address, bool ipv6Reachable)
+    {
+        var order = new List<string>();
+        var timers = new Timers();
+        var source = new ScriptedSource(); source.Enqueue(Ok(TestData.Session()));
+        var reports = new List<EnvironmentReport>();
+        var ipv6 = new ScriptedIpv6(ipv6Reachable);
+        var probe = new ScriptedProbe(Enumerable.Repeat(address is null ? null : IPAddress.Parse(address), 5).ToArray());
+        using var controller = new ClientController(source, new Firewall(order), new Tunnel(order), Path.GetFullPath("fake.exe"),
+            TestData.Device, timers.Delay, exitProbe: probe, ipv6Probe: ipv6, reportSink: reports.Add)
+            { DelayWithPurposeAsync = timers.Delay };
+        controller.Changed += _ => Interlocked.Increment(ref timers.Published);
+        await controller.ConnectAsync();
+        await FireAndPublish(controller, timers, "出口核验", TimeSpan.FromSeconds(3));
+        if (address is null)
+        {
+            Assert.Empty(reports);
+            for (var i = 1; i < 5; i++) await FireAndPublish(controller, timers, "出口核验", TimeSpan.FromSeconds(5));
+        }
+        var report = Assert.Single(reports);
+        Assert.Equal(8, report.Items.Count);
+        Assert.Equal(report.Summary, controller.Snapshot.SelfCheckStatus);
+        Assert.DoesNotContain(controller.Snapshot.SelfCheckStatus, new[] { "未检测", "检测中" });
+        Assert.Equal(1, ipv6.Calls);
+        if (address is null) Assert.All(report.Items.Take(2), item => Assert.Equal("无法核验", item.Result));
+        if (ipv6Reachable) Assert.Contains("IPv6 已封堵", controller.Snapshot.SelfCheckStatus);
+        Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
+        Assert.True(controller.Snapshot.ProtectionActive);
+        Assert.DoesNotContain("stop", order); Assert.DoesNotContain("remove", order);
+        if (address is null or "192.0.2.5") Assert.Equal("虚拟网卡已就绪。", controller.Snapshot.Message);
+        if (address is not null)
+        {
+            await FireAndPublish(controller, timers, "出口核验", TimeSpan.FromMinutes(5));
+            Assert.Equal(2, reports.Count);
+        }
+        await controller.DisconnectAsync();
+        Assert.Equal("未检测", controller.Snapshot.SelfCheckStatus);
+    }
+
+    private sealed class ScriptedIpv6(bool reachable) : IIpv6Probe
+    {
+        public int Calls;
+        public Task<bool> CanReachAsync(CancellationToken token) { Calls++; return Task.FromResult(reachable); }
+    }
+
+    [Theory]
+    [InlineData(true, false)]
+    [InlineData(false, false)]
+    [InlineData(true, true)]
+    public async Task SelfCheckInspectsOnlyWhenEnabledAndFailuresCannotAffectConnection(bool enabled, bool fail)
+    {
+        var order = new List<string>();
+        var timers = new Timers();
+        var source = new ScriptedSource();
+        source.Enqueue(Ok(TestData.SessionExpiringIn(TimeSpan.FromHours(6),
+            config: JsonSerializer.Deserialize<JsonElement>(EnvironmentSelfCheckTests.GoodConfig))));
+        var environment = new InspectableEnvironment(fail);
+        var reports = new List<EnvironmentReport>();
+        var snapshots = new List<ClientSnapshot>();
+        using var controller = new ClientController(source, new Firewall(order), new Tunnel(order), Path.GetFullPath("fake.exe"),
+            TestData.Device, timers.Delay, exitProbe: new DetailedProbe(), environment: environment,
+            environmentSettings: new MemoryEnvironmentSettings { Enabled = enabled },
+            ipv6Probe: fail ? new ThrowingIpv6() : new ScriptedIpv6(false), reportSink: report =>
+            {
+                reports.Add(report);
+                if (fail) throw new IOException("模拟报告写入失败");
+            }) { DelayWithPurposeAsync = timers.Delay };
+        controller.Changed += snapshot => { snapshots.Add(snapshot); Interlocked.Increment(ref timers.Published); };
+        await controller.ConnectAsync();
+        await FireAndPublish(controller, timers, "出口核验", TimeSpan.FromSeconds(3));
+        Assert.Equal(enabled ? 1 : 0, environment.Inspections);
+        var report = Assert.Single(reports);
+        Assert.Contains(snapshots, snapshot => snapshot.SelfCheckStatus == "检测中");
+        Assert.Equal(report.Summary, controller.Snapshot.SelfCheckStatus);
+        Assert.Equal(fail ? "3 项通过,5 项未能检查" : enabled ? "8 项通过" : "4 项通过,4 项未能检查", report.Summary);
+        Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
+        Assert.Equal("虚拟网卡已就绪。", controller.Snapshot.Message);
+        Assert.True(controller.Snapshot.ProtectionActive);
+        Assert.Equal(new[] { "apply", "start" }, order);
+        Assert.Contains(TimeSpan.FromMinutes(5), timers.For("出口核验"));
+    }
+
+    private sealed class DetailedProbe : IExitProbe
+    {
+        public Task<IPAddress?> ProbeAsync(CancellationToken token) => throw new InvalidOperationException("控制器应使用详细探测");
+        public Task<ExitProbeResult?> ProbeDetailedAsync(CancellationToken token)
+            => Task.FromResult<ExitProbeResult?>(new(IPAddress.Parse(TestData.Node().Host), "AU"));
+    }
+
+    private sealed class ThrowingIpv6 : IIpv6Probe
+    {
+        public Task<bool> CanReachAsync(CancellationToken token) => throw new System.Net.Sockets.SocketException();
+    }
+
+    private sealed class InspectableEnvironment(bool fail) : IEnvironmentEnforcer
+    {
+        public int Inspections;
+        public bool HasPendingState => false;
+        public Task ApplyAsync(EnvironmentTarget target) => Task.CompletedTask;
+        public Task RestoreAsync() => Task.CompletedTask;
+        public Task<EnvironmentInspection?> InspectAsync()
+        {
+            Inspections++;
+            if (fail) throw new IOException("模拟巡查失败");
+            return Task.FromResult<EnvironmentInspection?>(EnvironmentSelfCheckTests.GoodInspection);
+        }
+    }
+
     [Fact]
     public async Task EnvironmentAppliesAfterTunnelAndRestoresAfterNetwork()
     {

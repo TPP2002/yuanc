@@ -13,7 +13,7 @@ public sealed class ControlServer(IClientFacade facade, DesiredStateStore desire
     public static readonly TimeSpan DefaultIdleTimeout = TimeSpan.FromSeconds(30);
     /// <summary>不可信调用者发会改变连接状态的指令时返回的错误文案。</summary>
     public const string UntrustedCallerError = "只有本产品的界面程序可以执行此操作";
-    // 会改变连接状态或配对的指令：只允许程序位于安装目录之下的调用者执行。其余（status/subscribe/check_update/read_audit）只读，不受限。
+    // 会改变连接状态或配对的指令：只允许程序位于安装目录之下的调用者执行。其余（status/subscribe/check_update/read_audit/read_selfcheck）只读，不受限。
     private static readonly HashSet<string> StateChangingOps = ["connect", "disconnect", "redeem", "import_pairing", "clear_pairing", "set_environment"];
     // One ordering across connections keeps persisted intent consistent with completed commands.
     private readonly SemaphoreSlim commands = new(1, 1);
@@ -135,6 +135,10 @@ public sealed class ControlServer(IClientFacade facade, DesiredStateStore desire
                     var response = new ControlResponse(request.Id, true, Audit: facade.ReadAudit());
                     return ControlProtocol.Utf8.GetByteCount(ControlProtocol.Encode(response)) - 1 <= ControlProtocol.MaxLineBytes
                         ? response : new(request.Id, false, "审计记录过大，请联系管理员。");
+                case "read_selfcheck":
+                    var selfCheckResponse = new ControlResponse(request.Id, true, SelfCheck: facade.ReadSelfCheck());
+                    return ControlProtocol.Utf8.GetByteCount(ControlProtocol.Encode(selfCheckResponse)) - 1 <= ControlProtocol.MaxLineBytes
+                        ? selfCheckResponse : new(request.Id, false, "自检报告过大，请联系管理员。");
                 default: return new(request.Id, false, "不支持的指令");
             }
             return new(request.Id, true, Snapshot: Snapshot());

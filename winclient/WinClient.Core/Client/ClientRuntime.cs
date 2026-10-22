@@ -1,5 +1,6 @@
 using System.Runtime.Versioning;
 using System.Security.Cryptography;
+using System.Text.Json;
 using WinClient.Core.Auth;
 using WinClient.Core.Firewall;
 using WinClient.Core.Process;
@@ -30,6 +31,11 @@ public sealed class ClientRuntime : IClientFacade, IDisposable
     public Task SetEnvironmentEnabledAsync(bool enabled) => Controller.SetEnvironmentEnabledAsync(enabled);
     public Task RedeemAsync(string code) => Controller.RedeemAsync(code);
     public string? ReadAudit() => File.Exists(firewall.AuditPath) ? File.ReadAllText(firewall.AuditPath) : null;
+    public string? ReadSelfCheck()
+    {
+        var path = Path.Combine(ClientSettings.DataDirectory, "run", "selfcheck.json");
+        return File.Exists(path) ? File.ReadAllText(path) : null;
+    }
     private ClientRuntime(ClientController controller, KillSwitchApplier firewall, HttpClient? http, PairingStore pairingStore, RedactingLog log,
         string? storeRoot, DataProtectionScope scope)
     { Controller = controller; this.firewall = firewall; this.http = http; this.pairingStore = pairingStore; this.log = log; this.storeRoot = storeRoot; this.scope = scope; }
@@ -65,10 +71,33 @@ public sealed class ClientRuntime : IClientFacade, IDisposable
                 transport, program, new DeviceInfo { Platform = "windows", Name = Environment.MachineName, Fingerprint = ClientSettings.GetDeviceFingerprint(storeRoot, scope) },
                 authEndpoint: settings?.AuthEndpoint, exitProbe: new HttpExitProbe(),
                 environment: new EnvironmentApplier(Path.Combine(ClientSettings.DataDirectory, "run")),
-                environmentSettings: new EnvironmentSettingsStore());
+                environmentSettings: new EnvironmentSettingsStore(), ipv6Probe: new SocketIpv6Probe(),
+                reportSink: report => WriteSelfCheck(Path.Combine(ClientSettings.DataDirectory, "run", "selfcheck.json"), report));
             return new(controller, firewall, http, pairingStore, log, storeRoot, scope);
         }
         catch { http?.Dispose(); throw; }
+    }
+
+    internal static void WriteSelfCheck(string path, EnvironmentReport report)
+    {
+        var temporary = path + ".tmp";
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            try
+            {
+                using (var stream = new FileStream(temporary, FileMode.Create, FileAccess.Write, FileShare.None))
+                {
+                    JsonSerializer.Serialize(stream, new { report.CheckedAt, report.Summary, report.Items },
+                        new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower });
+                    stream.Flush(true);
+                }
+                File.Move(temporary, path, overwrite: true);
+            }
+            finally { if (File.Exists(temporary)) File.Delete(temporary); }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or InvalidOperationException or System.Security.SecurityException)
+        { } // 诊断落盘失败不改变连接状态，也不记录报告或异常正文。
     }
 
     public static ISessionSource? SelectSessionSource(PairingStore store, Func<ISessionSource?> serverSource, RedactingLog? log = null)

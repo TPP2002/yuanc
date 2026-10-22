@@ -14,6 +14,39 @@ namespace WinClient.Tests;
 public sealed class IpcTests
 {
     [Fact]
+    public void SelfCheckSnapshotRoundTripsAndLegacyDefaultsToNotChecked()
+    {
+        var snapshot = new ClientSnapshot(ConnectionState.Connected, "已连接", "", true) { SelfCheckStatus = "8 项通过" };
+        var encoded = ControlProtocol.Encode(new ControlResponse(1, true, Snapshot: snapshot));
+        Assert.Contains("self_check_status", encoded);
+        ClientSnapshot decoded = ControlProtocol.DecodeResponse(encoded).Snapshot!;
+        Assert.Equal(snapshot, decoded);
+        var legacy = ControlProtocol.DecodeResponse("{\"id\":1,\"ok\":true,\"snapshot\":{\"state\":\"Disconnected\",\"status\":\"\",\"message\":\"\",\"protection_active\":false}}").Snapshot!;
+        Assert.Equal("未检测", legacy.SelfCheckStatus);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task ReadSelfCheckAllowsUntrustedCallersAndPreservesContent(bool trusted)
+    {
+        using var temp = new TempDirectory();
+        using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var facade = new FakeFacade();
+        var desired = new DesiredStateStore(temp.Path);
+        var server = new ControlServer(facade, desired);
+        var (peer, host) = DuplexStream.Pair();
+        var serving = server.ServeAsync(host, stop.Token, callerTrusted: trusted);
+        using (var client = new ControlClient(peer))
+        {
+            var response = await client.SendAsync("read_selfcheck", cancellationToken: stop.Token);
+            Assert.True(response.Ok); Assert.Equal(facade.ReadSelfCheck(), response.SelfCheck);
+            Assert.Empty(facade.Actions); Assert.Null(desired.Read());
+        }
+        await serving.WaitAsync(stop.Token);
+    }
+
+    [Fact]
     public void EnvironmentSnapshotRoundTripsAndLegacyDefaultsRemainEnabled()
     {
         var snapshot = new ClientSnapshot(ConnectionState.Connected, "已连接", "", true)
@@ -468,6 +501,7 @@ public sealed class IpcTests
         public Task ImportPairingAsync(string json) { Actions.Add("import:" + json); return Task.CompletedTask; }
         public Task ClearPairingAsync() { Actions.Add("clear"); return Task.CompletedTask; }
         public string? ReadAudit() => "完整审计";
+        public string? ReadSelfCheck() => "{\"summary\":\"8 项通过\",\"items\":[]}";
     }
 
     // Two independent byte queues: no OS pipes, sockets or production operations in tests.

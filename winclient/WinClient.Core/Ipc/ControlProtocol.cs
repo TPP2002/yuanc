@@ -10,7 +10,7 @@ using System.Reflection;
 namespace WinClient.Core.Ipc;
 
 public sealed record ControlRequest(long Id, string Op, string? Code = null, string? PairingJson = null, bool? Enabled = null);
-public sealed record ControlResponse(long? Id, bool Ok, string? Error = null, ControlSnapshot? Snapshot = null, string? Audit = null);
+public sealed record ControlResponse(long? Id, bool Ok, string? Error = null, ControlSnapshot? Snapshot = null, string? Audit = null, string? SelfCheck = null);
 public sealed record SnapshotEvent(string Event, ControlSnapshot Snapshot);
 public sealed record ControlSnapshot(ConnectionState State, string Status, string Message, bool ProtectionActive)
 {
@@ -21,14 +21,15 @@ public sealed record ControlSnapshot(ConnectionState State, string Status, strin
     public string GuardStatus { get; init; } = "";
     public bool EnvironmentEnabled { get; init; } = true;
     public string EnvironmentStatus { get; init; } = "未应用";
+    public string SelfCheckStatus { get; init; } = "未检测";
     public string ServiceVersion { get; init; } = CurrentVersion;
     public UpdateStatus Update { get; init; } = new();
     public static implicit operator ControlSnapshot(ClientSnapshot value) => new(value.State, value.Status, value.Message, value.ProtectionActive)
     { Mode = value.Mode, ExitStatus = value.ExitStatus, ExitIp = value.ExitIp, GuardStatus = value.GuardStatus,
-        EnvironmentEnabled = value.EnvironmentEnabled, EnvironmentStatus = value.EnvironmentStatus };
+        EnvironmentEnabled = value.EnvironmentEnabled, EnvironmentStatus = value.EnvironmentStatus, SelfCheckStatus = value.SelfCheckStatus };
     public static implicit operator ClientSnapshot(ControlSnapshot value) => new(value.State, value.Status, value.Message, value.ProtectionActive)
     { Mode = value.Mode, ExitStatus = value.ExitStatus, ExitIp = value.ExitIp, GuardStatus = value.GuardStatus,
-        EnvironmentEnabled = value.EnvironmentEnabled, EnvironmentStatus = value.EnvironmentStatus };
+        EnvironmentEnabled = value.EnvironmentEnabled, EnvironmentStatus = value.EnvironmentStatus, SelfCheckStatus = value.SelfCheckStatus };
 }
 
 public static class ControlProtocol

@@ -9,6 +9,62 @@ namespace WinClient.Tests;
 public sealed class EnvironmentApplierTests
 {
     [Theory]
+    [InlineData("AU", "AU")]
+    [InlineData("NZ", "NZ")]
+    [InlineData("au", "AU")]
+    [InlineData("AUS", "AU")]
+    [InlineData(null, "AU")]
+    public void CountryUsesUppercasePairOrDefaultWithoutLosingOtherSettings(string? country, string expected)
+    {
+        using var temp = new TempDirectory();
+        File.WriteAllText(Path.Combine(temp.Path, "environment.json"), JsonSerializer.Serialize(new
+            { enabled = false, time_zone = "UTC", languages = new[] { "en" }, country }));
+        var store = new EnvironmentSettingsStore(temp.Path);
+        Assert.Equal(expected, store.Read().ExpectedCountry);
+        Assert.False(store.Read().Enabled); Assert.Equal("UTC", store.Read().Target.TimeZoneId);
+        store.WriteEnabled(true);
+        Assert.Equal(expected, store.Read().ExpectedCountry);
+    }
+
+    [Fact]
+    public async Task InspectReadsLastNonemptyJsonLineAndNormalizesValues()
+    {
+        using var temp = new TempDirectory();
+        var runner = new InspectionRunner(0, "提示\n" + """
+            {"time_zone":"AUS Eastern Standard Time","tzautoupdate_start":4,
+            "chrome":{"forced_languages":["en-AU","en"],"WebRtcIPHandling":"default_public_interface_only","DefaultGeolocationSetting":2},
+            "edge":{"DefinePreferredLanguages":"en-AU,en","DefaultGeolocationSetting":2}}
+            """.Replace("\n", "") + "\n\n");
+        var inspection = await new EnvironmentApplier(temp.Path, runner).InspectAsync();
+        Assert.NotNull(inspection);
+        Assert.Equal("AUS Eastern Standard Time", inspection.TimeZone);
+        Assert.Equal(4, inspection.AutoTimeZoneStart);
+        Assert.Equal(new[] { "en-AU", "en" }, inspection.ChromeForcedLanguages);
+        Assert.Equal("2", inspection.Chrome["DefaultGeolocationSetting"]);
+        Assert.Equal("2", inspection.Edge["DefaultGeolocationSetting"]);
+        Assert.Null(inspection.Edge["WebRtcLocalhostIpHandling"]);
+        Assert.Equal(3, inspection.Chrome.Count); Assert.Equal(3, inspection.Edge.Count);
+        Assert.True(runner.Start!.CreateNoWindow);
+    }
+
+    [Theory]
+    [InlineData(1, "{}")]
+    [InlineData(0, "坏 JSON")]
+    [InlineData(0, "")]
+    public async Task FailedInspectionReturnsNull(int exitCode, string output)
+    {
+        using var temp = new TempDirectory();
+        Assert.Null(await new EnvironmentApplier(temp.Path, new InspectionRunner(exitCode, output)).InspectAsync());
+    }
+
+    private sealed class InspectionRunner(int exitCode, string output) : ICommandRunner
+    {
+        public ProcessStartInfo? Start;
+        public Task<CommandResult> RunAsync(ProcessStartInfo startInfo, CancellationToken cancellationToken = default)
+        { Start = startInfo; return Task.FromResult(new CommandResult(exitCode, output)); }
+    }
+
+    [Theory]
     [InlineData(0)]
     [InlineData(1)]
     [InlineData(4)]
