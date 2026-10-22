@@ -20,6 +20,17 @@ CHECK = ("/usr/bin/sing-box", "check", "-c", service.LIVE + ".check.tmp")
 RELOAD = ("systemctl", "reload", service.UNIT)
 
 
+def test_revoke_updates_last_good_without_either_credential(installed):
+    config, runner = installed
+    first = device.add(config, runner, name="电脑", host=HOST)
+    device.add(config, runner, name="手机", host=HOST)
+    device.revoke(config, runner, name="电脑")
+    backup = service.LIVE.replace(".json", ".last-good.json")
+    assert runner.files[backup] == runner.files[service.LIVE]
+    assert first.uuid not in runner.files[backup]
+    assert first.hy2_password not in runner.files[backup]
+
+
 @pytest.fixture
 def installed():
     runner = fake(pairing=True)

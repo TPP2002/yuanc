@@ -3,10 +3,10 @@
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from ..service import LIVE
+from ..proxy.lastgood import prune_revoked
+from ..service import LAST_GOOD, LIVE, SECRETS
 from . import state as storage
 
-LAST_GOOD = LIVE.replace(".json", ".last-good.json")
 ALLOWED_SERVICES = {"exitnode-proxy.service", "exitnode-admin.service"}
 
 
@@ -98,6 +98,7 @@ def execute(action, runner, config):
     elif name == "reboot":
         state["last_reboot_at"] = now.isoformat()
     storage.save(config, runner, state, now)
+    registry_corrupt = False
     try:
         if name == "restart_service":
             runner.run(["systemctl", "restart", action.unit])
@@ -105,12 +106,24 @@ def execute(action, runner, config):
             # 检查暂存副本，替换的必须是刚刚校验过的同一份内容。
             temporary = LIVE + ".watchdog.tmp"
             try:
-                runner.write_file(temporary, runner.read_file(LAST_GOOD), 0o600)
+                text = runner.read_file(LAST_GOOD)
+                devices_path = SECRETS + "/devices.json"
+                try:
+                    devices_text = (runner.read_file(devices_path)
+                                    if runner.exists(devices_path) else None)
+                    text, removed = prune_revoked(text, devices_text)
+                except ValueError:
+                    registry_corrupt = True
+                    raise
+                runner.write_file(temporary, text, 0o600)
                 valid = runner.run([config.proxy.binary, "check", "-c", temporary], check=False)
                 if valid.code:
                     raise ValueError("上次配置校验未通过，当前配置未更改，请联系维护人员")
                 runner.replace(temporary, LIVE)
                 runner.run(["systemctl", "restart", "exitnode-proxy.service"])
+                if removed:
+                    state["reason"] += f"；已剔除 {removed} 条不在登记表上的用户记录"
+                    storage.save(config, runner, state, now)
             finally:
                 if runner.exists(temporary):
                     runner.remove(temporary)
@@ -119,6 +132,8 @@ def execute(action, runner, config):
     except (OSError, RuntimeError, ValueError):
         # 不转印异常或内核输出，可能带有凭据。
         state["reason"] = "恢复动作未完成，请检查服务权限、磁盘或配置；详细输出已隐藏"
+        if registry_corrupt:
+            state["reason"] = "设备登记表损坏，无法核对上次可用配置，请联系维护人员"
         if name in {"rollback_config", "reboot"}:
             state["state"] = "manual"
         storage.record(state, "action_failed", now, state["reason"])
