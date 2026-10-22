@@ -245,6 +245,8 @@ def test_repeated_init_does_not_repeat_commands_and_uninstall_keeps_secrets():
     assert sent.index(("nft", "-f", "/var/lib/exitnode/exitnode.nft")) < sent.index(
         ("systemctl", "enable", "exitnode-nft.service"))
     assert "/var/lib/exitnode/exitnode.nft" in runner.files
+    assert ('meta skuid "exitnode" ct direction original ip ttl set 128'
+            in runner.files["/var/lib/exitnode/exitnode.nft"])
     assert "/etc/systemd/system/exitnode-nft.service" in runner.files
     before = [c for c in runner.calls if c[0] == "run"]
     assert main(["init"], runner) == 0

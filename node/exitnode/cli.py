@@ -249,7 +249,8 @@ def _install(config, config_path, runner, manifest):
         if not any(s["step"] == "安装网络规则" for s in manifest.steps) and nft._exists(runner):
             raise ValueError("已有同名规则表未在本安装清单中，请联系维护人员")
         context = {"reality_port": config.proxy.reality_port, "hy2_port": config.proxy.hy2_port,
-                   "admin_port": config.admin.port, "admin_bind": config.admin.bind}
+                   "admin_port": config.admin.port, "admin_bind": config.admin.bind,
+                   "service_user": service.SERVICE_USER}
         apply("安装网络规则", lambda: nft.apply(runner, context), {"kind": "nft"})
         # 规则已由上一步加载，只设开机重新加载，不加 --now。
         apply("启用防火墙规则单元",

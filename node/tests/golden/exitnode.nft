@@ -1,4 +1,4 @@
-# 占位规则表:policy accept,只放行本项目端口,不限制其他流量;开机由 exitnode-nft.service 重新加载。管理入口只收本机连接由 exitnode-admin.service 的 IPAddressAllow 保证,不靠本表。
+# 占位规则表:policy accept,只放行本项目端口,不限制其他流量;隧道服务发起的出站连接 TTL 设为 128;开机由 exitnode-nft.service 重新加载。管理入口只收本机连接由 exitnode-admin.service 的 IPAddressAllow 保证,不靠本表。
 table inet exitnode {
     chain input {
         type filter hook input priority 0; policy accept;
@@ -13,5 +13,11 @@ table inet exitnode {
     chain postrouting {
         type nat hook postrouting priority 100; policy accept;
         # 待确定隧道源地址后添加受限 masquerade 规则。
+    }
+    chain output {
+        type filter hook output priority mangle; policy accept;
+        # 只改隧道服务账户自己发起的连接(代理出口流量与它的域名解析):与客户端系统的默认值 128 一致;给客户端的应答与节点自身的其他流量不改。
+        meta skuid "exitnode" ct direction original ip ttl set 128
+        meta skuid "exitnode" ct direction original ip6 hoplimit set 128
     }
 }

@@ -2,6 +2,7 @@
 
 import ipaddress
 import json
+import re
 
 # 规则表文件由 exitnode-nft.service 开机重新加载。
 RULES = "/var/lib/exitnode/exitnode.nft"
@@ -11,10 +12,14 @@ def render_ruleset(ctx):
     ports = {key: ctx[key] for key in ("reality_port", "hy2_port", "admin_port")}
     if any(type(p) is not int or not 1 <= p <= 65535 for p in ports.values()):
         raise ValueError("规则端口须为 1 至 65535 的整数")
+    user = ctx.get("service_user", "exitnode")
+    if not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", user):
+        raise ValueError("服务账户名不合法")
     bind = ipaddress.ip_address(ctx.get("admin_bind", "127.0.0.1"))
     family = "ip6" if bind.version == 6 else "ip"
     return (
         "# 占位规则表:policy accept,只放行本项目端口,不限制其他流量;"
+        "隧道服务发起的出站连接 TTL 设为 128;"
         "开机由 exitnode-nft.service 重新加载。"
         "管理入口只收本机连接由 exitnode-admin.service 的 IPAddressAllow 保证,不靠本表。\n"
         "table inet exitnode {\n"
@@ -31,6 +36,13 @@ def render_ruleset(ctx):
         "    chain postrouting {\n"
         "        type nat hook postrouting priority 100; policy accept;\n"
         "        # 待确定隧道源地址后添加受限 masquerade 规则。\n"
+        "    }\n"
+        "    chain output {\n"
+        "        type filter hook output priority mangle; policy accept;\n"
+        "        # 只改隧道服务账户自己发起的连接(代理出口流量与它的域名解析):"
+        "与客户端系统的默认值 128 一致;给客户端的应答与节点自身的其他流量不改。\n"
+        f'        meta skuid "{user}" ct direction original ip ttl set 128\n'
+        f'        meta skuid "{user}" ct direction original ip6 hoplimit set 128\n'
         "    }\n"
         "}\n"
     )
