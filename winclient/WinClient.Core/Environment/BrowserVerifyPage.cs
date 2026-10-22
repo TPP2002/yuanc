@@ -11,6 +11,7 @@ public static class BrowserVerifyPage
     public const string ExpectedCountry = "AU";
     public const string TraceUrl = "https://1.1.1.1/cdn-cgi/trace";
     public const string TunAddressPrefix = "172.19.0.";
+    public const string TunAddressPrefixV6 = "fdfe:dcba:9876:";
 
     public static string Html(VerifyContext context) => $$$"""
         <!doctype html><html lang="zh-CN">
@@ -48,6 +49,7 @@ public static class BrowserVerifyPage
         const expectedCountry = '{{{ExpectedCountry}}}';
         const traceUrl = '{{{TraceUrl}}}';
         const tunPrefix = '{{{TunAddressPrefix}}}';
+        const tunPrefix6 = '{{{TunAddressPrefixV6}}}';
         const results = [];
         const again = document.getElementById('again');
         const summary = document.getElementById('summary');
@@ -93,19 +95,18 @@ public static class BrowserVerifyPage
           const lan = [], ipv6 = [];
           for (const address of addresses) {
             if (address.endsWith('.local')) { hidden++; continue; }
-            if (address.startsWith(tunPrefix)) { tunnel++; continue; }
+            if (address.startsWith(tunPrefix) || address.toLowerCase().startsWith(tunPrefix6)) { tunnel++; continue; }
             const parts = address.split('.');
             const ipv4 = parts.length === 4 && parts.every(part => /^\d{1,3}$/.test(part) && Number(part) <= 255);
             const octets = parts.map(Number);
-            if (ipv4 && (octets[0] === 10 || (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31) ||
-                (octets[0] === 192 && octets[1] === 168) || (octets[0] === 169 && octets[1] === 254))) lan.push(address);
+            if (ipv4) lan.push(address);
             else if (address.includes(':')) ipv6.push(address);
             else other++;
           }
           const exposed = lan.concat(ipv6);
           show(4, exposed.length ? '未通过' : '通过',
-            '已隐藏:' + hidden + ',隧道网卡地址:' + tunnel + ',局域网明文地址:' + lan.length + ',IPv6 明文地址:' + ipv6.length + ',其他候选:' + other +
-            (exposed.length ? ';明文地址:' + exposed.join(', ') : ';未发现局域网或 IPv6 明文地址'));
+            '已隐藏:' + hidden + ',隧道网卡地址:' + tunnel + ',IPv4 明文地址:' + lan.length + ',IPv6 明文地址:' + ipv6.length + ',其他候选:' + other +
+            (exposed.length ? ';明文地址:' + exposed.join(', ') : ';未发现隧道网卡以外的明文地址'));
         }
         async function check() {
           if (again.disabled) return;
