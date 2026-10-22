@@ -11,6 +11,7 @@ def tick(config, runner, clock=lambda: datetime.now(UTC)):
         return 0
     now = clock()
     value = state.load(config, runner, now)
+    ladder.sanitize_clock(value, now)  # 有改动时下面任一分支都会保存。
     rows = probes.probe(config, runner)
     failed = any(p["result"] == "失败" for p in rows)
     if failed and value["consecutive_failures"] == 0:

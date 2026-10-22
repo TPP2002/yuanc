@@ -499,3 +499,119 @@ def test_prune_corrupt_registry_is_always_rejected(package, devices):
     prune = import_module(f"exitnode.{package}.lastgood").prune_revoked
     with pytest.raises(ValueError, match="^设备登记表损坏，无法核对上次可用配置$"):
         prune("非 JSON 占位", devices)
+
+
+RESET = ("systemctl", "reset-failed", "exitnode-proxy.service")
+
+
+def clock_actions(config, runner):
+    return [a for a in state.read(config, runner)["actions"] if a["action"] == "clock_adjusted"]
+
+
+def test_reset_failed_precedes_restart_and_its_failure_is_harmless():
+    config, runner = setup()
+    broken(runner)
+    for minute in range(3):
+        run_at(config, runner, minute)
+    assert run_at(config, runner, 3) == 1
+    seen = commands(runner)
+    assert seen[seen.index(RESTART) - 1] == RESET
+    config, runner = setup()
+    broken(runner)
+    runner.responses[RESET] = CompletedResult(1, err="password=HIDDEN-SECRET")
+    for minute in range(4):
+        run_at(config, runner, minute)
+    assert commands(runner).count(RESTART) == 1
+    saved = state.read(config, runner)
+    assert saved["actions"][-1]["action"] == "restart_service"
+    assert saved["state"] == "degraded"
+    assert "HIDDEN-SECRET" not in runner.files[state.path(config)]
+
+
+def test_reset_failed_precedes_rollback_restart():
+    config, runner = setup()
+    broken(runner)
+    exhausted(config, runner)
+    runner.files[LAST_GOOD] = "LAST-GOOD-CONTENT"
+    assert run_at(config, runner) == 1
+    seen = commands(runner)
+    assert seen[seen.index(RESTART) - 1] == RESET
+
+
+def test_future_restart_times_are_dropped_and_restart_runs():
+    config, runner = setup()
+    broken(runner)
+    value = exhausted(config, runner)
+    value["restart_times"] = [(NOW + timedelta(hours=1)).isoformat()] * 3
+    state.save(config, runner, value, NOW)
+    assert run_at(config, runner) == 1
+    assert commands(runner).count(RESTART) == 1
+    saved = state.read(config, runner)
+    assert all(at == NOW.isoformat() for at in saved["restart_times"])
+    assert len(clock_actions(config, runner)) == 1
+    reason = clock_actions(config, runner)[0]["reason"]
+    assert "SECRET" not in reason and "test-identity" not in reason
+
+
+def test_future_last_rollback_does_not_lock_rollback():
+    config, runner = setup()
+    broken(runner)
+    value = exhausted(config, runner)
+    value["last_rollback_at"] = (NOW + timedelta(days=1)).isoformat()
+    state.save(config, runner, value, NOW)
+    runner.files[LAST_GOOD] = "LAST-GOOD-CONTENT"
+    assert run_at(config, runner) == 1
+    assert runner.files[LIVE] == "LAST-GOOD-CONTENT"
+    assert RESTART in commands(runner)
+    assert state.read(config, runner)["last_rollback_at"] == NOW.isoformat()
+    assert len(clock_actions(config, runner)) == 1
+
+
+def test_future_reboot_and_first_failure_handling():
+    config, runner = setup()
+    broken(runner)
+    value = state.fresh()
+    value.update(state="manual", consecutive_failures=20,
+                 first_failure_at=(NOW - timedelta(minutes=40)).isoformat(),
+                 last_reboot_at=(NOW + timedelta(days=1)).isoformat())
+    state.save(config, runner, value, NOW)
+    assert run_at(config, runner) == 2
+    assert commands(runner).count(REBOOT) == 1
+    config, runner = setup()
+    broken(runner)
+    value = state.fresh()
+    value.update(state="manual", consecutive_failures=20,
+                 first_failure_at=(NOW + timedelta(days=1)).isoformat())
+    state.save(config, runner, value, NOW)
+    assert run_at(config, runner) == 2
+    assert REBOOT not in commands(runner)
+    assert state.read(config, runner)["first_failure_at"] == NOW.isoformat()
+    assert len(clock_actions(config, runner)) == 1
+    assert run_at(config, runner, 29) == 2
+    assert REBOOT not in commands(runner)
+    assert run_at(config, runner, 30) == 2
+    assert commands(runner).count(REBOOT) == 1
+
+
+def test_clock_tolerance_is_300_seconds():
+    from exitnode.watchdog.ladder import sanitize_clock
+    value = state.fresh()
+    value["last_ok_at"] = (NOW + timedelta(seconds=299)).isoformat()
+    assert sanitize_clock(value, NOW) == 0
+    assert value["last_ok_at"] is not None
+    value["last_ok_at"] = (NOW + timedelta(seconds=301)).isoformat()
+    assert sanitize_clock(value, NOW) == 1
+    assert value["last_ok_at"] is None
+    assert value["actions"][-1]["action"] == "clock_adjusted"
+
+
+def test_sanitize_clock_without_future_is_silent():
+    from exitnode.watchdog.ladder import sanitize_clock
+    value = state.fresh()
+    value.update(last_ok_at=NOW.isoformat(), restart_times=[NOW.isoformat()],
+                 restart_count_window=1)
+    assert sanitize_clock(value, NOW) == 0
+    assert value["actions"] == []
+    config, runner = setup()
+    assert run_at(config, runner) == 0
+    assert not any(a["action"] == "clock_adjusted" for a in state.read(config, runner)["actions"])

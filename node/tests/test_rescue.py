@@ -127,6 +127,52 @@ def test_reinstall_six_hour_and_daily_limit(times):
     assert not service_actions(runner)
 
 
+def history_actions(runner):
+    return [json.loads(line)["action"] for line in runner.files[s.HISTORY].splitlines()]
+
+
+def test_future_reinstall_time_is_dropped_and_not_counted():
+    runner = ready()
+    damage(runner, "P1")
+    value = s.fresh()
+    value["reinstall_times"] = [runner.clock + 3600]
+    value["counts"]["P1"] = 1
+    s.save(runner, value)
+    runner.clock += 300
+    assert actions.tick(runner) == 0
+    assert "频率超限" not in s.read(runner)["reason"]
+    saved = s.read(runner)
+    assert all(at <= runner.clock for at in saved["reinstall_times"])
+    assert len(saved["reinstall_times"]) == 1
+    assert "clock_adjusted" in history_actions(runner)
+
+
+def test_future_reinstall_time_cleared_in_state_file():
+    runner = ready()
+    value = s.fresh()
+    value["reinstall_times"] = [runner.clock + 3600]
+    s.save(runner, value)
+    actions.tick(runner)
+    assert s.read(runner)["reinstall_times"] == []
+    assert history_actions(runner) == ["clock_adjusted"]
+    assert json.loads(runner.files[s.HISTORY].splitlines()[-1])["status"] == "ok"
+
+
+def test_future_restart_time_is_dropped():
+    runner = ready()
+    value = s.fresh()
+    value["restart_times"] = [runner.clock + 3600]
+    s.save(runner, value)
+    actions.tick(runner)
+    assert s.read(runner)["restart_times"] == []
+    assert history_actions(runner) == ["clock_adjusted"]
+
+
+def test_limit_tolerates_small_skew_only():
+    assert actions.limit([1000 + 299], 1000, 3600, 1)
+    assert not actions.limit([1000 + 301], 1000, 3600, 1)
+
+
 def test_updater_lock_skips_entire_round_even_cleanup_and_state():
     runner = ready()
     runner.locks.add(p.LOCK)

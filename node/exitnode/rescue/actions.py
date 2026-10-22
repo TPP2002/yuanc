@@ -136,9 +136,13 @@ def promotable(runner, watcher):
     return False
 
 
+CLOCK_SKEW_TOLERANCE_SEC = 300
+
+
 def limit(times, now, seconds, maximum):
-    # 时钟倒退不重新获得额度。
-    return sum(now - at < seconds for at in times) >= maximum
+    # 晚于当前时间超过容差的未来条目视为失效，不计入额度。
+    return sum(now - at < seconds for at in times
+               if not at > now + CLOCK_SKEW_TOLERANCE_SEC) >= maximum
 
 
 def tick(runner):
@@ -152,6 +156,14 @@ def tick(runner):
         if value["corrupt"]:
             s.save(runner, value)
             return 2
+        cutoff = runner.now() + CLOCK_SKEW_TOLERANCE_SEC
+        dropped = 0
+        for key in ("reinstall_times", "restart_times"):
+            kept = [at for at in value[key] if not at > cutoff]
+            dropped += len(value[key]) - len(kept)
+            value[key] = kept
+        if dropped:
+            s.history(runner, "clock_adjusted", "ok")  # 随本轮 save 一起落盘。
         result = p.probe(runner)
         watcher = p.watchdog(runner)
         value["watchdog_state"] = watcher["state"] if watcher else None
