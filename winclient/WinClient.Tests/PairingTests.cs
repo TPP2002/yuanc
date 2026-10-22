@@ -192,11 +192,11 @@ public sealed class PairingTests
         if (!OperatingSystem.IsWindows()) return;
         using var directory = new TempDirectory(); var store = new PairingStore(directory.Path);
         var serverPath = Path.Combine(directory.Path, "server.json");
-        File.WriteAllText(serverPath, JsonSerializer.Serialize(new { server_url = "https://unit.invalid", sing_box_path = Path.GetFullPath("fake.exe") }));
+        File.WriteAllText(serverPath, JsonSerializer.Serialize(new { server_url = "https://unit.invalid", sing_box_path = Path.Combine(directory.Path, "fake.exe") }));
         using var http = new HttpClient(new AuthTests.Handler(_ => throw new InvalidOperationException())) { BaseAddress = new("https://unit.invalid") };
         var server = new AuthServerSessionSource(new AuthApiClient(http), new WinClient.Core.Storage.InMemoryCredentialStore());
         var fallbackCalls = 0;
-        ISessionSource? Fallback() { fallbackCalls++; return ClientSettings.Load(directory.Path) is null ? null : server; }
+        ISessionSource? Fallback() { fallbackCalls++; return ClientSettings.Load(directory.Path, kernelRoot: directory.Path) is null ? null : server; }
         store.Save(ValidPairing());
         Assert.IsType<PairingSessionSource>(ClientRuntime.SelectSessionSource(store, Fallback));
         Assert.Equal(0, fallbackCalls);

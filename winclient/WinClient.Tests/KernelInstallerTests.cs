@@ -106,12 +106,12 @@ public sealed class KernelInstallerTests
         using var directory = new TempDirectory();
         var configPath = Path.Combine(directory.Path, "server.json");
         File.WriteAllText(configPath, "{\"server_url\":\"https://192.0.2.1\"}");
-        Assert.Null(ClientSettings.Load(directory.Path)!.SingBoxPath);
+        Assert.Null(ClientSettings.Load(directory.Path, kernelRoot: directory.Path)!.SingBoxPath);
         var explicitPath = Path.Combine(directory.Path, "custom", "sing-box.exe");
         File.WriteAllText(configPath, JsonSerializer.Serialize(new { server_url = "https://192.0.2.1", sing_box_path = explicitPath }));
-        Assert.Equal(explicitPath, ClientSettings.Load(directory.Path)!.SingBoxPath);
+        Assert.Equal(explicitPath, ClientSettings.Load(directory.Path, kernelRoot: directory.Path)!.SingBoxPath);
         File.WriteAllText(configPath, "{\"server_url\":\"https://192.0.2.1\",\"sing_box_path\":\"relative.exe\"}");
-        Assert.Throws<InvalidDataException>(() => ClientSettings.Load(directory.Path));
+        Assert.Throws<InvalidDataException>(() => ClientSettings.Load(directory.Path, kernelRoot: directory.Path));
     }
 
     private static void AssertFiles(FakeSource source, string directory)
