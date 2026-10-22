@@ -42,12 +42,16 @@ public sealed class ControllerTests
         { Content = new StringContent(json) })) { BaseAddress = new("https://unit.invalid") };
         using var controller = new ClientController(new AuthServerSessionSource(new AuthApiClient(http), credentials),
             new Firewall(order), tunnel, Path.GetFullPath("fake.exe"), TestData.Device,
-            routingSettings: new MemoryRouting { Policy = RoutingPolicy.Global });
+            routingSettings: new MemoryRouting { Policy = RoutingPolicy.Global }, serviceProcessPath: RoutingTests.Service,
+            authEndpoint: new(IPAddress.Parse("192.0.2.5"), 8080, RoutingTests.Service));
         await controller.ConnectAsync();
         Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
-        Assert.Equal(WinClient.Core.Pairing.LocalConfigRenderer.Render(session.Node).GetRawText(), tunnel.Config.GetRawText());
-        Assert.DoesNotContain(tunnel.Config.GetProperty("outbounds").EnumerateArray(),
-            outbound => outbound.GetProperty("type").GetString() == "direct");
+        Assert.Equal(RoutingRenderer.Render(WinClient.Core.Pairing.LocalConfigRenderer.Render(session.Node),
+            RoutingPolicy.Global, RoutingTests.Service, new(IPAddress.Parse("192.0.2.5"), 8080, RoutingTests.Service)).GetRawText(), tunnel.Config.GetRawText());
+        var direct = Assert.Single(tunnel.Config.GetProperty("route").GetProperty("rules").EnumerateArray(),
+            rule => rule.GetProperty("outbound").GetString() == "direct");
+        Assert.Equal("192.0.2.5/32", Assert.Single(direct.GetProperty("ip_cidr").EnumerateArray()).GetString());
+        Assert.Equal(8080, Assert.Single(direct.GetProperty("port").EnumerateArray()).GetInt32());
     }
 
     [Theory]
