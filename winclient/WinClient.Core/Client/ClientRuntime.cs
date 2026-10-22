@@ -7,6 +7,7 @@ using WinClient.Core.Storage;
 using WinClient.Core.Logging;
 using WinClient.Core.Pairing;
 using WinClient.Core.Kernel;
+using WinClient.Core.Hosting;
 
 namespace WinClient.Core.Client;
 
@@ -42,7 +43,7 @@ public sealed class ClientRuntime : IClientFacade, IDisposable
         }
         var pairingStore = new PairingStore(root: storeRoot, scope: scope);
         var log = new RedactingLog(new RollingFileLog(Path.Combine(ClientSettings.DataDirectory, "run", "sing-box.log")));
-        var settings = ClientSettings.Load();
+        var settings = ClientSettings.Load(ownerIsTrusted: DataDirectorySecurity.IsTrustedOwner);
         HttpClient? http = null;
         try
         {
@@ -85,7 +86,7 @@ public sealed class ClientRuntime : IClientFacade, IDisposable
     public Task ClearPairingAsync() => Controller.ChangeSessionSourceAsync(() =>
     {
         // Validate the fallback first, leaving the imported pairing intact on failure.
-        var settings = ClientSettings.Load();
+        var settings = ClientSettings.Load(ownerIsTrusted: DataDirectorySecurity.IsTrustedOwner);
         HttpClient? nextHttp = settings is null ? null : new HttpClient(new HttpClientHandler { AllowAutoRedirect = false })
         { BaseAddress = new Uri(settings.ServerUrl), Timeout = TimeSpan.FromSeconds(15) };
         try { pairingStore.Clear(); }

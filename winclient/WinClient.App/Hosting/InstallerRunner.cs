@@ -8,6 +8,7 @@ using System.Security.Principal;
 using System.ServiceProcess;
 using Microsoft.Win32;
 using WinClient.Core.Firewall;
+using WinClient.Core.Client;
 using WinClient.Core.Hosting;
 using WinClient.Core.Ipc;
 using WinClient.Core.State;
@@ -75,6 +76,7 @@ public sealed class InstallerRunner
             File.Copy(CurrentExecutable, destination, overwrite: true);
             if (ServiceInstaller.ShouldCopy(Hash(CurrentExecutable), Hash(destination))) throw SafeError("程序复制校验失败，请重新安装。");
         }
+        EnsureDataDirectory();
         await RunCommandAsync(ServiceInstaller.Configure(destination, ServiceStatus() is not null), "配置后台服务失败。");
         await RunCommandAsync(ServiceInstaller.Describe(), "设置后台服务说明失败。");
         await RunCommandAsync(ServiceInstaller.FailureActions(), "设置后台服务自动重启失败。");
@@ -90,6 +92,7 @@ public sealed class InstallerRunner
 
     private async Task StartAsync()
     {
+        EnsureDataDirectory();
         var status = ServiceStatus() ?? throw SafeError("后台服务尚未安装，请先安装。");
         if (status == ServiceControllerStatus.Running) return;
         if (status == ServiceControllerStatus.StopPending) await WaitForAsync(ServiceControllerStatus.Stopped);
@@ -146,5 +149,11 @@ public sealed class InstallerRunner
     private static InvalidOperationException SafeError(string message)
     {
         var error = new InvalidOperationException(message); error.Data["safe"] = true; return error;
+    }
+
+    private static void EnsureDataDirectory()
+    {
+        try { DataDirectorySecurity.EnsureHardened(ClientSettings.DataDirectory); }
+        catch (Exception) { throw SafeError("数据目录权限设置失败，请以管理员身份重试或联系管理员。"); }
     }
 }

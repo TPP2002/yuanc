@@ -43,11 +43,16 @@ public sealed class ControlService : ServiceBase
         {
             try
             {
+                try { DataDirectorySecurity.EnsureHardened(ClientSettings.DataDirectory); }
+                catch (InvalidOperationException ex)
+                {
+                    try { Log.Write("数据目录权限异常，后台服务拒绝启动：" + ex.Message); }
+                    finally { Fatal(); }
+                    return;
+                }
                 var updateStore = new UpdateStore();
-                PrepareSecureDirectory(updateStore.Root);
                 UpdateRecovery.Run(updateStore, InstallerRunner.CurrentExecutable, new UpdateWindowsHost(), UpdatePlanner.DefaultAppRoot, UpdateWindowsHost.Log);
                 var secure = Path.Combine(ClientSettings.DataDirectory, "secure");
-                PrepareSecureDirectory(secure);
                 runtime = await ClientRuntime.CreateAsync(new KernelInstaller(new EmbeddedKernelSource()), secure, DataProtectionScope.LocalMachine).ConfigureAwait(false);
                 if (runtime.RecoveryWarning is { } warning) Log.Write("启动时断网保护降级恢复：" + warning);
                 if (lifetime.IsCancellationRequested) return;
@@ -72,17 +77,6 @@ public sealed class ControlService : ServiceBase
     {
         try { await runtime!.Controller.InitializeAsync(autoConnect: desired.Read() != false).ConfigureAwait(false); }
         catch (Exception) { Fatal(); }
-    }
-
-    public static void PrepareSecureDirectory(string path)
-    {
-        var security = new DirectorySecurity();
-        security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
-        foreach (var sid in new[] { WellKnownSidType.LocalSystemSid, WellKnownSidType.BuiltinAdministratorsSid })
-            security.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier(sid, null), FileSystemRights.FullControl,
-                InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit, PropagationFlags.None, AccessControlType.Allow));
-        // Set the restrictive descriptor before any secret is loaded or written.
-        Directory.CreateDirectory(path).SetAccessControl(security);
     }
 
     public static PipeSecurity CreatePipeSecurity()
