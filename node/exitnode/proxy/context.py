@@ -25,6 +25,7 @@ class ProxyContext:
     urltest_interval: str = "1m"
     admin_bind: str = "127.0.0.1"
     admin_port: int = 8443
+    maintenance_device_ids: tuple[str, ...] = ()
 
 
 def ipv4_host(ctx: ProxyContext) -> str:
@@ -40,6 +41,13 @@ def ipv4_host(ctx: ProxyContext) -> str:
 
 
 def validate_context(ctx: ProxyContext) -> None:
+    seen = set()
+    for device_id in ctx.maintenance_device_ids:
+        if not isinstance(device_id, str) or not device_id:
+            raise ValueError("维护设备编号必须为非空字符串")
+        if device_id in seen:
+            raise ValueError("维护设备编号不能重复")
+        seen.add(device_id)
     if isinstance(ctx.hy2_port, bool) or not isinstance(ctx.hy2_port, int):
         raise TypeError("备用通道端口无效")
     if not 1 <= ctx.hy2_port <= 65535:

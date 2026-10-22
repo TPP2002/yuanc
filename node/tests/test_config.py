@@ -138,3 +138,25 @@ def test_github_source_requires_repository():
     text = EXAMPLE.read_text(encoding="utf-8").replace('source = "none"', 'source = "github"')
     with pytest.raises(ConfigError, match="github_repo"):
         load("/config", FakeRunner(files={"/config": text}))
+
+
+def test_maintenance_devices_default_empty():
+    text = EXAMPLE.read_text(encoding="utf-8")
+    config = load("/config", FakeRunner(files={"/config": text}))
+    assert config.proxy.maintenance_device_ids == []
+
+
+@pytest.mark.parametrize("value,expected", [('[]', []), ('["dev-b", "dev-a"]', ["dev-b", "dev-a"])])
+def test_maintenance_device_list_loaded(value, expected):
+    text = EXAMPLE.read_text(encoding="utf-8").replace(
+        "[proxy]", f"[proxy]\nmaintenance_device_ids = {value}")
+    config = load("/config", FakeRunner(files={"/config": text}))
+    assert config.proxy.maintenance_device_ids == expected
+
+
+@pytest.mark.parametrize("value", ['"device"', '22', 'true', '{}', '[22]', '["dev", false]'])
+def test_maintenance_device_list_rejects_wrong_types(value):
+    text = EXAMPLE.read_text(encoding="utf-8").replace(
+        "[proxy]", f"[proxy]\nmaintenance_device_ids = {value}")
+    with pytest.raises(ConfigError, match="proxy.maintenance_device_ids.*类型"):
+        load("/config", FakeRunner(files={"/config": text}))

@@ -109,7 +109,8 @@ def test_revoke_removes_both_users_and_rejects_export_and_add(installed, capsys)
     rows = device.registry(config, runner).all()
     assert rows[0].revoked_at and rows[0].created_at == first.created_at
     live = json.loads(runner.files[service.LIVE])
-    assert live["inbounds"][0]["users"] == [{"uuid": other.uuid, "flow": "xtls-rprx-vision"}]
+    assert live["inbounds"][0]["users"] == [
+        {"name": other.device_id, "uuid": other.uuid, "flow": "xtls-rprx-vision"}]
     assert live["inbounds"][1]["users"] == [{"name": other.device_id, "password": other.hy2_password}]
     assert commands(runner)[boundary:] == [CHECK, RELOAD]
     for operation in (device.export, device.add):
