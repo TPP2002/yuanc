@@ -20,7 +20,35 @@ public sealed class ControllerTests
         public void Write(RoutingPolicy policy) { Writes++; Policy = policy; }
     }
     private static SessionResponse AppsSession(string host = "192.0.2.5") => TestData.SessionExpiringIn(
-        TimeSpan.FromHours(6), node: TestData.Node(host: host), config: WinClient.Core.Pairing.LocalConfigRenderer.Render(TestData.Node(host: host)));
+        TimeSpan.FromHours(6), node: TestData.Node(host: host));
+
+    [Fact]
+    public async Task ServerProvidedSingboxConfigIsIgnored()
+    {
+        var options = new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower };
+        var payload = JsonSerializer.SerializeToNode(TestData.SessionExpiringIn(TimeSpan.FromHours(6)), options)!;
+        payload["singbox_config"] = System.Text.Json.Nodes.JsonNode.Parse(
+            """{"outbounds":[{"type":"direct","tag":"direct"}]}""");
+        var json = payload.ToJsonString();
+        var session = JsonSerializer.Deserialize<SessionResponse>(json, options);
+        Assert.NotNull(session);
+        Assert.Null(typeof(SessionResponse).GetProperty("SingboxConfig"));
+        Assert.False(JsonSerializer.SerializeToElement(session, options).TryGetProperty("singbox_config", out _));
+
+        var order = new List<string>();
+        var tunnel = new Tunnel(order);
+        var credentials = new InMemoryCredentialStore(); credentials.Save("test-refresh");
+        using var http = new HttpClient(new AuthTests.Handler(_ => new(HttpStatusCode.OK)
+        { Content = new StringContent(json) })) { BaseAddress = new("https://unit.invalid") };
+        using var controller = new ClientController(new AuthServerSessionSource(new AuthApiClient(http), credentials),
+            new Firewall(order), tunnel, Path.GetFullPath("fake.exe"), TestData.Device,
+            routingSettings: new MemoryRouting { Policy = RoutingPolicy.Global });
+        await controller.ConnectAsync();
+        Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
+        Assert.Equal(WinClient.Core.Pairing.LocalConfigRenderer.Render(session.Node).GetRawText(), tunnel.Config.GetRawText());
+        Assert.DoesNotContain(tunnel.Config.GetProperty("outbounds").EnumerateArray(),
+            outbound => outbound.GetProperty("type").GetString() == "direct");
+    }
 
     [Theory]
     [InlineData(false)]
@@ -255,8 +283,7 @@ public sealed class ControllerTests
         var order = new List<string>();
         var timers = new Timers();
         var source = new ScriptedSource();
-        source.Enqueue(Ok(TestData.SessionExpiringIn(TimeSpan.FromHours(6),
-            config: JsonSerializer.Deserialize<JsonElement>(EnvironmentSelfCheckTests.GoodConfig))));
+        source.Enqueue(Ok(TestData.SessionExpiringIn(TimeSpan.FromHours(6))));
         var environment = new InspectableEnvironment(fail);
         var reports = new List<EnvironmentReport>();
         var snapshots = new List<ClientSnapshot>();
@@ -1326,7 +1353,6 @@ public sealed class ControllerTests
     [InlineData("hy2_server_name")]
     [InlineData("hy2_certificate")]
     [InlineData("hy2_obfs_password")]
-    [InlineData("singbox_config")]
     public void SameSessionDetectsAnyNodeOrConfigDifference(string field)
     {
         var baseline = TestData.SessionExpiringIn(TimeSpan.FromHours(6));
@@ -1345,9 +1371,7 @@ public sealed class ControllerTests
             "hy2_obfs_password" => TestData.Node(hy2ObfsPassword: "other-obfs-password"),
             _ => TestData.Node()
         };
-        var config = field == "singbox_config"
-            ? JsonSerializer.SerializeToElement(new { inbounds = new[] { new { type = "mixed" } } }) : TestData.Config;
-        var changed = TestData.SessionExpiringIn(TimeSpan.FromHours(6), node: node, config: config);
+        var changed = TestData.SessionExpiringIn(TimeSpan.FromHours(6), node: node);
         Assert.False(ClientController.SameSession(baseline, changed));
     }
 

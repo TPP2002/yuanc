@@ -3,7 +3,6 @@ from datetime import datetime, timedelta
 
 import pytest
 from authserver.app import create_app
-from authserver.clientconfig import render
 from authserver.config import Settings
 from authserver.service import Problem
 from fastapi.testclient import TestClient
@@ -20,14 +19,12 @@ def test_node_environment_defaults_empty(settings):
 
 @pytest.mark.parametrize("zone,country", [("Australia/Perth", "AU"), ("", "")])
 def test_session_node_environment_fields(client, enrolled, settings, app, zone, country):
-    baseline = issue(client, enrolled).json()
     app.state.service.settings = Settings.model_validate(node_values(settings, time_zone=zone, country=country))
     response = issue(client, enrolled)
     assert response.status_code == 200
     body = response.json()
     assert body["node"]["time_zone"] == zone
     assert body["node"]["country"] == country
-    assert body["singbox_config"] == baseline["singbox_config"]
 
 
 @pytest.mark.parametrize("field,value,reason", [
@@ -53,22 +50,7 @@ def test_session_credentials_and_config(client, enrolled, settings, app):
     for field, value in settings.node.model_dump().items():
         assert node[field] == value
     assert node["uuid"] and len(node["hy2_password"]) >= 32
-    config = body["singbox_config"]
-    outbounds = {item["tag"]: item for item in config["outbounds"]}
-    assert not any(item["type"] == "direct" for item in config["outbounds"])
-    assert outbounds["main"]["uuid"] == node["uuid"]
-    assert outbounds["backup"]["password"] == node["hy2_password"]
-    assert outbounds["main"]["tls"]["reality"]["public_key"] == node["reality_public_key"]
-    assert outbounds["urltest"]["outbounds"] == ["main", "backup"]
-    assert outbounds["urltest"]["tolerance"] == 300
-    assert outbounds["block"]["type"] == "block"
-    assert config["inbounds"][0]["type"] == "tun"
-    assert config["inbounds"][0]["strict_route"] is True
-    assert any(":" in address for address in config["inbounds"][0]["address"])
-    assert {"ip_version": 6, "outbound": "block"} in config["route"]["rules"]
-    assert config["route"]["final"] == "urltest"
-    assert all(server["detour"] == "urltest" for server in config["dns"]["servers"])
-    assert config["dns"]["strategy"] == "ipv4_only"
+    assert "singbox_config" not in body
     assert response.headers["cache-control"] == "no-store"
 
 
@@ -150,11 +132,6 @@ def test_session_carries_obfs_password_into_node_and_backup(client, enrolled, se
     password = body["node"]["hy2_obfs_password"]
     assert OBFS_PATTERN.fullmatch(password)
     assert password == settings.node.hy2_obfs_password
-    outbounds = {item["tag"]: item for item in body["singbox_config"]["outbounds"]}
-    assert list(outbounds["backup"]) == [
-        "type", "tag", "server", "server_port", "password", "obfs", "tls"]
-    assert outbounds["backup"]["obfs"] == {"type": "salamander", "password": password}
-    assert "obfs" not in outbounds["main"]
     assert password not in repr(settings) and password not in repr(settings.node)
 
 
@@ -168,16 +145,6 @@ def test_empty_obfs_path_sends_empty_password_and_no_obfs(tmp_path, settings, cl
         enrolled = client.post("/client/redeem", json={"code": code, "device": device}).json()
         body = issue(client, enrolled).json()
     assert body["node"]["hy2_obfs_password"] == ""
-    backup = next(o for o in body["singbox_config"]["outbounds"] if o["tag"] == "backup")
-    assert "obfs" not in backup
-
-
-def test_render_without_obfs_key_has_no_obfs(settings):
-    node = settings.node.model_dump()
-    del node["hy2_obfs_password"]
-    node.update(uuid="00000000-0000-4000-8000-000000000001", hy2_password="TEST-ONLY")
-    backup = render(node, node)["outbounds"][1]
-    assert backup["tag"] == "backup" and "obfs" not in backup
 
 
 @pytest.mark.parametrize("content", [None, "", "   \n", "has space 0123456789", "a" * 15,

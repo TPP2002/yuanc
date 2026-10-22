@@ -10,7 +10,7 @@ internal static class TestData
     public static SessionResponse Session(string host = "192.0.2.5") => new()
     {
         SessionToken = "test-session", SessionExpiresAt = DateTimeOffset.UtcNow.AddHours(6),
-        AccountExpiresAt = DateTimeOffset.UtcNow.AddDays(1), SingboxConfig = Config,
+        AccountExpiresAt = DateTimeOffset.UtcNow.AddDays(1),
         Node = new() { Host = host, RealityPort = 443, Hy2Port = 8443, Sni = "unit.invalid", RealityPublicKey = "test-key",
             ShortId = "test-short", Uuid = "test-uuid", Hy2Password = "test-password" }
     };
@@ -29,10 +29,10 @@ internal static class TestData
 
     /// <summary>构造在指定时长后到期的会话；账号到期时间默认晚于会话。</summary>
     public static SessionResponse SessionExpiringIn(TimeSpan lifetime, string token = "test-session",
-        NodeInfo? node = null, JsonElement? config = null, TimeSpan? accountLifetime = null) => new()
+        NodeInfo? node = null, TimeSpan? accountLifetime = null) => new()
     {
         SessionToken = token, SessionExpiresAt = DateTimeOffset.UtcNow.Add(lifetime),
         AccountExpiresAt = DateTimeOffset.UtcNow.Add(accountLifetime ?? TimeSpan.FromDays(30)),
-        SingboxConfig = config ?? Config, Node = node ?? Node()
+        Node = node ?? Node()
     };
 }

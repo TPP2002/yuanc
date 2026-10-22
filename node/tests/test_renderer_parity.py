@@ -6,7 +6,6 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from authserver.app import DeviceInput
-from authserver.clientconfig import render
 from authserver.config import Settings
 from authserver.db import Database
 from authserver.service import Service
@@ -56,20 +55,22 @@ def test_pair_session_and_tls_parity(tmp_path):
     assert session["node"]["time_zone"] == ""
     assert session["node"]["country"] == ""
     assert pair["format"] == "ycpair/3"
+    for key in ("host", "reality_port", "hy2_port", "sni", "reality_public_key", "short_id",
+                "hy2_server_name", "hy2_certificate", "hy2_obfs_password"):
+        assert session["node"][key] == pair["node"][key]
     client = render_client_windows(ctx, device)
-    auth = render(session["node"], session["node"])
-    assert client["outbounds"][1]["obfs"] == auth["outbounds"][1]["obfs"] == {
+    assert client["outbounds"][1]["obfs"] == {
         "type": "salamander", "password": ctx.hy2_obfs_password,
     }
     assert pair["node"]["hy2_obfs_password"] == session["node"]["hy2_obfs_password"]
-    assert client["outbounds"][1]["tls"] == auth["outbounds"][1]["tls"] == {
+    assert client["outbounds"][1]["tls"] == {
         "enabled": True, "server_name": ctx.hy2_server_name,
         "certificate": list(ctx.hy2_certificate),
     }
     client_urltest = next(o for o in client["outbounds"] if o["type"] == "urltest")
-    auth_urltest = next(o for o in auth["outbounds"] if o["type"] == "urltest")
-    for key in ("url", "interval", "tolerance"):
-        assert client_urltest[key] == auth_urltest[key]
+    assert client_urltest["url"] == ctx.urltest_url
+    assert client_urltest["interval"] == ctx.urltest_interval
+    assert client_urltest["tolerance"] == ctx.urltest_tolerance_ms
     assert client_urltest["tolerance"] == 300
     assert client["outbounds"][0]["server_port"] == 14443
     assert urlsplit(vless_link(ctx, device)).port == 14443
