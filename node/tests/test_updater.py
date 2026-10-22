@@ -9,11 +9,12 @@ import traceback
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from exitnode import runner as runner_module
 from exitnode.cli import main
 from exitnode.config import load
 from exitnode.runner import CompletedResult, FakeRunner
 from exitnode.updater import layout, package, trust
-from exitnode.updater.upgrade import UpdateError, _request, upgrade
+from exitnode.updater.upgrade import UpdateError, _healthy, _request, recover, upgrade
 from exitnode.updater.version import Version
 from test_cli import CONFIG, TEXT
 
@@ -26,6 +27,8 @@ DATA = "/var/lib/exitnode"
 INCOMING = DATA + "/updater/incoming"
 LOCK = DATA + "/updater.lock"
 HEALTH = ("env", "PYTHONPATH=" + CURRENT, "python3", "-m", "exitnode")
+IS_ACTIVE = ("systemctl", "is-active", "exitnode-proxy.service")
+NRESTARTS = ("systemctl", "show", "exitnode-proxy.service", "-p", "NRestarts", "--value")
 
 
 def archive_bytes(version="0.2.0", *, minimum=1, corrupt_hash=False, extra=None,
@@ -79,7 +82,8 @@ def signing(monkeypatch):
 def prepared(signing, **package_options):
     runner = FakeRunner(files={CONFIG: TEXT}, connections={("1.1.1.1", 443): True},
                         responses={("systemctl",): CompletedResult(), HEALTH: CompletedResult(
-                            out=json.dumps({"layers": [{"name": "隧道服务", "result": "通过"}]}))})
+                            out=json.dumps({"layers": [{"name": "隧道服务", "result": "通过"}]})),
+                            IS_ACTIVE: CompletedResult(0, "active\n")})
     put_release(runner, "0.1.0")
     runner.symlink(OLD, CURRENT)
     data = archive_bytes(**package_options)
@@ -228,16 +232,20 @@ def test_dangling_current_repairs_latest_good_pep440_version(signing):
     assert runner.readlink(CURRENT) == expected
 
 
-def test_killed_after_switch_rolls_back_before_next_package(signing):
+def test_killed_after_switch_completes_when_healthy(signing, capsys):
     config, runner = prepared(signing)
     put_release(runner, "0.2.0")
     runner.links[CURRENT] = NEW
+    # 旧记录没有 stage 字段，按已切换处理；现场健康检查通过即转正。
     runner.files[DATA + "/updater/pending.json"] = json.dumps({
         "old": OLD, "target": NEW, "version": "0.2.0"})
-    assert run(config, runner) == 1  # 恢复旧版后，同版本已存在，拒绝再次安装。
-    assert runner.readlink(CURRENT) == OLD and NEW + ".bad" in runner.files
+    assert run(config, runner) == 1  # 收尾转正后，同版本已是当前版本，拒绝再次安装。
+    assert "同版本程序已经安装" in capsys.readouterr().out
+    assert runner.readlink(CURRENT) == NEW and NEW + ".bad" not in runner.files
     assert DATA + "/updater/pending.json" not in runner.files
-    assert json.loads(runner.read_file(DATA + "/updater/history.jsonl"))["status"] == "rolled_back"
+    history = runner.read_file(DATA + "/updater/history.jsonl").splitlines()
+    assert json.loads(history[-1])["status"] == "ok"
+    assert json.loads(runner.read_file(DATA + "/updater/highest.json")) == {"version": "0.2.0"}
 
 
 @pytest.mark.parametrize("options", [{"extra": {"../outside": b"bad"}},
@@ -717,3 +725,283 @@ def test_cli_switch_check_does_not_restart_or_change_current(signing, capsys):
     assert not runner.exists(HIGHEST)
     assert not runner.exists(PENDING)
     assert_releases_untouched(runner, before)
+
+
+CHECK = (*HEALTH, "--config", CONFIG, "check", "--json")
+HISTORY = DATA + "/updater/history.jsonl"
+RESTART = ("systemctl", "restart", "exitnode-proxy.service")
+
+
+def put_pending(runner, stage=None, current=NEW):
+    put_release(runner, "0.2.0")
+    runner.links[CURRENT] = current
+    record = {"old": OLD, "target": NEW, "version": "0.2.0"}
+    if stage is not None:
+        record["stage"] = stage
+    runner.files[PENDING] = json.dumps(record)
+    runner.calls.clear()
+
+
+def statuses(runner):
+    return [json.loads(line)["status"] for line in runner.read_file(HISTORY).splitlines()]
+
+
+def commands(runner):
+    return [c[1] for c in runner.calls if c[0] == "run"]
+
+
+def test_pending_records_stage_staged_then_switched(signing, monkeypatch):
+    config, runner = prepared(signing)
+    stages = []
+    original = runner.replace
+
+    def replace(source, target):
+        original(source, target)
+        if target == PENDING:
+            stages.append((json.loads(runner.files[PENDING])["stage"], runner.readlink(CURRENT)))
+
+    monkeypatch.setattr(runner, "replace", replace)
+    assert run(config, runner) == 0
+    assert stages == [("staged", OLD), ("switched", NEW)]
+    switched = next(i for i, c in enumerate(runner.calls)
+                    if c[0] == "write_file" and c[1] == PENDING + ".tmp"
+                    and json.loads(c[2])["stage"] == "switched")
+    assert switched < runner.calls.index(("run", RESTART, False, None))
+
+
+def test_switch_pending_records_stage_staged_then_switched(signing, monkeypatch):
+    config, runner = prepared(signing)
+    put_release(runner, "0.2.0")
+    stages = []
+    original = runner.replace
+
+    def replace(source, target):
+        original(source, target)
+        if target == PENDING:
+            stages.append(json.loads(runner.files[PENDING])["stage"])
+
+    monkeypatch.setattr(runner, "replace", replace)
+    assert upgrade(config, runner, switch="0.2.0") == 0
+    assert stages == ["staged", "switched"]
+
+
+def test_recover_switched_and_healthy_completes_offline(signing, capsys):
+    config, runner = prepared(signing)
+    runner.connections.clear()
+    put_pending(runner, "switched")
+    assert recover(config, runner, config_path=CONFIG) == 0
+    assert "未完成的更新已收尾。" in capsys.readouterr().out
+    assert runner.readlink(CURRENT) == NEW and NEW + ".bad" not in runner.files
+    assert not runner.exists(PENDING)
+    assert statuses(runner)[-1] == "ok"
+    assert json.loads(runner.read_file(HIGHEST)) == {"version": "0.2.0"}
+    # 收尾只做现场健康检查，不先重启服务，也不探网、不取包。
+    assert RESTART not in commands(runner)
+    assert not any(c[0] == "tcp_connect" for c in runner.calls)
+    assert not any(c[0] == "read_bytes" and c[1].startswith("/push/") for c in runner.calls)
+    assert_clean(runner)
+
+
+def test_recover_switched_unhealthy_rolls_back(signing):
+    config, runner = prepared(signing)
+    put_pending(runner, "switched")
+    runner.responses[IS_ACTIVE] = CompletedResult(3, "failed\n")
+    assert recover(config, runner, config_path=CONFIG) == 0
+    assert runner.readlink(CURRENT) == OLD and NEW + ".bad" in runner.files
+    assert statuses(runner)[-1] == "rolled_back"
+    assert not runner.exists(PENDING)
+    assert not runner.exists(HIGHEST)
+    assert_clean(runner)
+
+
+def test_recover_staged_never_switched_aborts_without_bad_mark(signing):
+    config, runner = prepared(signing)
+    put_pending(runner, "staged", current=OLD)
+    runner.mkdir(NEW + ".staging")
+    runner.files[NEW + ".staging/partial"] = b"partial"
+    assert recover(config, runner, config_path=CONFIG) == 0
+    assert runner.readlink(CURRENT) == OLD
+    assert not runner.exists(NEW) and not runner.exists(NEW + ".staging")
+    assert NEW + ".bad" not in runner.files
+    assert statuses(runner) == ["aborted"]
+    assert not runner.exists(PENDING)
+    assert not any(c[0] == "systemctl" for c in commands(runner))
+    assert_clean(runner)
+    runner.calls.clear()
+    assert run(config, runner) == 0
+    assert runner.readlink(CURRENT) == NEW
+    assert statuses(runner) == ["aborted", "ok"]
+
+
+def test_recover_switched_but_link_already_old_rolls_back(signing):
+    config, runner = prepared(signing)
+    put_pending(runner, "switched", current=OLD)
+    assert recover(config, runner, config_path=CONFIG) == 0
+    assert runner.readlink(CURRENT) == OLD and NEW + ".bad" in runner.files
+    assert statuses(runner)[-1] == "rolled_back"
+    assert not runner.exists(PENDING)
+
+
+@pytest.mark.parametrize("entry", ["recover", "upgrade"])
+def test_recover_unknown_stage_is_corrupt(signing, entry, capsys):
+    config, runner = prepared(signing)
+    put_pending(runner, "half-done")
+    result = (recover(config, runner, config_path=CONFIG) if entry == "recover"
+              else run(config, runner))
+    assert result == 1
+    assert "未完成更新的记录损坏" in capsys.readouterr().out
+    assert runner.exists(PENDING)
+    assert runner.readlink(CURRENT) == NEW and NEW + ".bad" not in runner.files
+
+
+def test_recover_without_pending_is_offline_noop(signing, capsys):
+    config, runner = prepared(signing)
+    runner.connections.clear()
+    assert recover(config, runner, config_path=CONFIG) == 0
+    assert "没有未完成的更新。" in capsys.readouterr().out
+    assert not any(c[0] == "tcp_connect" for c in runner.calls)
+    assert not any(c[0] == "read_bytes" and c[1].startswith("/push/") for c in runner.calls)
+    assert not any(c[0] == "run" for c in runner.calls)
+    assert runner.readlink(CURRENT) == OLD
+    assert_clean(runner)
+
+
+def test_recover_lock_held_by_live_process(signing, capsys):
+    config, runner = prepared(signing)
+    put_pending(runner, "switched")
+    runner.files[LOCK] = json.dumps({"pid": 200, "at": runner.now()})
+    runner.live_pids.add(200)
+    assert recover(config, runner, config_path=CONFIG) == 4
+    assert "已有更新任务正在执行" in capsys.readouterr().out
+    assert runner.exists(PENDING) and runner.readlink(CURRENT) == NEW
+
+
+def test_recover_takes_over_lock_written_before_boot(signing):
+    config, runner = prepared(signing)
+    put_pending(runner, "switched")
+    runner.uptime = 50
+    runner.files[LOCK] = json.dumps({"pid": 200, "at": runner.now() - 100})
+    runner.live_pids.add(200)
+    assert recover(config, runner, config_path=CONFIG) == 0
+    assert not runner.exists(PENDING) and statuses(runner)[-1] == "ok"
+    assert LOCK not in runner.files
+
+
+def stable_config(signing, seconds=30):
+    config, runner = prepared(signing)
+    config.updater.health_stable_sec = seconds
+    return config, runner
+
+
+def assert_rolled_back(runner):
+    assert runner.readlink(CURRENT) == OLD and NEW + ".bad" in runner.files
+    assert statuses(runner)[-1] == "rolled_back"
+    assert not runner.exists(PENDING)
+
+
+def test_stable_window_service_dies_on_second_round(signing):
+    config, runner = stable_config(signing)
+    runner.responses[IS_ACTIVE] = [CompletedResult(0, "active\n"), CompletedResult(3, "failed\n")]
+    assert run(config, runner) == 1
+    assert_rolled_back(runner)
+    assert sum(c == IS_ACTIVE for c in commands(runner)) == 2
+
+
+def test_stable_window_restart_count_changes(signing):
+    config, runner = stable_config(signing)
+    runner.responses[NRESTARTS] = [CompletedResult(0, "0\n"), CompletedResult(0, "0\n"),
+                                   CompletedResult(0, "1\n")]
+    assert run(config, runner) == 1
+    assert_rolled_back(runner)
+
+
+def test_stable_window_port_not_listening(signing):
+    config, runner = stable_config(signing)
+    runner.responses[("ss", "-ltnH")] = CompletedResult(0, "LISTEN 0 4096 *:8443 *:*\n")
+    assert run(config, runner) == 1
+    assert_rolled_back(runner)
+
+
+def test_stable_window_tunnel_layer_fails_later(signing):
+    config, runner = stable_config(signing)
+    passed = CompletedResult(out=json.dumps({"layers": [{"name": "隧道服务", "result": "通过"}]}))
+    runner.responses[HEALTH] = [passed, passed, CompletedResult(out='{"layers":[]}')]
+    assert run(config, runner) == 1
+    assert_rolled_back(runner)
+
+
+def test_stable_window_all_pass_waits_full_window(signing):
+    config, runner = stable_config(signing)
+    runner.responses[NRESTARTS] = CompletedResult(0, "2\n")
+    runner.responses[("ss", "-ltnH")] = CompletedResult(0, "LISTEN 0 4096 *:443 *:*\n")
+    runner.responses[("ss", "-lunH")] = CompletedResult(0, "UNCONN 0 0 *:24443 *:*\n")
+    before = runner.clock
+    assert run(config, runner) == 0
+    assert runner.readlink(CURRENT) == NEW
+    assert runner.clock - before >= 30
+    ran = commands(runner)
+    assert ran[-1] == CHECK
+    assert ran.count(IS_ACTIVE) >= 2
+    assert ("ss", "-ltnH") in ran and ("ss", "-lunH") in ran
+    assert statuses(runner) == ["ok"]
+
+
+def test_stable_window_disabled_sends_no_extra_commands(signing):
+    config, runner = stable_config(signing, 0)
+    assert run(config, runner) == 0
+    assert runner.readlink(CURRENT) == NEW
+    assert not any(c[:2] in {("systemctl", "is-active"), ("systemctl", "show")} or c[0] == "ss"
+                   for c in commands(runner))
+    assert commands(runner)[-1] == CHECK
+
+
+def test_health_total_time_bounded_by_timeout_plus_stable(signing, monkeypatch):
+    config, runner = prepared(signing)
+    config.updater.health_timeout_sec = 7
+    config.updater.health_stable_sec = 5
+    original = runner.run
+    seen = []
+
+    def run_timed(argv, check=True, input=None, timeout=30):
+        seen.append((tuple(argv), timeout, runner.clock))
+        if tuple(argv[:len(HEALTH)]) == HEALTH and len(seen) == 1:
+            runner.clock += 6  # 第一段恰在第 6 秒通过。
+        return original(argv, check, input, timeout)
+
+    monkeypatch.setattr(runner, "run", run_timed)
+    start = runner.clock
+    assert _healthy(config, runner, CONFIG) is True
+    assert runner.clock - start <= 12
+    assert seen[0][1] <= 7
+    for _, timeout, at in seen:
+        assert 0 < timeout <= min(30, start + 12 - at)
+
+
+def test_lock_written_before_boot_is_stale_in_fake_runner():
+    runner = FakeRunner()
+    runner.uptime = 50
+    runner.files[LOCK] = json.dumps({"pid": 200, "at": runner.clock - 100})
+    runner.live_pids.add(200)
+    assert runner.lock_busy(LOCK) is False
+    assert runner.acquire_lock(LOCK) is True
+    assert json.loads(runner.files[LOCK])["pid"] == runner.pid
+    other = FakeRunner()
+    other.uptime = 1000
+    other.files[LOCK] = json.dumps({"pid": 200, "at": other.clock - 100})
+    other.live_pids.add(200)
+    assert other.lock_busy(LOCK) is True
+    assert other.acquire_lock(LOCK) is False
+
+
+def test_real_runner_uptime_reads_proc_or_returns_infinity(monkeypatch):
+    real = object.__new__(runner_module.RealRunner)
+    monkeypatch.setattr(runner_module, "_read_proc_uptime", lambda: "12345.67 54321.00\n")
+    assert real.uptime_seconds() == 12345.67
+
+    def unreadable():
+        raise OSError("模拟读取失败")
+
+    monkeypatch.setattr(runner_module, "_read_proc_uptime", unreadable)
+    assert real.uptime_seconds() == float("inf")
+    monkeypatch.setattr(runner_module, "_read_proc_uptime", lambda: "garbage")
+    assert real.uptime_seconds() == float("inf")

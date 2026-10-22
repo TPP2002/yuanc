@@ -1,0 +1,15 @@
+[Unit]
+Description=出口节点未完成更新收尾
+After=network-online.target exitnode-proxy.service
+Wants=network-online.target
+
+[Service]
+Environment=PYTHONPATH=/opt/exitnode/current
+Type=oneshot
+ExecStart=/usr/bin/python3 -m exitnode --config "/etc/exitnode/config.toml" upgrade --recover
+Restart=no
+NoNewPrivileges=true
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

@@ -8,7 +8,8 @@ from .runner import Runner
 
 UNITS = {"exitnode-admin.service", "exitnode-proxy.service",
          "exitnode-watchdog.service", "exitnode-watchdog.timer",
-         "exitnode-rescue.service", "exitnode-rescue.timer"}
+         "exitnode-rescue.service", "exitnode-rescue.timer",
+         "exitnode-recover.service"}
 
 
 class Manifest:

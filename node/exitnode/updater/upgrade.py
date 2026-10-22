@@ -106,27 +106,130 @@ def _restart(runner):
         raise UpdateError("本项目服务重启失败")
 
 
+PROXY_UNIT = "exitnode-proxy.service"
+
+
+class _OutOfTime(Exception):
+    """稳定窗的总时限已用尽。"""
+
+
+def _tunnel_passes(config, runner, config_path, deadline):
+    # env 确保检查的是刚切换的程序，而非安装更新器时的旧进程路径。
+    result = runner.run(["env", "PYTHONPATH=" + layout.root(config) + "/current",
+                         "python3", "-m", "exitnode", "--config", config_path,
+                         "check", "--json"], check=False,
+                        timeout=min(30, deadline - runner.now()))
+    payload = json.loads(result.out)
+    return (runner.now() <= deadline
+            and any(layer.get("name") == "隧道服务" and layer.get("result") == "通过"
+                    for layer in payload["layers"]))
+
+
+def _budget(runner, limit):
+    """单条命令的超时：不超过稳定窗剩余时间与 30 秒的较小者。"""
+    remaining = limit - runner.now()
+    if remaining <= 0:
+        raise _OutOfTime
+    return min(30, remaining)
+
+
+def _restarts(runner, timeout=30):
+    """读取隧道服务的重启次数；读不到或解析不出返回 None（未知）。"""
+    try:
+        result = runner.run(["systemctl", "show", PROXY_UNIT, "-p", "NRestarts", "--value"],
+                            check=False, timeout=timeout)
+    except Exception:
+        return None
+    if result.code:
+        return None
+    try:
+        return int(result.out.strip())
+    except ValueError:
+        return None
+
+
+def _listen(runner, argv, port, timeout):
+    """与看门狗监听探测同一口径：返回 通过/失败/未知，命令缺失或超时算未知。"""
+    try:
+        result = runner.run(argv, check=False, timeout=timeout)
+    except (OSError, RuntimeError):
+        return "未知"
+    if result.code == 127:
+        return "未知"
+    if result.code:
+        return "失败"
+    for line in result.out.splitlines():
+        columns = line.split()
+        # ss -H: State Recv-Q Send-Q Local-Address:Port Peer-Address:Port
+        if len(columns) >= 5 and columns[3].rsplit(":", 1)[-1] == str(port):
+            return "通过"
+    return "失败"
+
+
+def _stable(config, runner, config_path, limit):
+    """稳定窗：从首次通过起观察 health_stable_sec 秒，任何一轮失败立即判不健康。"""
+    stable_deadline = runner.now() + config.updater.health_stable_sec
+    try:
+        base = _restarts(runner, _budget(runner, limit))
+        while True:
+            # (a) 服务仍在运行；只看退出码，不看输出。
+            try:
+                alive = runner.run(["systemctl", "is-active", PROXY_UNIT], check=False,
+                                   timeout=_budget(runner, limit)).code == 0
+            except _OutOfTime:
+                raise
+            except Exception:
+                alive = False
+            if not alive:
+                return False
+            # (b) 重启次数不变；基线或本次读不到都算未知，不参与比较。
+            if base is not None:
+                count = _restarts(runner, _budget(runner, limit))
+                if count is not None and count != base:
+                    return False
+            # (c) 两个入口仍在监听；未知不算失败。
+            results = [_listen(runner, ["ss", "-ltnH"], config.proxy.reality_port,
+                               _budget(runner, limit)),
+                       _listen(runner, ["ss", "-lunH"], config.proxy.hy2_port,
+                               _budget(runner, limit))]
+            if "失败" in results:
+                return False
+            # (d) 最后一条命令仍是 check --json，隧道服务层须通过。
+            try:
+                if not _tunnel_passes(config, runner, config_path, limit):
+                    return False
+            except _OutOfTime:
+                raise
+            except Exception:
+                return False
+            now = runner.now()
+            if now >= stable_deadline:
+                return True
+            runner.sleep(min(5, stable_deadline - now))
+    except _OutOfTime:
+        return False
+
+
 def _healthy(config, runner, config_path):
     deadline = runner.now() + config.updater.health_timeout_sec
+    passed = False
     while runner.now() < deadline:
         try:
-            # env 确保检查的是刚切换的程序，而非安装更新器时的旧进程路径。
-            result = runner.run(["env", "PYTHONPATH=" + layout.root(config) + "/current",
-                                 "python3", "-m", "exitnode", "--config", config_path,
-                                 "check", "--json"], check=False,
-                                 timeout=min(30, deadline - runner.now()))
-            payload = json.loads(result.out)
-            if (runner.now() <= deadline
-                    and any(layer.get("name") == "隧道服务" and layer.get("result") == "通过"
-                            for layer in payload["layers"])):
-                return True
+            if _tunnel_passes(config, runner, config_path, deadline):
+                passed = True
+                break
         except Exception:
             pass  # 单次探测失败仍在同一固定截止时间内继续。
         remaining = deadline - runner.now()
         if remaining <= 0:
             return False
         runner.sleep(min(5, remaining))
-    return False
+    if not passed:
+        return False
+    if config.updater.health_stable_sec <= 0:
+        return True
+    # 总耗时上限 = health_timeout_sec + health_stable_sec。
+    return _stable(config, runner, config_path, deadline + config.updater.health_stable_sec)
 
 
 def _state_path(config, name):
@@ -184,21 +287,61 @@ def _rollback(config, runner, old, target, version):
         _history(config, runner, version, "rolled_back")
 
 
-def _recover(config, runner):
+STAGES = ("staged", "switched")
+
+
+def _write_pending(config, runner, old, target, version, stage):
+    # staged = 目标目录就位、链接未切；switched = 链接已切到目标。
+    path = _state_path(config, "pending.json")
+    runner.write_file(path + ".tmp", json.dumps({"old": old, "target": target,
+                                                 "version": version, "stage": stage}), 0o600)
+    runner.replace(path + ".tmp", path)
+
+
+def _recover(config, runner, config_path):
     path = _state_path(config, "pending.json")
     if not runner.exists(path):
         return
+    corrupt = "未完成更新的记录损坏，请联系维护人员"
     try:
         pending = json.loads(runner.read_file(path))
         old, target = pending["old"], pending["target"]
         version = str(Version(pending["version"]))
+        # 没有阶段字段的旧记录保守按已切换处理。
+        stage = pending.get("stage", "switched")
+        if stage not in STAGES:
+            raise ValueError
         allowed = {p for _, p in layout.versions(config, runner)}
         if old not in allowed or target != layout.releases(config) + "/" + version:
             raise ValueError
     except (KeyError, TypeError, ValueError):
-        raise UpdateError("未完成更新的记录损坏，请联系维护人员") from None
-    _rollback(config, runner, old, target, version)
-    runner.remove(path)
+        raise UpdateError(corrupt) from None
+    try:
+        current = layout.current_target(config, runner)
+    except ValueError:
+        raise UpdateError(corrupt) from None
+    if stage == "staged" and current == old:
+        # 切换从未发生：删掉没验证过的目标目录，不标坏，也不重启服务。
+        runner.remove_tree(target)
+        if runner.exists(target + ".staging"):
+            runner.remove_tree(target + ".staging")
+        _history(config, runner, version, "aborted")
+        runner.remove(path)
+    elif current == target:
+        # 服务已由 systemd 按链接拉起，现场做健康检查，不先重启。
+        if _healthy(config, runner, config_path):
+            _history(config, runner, version, "ok")
+            runner.remove(path)
+            _record_highest(config, runner, old, version)
+        else:
+            _rollback(config, runner, old, target, version)
+            runner.remove(path)
+    elif stage == "switched" and current == old:
+        # 链接已被切回，但目标仍未验证过，按原逻辑标坏回退。
+        _rollback(config, runner, old, target, version)
+        runner.remove(path)
+    else:
+        raise UpdateError(corrupt)
 
 
 def _install(config, runner, info, archive, config_path):
@@ -214,12 +357,11 @@ def _install(config, runner, info, archive, config_path):
         if not layout.valid_release(runner, staging):
             raise UpdateError("解包后程序校验失败")
         runner.replace(staging, target)
-        runner.write_file(pending + ".tmp", json.dumps({"old": old, "target": target,
-                                                       "version": info.version}), 0o600)
-        runner.replace(pending + ".tmp", pending)
+        _write_pending(config, runner, old, target, info.version, "staged")
         # replace 可能已经成功、但目录同步失败；此后任何异常均恢复旧链接。
         switched = True
         layout.switch(config, runner, target)
+        _write_pending(config, runner, old, target, info.version, "switched")
         _restart(runner)
         if not _healthy(config, runner, config_path):
             raise UpdateError("新版健康检查未通过")
@@ -244,12 +386,11 @@ def _switch(config, runner, target, version, config_path):
     pending = _state_path(config, "pending.json")
     switched = False
     try:
-        runner.write_file(pending + ".tmp", json.dumps({"old": old, "target": target,
-                                                       "version": version}), 0o600)
-        runner.replace(pending + ".tmp", pending)
+        _write_pending(config, runner, old, target, version, "staged")
         # 与安装路径一样，切换后的目录同步异常也必须回退。
         switched = True
         layout.switch(config, runner, target)
+        _write_pending(config, runner, old, target, version, "switched")
         _restart(runner)
         if not _healthy(config, runner, config_path):
             raise UpdateError("新版健康检查未通过")
@@ -309,7 +450,7 @@ def upgrade(config, runner, *, file=None, signature=None, check=False,
             raise UpdateError("已有更新任务正在执行，请稍后重试", 4)
         locked = True
         runner.mkdir(_state_path(config, "").rstrip("/"), 0o700)
-        _recover(config, runner)
+        _recover(config, runner, config_path)
         layout.repair(config, runner)
         layout.cleanup(config, runner)
         current = Version(layout.current_target(config, runner).rsplit("/", 1)[-1])
@@ -349,6 +490,42 @@ def upgrade(config, runner, *, file=None, signature=None, check=False,
         else:
             _install(config, runner, info, archive, config_path)
             print("升级完成，健康检查通过。")
+        return 0
+    except UpdateError as exc:
+        print(redact(str(exc)))
+        return exc.code
+    except Exception:
+        print("更新失败：程序或文件操作异常，请联系维护人员。")
+        return 1
+    finally:
+        if locked:
+            try:
+                runner.remove_tree(layout.incoming(config))
+            finally:
+                runner.release_lock(lock)
+
+
+def recover(config, runner, *, config_path):
+    """只收尾上次未完成的更新；不探测网络、不取包，断网也能执行。返回退出码。"""
+    locked = False
+    lock = config.node.data_dir.rstrip("/") + "/updater.lock"
+    try:
+        if runner.lock_busy(lock):
+            raise UpdateError("已有更新任务正在执行，请稍后重试", 4)
+        runner.mkdir(config.node.data_dir, 0o700)
+        if not runner.acquire_lock(lock):
+            raise UpdateError("已有更新任务正在执行，请稍后重试", 4)
+        locked = True
+        runner.mkdir(_state_path(config, "").rstrip("/"), 0o700)
+        if not runner.exists(_state_path(config, "pending.json")):
+            layout.repair(config, runner)
+            layout.cleanup(config, runner)
+            print("没有未完成的更新。")
+            return 0
+        _recover(config, runner, config_path)
+        layout.repair(config, runner)
+        layout.cleanup(config, runner)
+        print("未完成的更新已收尾。")
         return 0
     except UpdateError as exc:
         print(redact(str(exc)))

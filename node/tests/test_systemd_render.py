@@ -4,7 +4,8 @@ import pytest
 from exitnode.systemd import render
 
 UNITS = ("exitnode-admin.service", "exitnode-proxy.service",
-         "exitnode-watchdog.service", "exitnode-watchdog.timer")
+         "exitnode-watchdog.service", "exitnode-watchdog.timer",
+         "exitnode-recover.service")
 
 
 @pytest.mark.parametrize("name", UNITS)
@@ -59,6 +60,17 @@ def test_watchdog_service_timer_and_context():
     for unsafe in ('/a\nExecStart=/bin/other', '/a"', '/%n', '/$HOME', '/a\\b'):
         with pytest.raises(ValueError):
             render("exitnode-watchdog.service", {"config_path": unsafe})
+
+
+def test_recover_unit_runs_once_after_proxy_on_boot():
+    text = render("exitnode-recover.service", {"config_path": "/etc/custom config.toml",
+                                               "program_path": "/srv/exitnode/current"})
+    assert "Type=oneshot\n" in text and "Restart=no\n" in text
+    assert "After=network-online.target exitnode-proxy.service\n" in text
+    assert 'ExecStart=/usr/bin/python3 -m exitnode --config "/etc/custom config.toml" upgrade --recover\n' in text
+    assert "Environment=PYTHONPATH=/srv/exitnode/current\n" in text
+    assert "WantedBy=multi-user.target\n" in text
+    assert "StartLimit" not in text
 
 
 @pytest.mark.parametrize("name", ["exitnode-rescue.service", "exitnode-rescue.timer"])
