@@ -22,9 +22,12 @@ public sealed class FirewallTests
         Assert.Equal(ProgramPath, tcp.Program); Assert.Equal(new[] { "192.0.2.5" }, tcp.RemoteAddress);
         Assert.Equal("TCP", tcp.Protocol); Assert.Equal("443", tcp.RemotePort);
         Assert.Equal("8443", rules.Single(r => r.Name.EndsWith("Node-Udp")).RemotePort);
-        Assert.Equal("YuanC-TUN", rules.Single(r => r.Name.EndsWith("Tun")).InterfaceAlias);
+        var tun = rules.Single(r => r.Name.EndsWith("Tun"));
+        Assert.Equal(new[] { "172.19.0.1" }, tun.LocalAddress); Assert.Null(tun.InterfaceAlias);
         Assert.Equal(new[] { "127.0.0.0/8", "::1" }, rules.Single(r => r.Name.EndsWith("Loopback")).RemoteAddress);
         var dhcp = rules.Single(r => r.Name.EndsWith("Dhcp"));
+        Assert.Equal(KillSwitchPlanner.DhcpProgram, dhcp.Program); Assert.Equal("Dhcp", dhcp.Service);
+        Assert.Equal(new[] { "255.255.255.255", "LocalSubnet" }, dhcp.RemoteAddress);
         Assert.Equal("UDP", dhcp.Protocol); Assert.Equal("68", dhcp.LocalPort); Assert.Equal("67", dhcp.RemotePort);
         Assert.Single(plan.OfType<Audit>());
         Assert.DoesNotContain(rules, r => r.RemotePort == "53");
