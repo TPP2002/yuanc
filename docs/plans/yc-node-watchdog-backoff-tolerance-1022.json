@@ -1,0 +1,182 @@
+{
+  "schemaVersion": 1,
+  "taskId": "SEC-NODE-WATCHDOG-BACKOFF-TOLERANCE-1022",
+  "slug": "yc-node-watchdog-backoff-tolerance-1022",
+  "title": "看门狗:冷却到期时刻的「未来时间戳」判定阈值随 max_backoff_seconds 放宽(300 秒 + 退避上限),退避上限调大后冷却不再被当成时钟故障每轮清掉、不再假记 clock_adjusted",
+  "goal": "以派单时 origin/main 头为基点。冷却到期时刻 `next_action_at` 是看门狗自己写的、合法地在未来(最多晚 `watchdog.max_backoff_seconds` 秒),不能被当作时钟回拨留下的「未来时间戳」清掉。采用看板卡上的修法②(容差随配置放宽),不加配置上限。做完后:\n\n① node/exitnode/watchdog/ladder.py(四处,其余一行不动):\n  - `def is_future(at, now, tolerance_seconds=CLOCK_SKEW_TOLERANCE_SEC)`:容差改成参数,默认值不变,判定仍是 (at - now) > tolerance_seconds。\n  - `def elapsed(at, now, seconds, tolerance_seconds=CLOCK_SKEW_TOLERANCE_SEC)`:把容差透传给 is_future,其余逻辑(None 为 True、未来为 True、否则 ≥ seconds)不变。\n  - `def sanitize_clock(state, now, max_backoff_seconds=0)`:只对 `next_action_at` 这一个字段用 `CLOCK_SKEW_TOLERANCE_SEC + max_backoff_seconds` 作容差(代码里就写这个表达式);restart_times 与其余六个字段仍用默认 300 秒;返回值语义、clock_adjusted 的记录文案、first_failure_at 重置为 now 的规则全部不变。两参调用(既有测试)行为必须和现在一模一样。\n  - `decide()` 里的冷却判断 `elapsed(state[\"next_action_at\"], now, 0)` 改为传 `tolerance_seconds=CLOCK_SKEW_TOLERANCE_SEC + settings.max_backoff_seconds`(代码里就写这个表达式;这行已在 `settings = config.watchdog` 之后)。\n  - `execute()` 的 delay 计算不改:它已用 min(max_backoff_seconds, …) 封顶,写出的 next_action_at 永远 ≤ now + max_backoff_seconds,落在新容差之内。\n  - 不改 CLOCK_SKEW_TOLERANCE_SEC 的名字与值(300),不加新常量,不改 refresh_window / reboot_allowed。\n\n② node/exitnode/watchdog/__init__.py 的 tick():改成 `ladder.sanitize_clock(value, now, config.watchdog.max_backoff_seconds)`(行尾原注释保留)。其余不动。\n\n③ node/tests/test_watchdog.py:**只在文件末尾追加,既有行一字不改、不加顶部 import**(验收用「新文件以旧文件为前缀」核;需要的符号在测试函数内 import,文件顶部已有 `from test_cli import CONFIG, fake`、`from exitnode.config import load`、`decide`、`Action`、`state`、`timedelta`)。追加至少 4 个测试,每个先在当前代码下跑红再改实现:\n  (a) `test_sanitize_clock_keeps_cooldown_within_backoff`:state.fresh() 后 next_action_at = NOW+600 秒;`sanitize_clock(value, NOW, 900)` 返回 0、字段不变、actions 为空;再对同样的值调两参 `sanitize_clock(value, NOW)` 返回 1、next_action_at 置 None、末条 action 是 clock_adjusted(证明默认行为没变、容差确实随 max_backoff 放宽;当前代码下第一处会 TypeError)。\n  (b) `test_cooldown_beyond_backoff_is_still_future`:max_backoff 900 下 next_action_at = NOW+1200 秒(900+300,恰好)不算未来 → 返回 0;NOW+1201 秒算未来 → 返回 1 并记 clock_adjusted;同一调用里 last_ok_at = NOW+301 秒在 max_backoff 900 下仍算未来(其他字段的容差不随之放宽)。\n  (c) `test_long_backoff_cooldown_is_respected_by_tick`(端到端):`runner = fake(pairing=True)` 后把 runner.files[CONFIG] 里的 `retry_interval_seconds = 60` 换成 240、`max_backoff_seconds = 300` 换成 900(str.replace,两处都要断言替换前后文本不同),再 `load(CONFIG, runner)`,补上 setup() 里那三条 responses 与 LIVE 文件(可以把 setup 的逻辑在测试里重复,不许改 setup);broken(runner);状态:state=\"degraded\"、consecutive_failures=9、first_failure_at=NOW-10 分钟、restart_times=[NOW-8 分钟, NOW-4 分钟]、restart_count_window=2、next_action_at=NOW+420 秒;state.save 后 `run_at(config, runner)` 返回 1,commands 里没有 RESTART,clock_actions 为空,保存的 next_action_at 仍等于 NOW+420 秒的 isoformat,末条 action 是 wait 且 reason 含「冷却中」;`run_at(config, runner, 6)` 仍没有 RESTART;`run_at(config, runner, 7)` 后 RESTART 恰好执行一次,clock_actions 仍为空。当前代码下第一轮就会把 420 秒的冷却清掉并立刻重启。\n  (d) `test_default_backoff_keeps_cooldown_tolerance_at_600`:默认配置(setup())、同 (c) 的状态但 next_action_at = NOW+600 秒 → tick 后 clock_actions 为空、没有 RESTART、末条 action 是 wait;另起一份 next_action_at = NOW+601 秒 → tick 后 clock_actions 恰好 1 条、RESTART 执行一次。\n  (e) `test_decide_respects_cooldown_within_backoff_without_sanitize`:直接调 decide(双保险):config 用 (c) 的 240/900 配置,state 同 (c)(next_action_at = NOW+420 秒),probes = [{\"layer\": \"L-proxy\", \"result\": \"失败\", \"reason\": \"测试\"}],`decide(value, probes, NOW, config).name == \"wait\"` 且 reason 含「冷却中」;next_action_at = NOW+1201 秒时 name == \"restart_service\"。\n  既有 test_clock_tolerance_is_300_seconds、test_sanitize_clock_without_future_is_silent、test_fast_ticks_do_not_advance_failure_minutes_or_bypass_backoff 等全部原样通过。\n\n④ docs/node/看门狗说明.md(三处):\n  - 「什么情况会重启服务」段「等待时间最多 300 秒」后补「(配置 `max_backoff_seconds`,可调整)」。\n  - 「时钟异常」段末尾补一小段:冷却到期时刻 `next_action_at` 本来就在未来,它的未来判定阈值是 300 秒加上 `max_backoff_seconds`,调大 `max_backoff_seconds` 后冷却不会被误当成时钟故障清掉;调小之后,上一轮留下的更长冷却可能被当作未来时间戳清掉一次并记一条 `clock_adjusted`,只影响那一次。\n  - 「真机待验证」加一条:把 `retry_interval_seconds` 调到 240、`max_backoff_seconds` 调到 900,制造隧道服务连续失败触发两次重启后,第二次重启后的 8 分钟冷却期内不应再重启、状态历史不应出现 `clock_adjusted`;尚未实测。\n\n⑤ 全程中文注释与文案;ruff(行宽 100,E4/E7/E9/F/I/B/SIM/UP,import 排序会查);不新增依赖;不碰 rescue 包、config.py、示例配置。",
+  "background": "项目:外包,澳洲 Debian 软路由 node/exitnode(Python 3.11;主机操作经 Runner,测试用 FakeRunner;时钟由 tick(config, runner, clock) 注入)。看门狗每分钟一轮:tick → state.load → ladder.sanitize_clock(value, now) → probes.probe → ladder.decide → ladder.execute。\nladder.py 现状:CLOCK_SKEW_TOLERANCE_SEC = 300;is_future(at, now) 判 at 晚于 now 超过 300 秒;elapsed(at, now, seconds) 对 None 或未来时间戳返回 True,否则 (now - at) ≥ seconds;sanitize_clock(state, now) 把 restart_times 中未来条目丢弃并同步 restart_count_window,七个时间字段(first_failure_at / last_ok_at / last_rollback_at / last_reboot_at / updated_at / last_failure_tick_at / next_action_at)中未来的置 None(first_failure_at 置 now),有改动时 storage.record(state, \"clock_adjusted\", now, \"检测到时间回拨，已丢弃未来时间的频率记录\") 并返回改动条数;decide() 在 restart_count_window < restart_limit_per_hour 时用 `elapsed(state[\"next_action_at\"], now, 0)` 判冷却,没到期返回 Action(\"wait\", …, reason + \"；恢复动作冷却中\");execute() 的 restart_service 分支写 next_action_at = now + min(max_backoff_seconds, retry_interval_seconds * 2 ** min(restart_count_window - 1, 16)),默认 60/300 下三次重启的冷却是 60、120、240 秒。\n配置 Watchdog dataclass(config.py):retry_interval_seconds=60、max_backoff_seconds=300、restart_limit_per_hour=3、restart_after_failures=4;config.load 只校验这些为正整数且 max_backoff ≥ retry_interval。\n现象:max_backoff_seconds 调到 >300、retry_interval_seconds 调大后,第二次重启写下的冷却(2×retry,例如 480 秒)在下一轮开头被 sanitize_clock 当作未来时间戳清掉并记 clock_adjusted,decide 随即不等冷却就重启;默认配置 60/300 下冷却最长 240 秒,不触发。\n测试夹具 node/tests/test_watchdog.py:NOW = 2026-10-22 00:00 UTC;setup() 返回 (config, runner):runner = fake(pairing=True),config = load(CONFIG, runner),CONFIG 是 FakeRunner 里的 /etc/exitnode/config.toml,内容 = node/examples/config.example.toml 原文(含 `retry_interval_seconds = 60`、`max_backoff_seconds = 300` 两行),setup 还设三条 responses(systemctl is-active 为 active、ss -ltnH 有 443、ss -lunH 有 24443)并写 runner.files[LIVE];broken(runner) 默认让 L-proxy 失败;run_at(config, runner, minutes) 在 NOW+minutes 分钟跑一轮 tick;commands(runner) 列出 run 调用的 argv 元组;常量 RESTART = (\"systemctl\",\"restart\",\"exitnode-proxy.service\");clock_actions(config, runner) 列出 clock_adjusted 记录;exhausted() 造的是重启窗口已满(3 条)的状态,本单的测试要窗口 2 条的状态需自己 state.fresh() 后 update;state.save(config, runner, value, NOW) 落盘、state.read(config, runner) 读回。既有测试 test_clock_tolerance_is_300_seconds / test_sanitize_clock_without_future_is_silent 用两参调用 sanitize_clock,必须继续通过。\nruff:行宽 100,规则 E4/E7/E9/F/I/B/SIM/UP(import 排序会查)。pytest 从仓根跑 `python -m pytest -q node/tests`(pyproject 的 pythonpath=node)。看板卡 SEC-NODE-WATCHDOG-BACKOFF-TOLERANCE-1022,来源 PR #31 自审。",
+  "nonGoals": [
+    "不给 max_backoff_seconds 加配置上限、不改默认值(卡上的修法①不采用)",
+    "不改 CLOCK_SKEW_TOLERANCE_SEC 的值(300)以及 restart_times、first_failure_at 等其他字段的容差",
+    "不改 rescue 包(救援单元没有冷却字段,limit 的 300 秒口径不变)、config.py、示例配置、probes.py、state.py",
+    "不改既有测试的任何一行(只在 test_watchdog.py 末尾追加)",
+    "不在真机实测;真机项写进文档待验证清单"
+  ],
+  "allowedPaths": [
+    "node/exitnode/watchdog/ladder.py",
+    "node/exitnode/watchdog/__init__.py",
+    "node/tests/test_watchdog.py",
+    "docs/node/看门狗说明.md"
+  ],
+  "forbiddenPaths": [
+    "winclient/**",
+    "authserver/**",
+    "scripts/**",
+    ".github/**",
+    ".codex/**",
+    ".gitignore",
+    "pyproject.toml",
+    "docs/开工须知.md",
+    "docs/口径速查表.md",
+    "docs/design/**",
+    "docs/交接/**",
+    "docs/plans/**",
+    "docs/acceptance/**",
+    "docs/authserver/**",
+    "docs/winclient/**",
+    "docs/node/救援单元说明.md",
+    "docs/node/更新与回退说明.md",
+    "docs/node/配置说明.md",
+    "docs/node/隧道配置说明.md",
+    "docs/node/自用配对说明.md",
+    "docs/node/客户端包托管说明.md",
+    "node/README.md",
+    "node/examples/**",
+    "node/exitnode/__init__.py",
+    "node/exitnode/__main__.py",
+    "node/exitnode/watchdog/probes.py",
+    "node/exitnode/watchdog/state.py",
+    "node/exitnode/rescue/**",
+    "node/exitnode/updater/**",
+    "node/exitnode/admin/**",
+    "node/exitnode/proxy/**",
+    "node/exitnode/service.py",
+    "node/exitnode/device.py",
+    "node/exitnode/cli.py",
+    "node/exitnode/config.py",
+    "node/exitnode/runner.py",
+    "node/exitnode/manifest.py",
+    "node/exitnode/systemd.py",
+    "node/exitnode/status.py",
+    "node/exitnode/netinfo.py",
+    "node/exitnode/nft.py",
+    "node/exitnode/log.py",
+    "node/exitnode/templates/**",
+    "node/tests/golden/**",
+    "node/tests/test_config.py",
+    "node/tests/test_rescue.py",
+    "node/tests/test_cli.py",
+    "node/tests/test_updater.py",
+    "node/tests/test_service.py",
+    "node/tests/test_device.py",
+    "node/tests/test_systemd_render.py",
+    "node/tests/test_admin_server.py",
+    "node/tests/test_admin_publish.py",
+    "node/tests/test_proxy_sync.py",
+    "node/tests/test_proxy_server_render.py",
+    "node/tests/test_proxy_client_render.py",
+    "node/tests/test_proxy_keys.py",
+    "node/tests/test_proxy_registry.py",
+    "node/tests/test_manifest.py",
+    "node/tests/test_netinfo_public.py",
+    "node/tests/test_nft_render.py",
+    "node/tests/test_hy2_certificate.py",
+    "node/tests/test_hy2_service.py",
+    "node/tests/test_release_script.py",
+    "node/tests/test_renderer_parity.py",
+    "node/tests/test_sign_winclient.py"
+  ],
+  "expectArtifacts": [
+    "node/exitnode/watchdog/ladder.py",
+    "node/exitnode/watchdog/__init__.py",
+    "node/tests/test_watchdog.py",
+    "docs/node/看门狗说明.md"
+  ],
+  "acceptance": [
+    {
+      "id": "RUFF",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "ruff",
+        "check",
+        "node",
+        "scripts",
+        "authserver"
+      ],
+      "required": true,
+      "timeoutSec": 300
+    },
+    {
+      "id": "PYTEST",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+        "node/tests"
+      ],
+      "required": true,
+      "timeoutSec": 900
+    },
+    {
+      "id": "SHAPE-LADDER",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda p:pathlib.Path(p).read_text(encoding='utf-8');la=r('node/exitnode/watchdog/ladder.py');wd=r('node/exitnode/watchdog/__init__.py');bad=[k for k,ok in (('const','CLOCK_SKEW_TOLERANCE_SEC = 300' in la),('is_future','def is_future(at, now, tolerance_seconds=CLOCK_SKEW_TOLERANCE_SEC)' in la),('elapsed','def elapsed(at, now, seconds, tolerance_seconds=CLOCK_SKEW_TOLERANCE_SEC)' in la),('sanitize','def sanitize_clock(state, now, max_backoff_seconds=0)' in la),('sanitize-tol','CLOCK_SKEW_TOLERANCE_SEC + max_backoff_seconds' in la),('decide-tol','CLOCK_SKEW_TOLERANCE_SEC + settings.max_backoff_seconds' in la),('tick','sanitize_clock(value, now, config.watchdog.max_backoff_seconds)' in wd)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "TESTS-APPEND-ONLY",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess as sp,pathlib,re,sys;mb=sp.check_output(['git','merge-base','origin/main','HEAD'],text=True).strip();n=lambda t:t.replace(chr(13),'');old=n(sp.check_output(['git','show',mb+':node/tests/test_watchdog.py']).decode('utf-8'));new=n(pathlib.Path('node/tests/test_watchdog.py').read_text(encoding='utf-8'));c=lambda t:len(re.findall('^def test_',t,re.M));add=new[len(old.rstrip()):];bad=[k for k,ok in (('prefix',new.startswith(old.rstrip())),('count',c(new)-c(old)>=4),('backoff','max_backoff_seconds = 900' in add),('next','next_action_at' in add),('three-arg','sanitize_clock(value, NOW, 900)' in add),('tick','run_at(' in add and 'RESTART' in add and 'clock_actions(' in add),('decide','decide(' in add)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "SCOPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess as sp,sys;g=lambda *a:sp.check_output(['git','-c','core.quotepath=false']+list(a)).decode('utf-8').split(chr(10));mb=g('merge-base','origin/main','HEAD')[0].strip();ch={p.strip() for p in g('diff','--name-only',mb)+g('ls-files','--others','--exclude-standard') if p.strip()};ok={'node/exitnode/watchdog/ladder.py','node/exitnode/watchdog/__init__.py','node/tests/test_watchdog.py','docs/node/看门狗说明.md'};bad=sorted(ch-ok);print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;a=pathlib.Path('docs/node/看门狗说明.md').read_text(encoding='utf-8');bad=[k for k,ok in (('backoff-x2',a.count('max_backoff_seconds')>=2),('next','next_action_at' in a),('cool','冷却' in a),('verify','retry_interval_seconds' in a),('once','只影响' in a)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "model": null,
+  "timeoutSec": 3600,
+  "repoRoot": "E:/yuanc",
+  "engine": "codex",
+  "reasoningEffort": "medium",
+  "steps": [
+    "读 ladder.py / watchdog/__init__.py / test_watchdog.py 顶部辅助与末尾时钟测试;先在 test_watchdog.py 末尾追加 ③ 的五个测试并跑红(当前代码下 (a) 三参调用 TypeError,(c)(d)(e) 会多出 RESTART 或 clock_adjusted)。",
+    "改 ladder.py 四处与 tick 接线;跑 RUFF / PYTEST / SHAPE-LADDER / TESTS-APPEND-ONLY / SCOPE 全绿。",
+    "改文档三处;跑 DOCS;交活说明写清真机待验证项与「默认配置下冷却容差为 600 秒」这一口径变化。"
+  ]
+}
