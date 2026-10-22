@@ -66,3 +66,47 @@ def test_missing_table_removal_is_noop_and_command_failure_is_not_hidden():
 def test_ports_cannot_inject_rules():
     with pytest.raises(ValueError):
         render_ruleset({**CTX, "admin_port": "443; delete table inet other"})
+
+
+def test_output_chain_sets_ttl_only_for_service_originated_connections():
+    text = render_ruleset(CTX)
+    assert "chain output {" in text
+    assert "type filter hook output priority mangle; policy accept;" in text
+    for rule in ("ip ttl set 128", "ip6 hoplimit set 128"):
+        assert text.count(rule) == 1
+        line = next(line for line in text.splitlines() if rule in line)
+        assert 'meta skuid "exitnode"' in line
+        assert "ct direction original" in line
+    # 固定基点的三条链，避免黄金文件同步更新掩盖既有规则变化。
+    original_chains = (
+        "    chain input {\n"
+        "        type filter hook input priority 0; policy accept;\n"
+        "        tcp dport 443 accept\n"
+        "        udp dport 24443 accept\n"
+        "        ip daddr 127.0.0.1 tcp dport 8443 accept\n"
+        "    }\n"
+        "    chain forward {\n"
+        "        type filter hook forward priority 0; policy accept;\n"
+        "        # 出口转发规则由后续代理接入卡提供，当前不扩大转发权限。\n"
+        "    }\n"
+        "    chain postrouting {\n"
+        "        type nat hook postrouting priority 100; policy accept;\n"
+        "        # 待确定隧道源地址后添加受限 masquerade 规则。\n"
+        "    }\n"
+    )
+    assert text.split("table inet exitnode {\n", 1)[1].split("    chain output {", 1)[0] == (
+        original_chains
+    )
+    for source in (Path(__file__).parents[1] / "exitnode").rglob("*.py"):
+        content = source.read_text(encoding="utf-8")
+        assert "ip_default_ttl" not in content
+        assert "sysctl" not in content
+
+
+def test_service_user_cannot_inject_rules():
+    for user in ('exitnode" accept; delete table inet other', "Root"):
+        with pytest.raises(ValueError, match="服务账户名不合法"):
+            render_ruleset({**CTX, "service_user": user})
+    text = render_ruleset({**CTX, "service_user": "svc-user_1"})
+    for rule in ("ip ttl set 128", "ip6 hoplimit set 128"):
+        assert f'meta skuid "svc-user_1" ct direction original {rule}' in text
