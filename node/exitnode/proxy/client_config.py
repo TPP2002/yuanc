@@ -52,6 +52,7 @@ def render_client_windows(ctx: ProxyContext, device: Device) -> dict:
             {
                 "type": "urltest", "tag": "proxy", "outbounds": ["main", "backup"],
                 "url": ctx.urltest_url, "interval": ctx.urltest_interval,
+                "tolerance": ctx.urltest_tolerance_ms,
             },
             {"type": "block", "tag": "block"},
             {"type": "dns", "tag": "dns-out"},

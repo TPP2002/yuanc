@@ -36,7 +36,7 @@ def render(node_ctx, device) -> dict:
             backup,
             {"type": "urltest", "tag": "urltest", "outbounds": ["main", "backup"],
              "url": "https://www.gstatic.com/generate_204", "interval": "1m",
-             "tolerance": 50},
+             "tolerance": 300},
             {"type": "block", "tag": "block"},
             {"type": "dns", "tag": "dns-out"},
         ],

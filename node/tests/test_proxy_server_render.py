@@ -40,17 +40,26 @@ def test_server_exact_golden_and_revoked_exclusion(inputs):
 
 def test_server_custom_targets_and_certificate_paths(inputs):
     ctx, device = inputs
-    ctx = replace(ctx, sni="cover.example", handshake_server="handshake.example",
+    ctx = replace(ctx, sni="cover.example", handshake_server="cover.example",
                   hy2_port=34567, masquerade="https://cover.example",
                   hy2_certificate_path="/srv/secrets/tls.crt", hy2_key_path="/srv/secrets/tls.key")
     main, backup = render_server(ctx, [device])["inbounds"]
     assert main["tls"]["server_name"] == "cover.example"
-    assert main["tls"]["reality"]["handshake"]["server"] == "handshake.example"
+    assert main["tls"]["reality"]["handshake"]["server"] == "cover.example"
     assert backup["listen_port"] == 34567
     assert backup["masquerade"] == "https://cover.example"
     assert backup["tls"]["key_path"] == "/srv/secrets/tls.key"
     with pytest.raises(ValueError, match="secrets"):
         render_server(replace(ctx, hy2_key_path="/public/key.pem"), [device])
+
+
+def test_camouflage_target_and_handshake_must_match(inputs):
+    ctx, device = inputs
+    mismatched = replace(ctx, sni="cover.example", handshake_server="handshake.example")
+    with pytest.raises(ValueError, match="必须相同"):
+        validate_context(mismatched)
+    with pytest.raises(ValueError, match="必须相同"):
+        render_server(mismatched, [device])
 
 
 def test_empty_allowlist_has_no_users(inputs):

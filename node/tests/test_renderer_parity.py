@@ -61,6 +61,11 @@ def test_pair_session_and_tls_parity(tmp_path):
         "enabled": True, "server_name": ctx.hy2_server_name,
         "certificate": list(ctx.hy2_certificate),
     }
+    client_urltest = next(o for o in client["outbounds"] if o["type"] == "urltest")
+    auth_urltest = next(o for o in auth["outbounds"] if o["type"] == "urltest")
+    for key in ("url", "interval", "tolerance"):
+        assert client_urltest[key] == auth_urltest[key]
+    assert client_urltest["tolerance"] == 300
     assert client["outbounds"][0]["server_port"] == 14443
     assert urlsplit(vless_link(ctx, device)).port == 14443
     assert render_server(ctx, [device])["inbounds"][0]["listen_port"] == 14443

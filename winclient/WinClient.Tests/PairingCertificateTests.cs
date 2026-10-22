@@ -78,6 +78,17 @@ public sealed class PairingCertificateTests
     }
 
     [Fact]
+    public void RenderedUrltestHasThreeHundredMillisecondTolerance()
+    {
+        var pair = PairingFile.Parse(PairingTests.ValidDocument().ToJsonString());
+        var outbounds = LocalConfigRenderer.Render(pair.Node).GetProperty("outbounds");
+        var urltest = outbounds.EnumerateArray().Single(o => o.GetProperty("type").GetString() == "urltest");
+        Assert.Equal(300, urltest.GetProperty("tolerance").GetInt32());
+        Assert.Equal(new[] { "type", "tag", "outbounds", "url", "interval", "tolerance" },
+            urltest.EnumerateObject().Select(p => p.Name));
+    }
+
+    [Fact]
     public void V1WithoutNewKeysKeepsOriginalConfigurationAndShowsWarning()
     {
         var document = PairingTests.ValidDocument();

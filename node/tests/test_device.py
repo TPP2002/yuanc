@@ -9,6 +9,7 @@ from exitnode import device, service
 from exitnode.cli import main
 from exitnode.config import load
 from exitnode.proxy import registry as registry_module
+from exitnode.proxy.context import ProxyContext
 from exitnode.runner import CompletedResult, RunnerError
 from test_cli import CONFIG, fake
 
@@ -72,6 +73,8 @@ def test_add_credentials_permissions_and_checked_reload(installed, capsys):
 def test_exact_pair_golden_and_session_node_keys(installed, monkeypatch):
     config, runner = installed
     vector = json.loads((GOLDEN / "proxy" / "inputs.json").read_text(encoding="utf-8"))
+    # 配对黄金按测试向量的伪装目标生成;示例配置已改为澳洲站点,这里对齐到向量值。
+    config.proxy.sni = config.proxy.handshake_server = ProxyContext.sni
     runner.files[service.SECRETS + "/reality.json"] = json.dumps(vector["context"]["reality"])
     runner.files[service.SECRETS + "/hy2.crt"] = "\n".join(vector["context"]["hy2_certificate"])
     runner.files[service.SECRETS + "/hy2.obfs"] = vector["context"]["hy2_obfs_password"] + "\n"

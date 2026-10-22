@@ -6,7 +6,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 import pytest
 from exitnode.proxy.client_config import render_client_windows
-from exitnode.proxy.context import ProxyContext
+from exitnode.proxy.context import ProxyContext, validate_context
 from exitnode.proxy.keys import RealityKeys
 from exitnode.proxy.registry import Device
 from exitnode.proxy.subscription import render_android_subscription, vless_link
@@ -60,6 +60,18 @@ def test_windows_exact_golden_and_no_fallback(inputs):
     assert "obfs" not in config["outbounds"][0]
 
 
+def test_urltest_tolerance_key_order_and_validation(inputs):
+    ctx, device = inputs
+    urltest = render_client_windows(ctx, device)["outbounds"][2]
+    assert list(urltest) == ["type", "tag", "outbounds", "url", "interval", "tolerance"]
+    assert urltest["tolerance"] == 300
+    for bad in (True, -1, 10001, "300"):
+        with pytest.raises(ValueError, match="容差"):
+            validate_context(replace(ctx, urltest_tolerance_ms=bad))
+    for good in (0, 10000):
+        validate_context(replace(ctx, urltest_tolerance_ms=good))
+
+
 def test_android_subscription_keeps_obfs_and_vless_link_omits_it(inputs):
     ctx, device = inputs
     android = render_android_subscription(ctx, device)
@@ -106,7 +118,7 @@ def test_revoked_device_cannot_export(inputs):
 def test_self_signed_trust_and_sni_are_explicit(inputs):
     ctx, device = inputs
     config = render_client_windows(replace(ctx, sni="cover.example",
-        hy2_server_name="node-cert.example", hy2_certificate=("TEST-CERTIFICATE",)), device)
+        handshake_server="cover.example", hy2_server_name="node-cert.example", hy2_certificate=("TEST-CERTIFICATE",)), device)
     main, backup = config["outbounds"][:2]
     assert main["server"] == backup["server"] == ctx.server_host
     assert main["tls"]["server_name"] == "cover.example"
