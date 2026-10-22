@@ -40,8 +40,8 @@ public partial class App : Application
         }, null, Timeout.Infinite, executeOnlyOnce: false);
         var menu = new Forms.ContextMenuStrip();
         menu.Items.Add("打开窗口", null, (_, _) => ShowWindow());
-        var connect = menu.Items.Add("连接", null, async (_, _) => await window.Model.ConnectFromTrayAsync());
-        var disconnect = menu.Items.Add("断开", null, async (_, _) => await window.Model.DisconnectFromTrayAsync());
+        var connect = menu.Items.Add("连接", null, async (_, _) => { await window.Model.ConnectFromTrayAsync(); if (window.Model.BrowserWarningShown) ShowWindow(); });
+        var disconnect = menu.Items.Add("断开", null, async (_, _) => { await window.Model.DisconnectFromTrayAsync(); if (window.Model.BrowserWarningShown) ShowWindow(); });
         menu.Items.Add("退出界面(隧道不受影响)", null, (_, _) => Shutdown());
         menu.Opening += (_, _) => { connect.Enabled = window.Model.CanUseConnection; disconnect.Enabled = window.Model.CanUseConnection; };
         tray = new Forms.NotifyIcon { Icon = trayIcons[TrayIcon.N], Text = "澳洲出口客户端", ContextMenuStrip = menu, Visible = true };

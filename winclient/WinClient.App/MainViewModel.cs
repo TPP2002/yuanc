@@ -70,6 +70,8 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
     public string ConnectLabel => IsBusy ? Hero.BusyLabel : Hero.PrimaryLabel;
     public ICommand RedeemCommand { get; }
     public ICommand ConnectCommand { get; }
+    public bool BrowserWarningShown => snapshot.Message.Contains(ClientController.BrowserWarningMarker, StringComparison.Ordinal);
+    public ICommand ContinueAnywayCommand { get; }
     public ICommand ImportPairingCommand { get; }
     public ICommand ClearPairingCommand { get; }
     public ICommand CheckUpdateCommand { get; }
@@ -144,6 +146,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         RedeemCommand = new AsyncCommand(() => RunAsync(async () =>
         { await SendAsync("redeem", Code); Code = ""; }), () => CanUseConnection);
         ConnectCommand = new AsyncCommand(() => RunAsync(MainActionAsync), () => !IsBusy);
+        ContinueAnywayCommand = new AsyncCommand(() => RunAsync(MainActionAsync), () => CanUseConnection && BrowserWarningShown);
         ImportPairingCommand = new AsyncCommand(() => RunAsync(async () =>
         {
             var path = choosePairingFile();
@@ -371,6 +374,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
     {
         if (disposed) return;
         Notify(nameof(CanRestoreEnvironment));
+        Notify(nameof(BrowserWarningShown));
         Hero = StatusPresentation.Build(snapshot, availability, ShouldDisconnect);
         Notify(nameof(Hero)); Notify(nameof(Status)); Notify(nameof(Message)); Notify(nameof(ConnectLabel)); Notify(nameof(ModeText)); Notify(nameof(IsBusy)); Notify(nameof(CanUseConnection));
         Notify(nameof(ServiceVersionText)); Notify(nameof(ServiceVersionDisplay)); Notify(nameof(ServiceStateText)); Notify(nameof(ServiceStateTone));

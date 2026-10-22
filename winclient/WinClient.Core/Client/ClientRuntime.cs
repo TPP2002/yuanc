@@ -75,7 +75,8 @@ public sealed class ClientRuntime : IClientFacade, IDisposable
                 environment: new EnvironmentApplier(Path.Combine(ClientSettings.DataDirectory, "run")),
                 environmentSettings: new EnvironmentSettingsStore(), ipv6Probe: new SocketIpv6Probe(),
                 reportSink: report => WriteSelfCheck(Path.Combine(ClientSettings.DataDirectory, "run", "selfcheck.json"), report),
-                routingSettings: new RoutingSettingsStore(), serviceProcessPath: Environment.ProcessPath, adapterProbe: new SystemAdapterProbe());
+                routingSettings: new RoutingSettingsStore(), serviceProcessPath: Environment.ProcessPath, adapterProbe: new SystemAdapterProbe(),
+                browserProbe: new SystemBrowserProcessProbe());
             return new(controller, firewall, http, pairingStore, log, storeRoot, scope);
         }
         catch { http?.Dispose(); throw; }

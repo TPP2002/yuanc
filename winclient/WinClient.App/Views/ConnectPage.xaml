@@ -15,6 +15,7 @@
   </Grid></Border>
   <ScrollViewer Grid.Row="2" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" Focusable="False"><StackPanel>
    <TextBlock Text="{Binding Message}" MinHeight="42" Margin="0,12,0,16" FontSize="{DynamicResource Yc.FontSize.Sm}" TextWrapping="Wrap" t:SemanticText.NormalKey="Yc.Text2" t:SemanticText.Tone="{Binding Hero.SubtitleTone}" AutomationProperties.LiveSetting="Polite"/>
+   <Button Content="仍然继续" Command="{Binding ContinueAnywayCommand}" Style="{DynamicResource Yc.Button.Secondary}" HorizontalAlignment="Left" Margin="0,0,0,12" AutomationProperties.Name="仍然继续" Visibility="{Binding BrowserWarningShown, Converter={x:Static t:VisibilityConverter.Instance}}"/>
    <ItemsControl x:Name="Rows" ItemsSource="{Binding Hero.Rows}"><ItemsControl.ItemTemplate><DataTemplate>
     <Border Style="{DynamicResource Yc.StatusRow}"><Grid>
      <Grid.ColumnDefinitions><ColumnDefinition Width="20"/><ColumnDefinition Width="100"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>

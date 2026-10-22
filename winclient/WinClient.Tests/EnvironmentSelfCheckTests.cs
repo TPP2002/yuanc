@@ -12,13 +12,51 @@ namespace WinClient.Tests;
 public sealed class EnvironmentSelfCheckTests
 {
     [Fact]
+    public void 未取得浏览器信息时无法核验()
+    {
+        var report = EnvironmentSelfCheck.Evaluate(Good with { BrowsersAtApply = null });
+        Assert.Equal("browser_closed", report.Items[9].Id);
+        Assert.Equal("无法核验", report.Items[9].Result);
+        Assert.Equal("未取得浏览器进程信息", report.Items[9].Detail);
+        Assert.Equal("9 项通过,1 项未能检查", report.Summary);
+    }
+
+    [Fact]
+    public void 套用时没有浏览器运行则通过()
+    {
+        var report = EnvironmentSelfCheck.Evaluate(Good with { BrowsersAtApply = [] });
+        Assert.Equal("通过", report.Items[9].Result);
+        Assert.Equal("套用环境时 Chrome / Edge 未运行", report.Items[9].Detail);
+        Assert.Equal("10 项通过", report.Summary);
+    }
+
+    [Fact]
+    public void 套用时浏览器仍在运行则提示重连()
+    {
+        var report = EnvironmentSelfCheck.Evaluate(Good with { BrowsersAtApply = ["Chrome"] });
+        Assert.Equal("未通过", report.Items[9].Result);
+        Assert.Contains("Chrome", report.Items[9].Detail);
+        Assert.Contains("关闭浏览器后重新连接一次即可通过", report.Items[9].Detail);
+        Assert.Equal("1 项未通过:浏览器在环境切换前已关闭", report.Summary);
+    }
+
+    [Fact]
+    public void 总开关关闭则跳过浏览器检查()
+    {
+        var report = EnvironmentSelfCheck.Evaluate(Good with { EnvironmentEnabled = false, BrowsersAtApply = ["Chrome"] });
+        Assert.Equal("跳过", report.Items[9].Result);
+        Assert.Equal("环境一致性未启用", report.Items[9].Detail);
+        Assert.Equal("5 项通过,5 项未能检查", report.Summary);
+    }
+
+    [Fact]
     public void 未取得网卡清单时无法核验()
     {
         var report = EnvironmentSelfCheck.Evaluate(Good with { Adapters = null });
         Assert.Equal("tun_subnet", report.Items[8].Id);
         Assert.Equal("无法核验", report.Items[8].Result);
         Assert.Equal("未取得本机网卡清单", report.Items[8].Detail);
-        Assert.Equal("8 项通过,1 项未能检查", report.Summary);
+        Assert.Equal("9 项通过,1 项未能检查", report.Summary);
     }
 
     [Fact]
@@ -92,7 +130,7 @@ public sealed class EnvironmentSelfCheckTests
         var report = EnvironmentSelfCheck.Evaluate(AuthInput());
         Assert.Equal("通过", report.Items[6].Result);
         Assert.Equal("符合目标要求", report.Items[6].Detail);
-        Assert.Equal("9 项通过", report.Summary);
+        Assert.Equal("10 项通过", report.Summary);
     }
 
     [Fact]
@@ -121,7 +159,7 @@ public sealed class EnvironmentSelfCheckTests
         var report = EnvironmentSelfCheck.Evaluate(Good with { Routing = RoutingTests.Apps, SingboxConfig = config, Ipv6Reachable = null });
         Assert.Equal("通过", report.Items[6].Result); Assert.StartsWith("仅指定程序模式:", report.Items[6].Detail);
         Assert.Equal("跳过", report.Items[7].Result);
-        Assert.Equal("8 项通过,1 项未能检查", report.Summary);
+        Assert.Equal("9 项通过,1 项未能检查", report.Summary);
         var original = EnvironmentSelfCheck.Evaluate(Good with { Routing = RoutingTests.Apps });
         Assert.Equal("未通过", original.Items[6].Result); Assert.Contains("指定程序→proxy", original.Items[6].Detail);
         var bad = JsonSerializer.Deserialize<JsonElement>(config.GetRawText().Replace("\"detour\":\"proxy\"", "\"detour\":\"direct\""));
@@ -139,7 +177,7 @@ public sealed class EnvironmentSelfCheckTests
     private static SelfCheckInput Good => new(new(IPAddress.Parse("192.0.2.5"), "AU"), "192.0.2.5", "AU",
         true, true, EnvironmentSettingsStore.Default.Target, GoodInspection, false,
         JsonSerializer.Deserialize<JsonElement>(GoodConfig), DateTimeOffset.Parse("2026-10-22T00:00:00Z"))
-        { Adapters = [new AdapterInfo(KillSwitchPlanner.TunAlias, "Wintun Userspace Tunnel", [new("172.19.0.1", 30)])] };
+        { BrowsersAtApply = [], Adapters = [new AdapterInfo(KillSwitchPlanner.TunAlias, "Wintun Userspace Tunnel", [new("172.19.0.1", 30)])] };
 
     [Fact]
     public void DohPolicyMismatchNamesOnlyTheValueName()
@@ -169,8 +207,8 @@ public sealed class EnvironmentSelfCheckTests
         using (var json = JsonDocument.Parse(File.ReadAllText(path)))
         {
             Assert.Equal(Good.Now, json.RootElement.GetProperty("checked_at").GetDateTimeOffset());
-            Assert.Equal("9 项通过", json.RootElement.GetProperty("summary").GetString());
-            Assert.Equal(9, json.RootElement.GetProperty("items").GetArrayLength());
+            Assert.Equal("10 项通过", json.RootElement.GetProperty("summary").GetString());
+            Assert.Equal(10, json.RootElement.GetProperty("items").GetArrayLength());
             Assert.Equal(new[] { "id", "name", "result", "detail" }, json.RootElement.GetProperty("items")[0].EnumerateObject().Select(x => x.Name));
         }
         Assert.False(File.Exists(path + ".tmp"));
@@ -187,10 +225,10 @@ public sealed class EnvironmentSelfCheckTests
     public void AllEightPassInContractOrderWithoutExportingAddress()
     {
         var report = EnvironmentSelfCheck.Evaluate(Good);
-        Assert.Equal(new[] { "exit_country", "exit_node", "time_zone", "auto_time_zone", "chrome_policy", "edge_policy", "no_direct_path", "ipv6_direct", "tun_subnet" }, report.Items.Select(x => x.Id));
+        Assert.Equal(new[] { "exit_country", "exit_node", "time_zone", "auto_time_zone", "chrome_policy", "edge_policy", "no_direct_path", "ipv6_direct", "tun_subnet", "browser_closed" }, report.Items.Select(x => x.Id));
         Assert.All(report.Items, item => Assert.Equal("通过", item.Result));
-        Assert.Equal(9, report.Passed); Assert.Equal(0, report.Failed);
-        Assert.Equal("9 项通过", report.Summary);
+        Assert.Equal(10, report.Passed); Assert.Equal(0, report.Failed);
+        Assert.Equal("10 项通过", report.Summary);
         Assert.Equal(Good.Now, report.CheckedAt);
         Assert.DoesNotContain("192.0.2.5", JsonSerializer.Serialize(report));
     }
@@ -240,7 +278,7 @@ public sealed class EnvironmentSelfCheckTests
     {
         var report = EnvironmentSelfCheck.Evaluate(Good with { EnvironmentEnabled = false, Inspection = null });
         Assert.All(report.Items.Skip(2).Take(4), item => { Assert.Equal("跳过", item.Result); Assert.Equal("环境一致性未启用", item.Detail); });
-        Assert.Equal("5 项通过,4 项未能检查", report.Summary);
+        Assert.Equal("5 项通过,5 项未能检查", report.Summary);
     }
 
     [Fact]
@@ -248,7 +286,7 @@ public sealed class EnvironmentSelfCheckTests
     {
         var report = EnvironmentSelfCheck.Evaluate(Good with { Inspection = null });
         Assert.All(report.Items.Skip(2).Take(4), item => Assert.Equal("无法核验", item.Result));
-        Assert.Equal("5 项通过,4 项未能检查", report.Summary);
+        Assert.Equal("6 项通过,4 项未能检查", report.Summary);
     }
 
     [Fact]
