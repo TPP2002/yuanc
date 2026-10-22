@@ -5,7 +5,16 @@ using WinClient.Core.Firewall;
 using WinClient.Core.State;
 using WinClient.Core.Storage;
 
+// 测试工程需要直接调用 SameSession，并用实现 IRenewableSessionSource 的假件驱动续期流程。
+[assembly: System.Runtime.CompilerServices.InternalsVisibleTo("WinClient.Tests")]
+
 namespace WinClient.Core.Client;
+
+/// <summary>
+/// 内部标记：实现此接口的会话来源与邀请码模式一样需要在连接期间续期。
+/// 仅供测试假件使用，生产代码只有 AuthServerSessionSource 续期；不改 ISessionSource。
+/// </summary>
+internal interface IRenewableSessionSource : ISessionSource { }
 
 public sealed record ClientSnapshot(ConnectionState State, string Status, string Message, bool ProtectionActive)
 {
@@ -15,6 +24,10 @@ public sealed record ClientSnapshot(ConnectionState State, string Status, string
 /// <summary>Owns the serialized user flow, effects and session lifetime; no UI dependencies.</summary>
 public sealed class ClientController : IDisposable
 {
+    // 会话续期（邀请码模式）：有效期走到八成时续期；网络类失败每五分钟重试，直到到期前一分钟为止。
+    internal const double RenewAtFraction = 0.8;
+    internal static readonly TimeSpan RenewRetryInterval = TimeSpan.FromMinutes(5);
+    internal static readonly TimeSpan RenewMinLead = TimeSpan.FromMinutes(1);
     private ISessionSource? sessionSource;
     private readonly Func<TimeSpan, CancellationToken, Task> delayAsync;
     private readonly IKillSwitch firewall;
@@ -178,11 +191,21 @@ public sealed class ClientController : IDisposable
         var next = response.Value;
         if (next.SessionExpiresAt <= DateTimeOffset.UtcNow || next.AccountExpiresAt <= DateTimeOffset.UtcNow)
         { await ExecuteAsync(machine.Handle(new(ConnectionEventKind.SessionExpired))); return; }
+        await ApplySessionAsync(next);
+    }
+
+    /// <summary>套用已通过到期校验的会话：取会话与续期共用。</summary>
+    private async Task ApplySessionAsync(SessionResponse next)
+    {
         var nextIps = NodeIps(next);
         _ = TunnelTransport.RenderConfiguration(next.SingboxConfig); // Validate before installing rules.
         var previous = session;
         session = next;
-        if (protection && previous is not null)
+        if (protection && previous is not null && machine.HasSession && SameSession(previous, next))
+        {
+            // 内容没变（只换了令牌与到期时间）：只换会话并重新安排定时器，不重启隧道。
+        }
+        else if (protection && previous is not null)
         {
             if (!NodeIps(previous).SequenceEqual(nextIps) || previous.Node.Hy2Port != next.Node.Hy2Port || previous.Node.RealityPort != next.Node.RealityPort)
                 await ExecuteAsync(machine.Handle(new(ConnectionEventKind.NodeChanged, OldIps: NodeIps(previous), NewIps: nextIps)));
@@ -191,7 +214,72 @@ public sealed class ClientController : IDisposable
         }
         else await ExecuteAsync(machine.Handle(new(ConnectionEventKind.SessionOk)));
         ScheduleExpiry(next);
+        ScheduleRenewal(next);
     }
+
+    /// <summary>
+    /// 邀请码模式在会话有效期走到八成时安排续期；自用模式会话固定远期，不续期。
+    /// 剩余不足一分钟时交给既有到期定时器。旧回调由 Schedule 的代数与 lifetime 取消自然作废。
+    /// </summary>
+    private void ScheduleRenewal(SessionResponse value)
+    {
+        if (sessionSource is not (AuthServerSessionSource or IRenewableSessionSource)) return;
+        var remaining = Expiry(value) - DateTimeOffset.UtcNow;
+        if (remaining <= RenewMinLead) return;
+        Schedule(remaining * RenewAtFraction, () => RenewAsync(value));
+    }
+
+    /// <summary>
+    /// 在串行锁内续期：内容不变只换会话；内容变了按既有刷新路径在保护下重启；
+    /// 凭据类拒绝按既有规则进入需重新登录或需人工处理；网络类失败每五分钟重试直到到期前一分钟。
+    /// </summary>
+    private async Task RenewAsync(SessionResponse value)
+    {
+        if (!ReferenceEquals(value, session) || machine.State is not (ConnectionState.Connected or ConnectionState.Reconnecting)) return;
+        var response = await sessionSource!.GetSessionAsync(lifetime.Token);
+        lifetime.Token.ThrowIfCancellationRequested();
+        if (response.Result == AuthResult.Ok && response.Value is not null)
+        {
+            var next = response.Value;
+            if (next.SessionExpiresAt <= DateTimeOffset.UtcNow || next.AccountExpiresAt <= DateTimeOffset.UtcNow)
+            { await ExecuteAsync(machine.Handle(new(ConnectionEventKind.SessionExpired))); return; }
+            if (SameSession(value, next))
+            {
+                // 只换会话：不产生状态机事件，不动隧道与防火墙，提示文字不变。
+                session = next;
+                ScheduleExpiry(next);
+                ScheduleRenewal(next);
+            }
+            else await ApplySessionAsync(next);
+            return;
+        }
+        if (response.Result is AuthResult.InvalidToken or AuthResult.Expired or AuthResult.InviteNotFound
+            or AuthResult.Disabled or AuthResult.Revoked or AuthResult.DeviceLimit)
+        { await ExecuteAsync(machine.Handle(new(ConnectionEventKind.AuthRejected, response.Result))); return; }
+        // 网络、限速、异常响应、参数错误（以及成功却没有内容的异常响应）：隧道与状态不动，稍后再试。
+        var remaining = Expiry(value) - DateTimeOffset.UtcNow;
+        if (remaining > RenewMinLead)
+        {
+            var wait = remaining - RenewMinLead;
+            Schedule(wait < RenewRetryInterval ? wait : RenewRetryInterval, () => RenewAsync(value));
+        }
+    }
+
+    /// <summary>两份会话的节点与内核配置是否完全一致；不比较令牌与到期时间。</summary>
+    internal static bool SameSession(SessionResponse a, SessionResponse b)
+    {
+        var x = a.Node;
+        var y = b.Node;
+        return x.Host == y.Host && x.RealityPort == y.RealityPort && x.Hy2Port == y.Hy2Port &&
+            x.Sni == y.Sni && x.RealityPublicKey == y.RealityPublicKey && x.ShortId == y.ShortId &&
+            x.Uuid == y.Uuid && x.Hy2Password == y.Hy2Password && x.Hy2ServerName == y.Hy2ServerName &&
+            x.Hy2ObfsPassword == y.Hy2ObfsPassword &&
+            (x.Hy2Certificate ?? []).SequenceEqual(y.Hy2Certificate ?? [], StringComparer.Ordinal) &&
+            a.SingboxConfig.GetRawText() == b.SingboxConfig.GetRawText();
+    }
+
+    private static DateTimeOffset Expiry(SessionResponse value) =>
+        value.SessionExpiresAt < value.AccountExpiresAt ? value.SessionExpiresAt : value.AccountExpiresAt;
 
     private async Task ExecuteAsync(Transition transition)
     {
@@ -249,8 +337,7 @@ public sealed class ClientController : IDisposable
 
     private void ScheduleExpiry(SessionResponse value)
     {
-        var expiry = value.SessionExpiresAt < value.AccountExpiresAt ? value.SessionExpiresAt : value.AccountExpiresAt;
-        Schedule(expiry - DateTimeOffset.UtcNow, async () =>
+        Schedule(Expiry(value) - DateTimeOffset.UtcNow, async () =>
         {
             if (ReferenceEquals(value, session)) await ExecuteAsync(machine.Handle(new(ConnectionEventKind.SessionExpired)));
         });
