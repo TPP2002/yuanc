@@ -1,0 +1,213 @@
+{
+  "schemaVersion": 1,
+  "taskId": "SEC-IPC-READONLY-OPS-CALLER-CHECK-1022",
+  "slug": "yc-ipc-readonly-ops-caller-check-1022",
+  "title": "管道只读指令纳入调用者核验:check_update / read_audit / read_selfcheck 只给安装目录内的本产品程序,安装目录之外的程序只剩 status / subscribe(自检含真实出口地址、审计含本机其他程序规则名与路径、检查更新会触发对外请求)",
+  "goal": "以派单时 origin/main 头为基点。把三条「只读」管道指令 check_update / read_audit / read_selfcheck 纳入既有的调用者核验:只有程序位于安装目录之下的调用者(callerTrusted)才能用,安装目录之外的程序只剩 status 与 subscribe。做完后:\n\n① winclient/WinClient.Core/Ipc/ControlServer.cs(只改三处):\n  - 集合 `StateChangingOps` 改名 `TrustedOnlyOps`,内容 = 原七条(connect / disconnect / redeem / import_pairing / clear_pairing / set_environment / set_routing)+ \"check_update\"、\"read_audit\"、\"read_selfcheck\",共十条;仍是 `private static readonly HashSet<string>`,写在同一行。\n  - 它上方那行注释改写为:会改变连接状态的指令,以及 check_update(会触发对外网络检查)、read_audit(含本机其他程序的规则名与完整路径)、read_selfcheck(含产品核验到的真实出口地址),只允许程序位于安装目录之下的调用者执行;status 与 subscribe 对任何本机程序开放。\n  - ExecuteAsync 第一行判断改成 `if (!callerTrusted && TrustedOnlyOps.Contains(request.Op)) return new(request.Id, false, UntrustedCallerError);`,位置不变(在 check_update 分支之前):被拒时不进指令信号量、不调 updates.CheckNowAsync、不调 facade.ReadAudit / ReadSelfCheck、应答不带 snapshot / audit / self_check。\n  - `UntrustedCallerError` 文案(\"只有本产品的界面程序可以执行此操作\")、status 不排队、subscribe 在 ServeAsync 里直接处理、空闲计时、指令串行顺序、超长应答判定、异常兜底文案全部不变。\n\n② winclient/WinClient.Tests/IpcTests.cs(既有测试只改下面两条,其余测试、FakeFacade、DuplexStream 一字不改;新增两条):\n  - `ReadSelfCheckAllowsUntrustedCallersAndPreservesContent(bool trusted)` 改名 `ReadSelfCheckRequiresTrustedCallerAndPreservesContent`:trusted 为 true 时断言不变;trusted 为 false 时断言 `Ok == false`、`Error == ControlServer.UntrustedCallerError`、`SelfCheck == null`、`Snapshot == null`,facade.Actions 为空、desired.Read() 为 null。\n  - `UntrustedCallerCannotChangeStateButCanRead` 改名 `UntrustedCallerCanOnlyQueryStatusAndSubscribe`:被拒清单加三条 (\"check_update\", null, null)、(\"read_audit\", null, null)、(\"read_selfcheck\", null, null),每条同样断言 Ok 为 false、Error 为 UntrustedCallerError、Snapshot 为 null,并加断言 Audit 与 SelfCheck 为 null;只读可用清单缩为 status、subscribe(Ok 为 true 且 Snapshot 非空);删掉 read_audit 成功那两行;facade.Actions 仍为空、desired.json 仍不存在。\n  - 新增 `[Fact] TrustedCallerStillReadsAuditSelfCheckAndChecksUpdate`:在测试类里加一个私有 `FakeUpdates : IUpdateCoordinator`(Status 返回 `new UpdateStatus()`,Changed 事件声明但不触发,CheckNowAsync 把计数 +1 并返回 `Task.FromResult(new UpdateStatus(\"checking\"))`),用 `new ControlServer(facade, desired, updates)` 建服务,callerTrusted 省略(默认 true):read_audit 返回 Ok 且 Audit == \"完整审计\";read_selfcheck 返回 Ok 且 SelfCheck == facade.ReadSelfCheck();check_update 返回 Ok、Snapshot 非空,随后 FakeUpdates 计数 == 1;facade.Actions 为空。\n  - 新增 `[Fact] UntrustedCheckUpdateDoesNotTriggerNetworkCheck`:同样的 FakeUpdates,`callerTrusted: false`:check_update 被拒(Ok false、Error 为 UntrustedCallerError、Snapshot null)且计数仍为 0;同一连接随后发 status 成功、Snapshot 非空;facade.Actions 为空。\n  - 两条新测试与改动的两条都先在当前代码下跑红(不可信调用者的三条只读指令现在会成功、CheckNowAsync 会被调)。IpcTests.cs 的 `[Fact]` 与 `[Theory]` 总数比基点多 2。\n\n③ docs/winclient/服务化与自启说明.md(五处,其余不动):\n  - 「本机管道协议」下「调用者核验」那条:受限指令清单补上 check_update / read_audit / read_selfcheck;「其他程序只能用 status / subscribe / check_update / read_audit / read_selfcheck」改成「其他程序只能用 status / subscribe」(保留这个确切写法),并补一句为什么:审计含本机其他程序的规则名与完整路径,自检含产品核验到的真实出口地址,检查更新会触发对外网络请求。\n  - 「两条只读指令均进入指令信号量,不受调用者核验限制」改成「两条只读指令均进入指令信号量,并与改状态指令一样受调用者核验限制,安装目录之外的程序被拒」。\n  - 「`set_routing` 与 `set_environment` 一样属于 StateChangingOps」改成「属于 TrustedOnlyOps(与 check_update / read_audit / read_selfcheck 一样只给安装目录内的程序)」;全文不再出现 StateChangingOps。\n  - 「调用者核验边界」第 1 条:「安装目录之外的程序连上管道只能查状态、订阅、检查更新、读审计和环境自检报告」改成「安装目录之外的程序连上管道只能查状态与订阅;检查更新、读审计、读自检报告同样只给本产品程序」。\n  - 「真机待验证」里「调用者核验」那条补:同一连接发 check_update / read_audit / read_selfcheck 应被拒(同一错误文案),status / subscribe 成功;正常界面的检查更新、导出审计与自检不受影响。\n\n④ 全程中文注释与文案;不新增 NuGet 包;不动 WinClient.App(界面本来就在安装目录内,三条指令照常可用;更新助手只发 status,卸载只发 disconnect,均不受影响);不改 CallerIdentity / ServerIdentity 的路径判定与宿主取进程路径的逻辑;不改协议字段。",
+  "background": "项目:外包,Windows 客户端 .NET 9(Core 类库 + WPF App + xunit Tests),后台服务以 SYSTEM 运行、经命名管道 \\\\.\\pipe\\YuanC-Control 接受本机指令,管道 ACL 给 BUILTIN\\Users 读写。\nControlServer.cs 现状(157 行):`UntrustedCallerError = \"只有本产品的界面程序可以执行此操作\"`;`StateChangingOps` 为 HashSet<string>,含 connect / disconnect / redeem / import_pairing / clear_pairing / set_environment / set_routing;ServeAsync(stream, token, bool callerTrusted = true) 由宿主按调用者程序路径判定 callerTrusted,subscribe 在 ServeAsync 内直接处理,其余交 ExecuteAsync;ExecuteAsync 第一行 `if (!callerTrusted && StateChangingOps.Contains(request.Op)) return new(request.Id, false, UntrustedCallerError);`,随后 check_update(不排队,调 updates?.CheckNowAsync() 后立即回快照)、status(不排队回快照),再进信号量 switch:connect/disconnect(写 desired)/redeem/import_pairing/clear_pairing/set_environment/set_routing/read_audit(facade.ReadAudit(),超长回「审计记录过大,请联系管理员。」)/read_selfcheck(facade.ReadSelfCheck(),超长回「自检报告过大,请联系管理员。」)/default「不支持的指令」。\n现象(会审·渗透测试 1、2):read_selfcheck、read_audit、check_update 不核调用者,同机任意低权限进程连管道发 {\"op\":\"read_selfcheck\"} 即拿到自检全文(含产品刻意核验的真实出口 IP)与防火墙审计(本机其他程序放行规则名与完整路径);check_update 可被反复触发对外网络检查。\n谁在用这三条指令:只有 WinClient.App/MainViewModel.cs(CheckUpdateCommand 发 check_update;导出审计依次发 read_audit、read_selfcheck),界面装在安装目录内,callerTrusted 为 true;Hosting/UpdateWindowsHost.cs 只发 status;Hosting/InstallerRunner.cs 卸载时发 disconnect(已受限、已允许)。\nIUpdateCoordinator(WinClient.Core/Update/UpdateCoordinator.cs):`UpdateStatus Status { get; }`、`event Action<UpdateStatus>? Changed;`、`Task<UpdateStatus> CheckNowAsync();`;`UpdateStatus` 是 record(string Stage = \"idle\", string? Version = null, string Message = \"\", DateTimeOffset? CheckedAt = null)。ControlServer 构造:(IClientFacade facade, DesiredStateStore desired, IUpdateCoordinator? updates = null, string? serviceVersion = null, TimeSpan? idleTimeout = null)。\nIpcTests.cs 现状(587 行,xunit):测试用 `new TempDirectory()`、`new DesiredStateStore(temp.Path)`、`new FakeFacade()`(Actions 列表记录门面调用;ReadAudit 返回 \"完整审计\";ReadSelfCheck 返回 \"{\\\"summary\\\":\\\"8 项通过\\\",\\\"items\\\":[]}\")、`DuplexStream.Pair()` 得 (peer, host)、`server.ServeAsync(host, stop.Token, callerTrusted: …)`、`new ControlClient(peer)`、`client.SendAsync(op, code: …, pairingJson: …, cancellationToken: …)` 返回 ControlResponse(Id, Ok, Error, Snapshot, Audit, SelfCheck),连接用完 `await serving.WaitAsync(stop.Token)`。两条要改的既有测试:`ReadSelfCheckAllowsUntrustedCallersAndPreservesContent(bool trusted)`(第 69~88 行,目前两种 trusted 都断言 Ok 为 true)、`UntrustedCallerCannotChangeStateButCanRead`(第 364~398 行,被拒清单五条,随后断言 status / subscribe / check_update 成功、read_audit 返回 \"完整审计\")。其他涉及调用者的测试(RoutingCommandRequiresModeAndTrustedCaller、EnvironmentCommandRequiresEnabledAndTrustedCaller、DefaultCallerTrustKeepsExistingBehavior、CallerIdentityTrustsOnlyImagesUnderAppRoot)不受影响、不许改。\n文档 docs/winclient/服务化与自启说明.md 相关句子:第 48 行「调用者核验:…只有位于 %ProgramFiles%\\YuanC\\app 之下的程序…才能执行 connect / disconnect / redeem / import_pairing / clear_pairing / set_environment,其他程序只能用 status / subscribe / check_update / read_audit / read_selfcheck。被拒时返回 ok=false、error=「只有本产品的界面程序可以执行此操作」…」;第 56 行「…两条只读指令均进入指令信号量,不受调用者核验限制;…」;第 66 行「`set_routing` 与 `set_environment` 一样属于 StateChangingOps,不可信调用者被拒,不调用门面。」;第 82 行「…安装目录之外的程序连上管道只能查状态、订阅、检查更新、读审计和环境自检报告。」;第 129 行真机待验证「调用者核验:用安装目录之外的任意程序…发 connect、disconnect 应被拒…同一连接发 status 应成功。…」。\nCI 跑 `dotnet test winclient --nologo`;本单验收同样跑整个 sln 的构建与测试(Release)。看板卡 SEC-IPC-READONLY-OPS-CALLER-CHECK-1022,来源会审·渗透测试 1、2。",
+  "nonGoals": [
+    "不改 status / subscribe 的开放性(更新助手探活与界面刷新靠它们)",
+    "不改 CallerIdentity / ServerIdentity 的路径规则,不改宿主取调用者进程路径与写 service.log 的逻辑",
+    "不加签名或共享密钥鉴权;不改协议字段、错误文案与快照结构",
+    "不动 WinClient.App;不改 IpcTests.cs 里除两条点名测试以外的任何既有测试与辅助类",
+    "不在真机实测;真机项写进文档待验证清单"
+  ],
+  "allowedPaths": [
+    "winclient/WinClient.Core/Ipc/ControlServer.cs",
+    "winclient/WinClient.Tests/IpcTests.cs",
+    "docs/winclient/服务化与自启说明.md"
+  ],
+  "forbiddenPaths": [
+    "docs/开工须知.md",
+    "docs/口径速查表.md",
+    "docs/design/**",
+    "docs/交接/**",
+    "docs/plans/**",
+    "docs/acceptance/**",
+    "docs/node/**",
+    "docs/authserver/**",
+    "docs/winclient/自动更新说明.md",
+    "docs/winclient/打包与发布说明.md",
+    "docs/winclient/分应用代理说明.md",
+    "docs/winclient/架构说明.md",
+    "docs/winclient/环境一致性说明.md",
+    "docs/winclient/界面说明.md",
+    ".github/**",
+    ".codex/**",
+    ".gitignore",
+    "pyproject.toml",
+    "scripts/**",
+    "node/**",
+    "authserver/**",
+    "winclient/third_party/**",
+    "winclient/*.sln",
+    "winclient/Directory.Build.props",
+    "winclient/NuGet.Config",
+    "winclient/WinClient.Core/WinClient.Core.csproj",
+    "winclient/WinClient.Tests/WinClient.Tests.csproj",
+    "winclient/WinClient.App/**",
+    "winclient/WinClient.UiTests/**",
+    "winclient/WinClient.Core/Auth/**",
+    "winclient/WinClient.Core/Client/**",
+    "winclient/WinClient.Core/Environment/**",
+    "winclient/WinClient.Core/Hosting/**",
+    "winclient/WinClient.Core/Kernel/**",
+    "winclient/WinClient.Core/Logging/**",
+    "winclient/WinClient.Core/Pairing/**",
+    "winclient/WinClient.Core/Process/**",
+    "winclient/WinClient.Core/State/**",
+    "winclient/WinClient.Core/Storage/**",
+    "winclient/WinClient.Core/Update/**",
+    "winclient/WinClient.Tests/AuthTests.cs",
+    "winclient/WinClient.Tests/ControllerTests.cs",
+    "winclient/WinClient.Tests/DataDirectorySecurityTests.cs",
+    "winclient/WinClient.Tests/EnvironmentApplierTests.cs",
+    "winclient/WinClient.Tests/EnvironmentPlannerTests.cs",
+    "winclient/WinClient.Tests/EnvironmentPolicyTests.cs",
+    "winclient/WinClient.Tests/EnvironmentSelfCheckTests.cs",
+    "winclient/WinClient.Tests/FirewallTests.cs",
+    "winclient/WinClient.Tests/HostingTests.cs",
+    "winclient/WinClient.Tests/KernelInstallerTests.cs",
+    "winclient/WinClient.Tests/KillSwitchAppsModeTests.cs",
+    "winclient/WinClient.Tests/KillSwitchAuthRuleTests.cs",
+    "winclient/WinClient.Tests/KillSwitchHardenTests.cs",
+    "winclient/WinClient.Tests/KillSwitchNarrowRuleTests.cs",
+    "winclient/WinClient.Tests/KillSwitchProfileTests.cs",
+    "winclient/WinClient.Tests/KillSwitchRecoveryTests.cs",
+    "winclient/WinClient.Tests/PairingCertificateTests.cs",
+    "winclient/WinClient.Tests/PairingTests.cs",
+    "winclient/WinClient.Tests/ProcessStorageTests.cs",
+    "winclient/WinClient.Tests/RoutingTests.cs",
+    "winclient/WinClient.Tests/StateTests.cs",
+    "winclient/WinClient.Tests/TestData.cs",
+    "winclient/WinClient.Tests/UpdateApplierTests.cs",
+    "winclient/WinClient.Tests/UpdateCoordinatorTests.cs",
+    "winclient/WinClient.Tests/UpdateHttpTests.cs",
+    "winclient/WinClient.Tests/UpdateIpcTests.cs",
+    "winclient/WinClient.Tests/UpdateTests.cs",
+    "winclient/WinClient.Tests/Fixtures/**",
+    "winclient/WinClient.Core/Ipc/CallerIdentity.cs",
+    "winclient/WinClient.Core/Ipc/ConnectionBudget.cs",
+    "winclient/WinClient.Core/Ipc/ControlClient.cs",
+    "winclient/WinClient.Core/Ipc/ControlProtocol.cs",
+    "winclient/WinClient.Core/Ipc/ServerIdentity.cs",
+    "winclient/WinClient.Core/Firewall/**",
+    "winclient/WinClient.Tests/KillSwitchPatrolTests.cs",
+    "docs/winclient/断网保护加固说明.md"
+  ],
+  "expectArtifacts": [
+    "winclient/WinClient.Core/Ipc/ControlServer.cs",
+    "winclient/WinClient.Tests/IpcTests.cs",
+    "docs/winclient/服务化与自启说明.md"
+  ],
+  "acceptance": [
+    {
+      "id": "BUILD",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "build",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1200
+    },
+    {
+      "id": "TEST",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "test",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--no-build",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1200
+    },
+    {
+      "id": "SHAPE-SERVER",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;cs=pathlib.Path('winclient/WinClient.Core/Ipc/ControlServer.cs').read_text(encoding='utf-8');ln=[l for l in cs.splitlines() if 'HashSet<string> TrustedOnlyOps' in l];ops=[\"connect\", \"disconnect\", \"redeem\", \"import_pairing\", \"clear_pairing\", \"set_environment\", \"set_routing\", \"check_update\", \"read_audit\", \"read_selfcheck\"];chk='if (!callerTrusted && TrustedOnlyOps.Contains(request.Op)) return new(request.Id, false, UntrustedCallerError);';bad=[k for k,ok in (('set-line',len(ln)==1),('ops',bool(ln) and all(('\"'+o+'\"') in ln[0] for o in ops)),('old-name','StateChangingOps' not in cs),('check',chk in cs),('order',chk in cs and cs.index(chk)<cs.index('request.Op == \"check_update\"')),('error-text','UntrustedCallerError = \"只有本产品的界面程序可以执行此操作\"' in cs)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "TESTS-IPC",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess as sp,pathlib,sys;mb=sp.check_output(['git','merge-base','origin/main','HEAD'],text=True).strip();old=sp.check_output(['git','show',mb+':winclient/WinClient.Tests/IpcTests.cs']).decode('utf-8');t=pathlib.Path('winclient/WinClient.Tests/IpcTests.cs').read_text(encoding='utf-8');c=lambda s:s.count('[Fact]')+s.count('[Theory]');bad=[k for k,ok in (('renamed-1','ReadSelfCheckRequiresTrustedCallerAndPreservesContent' in t),('renamed-2','UntrustedCallerCanOnlyQueryStatusAndSubscribe' in t),('new-1','TrustedCallerStillReadsAuditSelfCheckAndChecksUpdate' in t),('new-2','UntrustedCheckUpdateDoesNotTriggerNetworkCheck' in t),('old-1','ReadSelfCheckAllowsUntrustedCallersAndPreservesContent' not in t),('old-2','UntrustedCallerCannotChangeStateButCanRead' not in t),('fake-updates','IUpdateCoordinator' in t),('count',c(t)-c(old)==2)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "SCOPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess as sp,sys;g=lambda *a:sp.check_output(['git','-c','core.quotepath=false']+list(a)).decode('utf-8').split(chr(10));mb=g('merge-base','origin/main','HEAD')[0].strip();ch={p.strip() for p in g('diff','--name-only',mb)+g('ls-files','--others','--exclude-standard') if p.strip()};ok=[\"winclient/WinClient.Core/Ipc/ControlServer.cs\", \"winclient/WinClient.Tests/IpcTests.cs\", \"docs/winclient/服务化与自启说明.md\"];bad=sorted(ch-set(ok));print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;d=pathlib.Path('docs/winclient/服务化与自启说明.md').read_text(encoding='utf-8');i=d.find('真机待验证');tail=d[i:] if i>=0 else '';bad=[k for k,ok in (('trusted-only','TrustedOnlyOps' in d),('old-name','StateChangingOps' not in d),('only-status','只能用 status / subscribe' in d),('why','真实出口' in d and '对外网络' in d),('selfcheck-x4',d.count('read_selfcheck')>=4),('verify','read_selfcheck' in tail and '应被拒' in tail)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "NOWINDOW",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;norm=lambda p:str(p).replace(chr(92),'/');files=[p for root in ('winclient/WinClient.Core','winclient/WinClient.App') for p in pathlib.Path(root).rglob('*.cs') if '/obj/' not in norm(p) and '/bin/' not in norm(p)];bad=[norm(p) for p in files if 'ProcessStartInfo' in p.read_text(encoding='utf-8') and p.parent.name!='Process' and 'CreateNoWindow = true' not in p.read_text(encoding='utf-8')];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "NOBIN",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess,sys;out=subprocess.run(['git','ls-files','winclient','build'],capture_output=True,text=True).stdout.split();bad=[f for f in out if f.endswith(('.exe','.dll','.zip','.pdb'))];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "model": null,
+  "timeoutSec": 5400,
+  "repoRoot": "E:/yuanc",
+  "engine": "codex",
+  "reasoningEffort": "medium",
+  "steps": [
+    "读 ControlServer.cs 全文、IpcTests.cs 的两条点名测试与 FakeFacade / DuplexStream 辅助、IUpdateCoordinator 接口;先改两条既有测试、加两条新测试,跑红(当前代码下不可信调用者的三条只读指令会成功、CheckNowAsync 会被调)。",
+    "改 ControlServer.cs 三处(集合改名并加三条指令、注释、判断行);BUILD / TEST / SHAPE-SERVER / TESTS-IPC / SCOPE / NOWINDOW / NOBIN 全绿。",
+    "改文档五处;DOCS 绿;交活说明写真机待验证项。"
+  ]
+}
