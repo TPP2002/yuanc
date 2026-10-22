@@ -28,6 +28,7 @@ public sealed class ClientRuntime : IClientFacade, IDisposable
     public event Action<ClientSnapshot>? Changed { add => Controller.Changed += value; remove => Controller.Changed -= value; }
     public Task ConnectAsync() => Controller.ConnectAsync();
     public Task DisconnectAsync() => Controller.DisconnectAsync();
+    public Task SetRoutingAsync(string mode, IReadOnlyList<string> apps) => Controller.SetRoutingAsync(mode, apps);
     public Task SetEnvironmentEnabledAsync(bool enabled) => Controller.SetEnvironmentEnabledAsync(enabled);
     public Task RedeemAsync(string code) => Controller.RedeemAsync(code);
     public string? ReadAudit() => File.Exists(firewall.AuditPath) ? File.ReadAllText(firewall.AuditPath) : null;
@@ -72,7 +73,8 @@ public sealed class ClientRuntime : IClientFacade, IDisposable
                 authEndpoint: settings?.AuthEndpoint, exitProbe: new HttpExitProbe(),
                 environment: new EnvironmentApplier(Path.Combine(ClientSettings.DataDirectory, "run")),
                 environmentSettings: new EnvironmentSettingsStore(), ipv6Probe: new SocketIpv6Probe(),
-                reportSink: report => WriteSelfCheck(Path.Combine(ClientSettings.DataDirectory, "run", "selfcheck.json"), report));
+                reportSink: report => WriteSelfCheck(Path.Combine(ClientSettings.DataDirectory, "run", "selfcheck.json"), report),
+                routingSettings: new RoutingSettingsStore(), serviceProcessPath: Environment.ProcessPath);
             return new(controller, firewall, http, pairingStore, log, storeRoot, scope);
         }
         catch { http?.Dispose(); throw; }

@@ -14,6 +14,47 @@ namespace WinClient.Tests;
 public sealed class IpcTests
 {
     [Fact]
+    public void RoutingFieldsRoundTripAndOldSnapshotsDefaultToGlobal()
+    {
+        var value = new ClientSnapshot(ConnectionState.Disconnected, "", "", false)
+            { RoutingMode = "apps", RoutingApps = [RoutingTests.Chrome] };
+        var json = ControlProtocol.Encode(new ControlResponse(1, true, Snapshot: value));
+        Assert.Contains("routing_mode", json); Assert.Contains("routing_apps", json);
+        ClientSnapshot restored = ControlProtocol.DecodeResponse(json).Snapshot!;
+        Assert.Equal(value.RoutingMode, restored.RoutingMode); Assert.Equal(value.RoutingApps, restored.RoutingApps);
+        var old = ControlProtocol.DecodeResponse("{\"id\":1,\"ok\":true,\"snapshot\":{\"state\":\"Disconnected\",\"status\":\"\",\"message\":\"\",\"protection_active\":false}}").Snapshot!;
+        Assert.Equal("global", old.RoutingMode); Assert.Empty(old.RoutingApps);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task RoutingCommandRequiresModeAndTrustedCaller(bool trusted)
+    {
+        using var temp = new TempDirectory(); using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var facade = new FakeFacade(); var desired = new DesiredStateStore(temp.Path);
+        var server = new ControlServer(facade, desired); var (peer, host) = DuplexStream.Pair();
+        var serving = server.ServeAsync(host, stop.Token, callerTrusted: trusted);
+        using (var client = new ControlClient(peer))
+        {
+            var missing = await client.SendAsync("set_routing", cancellationToken: stop.Token);
+            Assert.False(missing.Ok); Assert.Equal(trusted ? "指令缺少 mode" : ControlServer.UntrustedCallerError, missing.Error);
+            Assert.Empty(facade.Actions);
+            var response = await client.SendAsync("set_routing", mode: "apps", apps: [RoutingTests.Chrome], cancellationToken: stop.Token);
+            Assert.Equal(trusted, response.Ok);
+            if (trusted)
+            {
+                Assert.Equal(new[] { "routing:apps" }, facade.Actions);
+                Assert.Equal(new[] { RoutingTests.Chrome }, response.Snapshot!.RoutingApps);
+                response = await client.SendAsync("set_routing", mode: "global", cancellationToken: stop.Token);
+                Assert.True(response.Ok); Assert.Empty(response.Snapshot!.RoutingApps);
+            }
+            else { Assert.Equal(ControlServer.UntrustedCallerError, response.Error); Assert.Empty(facade.Actions); }
+            Assert.Null(desired.Read());
+        }
+        await serving.WaitAsync(stop.Token);
+    }
+    [Fact]
     public void SelfCheckSnapshotRoundTripsAndLegacyDefaultsToNotChecked()
     {
         var snapshot = new ClientSnapshot(ConnectionState.Connected, "已连接", "", true) { SelfCheckStatus = "8 项通过" };
@@ -475,6 +516,11 @@ public sealed class IpcTests
 
     private sealed class FakeFacade : IClientFacade
     {
+        public Task SetRoutingAsync(string mode, IReadOnlyList<string> apps)
+        {
+            Actions.Add("routing:" + mode); Snapshot = Snapshot with { RoutingMode = mode, RoutingApps = apps.ToArray() };
+            Changed?.Invoke(Snapshot); return Task.CompletedTask;
+        }
         public Task SetEnvironmentEnabledAsync(bool enabled)
         {
             Actions.Add("environment:" + enabled);

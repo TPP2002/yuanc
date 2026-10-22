@@ -1,7 +1,7 @@
 <Window x:Class="WinClient.App.MainWindow"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="澳洲出口客户端" Width="480" Height="750" MinWidth="430" MinHeight="730"
+        Title="澳洲出口客户端" Width="480" Height="900" MinWidth="430" MinHeight="880"
         WindowStartupLocation="CenterScreen" Background="#F5F7FA">
   <Grid Margin="28">
     <Grid.RowDefinitions>
@@ -27,12 +27,26 @@
       <TextBlock Text="{Binding SelfCheckLine}" TextWrapping="Wrap" HorizontalAlignment="Center" Margin="0,8,0,0" Foreground="#536174" AutomationProperties.LiveSetting="Polite"/>
       <CheckBox Content="连接时切换到澳洲时区与浏览器语言(环境一致性)" IsChecked="{Binding EnvironmentEnabled, Mode=TwoWay}" IsEnabled="{Binding CanUseConnection}" Margin="0,12,0,0" HorizontalAlignment="Center"/>
       <TextBlock Text="{Binding EnvironmentLine}" TextWrapping="Wrap" HorizontalAlignment="Center" Margin="0,6,0,0" Foreground="#536174"/>
+      <StackPanel IsEnabled="{Binding CanChangeRouting}" Margin="0,10,0,0">
+        <TextBlock Text="代理范围" FontWeight="SemiBold"/>
+        <RadioButton Content="全部流量(推荐,断网保护最强)" GroupName="Routing" IsChecked="{Binding RoutingIsGlobal, Mode=TwoWay}" Margin="0,5,0,0"/>
+        <RadioButton GroupName="Routing" IsChecked="{Binding RoutingIsApps, Mode=TwoWay}" Margin="0,5,0,0">
+          <TextBlock Text="仅以下程序走澳洲出口,其他程序直连(不受断网保护)" TextWrapping="Wrap"/>
+        </RadioButton>
+        <ListBox ItemsSource="{Binding RoutingApps}" SelectedItem="{Binding SelectedRoutingApp, Mode=TwoWay}" Height="72" Margin="0,5,0,0" AutomationProperties.Name="指定程序完整路径"/>
+        <StackPanel Orientation="Horizontal" Margin="0,5,0,0">
+          <Button Content="添加程序…" Command="{Binding AddRoutingAppCommand}" Padding="10,4"/>
+          <Button Content="移除所选" Command="{Binding RemoveRoutingAppCommand}" Padding="10,4" Margin="8,0,0,0"/>
+        </StackPanel>
+        <TextBlock Text="程序按完整路径匹配;如 Discord 升级后路径改变,请重新添加。" TextWrapping="Wrap" FontSize="11" Foreground="#6B4B20" Margin="0,4,0,0"/>
+      </StackPanel>
+      <TextBlock Text="{Binding RoutingLine}" TextWrapping="Wrap" FontSize="11" Margin="0,4,0,0"/>
       <TextBlock Text="{Binding ServiceVersion}" HorizontalAlignment="Center" Margin="0,12,0,0"/>
       <TextBlock Text="{Binding UpdateMessage}" TextWrapping="Wrap" Margin="0,8,0,0" AutomationProperties.LiveSetting="Polite"/>
       <Button Content="检查更新" Command="{Binding CheckUpdateCommand}" HorizontalAlignment="Center" Padding="16,6" Margin="0,8,0,0"/>
     </StackPanel>
     <TextBlock Grid.Row="4" Text="{Binding Message}" TextWrapping="Wrap" Margin="0,18,0,0" AutomationProperties.LiveSetting="Polite"/>
-    <TextBlock Grid.Row="5" Text="部分程序自带防火墙放行规则，断线时可能仍可直连。" TextWrapping="Wrap" Foreground="#6B4B20" VerticalAlignment="Bottom" Margin="0,16"/>
+    <TextBlock Grid.Row="5" Text="全部流量模式下,部分程序自带防火墙放行规则,断线时可能仍可直连;仅指定程序模式下其他程序本来就直连。" TextWrapping="Wrap" Foreground="#6B4B20" VerticalAlignment="Bottom" Margin="0,16"/>
     <StackPanel Grid.Row="6">
       <Button Content="清除配对文件" Command="{Binding ClearPairingCommand}" HorizontalAlignment="Right" Padding="8,4" Margin="0,0,0,8"
               ToolTip="删除本机保存的配对资料；请先断开连接。"/>

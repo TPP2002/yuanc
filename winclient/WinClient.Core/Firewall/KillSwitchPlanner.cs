@@ -18,11 +18,31 @@ public sealed record RestoreProfileDefault : FirewallAction;
 public sealed record RecoverFallback : FirewallAction;
 public sealed record VerifyProfiles : FirewallAction;
 public sealed record Audit : FirewallAction;
-public sealed record Patrol(string[] ExpectedRules) : FirewallAction;
+public sealed record Patrol(string[] ExpectedRules, bool EnforceDefaultBlock = true) : FirewallAction;
+public sealed record RecordState(string Mode) : FirewallAction;
+public sealed record EnableProfiles : FirewallAction;
+public sealed record AddBlockRule(string Name, string Program, string[] LocalAddress) : FirewallAction;
+public sealed record VerifyRules(string[] Names) : FirewallAction;
 
 public static class KillSwitchPlanner
 {
     public const string Prefix = "YuanC-KS-";
+    public const string AppPrefix = Prefix + "App-";
+    public static readonly string[] NonTunLocalAddresses = ["0.0.0.0-126.255.255.255", "128.0.0.0-172.19.0.0",
+        "172.19.0.2-255.255.255.255", "::2-fdfe:dcba:9876::0", "fdfe:dcba:9876::2-ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"];
+    public static string[] AppRuleNames(int count) => Enumerable.Range(1, count).Select(i => AppPrefix + i).ToArray();
+
+    public static IReadOnlyList<FirewallAction> PlanApps(IReadOnlyList<string> programs)
+    {
+        if (programs.Count is < 1 or > 32 || programs.Any(path => string.IsNullOrWhiteSpace(path) || !Path.IsPathFullyQualified(path)))
+            throw new ArgumentException("仅指定程序模式必须提供 1 到 32 个程序的绝对路径。");
+        var names = AppRuleNames(programs.Count);
+        var actions = new List<FirewallAction> { new RecordState("apps"), new EnableProfiles() };
+        for (var i = 0; i < programs.Count; i++) actions.Add(new AddBlockRule(names[i], programs[i], NonTunLocalAddresses));
+        actions.Add(new VerifyRules(names));
+        actions.Add(new Audit());
+        return actions.AsReadOnly();
+    }
     public const string NodePrefix = Prefix + "Node-";
     public const string TunAlias = "YuanC-TUN";
     public const string TunAddress = "172.19.0.1";
@@ -84,6 +104,11 @@ public static class KillSwitchPlanner
 
     public static string ToPowerShellScript(IReadOnlyList<FirewallAction> actions, string statePath, string auditPath)
     {
+        var record = actions.OfType<RecordState>().SingleOrDefault();
+        // 仅指定程序模式的审计仍查询允许规则，使用只读过滤；不生成任何 Allow 操作参数。
+        var allowQuery = record is null
+            ? "Get-NetFirewallRule -PolicyStore ActiveStore -Enabled True -Direction Outbound -Action Allow | Where-Object { "
+            : "Get-NetFirewallRule -PolicyStore ActiveStore -Enabled True -Direction Outbound | Where-Object { [string]$_.Action -eq 'Allow' -and ";
         var script = new StringBuilder("$ErrorActionPreference = 'Stop'\n");
         script.AppendLine("$statePath = " + Quote(Path.GetFullPath(statePath)));
         script.AppendLine("$auditPath = " + Quote(Path.GetFullPath(auditPath)));
@@ -93,21 +118,44 @@ public static class KillSwitchPlanner
             script.AppendLine("function Read-UnmanagedRules {");
             // Include disabled local rules too: ActiveStore may still contain a rule with the same name.
             script.AppendLine("  $persistentNames = @(Get-NetFirewallRule -PolicyStore PersistentStore | Select-Object -ExpandProperty Name)");
-            script.AppendLine("  Get-NetFirewallRule -PolicyStore ActiveStore -Enabled True -Direction Outbound -Action Allow | Where-Object { $_.Name -notlike 'YuanC-KS-*' -and $persistentNames -notcontains $_.Name } | ForEach-Object { $r = $_; $app = $r | Get-NetFirewallApplicationFilter; [pscustomobject]@{ Name = $r.Name; Program = $app.Program } }");
+            script.AppendLine("  " + allowQuery + "$_.Name -notlike 'YuanC-KS-*' -and $persistentNames -notcontains $_.Name } | ForEach-Object { $r = $_; $app = $r | Get-NetFirewallApplicationFilter; [pscustomobject]@{ Name = $r.Name; Program = $app.Program } }");
             script.AppendLine("}");
         }
-        if (actions.OfType<SetProfileDefault>().Any())
+        if (actions.OfType<SetProfileDefault>().Any() || record is not null)
         {
             script.AppendLine("[IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($statePath)) | Out-Null");
             script.AppendLine("if (Test-Path -LiteralPath $statePath) { $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json } else {");
             script.AppendLine("  $profiles = @(Get-NetFirewallProfile | Select-Object Name,DefaultOutboundAction,Enabled)");
             script.AppendLine("  if ($profiles.Count -ne 3) { throw '无法读取全部防火墙配置，未更改系统。' }");
-            script.AppendLine("  $state = [pscustomobject]@{ applied = $false; profiles = @($profiles | ForEach-Object { @{ Name = [string]$_.Name; DefaultOutboundAction = [string]$_.DefaultOutboundAction; Enabled = [string]$_.Enabled } }) }; Write-State $state\n}");
+            if (record is null)
+                script.AppendLine("  $state = [pscustomobject]@{ applied = $false; profiles = @($profiles | ForEach-Object { @{ Name = [string]$_.Name; DefaultOutboundAction = [string]$_.DefaultOutboundAction; Enabled = [string]$_.Enabled } }) }; Write-State $state\n}");
+            else
+                script.AppendLine("  $state = [pscustomobject]@{ applied = $false; mode = " + Quote(record.Mode) + "; profiles = @($profiles | ForEach-Object { @{ Name = [string]$_.Name; DefaultOutboundAction = [string]$_.DefaultOutboundAction; Enabled = [string]$_.Enabled } }) }; Write-State $state\n}");
         }
         foreach (var action in actions)
         {
             switch (action)
             {
+                case RecordState:
+                    break; // 快照在所有修改动作之前写入。
+                case EnableProfiles:
+                    script.AppendLine("Set-NetFirewallProfile -Profile Domain,Private,Public -Enabled True");
+                    break;
+                case AddBlockRule block:
+                    if (!block.Name.StartsWith(AppPrefix, StringComparison.Ordinal) ||
+                        string.IsNullOrWhiteSpace(block.Program) || !Path.IsPathFullyQualified(block.Program) || block.LocalAddress.Length == 0)
+                        throw new ArgumentException("程序阻断规则必须使用本项目程序前缀、绝对路径和非空本地地址。");
+                    script.AppendLine("Get-NetFirewallRule -Name " + Quote(block.Name) + " -ErrorAction SilentlyContinue | Remove-NetFirewallRule");
+                    script.AppendLine("New-NetFirewallRule -Name " + Quote(block.Name) + " -DisplayName " + Quote(block.Name)
+                        + " -Direction Outbound -Action Block -Profile Any -Program " + Quote(block.Program)
+                        + " -LocalAddress @(" + string.Join(",", block.LocalAddress.Select(Quote)) + ") | Out-Null");
+                    break;
+                case VerifyRules verify:
+                    AppendVerifyRules(script, verify.Names);
+                    break;
+                case Patrol appsPatrol when !appsPatrol.EnforceDefaultBlock:
+                    AppendAppsPatrol(script, appsPatrol.ExpectedRules);
+                    break;
                 case Patrol patrol:
                     script.AppendLine("$reenforced=@()");
                     // 管理命令失败先留存，仍检查服务和实际配置，防止把失效误报成普通查询失败。
@@ -260,7 +308,7 @@ public static class KillSwitchPlanner
                     break;
                 case Audit:
                     script.AppendLine("[IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($auditPath)) | Out-Null");
-                    script.AppendLine("$foreignAllowRules = @(Get-NetFirewallRule -PolicyStore ActiveStore -Enabled True -Direction Outbound -Action Allow | Where-Object { $_.Name -notlike 'YuanC-KS-*' } | ForEach-Object { $r = $_; $app = $r | Get-NetFirewallApplicationFilter; [pscustomobject]@{ Name = $r.Name; Program = $app.Program } })");
+                    script.AppendLine("$foreignAllowRules = @(" + allowQuery + "$_.Name -notlike 'YuanC-KS-*' } | ForEach-Object { $r = $_; $app = $r | Get-NetFirewallApplicationFilter; [pscustomobject]@{ Name = $r.Name; Program = $app.Program } })");
                     script.AppendLine("$auditState = $null");
                     script.AppendLine("if (Test-Path -LiteralPath $statePath) { $auditState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json }");
                     script.AppendLine("if ($null -ne $auditState -and $null -ne $auditState.PSObject.Properties['unmanagedRules']) { $unmanagedRules = @($auditState.unmanagedRules) } else { $unmanagedRules = @(Read-UnmanagedRules) }");
@@ -270,8 +318,53 @@ public static class KillSwitchPlanner
                 default: throw new ArgumentException("未知的防火墙操作。");
             }
         }
-        if (actions.OfType<SetProfileDefault>().Any()) script.AppendLine("$state.applied = $true; Write-State $state");
+        if (actions.OfType<SetProfileDefault>().Any() || record is not null) script.AppendLine("$state.applied = $true; Write-State $state");
         return script.ToString();
+    }
+
+    private static void AppendVerifyRules(StringBuilder script, string[] names)
+    {
+        script.AppendLine("if ((Get-Service MpsSvc).Status -ne 'Running') { exit 3 }");
+        script.AppendLine("if ($null -eq $state.PSObject.Properties['verifyFailed']) { $state | Add-Member -NotePropertyName verifyFailed -NotePropertyValue @() }");
+        script.AppendLine("if ($null -eq $state.PSObject.Properties['verifiedAt']) { $state | Add-Member -NotePropertyName verifiedAt -NotePropertyValue $null }");
+        script.AppendLine("$effective = @(Get-NetFirewallProfile -PolicyStore ActiveStore)");
+        script.AppendLine("$bad = @($effective | Where-Object { [string]$_.Enabled -ne 'True' } | Select-Object -ExpandProperty Name)");
+        script.AppendLine("if ($effective.Count -ne 3) { $bad = @(@($bad) + @('Domain','Private','Public') | Sort-Object -Unique) }");
+        script.AppendLine("if ($bad.Count -gt 0) { $state.verifyFailed = @($bad); Write-State $state; exit 3 }");
+        AppendMissingAppRules(script, names);
+        script.AppendLine("if ($missing.Count -gt 0) { $state.verifyFailed = @($missing); Write-State $state; exit 3 }");
+        script.AppendLine("$state.verifiedAt = [DateTime]::UtcNow.ToString('o'); $state.verifyFailed = @(); Write-State $state");
+    }
+
+    private static void AppendMissingAppRules(StringBuilder script, string[] names)
+    {
+        script.AppendLine("$missing = @(@(" + string.Join(",", names.Select(Quote)) + ") | Where-Object { $rules = @(Get-NetFirewallRule -PolicyStore ActiveStore -Name $_ -ErrorAction SilentlyContinue); $rules.Count -ne 1 -or @($rules | Where-Object { [string]$_.Enabled -ne 'True' -or [string]$_.Action -ne 'Block' }).Count -gt 0 })");
+    }
+
+    private static void AppendAppsPatrol(StringBuilder script, string[] names)
+    {
+        script.AppendLine("$reenforced=@()");
+        script.AppendLine("$patrolErrors = @(); $newlyDisabled = @(); $state = $null");
+        script.AppendLine("$profiles = @(Get-NetFirewallProfile -PolicyStore ActiveStore -ErrorAction SilentlyContinue -ErrorVariable +patrolErrors)");
+        script.AppendLine("foreach ($p in $profiles) {");
+        script.AppendLine("  if ([string]$p.Enabled -ne 'True') {");
+        script.AppendLine("    Set-NetFirewallProfile -Profile $p.Name -Enabled True -ErrorAction SilentlyContinue -ErrorVariable +patrolErrors | Out-Null");
+        script.AppendLine("    $reenforced += [string]$p.Name");
+        script.AppendLine("  }\n}");
+        script.AppendLine("if (Test-Path -LiteralPath $statePath) { $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json }");
+        AppendMissingAppRules(script, names);
+        script.AppendLine("if ((Get-Service MpsSvc).Status -ne 'Running') { exit 3 }");
+        script.AppendLine("$effective = @(Get-NetFirewallProfile -PolicyStore ActiveStore -ErrorAction SilentlyContinue -ErrorVariable +patrolErrors)");
+        script.AppendLine("$bad = @($effective | Where-Object { [string]$_.Enabled -ne 'True' } | Select-Object -ExpandProperty Name)");
+        script.AppendLine("if ($effective.Count -ne 3) { $bad = @(@($bad) + @('Domain','Private','Public') | Sort-Object -Unique) }");
+        script.AppendLine("if ($bad.Count -gt 0) {");
+        script.AppendLine("  if ($null -ne $state) {");
+        script.AppendLine("    if ($null -eq $state.PSObject.Properties['verifyFailed']) { $state | Add-Member -NotePropertyName verifyFailed -NotePropertyValue @() }");
+        script.AppendLine("    $state.verifyFailed = @($bad); Write-State $state");
+        script.AppendLine("  }\n  exit 3\n}");
+        script.AppendLine("if ($patrolErrors.Count -gt 0) { throw '断网保护巡检失败,请联系管理员。' }");
+        script.AppendLine("ConvertTo-Json -Compress @{ reenforced=@($reenforced); newly_disabled=@($newlyDisabled); missing_rules=@($missing) }");
+        script.AppendLine("exit 0");
     }
 
     private static void AddArgument(StringBuilder script, string name, string? value)

@@ -26,6 +26,8 @@ public sealed record ClientSnapshot(ConnectionState State, string Status, string
     public bool EnvironmentEnabled { get; init; } = true;
     public string EnvironmentStatus { get; init; } = "未应用";
     public string SelfCheckStatus { get; init; } = "未检测";
+    public string RoutingMode { get; init; } = "global";
+    public string[] RoutingApps { get; init; } = [];
 }
 
 /// <summary>Owns the serialized user flow, effects and session lifetime; no UI dependencies.</summary>
@@ -43,6 +45,9 @@ public sealed class ClientController : IDisposable
     private readonly IEnvironmentSettingsStore? environmentSettings;
     private readonly IIpv6Probe? ipv6Probe;
     private readonly Action<EnvironmentReport>? reportSink;
+    private readonly IRoutingSettingsStore? routingSettings;
+    private readonly string serviceProcessPath;
+    private RoutingPolicy activeRouting = RoutingPolicy.Global;
     private string selfCheckStatus = "未检测";
     private bool environmentApplied;
     private string environmentStatus = "未应用";
@@ -71,25 +76,35 @@ public sealed class ClientController : IDisposable
     private bool disposed;
     private long generation;
     private string message = "";
-    public ClientSnapshot Snapshot => new(machine.State, machine.StatusText, message, protection)
-    { Mode = sessionSource?.Mode ?? "未配置", ExitStatus = exitStatus, ExitIp = exitIp, GuardStatus = guardStatus,
-        EnvironmentEnabled = environmentSettings?.Read().Enabled ?? true, EnvironmentStatus = environmentStatus,
-        SelfCheckStatus = selfCheckStatus };
+    public ClientSnapshot Snapshot
+    {
+        get
+        {
+            var routing = protection || machine.State != ConnectionState.Disconnected ? activeRouting : routingSettings?.Read() ?? RoutingPolicy.Global;
+            return new(machine.State, machine.StatusText, message, protection)
+            { Mode = sessionSource?.Mode ?? "未配置", ExitStatus = exitStatus, ExitIp = exitIp, GuardStatus = guardStatus,
+                EnvironmentEnabled = environmentSettings?.Read().Enabled ?? true, EnvironmentStatus = environmentStatus,
+                SelfCheckStatus = selfCheckStatus, RoutingMode = ModeName(routing), RoutingApps = routing.Apps.ToArray() };
+        }
+    }
+    private static string ModeName(RoutingPolicy policy) => policy.Mode == RoutingMode.Apps ? "apps" : "global";
     public event Action<ClientSnapshot>? Changed;
 
     public ClientController(AuthApiClient? auth, ICredentialStore credentials, IKillSwitch firewall,
         ITunnelTransport tunnel, string program, DeviceInfo device, AuthEndpoint? authEndpoint = null, IExitProbe? exitProbe = null,
         IEnvironmentEnforcer? environment = null, IEnvironmentSettingsStore? environmentSettings = null,
-        IIpv6Probe? ipv6Probe = null, Action<EnvironmentReport>? reportSink = null)
+        IIpv6Probe? ipv6Probe = null, Action<EnvironmentReport>? reportSink = null,
+        IRoutingSettingsStore? routingSettings = null, string? serviceProcessPath = null)
         : this(auth is null ? null : new AuthServerSessionSource(auth, credentials), firewall, tunnel, program, device,
             authEndpoint: authEndpoint, exitProbe: exitProbe, environment: environment, environmentSettings: environmentSettings,
-            ipv6Probe: ipv6Probe, reportSink: reportSink) { }
+            ipv6Probe: ipv6Probe, reportSink: reportSink, routingSettings: routingSettings, serviceProcessPath: serviceProcessPath) { }
 
     public ClientController(ISessionSource? sessionSource, IKillSwitch firewall,
         ITunnelTransport tunnel, string program, DeviceInfo device, Func<TimeSpan, CancellationToken, Task>? delayAsync = null,
         AuthEndpoint? authEndpoint = null, IExitProbe? exitProbe = null,
         IEnvironmentEnforcer? environment = null, IEnvironmentSettingsStore? environmentSettings = null,
-        IIpv6Probe? ipv6Probe = null, Action<EnvironmentReport>? reportSink = null)
+        IIpv6Probe? ipv6Probe = null, Action<EnvironmentReport>? reportSink = null,
+        IRoutingSettingsStore? routingSettings = null, string? serviceProcessPath = null)
     {
         this.sessionSource = sessionSource;
         this.delayAsync = delayAsync ?? ((delay, token) => Task.Delay(delay, token));
@@ -103,6 +118,8 @@ public sealed class ClientController : IDisposable
         this.environmentSettings = environmentSettings;
         this.ipv6Probe = ipv6Probe;
         this.reportSink = reportSink;
+        this.routingSettings = routingSettings;
+        this.serviceProcessPath = serviceProcessPath ?? Environment.ProcessPath ?? "WinClient.App.exe";
         tunnel.TunnelDown += OnTunnelDown;
     }
 
@@ -191,6 +208,11 @@ public sealed class ClientController : IDisposable
         {
             if (sessionSource is null) { message = "未配置服务器"; return; }
             if (machine.State is ConnectionState.Connected or ConnectionState.Connecting or ConnectionState.Reconnecting) return;
+            activeRouting = routingSettings?.Read() ?? RoutingPolicy.Global;
+            if (activeRouting.Mode == RoutingMode.Apps && activeRouting.Apps.Count == 0)
+            { message = "仅指定程序模式至少要选一个程序,请先添加程序或切回全部流量。"; return; }
+            if (firewall.HasPendingState && (firewall.PendingMode ?? "global") != ModeName(activeRouting))
+            { message = "上次的断网保护记录与当前代理范围不一致,请先用原来的代理范围连接并正常断开,或重启后台服务后再试。"; return; }
             lifetime.Cancel();
             lifetime.Dispose();
             lifetime = new();
@@ -231,6 +253,26 @@ public sealed class ClientController : IDisposable
         }
         catch (OperationCanceledException) when (lifetime.IsCancellationRequested) { }
         catch (Exception ex) when (IsOperational(ex)) { await FailAsync(ex); }
+        finally { Publish(); gate.Release(); }
+    }
+
+    public async Task SetRoutingAsync(string mode, IReadOnlyList<string> apps)
+    {
+        await gate.WaitAsync();
+        try
+        {
+            if (protection || machine.State != ConnectionState.Disconnected)
+            { message = "请先断开连接,再更改代理范围。"; return; }
+            if (firewall.HasPendingState)
+            { message = "断网保护的恢复记录尚在,请先连接并正常断开后再更改代理范围。"; return; }
+            RoutingPolicy policy;
+            try { policy = RoutingPolicy.Create(mode, apps); }
+            catch (ArgumentException ex) { message = ex.Message; return; }
+            if (routingSettings is null) { message = "代理范围设置不可用,请联系管理员。"; return; }
+            routingSettings.Write(policy);
+            message = policy.Mode == RoutingMode.Global ? "代理范围已更新:全部流量" : $"代理范围已更新:仅 {policy.Apps.Count} 个指定程序";
+        }
+        catch (Exception ex) when (IsOperational(ex)) { message = "代理范围保存失败,请联系管理员。"; }
         finally { Publish(); gate.Release(); }
     }
 
@@ -314,7 +356,8 @@ public sealed class ClientController : IDisposable
     private async Task ApplySessionAsync(SessionResponse next)
     {
         var nextIps = NodeIps(next);
-        _ = TunnelTransport.RenderConfiguration(next.SingboxConfig); // Validate before installing rules.
+        _ = TunnelTransport.RenderConfiguration(RoutingRenderer.Render(next.SingboxConfig, activeRouting, serviceProcessPath,
+            sessionSource is AuthServerSessionSource ? authEndpoint : null)); // 安装规则前校验渲染后的配置。
         var previous = session;
         session = next;
         if (environmentApplied)
@@ -426,11 +469,13 @@ public sealed class ClientController : IDisposable
                     break;
                 case EffectKind.ApplyKillSwitch:
                     protection = true; // Even partial Apply must be treated as requiring explicit recovery.
-                    await firewall.ApplyAsync(NodeIps(session!), program, session!.Node.Hy2Port, session.Node.RealityPort,
-                        sessionSource is AuthServerSessionSource ? authEndpoint : null);
+                    if (activeRouting.Mode == RoutingMode.Apps) await firewall.ApplyAppsAsync(activeRouting.Apps);
+                    else await firewall.ApplyAsync(NodeIps(session!), program, session!.Node.Hy2Port, session.Node.RealityPort,
+                            sessionSource is AuthServerSessionSource ? authEndpoint : null);
                     break;
                 case EffectKind.UpdateKillSwitchNode:
-                    await firewall.UpdateNodeAsync(effect.NewIps!, program, session!.Node.Hy2Port, session.Node.RealityPort);
+                    if (activeRouting.Mode != RoutingMode.Apps)
+                        await firewall.UpdateNodeAsync(effect.NewIps!, program, session!.Node.Hy2Port, session.Node.RealityPort);
                     break;
                 case EffectKind.RemoveKillSwitch:
                     await firewall.RemoveAsync(); protection = false; break;
@@ -440,7 +485,8 @@ public sealed class ClientController : IDisposable
                     { await ExecuteAsync(machine.Handle(new(ConnectionEventKind.SessionExpired))); break; }
                     try
                     {
-                        await tunnel.StartAsync(session.SingboxConfig, lifetime.Token);
+                        await tunnel.StartAsync(RoutingRenderer.Render(session.SingboxConfig, activeRouting, serviceProcessPath,
+                            sessionSource is AuthServerSessionSource ? authEndpoint : null), lifetime.Token);
                         lifetime.Token.ThrowIfCancellationRequested();
                         await ExecuteAsync(machine.Handle(new(ConnectionEventKind.TunnelUp)));
                         message = "虚拟网卡已就绪。";
@@ -451,6 +497,7 @@ public sealed class ClientController : IDisposable
                         await FailAsync(ex);
                         message = "未找到连接内核，请联系管理员配置 sing-box.exe 路径。";
                     }
+                    catch (InvalidDataException) { throw; }
                     catch (Exception ex) when (ex is IOException or TimeoutException)
                     { await ExecuteAsync(machine.Handle(new(ConnectionEventKind.TunnelDown))); }
                     break;
@@ -475,7 +522,7 @@ public sealed class ClientController : IDisposable
             selfCheckStatus = "未检测";
             exitStatus = "未检测";
             exitIp = "";
-            exitCycle = null;
+            if (activeRouting.Mode != RoutingMode.Apps || machine.State != ConnectionState.Reconnecting) exitCycle = null;
         }
         else if (session is not null && exitProbe is not null && exitCycle is null)
         {
@@ -503,7 +550,12 @@ public sealed class ClientController : IDisposable
     private async Task CheckExitAsync(object cycle, int attempt)
     {
         // 同一生命周期内也可能先断线后重连；连接轮次防止旧探测重复续排。
-        if (!ReferenceEquals(cycle, exitCycle) || machine.State != ConnectionState.Connected || session is null) return;
+        if (!ReferenceEquals(cycle, exitCycle) || session is null) return;
+        if (machine.State != ConnectionState.Connected)
+        {
+            if (activeRouting.Mode == RoutingMode.Apps) ScheduleExitCheck(ExitRecheckInterval, cycle, 1);
+            return;
+        }
         exitStatus = "核验中";
         Publish();
         ExitProbeResult? exit;
@@ -516,6 +568,7 @@ public sealed class ClientController : IDisposable
             exitIp = address.ToString();
             var matches = IPAddress.TryParse(session.Node.Host, out var expected) && address.Equals(expected);
             exitStatus = matches ? "已核验" : "不一致";
+            if (activeRouting.Mode == RoutingMode.Apps) exitStatus += "(后台服务出口)";
             if (!matches) message = "出口地址与澳洲节点不一致,请联系管理员;断网保护保持,未自动断开。";
         }
         else if (attempt < ExitCheckAttempts)
@@ -545,11 +598,13 @@ public sealed class ClientController : IDisposable
         }
         if (lifetime.IsCancellationRequested || disposed) return;
         bool? ipv6 = null;
-        try { if (ipv6Probe is not null) ipv6 = await ipv6Probe.CanReachAsync(lifetime.Token); }
+        try { if (activeRouting.Mode != RoutingMode.Apps && ipv6Probe is not null) ipv6 = await ipv6Probe.CanReachAsync(lifetime.Token); }
         catch (Exception) { } // 探测异常仅代表本项无法核验，不进入连接失败路径。
         if (lifetime.IsCancellationRequested || disposed) return;
         var report = EnvironmentSelfCheck.Evaluate(new(exit, session!.Node.Host, policy.ExpectedCountry,
-            policy.Enabled, environmentApplied, policy.Target, inspection, ipv6, session.SingboxConfig, DateTimeOffset.UtcNow));
+            policy.Enabled, environmentApplied, policy.Target, inspection, ipv6,
+            RoutingRenderer.Render(session.SingboxConfig, activeRouting, serviceProcessPath, sessionSource is AuthServerSessionSource ? authEndpoint : null),
+            DateTimeOffset.UtcNow) { Routing = activeRouting });
         selfCheckStatus = report.Summary;
         try { reportSink?.Invoke(report); }
         catch (Exception ex) when (IsOperational(ex)) { } // 写报告失败不影响已完成的检查与连接。
@@ -566,14 +621,17 @@ public sealed class ClientController : IDisposable
         if (!ReferenceEquals(cycle, patrolCycle) || !ShouldPatrol) return;
         try
         {
-            var report = await firewall.PatrolAsync(KillSwitchPlanner.ExpectedRuleNames(sessionSource is AuthServerSessionSource));
+            var report = activeRouting.Mode == RoutingMode.Apps
+                ? await firewall.PatrolAsync(KillSwitchPlanner.AppRuleNames(activeRouting.Apps.Count), enforceDefaultBlock: false)
+                : await firewall.PatrolAsync(KillSwitchPlanner.ExpectedRuleNames(sessionSource is AuthServerSessionSource));
             if (lifetime.IsCancellationRequested || disposed) return;
             if (report.MissingRules.Count > 0)
             {
                 if (session is not null)
                 {
-                    await firewall.ApplyAsync(NodeIps(session), program, session.Node.Hy2Port, session.Node.RealityPort,
-                        sessionSource is AuthServerSessionSource ? authEndpoint : null);
+                    if (activeRouting.Mode == RoutingMode.Apps) await firewall.ApplyAppsAsync(activeRouting.Apps);
+                    else await firewall.ApplyAsync(NodeIps(session), program, session.Node.Hy2Port, session.Node.RealityPort,
+                            sessionSource is AuthServerSessionSource ? authEndpoint : null);
                     guardStatus = $"已重建 {report.MissingRules.Count} 条本项目规则";
                 }
                 else guardStatus = "巡检失败,下一轮重试";

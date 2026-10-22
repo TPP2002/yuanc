@@ -20,7 +20,10 @@ public sealed record EnvironmentReport(DateTimeOffset CheckedAt, IReadOnlyList<C
 
 public sealed record SelfCheckInput(ExitProbeResult? Exit, string NodeHost, string ExpectedCountry,
     bool EnvironmentEnabled, bool EnvironmentApplied, EnvironmentTarget Target, EnvironmentInspection? Inspection,
-    bool? Ipv6Reachable, JsonElement SingboxConfig, DateTimeOffset Now);
+    bool? Ipv6Reachable, JsonElement SingboxConfig, DateTimeOffset Now)
+{
+    public RoutingPolicy Routing { get; init; } = RoutingPolicy.Global;
+}
 
 public interface IIpv6Probe
 {
@@ -88,6 +91,27 @@ public static class EnvironmentSelfCheck
         var rules = Property(route, "rules");
         var servers = Property(Property(config, "dns"), "servers");
         var outbounds = Property(config, "outbounds");
+        if (input.Routing.Mode == RoutingMode.Apps)
+        {
+            bool HasPrograms(JsonElement rule)
+            {
+                var patterns = Property(rule, "process_path_regex");
+                return patterns.ValueKind == JsonValueKind.Array && input.Routing.Apps.All(path =>
+                    patterns.EnumerateArray().Any(pattern => Text(pattern) == RoutingRenderer.PathPattern(path)));
+            }
+            bool HasRule(string outbound, bool ipv6) => rules.ValueKind == JsonValueKind.Array && rules.EnumerateArray().Any(rule =>
+                HasPrograms(rule) && Text(Property(rule, "outbound")) == outbound && (!ipv6 ||
+                    (Property(rule, "ip_version") is var version && version.ValueKind == JsonValueKind.Number && version.TryGetInt32(out var number) && number == 6)));
+            var scoped = Policy("no_direct_path", "配置无直连路径",
+                ("route.final direct", Text(Property(route, "final")) == "direct"),
+                ("route.rules 指定程序→proxy", HasRule("proxy", false)),
+                ("route.rules 指定程序 IPv6 阻断", HasRule("block", true)),
+                ("dns.servers detour", servers.ValueKind == JsonValueKind.Array && servers.EnumerateArray().All(server => Text(Property(server, "detour")) == "proxy")));
+            items.Add(scoped with { Detail = "仅指定程序模式:" + scoped.Detail });
+            items.Add(new("ipv6_direct", "IPv6 已封堵", "跳过", "仅指定程序模式不检测整机 IPv6;指定程序的 IPv6 已由配置与防火墙阻断"));
+        }
+        else
+        {
         items.Add(Policy("no_direct_path", "配置无直连路径",
             ("route.final", Text(Property(route, "final")) == "proxy"),
             ("route.rules IPv6 阻断", rules.ValueKind == JsonValueKind.Array && rules.EnumerateArray().Any(rule =>
@@ -97,6 +121,7 @@ public static class EnvironmentSelfCheck
             ("outbounds 无 direct", outbounds.ValueKind == JsonValueKind.Array && outbounds.EnumerateArray().All(outbound => Text(Property(outbound, "type")) != "direct"))));
         items.Add(new("ipv6_direct", "IPv6 已封堵", input.Ipv6Reachable is null ? "无法核验" : input.Ipv6Reachable.Value ? "未通过" : "通过",
             input.Ipv6Reachable is null ? "未取得 IPv6 探测结果" : input.Ipv6Reachable.Value ? "IPv6 可直连,可能泄漏" : "固定 IPv6 地址未能建立连接"));
+        }
         return new(input.Now, items);
     }
 

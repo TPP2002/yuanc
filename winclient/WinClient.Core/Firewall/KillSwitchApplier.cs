@@ -12,6 +12,9 @@ public sealed record PatrolReport(IReadOnlyList<string> Reenforced, IReadOnlyLis
 
 public interface IKillSwitch
 {
+    Task ApplyAppsAsync(IReadOnlyList<string> programs) => throw new InvalidOperationException("当前断网保护不支持仅指定程序模式。");
+    Task<PatrolReport> PatrolAsync(IReadOnlyList<string> expectedRules, bool enforceDefaultBlock) => PatrolAsync(expectedRules);
+    string? PendingMode => null;
     Task<PatrolReport> PatrolAsync(IReadOnlyList<string> expectedRules) => Task.FromResult(PatrolReport.Empty);
     bool HasPendingState { get; }
     Task ApplyAsync(IReadOnlyList<IPAddress> ips, string program, int hy2Port, AuthEndpoint? auth = null);
@@ -33,6 +36,19 @@ public sealed class KillSwitchApplier : IKillSwitch
     private readonly SemaphoreSlim gate = new(1, 1);
     public string StatePath { get; }
     public bool HasPendingState => File.Exists(StatePath);
+    public string? PendingMode
+    {
+        get
+        {
+            try
+            {
+                using var json = JsonDocument.Parse(File.ReadAllText(StatePath));
+                return json.RootElement.TryGetProperty("mode", out var mode) ? mode.GetString() : "global";
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException or InvalidOperationException)
+            { return null; }
+        }
+    }
     public string AuditPath { get; }
     public string? LastRecoveryWarning { get; private set; }
     public KillSwitchApplier(string runDirectory, ICommandRunner? runner = null)
@@ -52,13 +68,16 @@ public sealed class KillSwitchApplier : IKillSwitch
         ExecuteAsync(KillSwitchPlanner.UpdateNode(ips, program, hy2Port, realityPort));
     public Task RemoveAsync() => ExecuteAsync([new RemoveRulesByPrefix(KillSwitchPlanner.Prefix), new RestoreProfileDefault()]);
 
-    public async Task<PatrolReport> PatrolAsync(IReadOnlyList<string> expectedRules)
+    public Task ApplyAppsAsync(IReadOnlyList<string> programs) => ExecuteAsync(KillSwitchPlanner.PlanApps(programs));
+    public Task<PatrolReport> PatrolAsync(IReadOnlyList<string> expectedRules) => PatrolAsync(expectedRules, true);
+
+    public async Task<PatrolReport> PatrolAsync(IReadOnlyList<string> expectedRules, bool enforceDefaultBlock)
     {
         await gate.WaitAsync().ConfigureAwait(false);
         try
         {
             using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(180));
-            var script = KillSwitchPlanner.ToPowerShellScript([new Patrol(expectedRules.ToArray())], StatePath, AuditPath);
+            var script = KillSwitchPlanner.ToPowerShellScript([new Patrol(expectedRules.ToArray(), EnforceDefaultBlock: enforceDefaultBlock)], StatePath, AuditPath);
             var result = await runner.RunAsync(CreateStartInfo(script), timeout.Token).ConfigureAwait(false);
             if (result.ExitCode == VerifyFailedExitCode)
                 throw new FirewallIneffectiveException("系统防火墙已被关闭或被策略覆盖，断网保护无法生效，已拒绝连接。请点击断开，在 Windows 安全中心开启防火墙（或联系管理员解除策略）后重新连接。");
@@ -139,6 +158,8 @@ public sealed class KillSwitchApplier : IKillSwitch
         {
             using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(180));
             var result = await runner.RunAsync(CreateStartInfo(KillSwitchPlanner.ToPowerShellScript(actions, StatePath, AuditPath)), timeout.Token).ConfigureAwait(false);
+            if (result.ExitCode == VerifyFailedExitCode && actions.Any(action => action is VerifyRules))
+                throw new FirewallIneffectiveException("系统防火墙未运行、未开启或指定程序的阻断规则未生效,已拒绝连接。请在 Windows 安全中心开启防火墙或联系管理员。");
             if (result.ExitCode == VerifyFailedExitCode)
                 throw new FirewallIneffectiveException("系统防火墙已被关闭或被策略覆盖，断网保护无法生效，已拒绝连接。请点击断开，在 Windows 安全中心开启防火墙（或联系管理员解除策略）后重新连接。");
             if (result.ExitCode != 0) throw new InvalidOperationException("防火墙操作失败，恢复记录已保留，请联系管理员。");

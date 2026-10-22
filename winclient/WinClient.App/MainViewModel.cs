@@ -33,12 +33,35 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         "核验中" => "当前出口 IP:核验中…",
         "已核验" => $"当前出口 IP:{snapshot.ExitIp}(与澳洲节点一致)",
         "不一致" => $"⚠ 当前出口 IP:{snapshot.ExitIp},与澳洲节点不一致,请联系管理员",
+        "已核验(后台服务出口)" => $"后台服务出口 IP:{snapshot.ExitIp}(与澳洲节点一致,仅证明后台服务出口)",
+        "不一致(后台服务出口)" => $"⚠ 后台服务出口 IP:{snapshot.ExitIp},与澳洲节点不一致,请联系管理员",
         "无法核验" => "当前出口 IP:无法核验(隧道内暂无回应)",
         _ => "当前出口 IP:待检测"
     };
     public string GuardLine => snapshot.GuardStatus.Length == 0 ? "" : "断网保护巡检:" + snapshot.GuardStatus;
     public string SelfCheckLine => "环境自检:" + snapshot.SelfCheckStatus;
     public string EnvironmentLine => "环境一致性:" + snapshot.EnvironmentStatus;
+    public string RoutingLine => RoutingIsGlobal ? "代理范围:全部流量" : $"代理范围:仅 {RoutingApps.Count} 个指定程序(其他程序直连)";
+    public bool RoutingIsGlobal
+    {
+        get => snapshot.RoutingMode == "global";
+        set { if (value && !RoutingIsGlobal) _ = RunAsync(() => SendAsync("set_routing", mode: "global", apps: snapshot.RoutingApps)); }
+    }
+    public bool RoutingIsApps
+    {
+        get => snapshot.RoutingMode == "apps";
+        set { if (value && !RoutingIsApps) _ = RunAsync(() => SendAsync("set_routing", mode: "apps", apps: snapshot.RoutingApps)); }
+    }
+    public IReadOnlyList<string> RoutingApps => snapshot.RoutingApps;
+    private string? selectedRoutingApp;
+    public string? SelectedRoutingApp
+    {
+        get => selectedRoutingApp;
+        set { selectedRoutingApp = value; Notify(); CommandManager.InvalidateRequerySuggested(); }
+    }
+    public bool CanChangeRouting => CanUseConnection && !ShouldDisconnect;
+    public ICommand AddRoutingAppCommand { get; }
+    public ICommand RemoveRoutingAppCommand { get; }
     public bool EnvironmentEnabled
     {
         get => snapshot.EnvironmentEnabled;
@@ -66,8 +89,17 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
     public ICommand CheckUpdateCommand { get; }
     public event PropertyChangedEventHandler? PropertyChanged;
 
-    public MainViewModel(Func<string?> choosePairingFile)
+    public MainViewModel(Func<string?> choosePairingFile, Func<string?> chooseProgram)
     {
+        AddRoutingAppCommand = new AsyncCommand(() => RunAsync(async () =>
+        {
+            var path = chooseProgram();
+            if (!string.IsNullOrWhiteSpace(path))
+                await SendAsync("set_routing", mode: snapshot.RoutingMode, apps: [.. snapshot.RoutingApps, path]);
+        }), () => CanChangeRouting);
+        RemoveRoutingAppCommand = new AsyncCommand(() => RunAsync(() => SendAsync("set_routing", mode: snapshot.RoutingMode,
+            apps: snapshot.RoutingApps.Where(path => !string.Equals(path, SelectedRoutingApp, StringComparison.OrdinalIgnoreCase)).ToArray())),
+            () => CanChangeRouting && SelectedRoutingApp is not null);
         CheckUpdateCommand = new AsyncCommand(() => RunAsync(() => SendAsync("check_update")), () => CanUseConnection);
         RedeemCommand = new AsyncCommand(() => RunAsync(async () =>
         { await SendAsync("redeem", Code); Code = ""; }), () => CanUseConnection);
@@ -149,11 +181,21 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
     }
     public Task ConnectFromTrayAsync() => CanUseConnection ? RunAsync(() => SendAsync("connect")) : Task.CompletedTask;
     public Task DisconnectFromTrayAsync() => CanUseConnection ? RunAsync(() => SendAsync("disconnect")) : Task.CompletedTask;
-    private async Task SendAsync(string op, string? code = null, string? pairingJson = null, bool? enabled = null)
+    private async Task SendAsync(string op, string? code = null, string? pairingJson = null, bool? enabled = null,
+        string? mode = null, string[]? apps = null)
     {
-        var response = await (client ?? throw new IOException()).SendAsync(op, code, pairingJson, lifetime.Token, enabled);
+        var response = await (client ?? throw new IOException()).SendAsync(op, code, pairingJson, lifetime.Token, enabled, mode, apps);
         if (response.Snapshot is not null) UpdateProtocol(response.Snapshot);
-        if (!response.Ok) Update(snapshot with { Message = response.Error ?? "操作未完成，请联系管理员。" });
+        if (!response.Ok)
+        {
+            if (op == "set_routing")
+            {
+                var actual = await client.SendAsync("status", cancellationToken: lifetime.Token);
+                if (actual.Snapshot is not null) UpdateProtocol(actual.Snapshot);
+                Refresh();
+            }
+            Update(snapshot with { Message = response.Error ?? "操作未完成，请联系管理员。" });
+        }
     }
     private async Task RunAsync(Func<Task> action)
     {
@@ -200,6 +242,10 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         Notify(nameof(EnvironmentLine)); Notify(nameof(EnvironmentEnabled));
         Notify(nameof(ExitLine)); Notify(nameof(GuardLine));
         Notify(nameof(SelfCheckLine));
+        Notify(nameof(RoutingLine)); Notify(nameof(RoutingIsGlobal)); Notify(nameof(RoutingIsApps));
+        Notify(nameof(RoutingApps)); Notify(nameof(CanChangeRouting));
+        if (selectedRoutingApp is not null && !RoutingApps.Contains(selectedRoutingApp)) selectedRoutingApp = null;
+        Notify(nameof(SelectedRoutingApp));
         CommandManager.InvalidateRequerySuggested();
     }
     public Task ExportAuditAsync(string path) => RunAsync(async () =>
