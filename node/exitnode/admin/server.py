@@ -17,12 +17,39 @@ from .publish import FILENAME, releases
 
 class PackageServer(ThreadingHTTPServer):
     daemon_threads = True
+    request_queue_size = 64
+
+    def __init__(self, *args, max_connections=32, **kwargs):
+        # 必须先建好槽位:父类构造会开始监听,但不会处理连接。
+        self._slots = threading.BoundedSemaphore(max_connections)
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(blocking=False):
+            # 超限:直接关闭,不开线程、不写任何响应字节。
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            # 线程没能启动时槽位不会被 process_request_thread 归还。
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
 
     def handle_error(self, request, client_address):
         logging.getLogger("exitnode").error(redact("客户端包请求处理失败"))
 
 
 class PackageHandler(BaseHTTPRequestHandler):
+    # 每连接套接字超时(秒):读请求头或写响应卡住超过它就断开该连接。
+    timeout = 15
+
     def log_message(self, format, *args):
         pass
 
@@ -98,8 +125,10 @@ class PackageHandler(BaseHTTPRequestHandler):
             self.close_connection = True
 
 
-def create_server(bind, port, root):
-    server = PackageServer((bind, port), PackageHandler)
+def create_server(bind, port, root, *, max_connections=32, timeout=15):
+    # 派生子类承载本实例的超时,不改全局 PackageHandler.timeout。
+    handler = type("PackageHandler", (PackageHandler,), {"timeout": timeout})
+    server = PackageServer((bind, port), handler, max_connections=max_connections)
     server.root = Path(root).absolute()
     return server
 
