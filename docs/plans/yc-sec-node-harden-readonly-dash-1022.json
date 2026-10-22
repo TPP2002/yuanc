@@ -1,0 +1,139 @@
+{
+  "schemaVersion": 1,
+  "taskId": "SEC-NODE-SYSTEMD-HARDEN-1022",
+  "slug": "yc-sec-node-harden-readonly-dash-1022",
+  "title": "托管服务单元 ReadOnlyPaths 加 - 前缀:目录不存在时跳过,首次发布客户端包之前托管服务也能启动;黄金、测试断言与服务加固说明同步",
+  "goal": "以分支 codex/yc-sec-node-systemd-harden-nft-1022 的提交 fdb810e 为基点(那是上一单工人做完的全部加固改动,已自测全绿,只差本单这一处)。做完后:\n\n① node/exitnode/templates/exitnode-admin.service 里 `ReadOnlyPaths=/var/lib/exitnode/winclient` 改成 `ReadOnlyPaths=-/var/lib/exitnode/winclient`(只改这一行,其余一个字节不动)。\n② node/tests/golden/exitnode-admin.service 同一行同改,渲染结果必须与黄金逐字节一致(test_unit_matches_golden 已有)。\n③ node/tests/test_systemd_render.py 里 test_admin_uses_dynamic_user_without_capabilities_and_only_localhost 的期望串改为 `ReadOnlyPaths=-/var/lib/exitnode/winclient`,并在同一测试里再加一条断言:admin 单元里 `ReadOnlyPaths=` 这一行恰好一条、且以 `ReadOnlyPaths=-` 开头(例如 `assert [l for l in admin.splitlines() if l.startswith('ReadOnlyPaths=')] == ['ReadOnlyPaths=-/var/lib/exitnode/winclient']`)。\n④ docs/node/服务加固说明.md:托管服务加固项表格里 `ReadOnlyPaths=` 的取值改为 `-/var/lib/exitnode/winclient`,作用一栏写明「发布目录只读;前缀 - 表示目录不存在时跳过,首次发布客户端包之前托管服务也能正常启动,目录存在后只读」;「真机待验证」第 5 条改写为:「尚未发布任何客户端包、/var/lib/exitnode/winclient 不存在时重启节点,托管服务应正常启动(ReadOnlyPaths 带 - 前缀,目录不存在就跳过,不再因 226/NAMESPACE 起不来);发布一次客户端包后再重启,目录在托管服务里应为只读。」文档里不许再出现不带 - 的 `ReadOnlyPaths=/var/lib/exitnode/winclient` 字样。\n\n改完跑验收全绿即交活。",
+  "background": "上一单(yc-sec-node-systemd-harden-nft-1022,Opus 工人)把节点五个 systemd 单元降权加固做完、自测全绿后,在岔路停下:契约原文要求 admin 单元写 `ReadOnlyPaths=/var/lib/exitnode/winclient`,但这个目录只在第一次 `exitnode winclient publish` 时才创建,init 不建它;systemd 对 ReadOnlyPaths 里不带 - 前缀且不存在的路径会以 226/NAMESPACE 拒绝启动单元,所以没发布过客户端包的节点重启后托管服务起不来、反复重试到 StartLimit,check 的「客户端托管服务」层也会失败。派单方已拍板采纳工人推荐:加 - 前缀(目录不存在就跳过,存在时依旧只读),改动最小、不碰禁区、不加安装步骤。工人会话已满无法续聊,改动已原样提交为 fdb810e,本单只补这一处。项目:外包,澳洲 Debian 12 软路由 node/exitnode(Python 3.11 目标、本机 3.14 跑测试;systemd 252)。",
+  "nonGoals": [
+    "不改其他任何单元模板、黄金、测试或代码",
+    "不改 init 流程、不预建 winclient 目录",
+    "不在真机实测;真机项仍写在文档待验证清单"
+  ],
+  "allowedPaths": [
+    "node/exitnode/templates/exitnode-admin.service",
+    "node/tests/golden/exitnode-admin.service",
+    "node/tests/test_systemd_render.py",
+    "docs/node/服务加固说明.md"
+  ],
+  "forbiddenPaths": [
+    "docs/开工须知.md",
+    "docs/口径速查表.md",
+    "docs/design/**",
+    "docs/交接/**",
+    "docs/plans/**",
+    "docs/acceptance/**",
+    "docs/winclient/**",
+    "docs/node/客户端包托管说明.md",
+    "docs/node/配置说明.md",
+    "docs/node/看门狗说明.md",
+    "docs/node/更新与回退说明.md",
+    "docs/node/救援单元说明.md",
+    ".github/**",
+    ".codex/**",
+    ".gitignore",
+    "pyproject.toml",
+    "scripts/**",
+    "winclient/**",
+    "authserver/**",
+    "node/exitnode/*.py",
+    "node/exitnode/proxy/**",
+    "node/exitnode/updater/**",
+    "node/exitnode/admin/**",
+    "node/exitnode/watchdog/**",
+    "node/exitnode/rescue/**",
+    "node/exitnode/templates/exitnode-proxy.service",
+    "node/exitnode/templates/exitnode-nft.service",
+    "node/exitnode/templates/exitnode-watchdog.service",
+    "node/exitnode/templates/exitnode-watchdog.timer",
+    "node/exitnode/templates/exitnode-recover.service",
+    "node/exitnode/templates/exitnode-rescue.service",
+    "node/exitnode/templates/exitnode-rescue.timer",
+    "node/tests/golden/exitnode-proxy.service",
+    "node/tests/golden/exitnode-nft.service",
+    "node/tests/golden/exitnode-watchdog.service",
+    "node/tests/golden/exitnode-recover.service",
+    "node/tests/golden/exitnode-rescue.service",
+    "node/tests/golden/exitnode.nft",
+    "node/tests/golden/client-windows.json",
+    "node/tests/test_cli.py",
+    "node/tests/test_service.py",
+    "node/tests/test_nft_render.py",
+    "node/tests/test_manifest.py",
+    "node/tests/test_rescue.py",
+    "node/tests/test_watchdog.py",
+    "node/tests/test_config.py",
+    "node/tests/test_updater.py",
+    "node/examples/**"
+  ],
+  "expectArtifacts": [
+    "node/exitnode/templates/exitnode-admin.service",
+    "node/tests/golden/exitnode-admin.service",
+    "node/tests/test_systemd_render.py",
+    "docs/node/服务加固说明.md"
+  ],
+  "acceptance": [
+    {
+      "id": "RUFF",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "ruff",
+        "check",
+        "node",
+        "scripts",
+        "authserver"
+      ],
+      "required": true,
+      "timeoutSec": 300
+    },
+    {
+      "id": "PYTEST",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+        "node/tests"
+      ],
+      "required": true,
+      "timeoutSec": 900
+    },
+    {
+      "id": "SHAPE-DASH",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda p:pathlib.Path(p).read_text(encoding='utf-8');t=r('node/exitnode/templates/exitnode-admin.service');g=r('node/tests/golden/exitnode-admin.service');s=r('node/tests/test_systemd_render.py');good='ReadOnlyPaths=-/var/lib/exitnode/winclient';bad='ReadOnlyPaths=/var/lib/exitnode/winclient';e=[k for k,ok in (('tpl',good+chr(10) in t and bad not in t),('golden',good+chr(10) in g and bad not in g),('test',good in s and bad not in s),('one',t.count('ReadOnlyPaths=')==1 and g.count('ReadOnlyPaths=')==1),('same',t.replace('/opt/exitnode/current','$program_path').count(good)==g.count(good))) if not ok];print(e);sys.exit(1 if e else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "DOCS-DASH",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;a=pathlib.Path('docs/node/服务加固说明.md').read_text(encoding='utf-8');bad='ReadOnlyPaths=/var/lib/exitnode/winclient';e=[k for k,ok in (('nobad',bad not in a),('dash','-/var/lib/exitnode/winclient' in a),('skip','目录不存在' in a and '跳过' in a),('reboot','首次发布' in a and '重启' in a),('ro','只读' in a),('no226','226/NAMESPACE' not in a or '不再' in a or '避免' in a)) if not ok];print(e);sys.exit(1 if e else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    }
+  ],
+  "steps": [
+    "读 node/exitnode/templates/exitnode-admin.service、node/tests/golden/exitnode-admin.service、node/tests/test_systemd_render.py 与 docs/node/服务加固说明.md;先改测试断言让它红。",
+    "改模板与黄金各一行;改文档表格一格与真机清单第 5 条。",
+    "跑 RUFF / PYTEST / SHAPE-DASH / DOCS-DASH 全绿后交活;交活说明里写清这是上一单岔路的拍板落地。"
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "engine": "claude",
+  "model": "claude-sonnet-5-5",
+  "timeoutSec": 1800,
+  "repoRoot": "E:/yuanc"
+}

@@ -11,7 +11,17 @@ public static class ServerIdentity
     /// <param name="clientSessionId">期望的会话号；本产品后台是系统服务，调用方传 0。</param>
     public static bool IsTrusted(uint serverSessionId, uint clientSessionId, string? imagePath, string appRoot)
     {
-        if (serverSessionId != clientSessionId || string.IsNullOrEmpty(imagePath) || string.IsNullOrEmpty(appRoot)) return false;
+        if (serverSessionId != clientSessionId) return false;
+        return IsImageUnderRoot(imagePath, appRoot);
+    }
+
+    /// <summary>
+    /// 路径部分的纯判定（服务端身份与调用者身份共用）：程序完整路径非空、是完整路径，
+    /// 原始与规范化后都不含 ".." 段，规范化后严格位于 appRoot 之下（不等于 appRoot 本身，比较不分大小写）。
+    /// </summary>
+    internal static bool IsImageUnderRoot(string? imagePath, string appRoot)
+    {
+        if (string.IsNullOrEmpty(imagePath) || string.IsNullOrEmpty(appRoot)) return false;
         if (!Path.IsPathFullyQualified(imagePath) || HasParentSegment(imagePath)) return false;
         string full, root;
         try { full = Path.GetFullPath(imagePath); root = Path.GetFullPath(appRoot); }

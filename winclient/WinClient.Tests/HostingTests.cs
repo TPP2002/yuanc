@@ -73,6 +73,17 @@ public sealed class HostingTests
     }
 
     [Fact]
+    public void ControlServicePassesCallerIdentityVerdictToServeAsync()
+    {
+        var source = File.ReadAllText(Path.Combine(RepositoryRoot(), "winclient", "WinClient.App", "Hosting", "ControlService.cs"));
+        // 服务宿主按调用者程序路径与安装根判定可信，并把判定结果传给协议层。
+        Assert.Contains("var trusted = CallerIdentity.IsTrusted(PipePeer.ProcessImage(admitted), UpdatePlanner.DefaultAppRoot);", source);
+        Assert.Contains("server.ServeAsync(pipe, lifetime.Token, trusted)", source);
+        Assert.Contains("来自安装目录之外的程序连接了后台服务，只允许查询", source);
+        Assert.DoesNotContain("Process.Start", source);
+    }
+
+    [Fact]
     public void ApplicationAndCoreNeverDirectlyReferenceOrUseEventLogging()
     {
         var root = RepositoryRoot();
