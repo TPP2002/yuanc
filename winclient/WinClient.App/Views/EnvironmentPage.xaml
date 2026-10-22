@@ -38,5 +38,8 @@
    </Grid></Border>
   </DataTemplate></ItemsControl.ItemTemplate></ItemsControl>
   <TextBlock Text="连上一次后才有自检明细" Style="{DynamicResource Yc.Hint}" Visibility="{Binding SelfCheckItems.Count, Converter={x:Static t:VisibilityConverter.Instance}, ConverterParameter=Invert}"/>
+  <TextBlock Text="自检读的是系统设置;点下面的按钮打开一个本地页面,看这个浏览器自己报告的时区、语言、定位权限、WebRTC 地址和实际出口。只读取,不改设置。" FontSize="{DynamicResource Yc.FontSize.Sm}" Foreground="{DynamicResource Yc.Text2}" TextWrapping="Wrap" Margin="0,16,0,0"/>
+  <Button Content="在浏览器里复核" Style="{DynamicResource Yc.Button.Secondary}" Command="{Binding OpenVerifyPageCommand}" HorizontalAlignment="Left" Margin="0,8,0,0" AutomationProperties.Name="在浏览器里复核"/>
+  <TextBlock Text="{Binding VerifyPageMessage}" Style="{DynamicResource Yc.Hint}" TextWrapping="Wrap" Visibility="{Binding VerifyPageMessage, Converter={x:Static t:VisibilityConverter.Instance}}"/>
  </StackPanel></ScrollViewer>
 </UserControl>

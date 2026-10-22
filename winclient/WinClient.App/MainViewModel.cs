@@ -25,6 +25,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
     private bool disposed;
     private readonly CancellationTokenSource lifetime = new();
     private readonly Func<string, CancellationToken, Task<string?>> runScript;
+    private readonly Func<string, string?> publishVerifyPage;
     private ClientSnapshot snapshot = new(ConnectionState.Disconnected, "正在检查后台服务", "", false);
     private string serviceVersion = "";
     private string updateMessage = "";
@@ -73,6 +74,8 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
     public ICommand GoToAccountCommand { get; }
     public ICommand CreateBrowserProfileCommand { get; }
     public string BrowserProfileMessage { get; private set; } = "";
+    public ICommand OpenVerifyPageCommand { get; }
+    public string VerifyPageMessage { get; private set; } = "";
     public HeroPresentation Hero { get; private set; } = null!;
     private PageKind currentPage;
     public PageKind CurrentPage
@@ -117,9 +120,12 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
     public event PropertyChangedEventHandler? PropertyChanged;
 
     public MainViewModel(Func<string?> choosePairingFile, Func<string?> chooseProgram,
-        Func<string, CancellationToken, Task<string?>>? runScript = null)
+        Func<string, CancellationToken, Task<string?>>? runScript = null,
+        Func<string, string?>? publishVerifyPage = null)
     {
         this.runScript = runScript ?? RunBrowserScriptAsync;
+        this.publishVerifyPage = publishVerifyPage ?? VerifyPagePublisher.WriteAndOpen;
+        OpenVerifyPageCommand = new AsyncCommand(OpenVerifyPageAsync, () => !IsBusy);
         CreateBrowserProfileCommand = new AsyncCommand(CreateBrowserProfileAsync, () => !IsBusy);
         GoToAccountCommand = new AsyncCommand(() => { CurrentPage = PageKind.Account; return Task.CompletedTask; }, () => true);
         AddRoutingAppCommand = new AsyncCommand(() => RunAsync(async () =>
@@ -152,6 +158,23 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         var result = await new CommandRunner().RunAsync(KillSwitchApplier.CreateStartInfo(script), timeout.Token);
         return result.ExitCode == 0 ? result.Output : null;
     }
+    internal Task OpenVerifyPageAsync() => RunAsync(() =>
+    {
+        const string incomplete = "打开复核页未完成,请联系管理员。";
+        try
+        {
+            var html = BrowserVerifyPage.Html(new(snapshot.RoutingMode, snapshot.EnvironmentEnabled));
+            var path = publishVerifyPage(html);
+            VerifyPageMessage = path is null ? incomplete
+                : "已用默认浏览器打开复核页;要在澳洲专用浏览器里核对,把地址栏里的地址复制过去即可。页面文件:" + path;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or Win32Exception or
+            InvalidOperationException or OperationCanceledException or PlatformNotSupportedException or NotSupportedException)
+        { VerifyPageMessage = incomplete; }
+        Notify(nameof(VerifyPageMessage));
+        return Task.CompletedTask;
+    });
+
     internal Task CreateBrowserProfileAsync() => RunAsync(async () =>
     {
         try
