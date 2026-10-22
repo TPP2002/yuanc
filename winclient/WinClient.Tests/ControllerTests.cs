@@ -12,6 +12,127 @@ namespace WinClient.Tests;
 
 public sealed class ControllerTests
 {
+    private sealed class ScriptedBrowserProbe(params IReadOnlyList<string>?[] results) : IBrowserProcessProbe
+    {
+        private int index;
+        public IReadOnlyList<string>? RunningBrowsers() => results[Math.Min(index++, results.Length - 1)];
+    }
+
+    [Fact]
+    public async Task 浏览器运行时首次连接只提醒两分钟内再次点击才连接()
+    {
+        var order = new List<string>();
+        var now = DateTimeOffset.Parse("2026-10-23T00:00:00Z");
+        using var controller = EnvironmentController(order, new FakeEnvironment(order), new MemoryEnvironmentSettings(),
+            browserProbe: new ScriptedBrowserProbe(["Chrome"]));
+        controller.NowProvider = () => now;
+        await controller.ConnectAsync();
+        Assert.Equal(ConnectionState.Disconnected, controller.Snapshot.State);
+        Assert.Empty(order);
+        Assert.Contains("Chrome 正在运行:连接", controller.Snapshot.Message);
+        Assert.Contains(ClientController.BrowserWarningMarker, controller.Snapshot.Message);
+        await controller.ConnectAsync();
+        Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
+        Assert.Equal(new[] { "apply", "start", "env-apply" }, order);
+    }
+
+    [Fact]
+    public async Task 浏览器提醒超过两分钟需要重新确认()
+    {
+        var order = new List<string>();
+        var now = DateTimeOffset.Parse("2026-10-23T00:00:00Z");
+        using var controller = EnvironmentController(order, new FakeEnvironment(order), new MemoryEnvironmentSettings(),
+            browserProbe: new ScriptedBrowserProbe(["Chrome"]));
+        controller.NowProvider = () => now;
+        await controller.ConnectAsync();
+        now += TimeSpan.FromMinutes(3);
+        await controller.ConnectAsync();
+        Assert.Equal(ConnectionState.Disconnected, controller.Snapshot.State);
+        Assert.Empty(order);
+        Assert.Contains(ClientController.BrowserWarningMarker, controller.Snapshot.Message);
+        await controller.ConnectAsync();
+        Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
+        Assert.Contains("start", order);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task 自动连接包括保持保护分路都不提醒浏览器(bool keep)
+    {
+        var order = new List<string>();
+        var timers = new Timers();
+        using var controller = new ClientController(new PairingSessionSource(PairingTests.ValidPairing()),
+            new Firewall(order) { HasPendingState = keep }, new Tunnel(order), Path.GetFullPath("fake.exe"), TestData.Device,
+            timers.Delay, environment: new FakeEnvironment(order) { HasPendingState = keep },
+            environmentSettings: new MemoryEnvironmentSettings(), browserProbe: new ScriptedBrowserProbe(["Edge"]));
+        await controller.InitializeAsync(autoConnect: true, keepProtection: keep);
+        Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
+        Assert.Contains("apply", order);
+        Assert.Contains("start", order);
+        Assert.DoesNotContain(ClientController.BrowserWarningMarker, controller.Snapshot.Message);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task 总开关关闭或没有环境执行器时直接连接(bool missingEnvironment)
+    {
+        var order = new List<string>();
+        using var controller = EnvironmentController(order, missingEnvironment ? null : new FakeEnvironment(order),
+            new MemoryEnvironmentSettings { Enabled = missingEnvironment }, browserProbe: new ScriptedBrowserProbe(["Chrome"]));
+        await controller.ConnectAsync();
+        Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
+        Assert.Equal(new[] { "apply", "start" }, order);
+        Assert.DoesNotContain(ClientController.BrowserWarningMarker, controller.Snapshot.Message);
+    }
+
+    [Fact]
+    public async Task 浏览器运行时首次断开保持连接和保护再次点击才恢复()
+    {
+        var order = new List<string>();
+        using var controller = EnvironmentController(order, new FakeEnvironment(order), new MemoryEnvironmentSettings(),
+            browserProbe: new ScriptedBrowserProbe([], [], ["Chrome", "Edge"]));
+        controller.NowProvider = () => DateTimeOffset.Parse("2026-10-23T00:00:00Z");
+        await controller.ConnectAsync();
+        var before = order.ToArray();
+        await controller.DisconnectAsync();
+        Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
+        Assert.True(controller.Snapshot.ProtectionActive);
+        Assert.Contains("Chrome 与 Edge 正在运行:断开", controller.Snapshot.Message);
+        Assert.Contains(ClientController.BrowserWarningMarker, controller.Snapshot.Message);
+        Assert.Equal(before, order);
+        Assert.DoesNotContain("env-restore", order);
+        await controller.DisconnectAsync();
+        Assert.Equal(ConnectionState.Disconnected, controller.Snapshot.State);
+        Assert.False(controller.Snapshot.ProtectionActive);
+        Assert.Equal(1, order.Count(item => item == "env-restore"));
+    }
+
+    [Fact]
+    public async Task 自检记录套用瞬间的浏览器而非提醒时的清单()
+    {
+        var order = new List<string>();
+        var timers = new Timers();
+        var source = new ScriptedSource(); source.Enqueue(Ok(TestData.Session()));
+        var reports = new List<EnvironmentReport>();
+        using var controller = new ClientController(source, new Firewall(order), new Tunnel(order), Path.GetFullPath("fake.exe"),
+            TestData.Device, timers.Delay, exitProbe: new DetailedProbe(), environment: new InspectableEnvironment(false),
+            environmentSettings: new MemoryEnvironmentSettings(), ipv6Probe: new ScriptedIpv6(false), reportSink: reports.Add,
+            adapterProbe: new StaticAdapterProbe(TunAdapters), browserProbe: new ScriptedBrowserProbe([], ["Chrome"]))
+            { DelayWithPurposeAsync = timers.Delay };
+        controller.Changed += _ => Interlocked.Increment(ref timers.Published);
+        await controller.ConnectAsync();
+        await FireAndPublish(controller, timers, "出口核验", TimeSpan.FromSeconds(3));
+        var report = Assert.Single(reports);
+        Assert.Equal(10, report.Items.Count);
+        Assert.Equal("未通过", report.Items[9].Result);
+        Assert.Contains("Chrome", report.Items[9].Detail);
+        Assert.Equal("1 项未通过:浏览器在环境切换前已关闭", report.Summary);
+        Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
+        Assert.True(controller.Snapshot.ProtectionActive);
+    }
+
     [Fact]
     public async Task ForceRestoreRejectsConnectedWithoutChangingEnvironmentOrFirewall()
     {
@@ -307,7 +428,7 @@ public sealed class ControllerTests
             for (var i = 1; i < 5; i++) await FireAndPublish(controller, timers, "出口核验", TimeSpan.FromSeconds(5));
         }
         var report = Assert.Single(reports);
-        Assert.Equal(9, report.Items.Count);
+        Assert.Equal(10, report.Items.Count);
         Assert.Equal(report.Summary, controller.Snapshot.SelfCheckStatus);
         Assert.DoesNotContain(controller.Snapshot.SelfCheckStatus, new[] { "未检测", "检测中" });
         Assert.Equal(1, ipv6.Calls);
@@ -355,10 +476,10 @@ public sealed class ControllerTests
         await controller.ConnectAsync();
         await FireAndPublish(controller, timers, "出口核验", TimeSpan.FromSeconds(3));
         var report = Assert.Single(reports);
-        Assert.Equal(9, report.Items.Count);
+        Assert.Equal(10, report.Items.Count);
         Assert.Equal("无法核验", report.Items[8].Result);
         Assert.Equal("未取得本机网卡清单", report.Items[8].Detail);
-        Assert.Equal("8 项通过,1 项未能检查", report.Summary);
+        Assert.Equal("8 项通过,2 项未能检查", report.Summary);
         Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
         Assert.True(controller.Snapshot.ProtectionActive);
         Assert.Equal(new[] { "apply", "start" }, order);
@@ -398,7 +519,7 @@ public sealed class ControllerTests
         var report = Assert.Single(reports);
         Assert.Contains(snapshots, snapshot => snapshot.SelfCheckStatus == "检测中");
         Assert.Equal(report.Summary, controller.Snapshot.SelfCheckStatus);
-        Assert.Equal(fail ? "4 项通过,5 项未能检查" : enabled ? "9 项通过" : "5 项通过,4 项未能检查", report.Summary);
+        Assert.Equal(fail ? "4 项通过,6 项未能检查" : enabled ? "9 项通过,1 项未能检查" : "5 项通过,5 项未能检查", report.Summary);
         Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
         Assert.Equal("虚拟网卡已就绪。", controller.Snapshot.Message);
         Assert.True(controller.Snapshot.ProtectionActive);
@@ -577,12 +698,13 @@ public sealed class ControllerTests
     }
 
     private static ClientController EnvironmentController(List<string> order, IEnvironmentEnforcer? environment,
-        IEnvironmentSettingsStore settings, ITunnelTransport? tunnel = null, Timers? timers = null)
+        IEnvironmentSettingsStore settings, ITunnelTransport? tunnel = null, Timers? timers = null,
+        IBrowserProcessProbe? browserProbe = null)
     {
         timers ??= new Timers();
         return new ClientController(new PairingSessionSource(PairingTests.ValidPairing()), new Firewall(order),
             tunnel ?? new Tunnel(order), Path.GetFullPath("fake.exe"), TestData.Device, timers.Delay,
-            environment: environment, environmentSettings: settings) { DelayWithPurposeAsync = timers.Delay };
+            environment: environment, environmentSettings: settings, browserProbe: browserProbe) { DelayWithPurposeAsync = timers.Delay };
     }
 
     private sealed class FakeEnvironment(List<string> order) : IEnvironmentEnforcer

@@ -34,6 +34,11 @@ public sealed record ClientSnapshot(ConnectionState State, string Status, string
 /// <summary>Owns the serialized user flow, effects and session lifetime; no UI dependencies.</summary>
 public sealed class ClientController : IDisposable
 {
+    internal static readonly TimeSpan BrowserWarningWindow = TimeSpan.FromMinutes(2);
+    public const string BrowserWarningMarker = "再点一次「仍然继续」";
+    internal Func<DateTimeOffset>? NowProvider { get; set; }
+    private DateTimeOffset? browserWarnedAt;
+    private IReadOnlyList<string>? browsersAtApply;
     internal static readonly TimeSpan ExitCheckDelay = TimeSpan.FromSeconds(3);
     internal static readonly TimeSpan ExitCheckRetry = TimeSpan.FromSeconds(5);
     internal const int ExitCheckAttempts = 5;
@@ -49,6 +54,7 @@ public sealed class ClientController : IDisposable
     private readonly IEnvironmentSettingsStore? environmentSettings;
     private readonly IIpv6Probe? ipv6Probe;
     private readonly IAdapterProbe? adapterProbe;
+    private readonly IBrowserProcessProbe? browserProbe;
     private readonly Action<EnvironmentReport>? reportSink;
     private readonly IRoutingSettingsStore? routingSettings;
     private readonly string serviceProcessPath;
@@ -104,17 +110,20 @@ public sealed class ClientController : IDisposable
         ITunnelTransport tunnel, string program, DeviceInfo device, AuthEndpoint? authEndpoint = null, IExitProbe? exitProbe = null,
         IEnvironmentEnforcer? environment = null, IEnvironmentSettingsStore? environmentSettings = null,
         IIpv6Probe? ipv6Probe = null, Action<EnvironmentReport>? reportSink = null,
-        IRoutingSettingsStore? routingSettings = null, string? serviceProcessPath = null, IAdapterProbe? adapterProbe = null)
+        IRoutingSettingsStore? routingSettings = null, string? serviceProcessPath = null, IAdapterProbe? adapterProbe = null,
+        IBrowserProcessProbe? browserProbe = null)
         : this(auth is null ? null : new AuthServerSessionSource(auth, credentials), firewall, tunnel, program, device,
             authEndpoint: authEndpoint, exitProbe: exitProbe, environment: environment, environmentSettings: environmentSettings,
-            ipv6Probe: ipv6Probe, reportSink: reportSink, routingSettings: routingSettings, serviceProcessPath: serviceProcessPath, adapterProbe: adapterProbe) { }
+            ipv6Probe: ipv6Probe, reportSink: reportSink, routingSettings: routingSettings, serviceProcessPath: serviceProcessPath, adapterProbe: adapterProbe,
+            browserProbe: browserProbe) { }
 
     public ClientController(ISessionSource? sessionSource, IKillSwitch firewall,
         ITunnelTransport tunnel, string program, DeviceInfo device, Func<TimeSpan, CancellationToken, Task>? delayAsync = null,
         AuthEndpoint? authEndpoint = null, IExitProbe? exitProbe = null,
         IEnvironmentEnforcer? environment = null, IEnvironmentSettingsStore? environmentSettings = null,
         IIpv6Probe? ipv6Probe = null, Action<EnvironmentReport>? reportSink = null,
-        IRoutingSettingsStore? routingSettings = null, string? serviceProcessPath = null, IAdapterProbe? adapterProbe = null)
+        IRoutingSettingsStore? routingSettings = null, string? serviceProcessPath = null, IAdapterProbe? adapterProbe = null,
+        IBrowserProcessProbe? browserProbe = null)
     {
         this.sessionSource = sessionSource;
         this.delayAsync = delayAsync ?? ((delay, token) => Task.Delay(delay, token));
@@ -128,6 +137,7 @@ public sealed class ClientController : IDisposable
         this.environmentSettings = environmentSettings;
         this.ipv6Probe = ipv6Probe;
         this.adapterProbe = adapterProbe;
+        this.browserProbe = browserProbe;
         this.reportSink = reportSink;
         this.routingSettings = routingSettings;
         this.serviceProcessPath = serviceProcessPath ?? Environment.ProcessPath ?? "WinClient.App.exe";
@@ -172,7 +182,7 @@ public sealed class ClientController : IDisposable
         finally { Publish(); gate.Release(); }
         if (keptProtection)
         {
-            await ConnectAsync();
+            await ConnectAsync(fromUser: false);
             // 连接过程会更新消息；保留重启时的保护提示，不覆盖既有失败原因。
             if (!message.Contains("保持", StringComparison.Ordinal))
             {
@@ -183,7 +193,7 @@ public sealed class ClientController : IDisposable
         }
         if (autoConnect && sessionSource is not null && machine.State != ConnectionState.NeedsManual)
         {
-            try { if (sessionSource is PairingSessionSource || sessionSource is AuthServerSessionSource { HasCredentials: true }) await ConnectAsync(); }
+            try { if (sessionSource is PairingSessionSource || sessionSource is AuthServerSessionSource { HasCredentials: true }) await ConnectAsync(fromUser: false); }
             catch (Exception ex) when (IsOperational(ex)) { message = "无法读取本地登录凭据，请重新兑换邀请码。"; Publish(); }
         }
         // 自动连接会更新消息；保留降级提示，同时保留连接过程自身的结果。
@@ -213,7 +223,36 @@ public sealed class ClientController : IDisposable
         finally { Publish(); gate.Release(); }
     }
 
-    public async Task ConnectAsync()
+    internal static string BrowserRunningWarning(string action, IReadOnlyList<string> browsers) =>
+        $"{string.Join(" 与 ", browsers)} 正在运行:{action}会切换系统时区与浏览器策略,已打开的网页会当场跳变。请先关闭浏览器再{action},或在两分钟内{BrowserWarningMarker}。";
+
+    private bool ShouldWarnBrowsers(string action, bool checkApplied)
+    {
+        if (browserProbe is null || environment is null) return false;
+        if (checkApplied ? !environmentApplied : !(environmentSettings?.Read() ?? EnvironmentSettingsStore.Default).ForNode(session?.Node).Enabled)
+            return false;
+        var now = NowProvider?.Invoke() ?? DateTimeOffset.UtcNow;
+        if (browserWarnedAt.HasValue && now - browserWarnedAt.Value <= BrowserWarningWindow)
+        {
+            browserWarnedAt = null;
+            return false;
+        }
+        IReadOnlyList<string>? running = null;
+        try { running = browserProbe.RunningBrowsers(); }
+        catch (Exception ex) when (IsOperational(ex)) { }
+        if (running is null || running.Count == 0)
+        {
+            browserWarnedAt = null;
+            return false;
+        }
+        browserWarnedAt = now;
+        message = BrowserRunningWarning(action, running);
+        return true;
+    }
+
+    public Task ConnectAsync() => ConnectAsync(fromUser: true);
+
+    internal async Task ConnectAsync(bool fromUser)
     {
         await gate.WaitAsync();
         try
@@ -225,6 +264,7 @@ public sealed class ClientController : IDisposable
             { message = "仅指定程序模式至少要选一个程序,请先添加程序或切回全部流量。"; return; }
             if (firewall.HasPendingState && (firewall.PendingMode ?? "global") != ModeName(activeRouting))
             { message = "上次的断网保护记录与当前代理范围不一致,请先用原来的代理范围连接并正常断开,或重启后台服务后再试。"; return; }
+            if (fromUser && ShouldWarnBrowsers("连接", checkApplied: false)) return;
             lifetime.Cancel();
             lifetime.Dispose();
             lifetime = new();
@@ -239,6 +279,7 @@ public sealed class ClientController : IDisposable
 
     public async Task DisconnectAsync()
     {
+        if (ShouldWarnBrowsers("断开", checkApplied: true)) { Publish(); return; }
         lifetime.Cancel();
         Interlocked.Increment(ref generation);
         await gate.WaitAsync();
@@ -346,6 +387,9 @@ public sealed class ClientController : IDisposable
             var policy = (environmentSettings?.Read() ?? EnvironmentSettingsStore.Default).ForNode(session?.Node);
             if (!policy.Enabled) { environmentStatus = "未启用"; return; }
             if (machine.State != ConnectionState.Connected || environmentApplied) return;
+            browsersAtApply = null;
+            try { browsersAtApply = browserProbe?.RunningBrowsers(); }
+            catch (Exception ex) when (IsOperational(ex)) { }
             await environment.ApplyAsync(policy.Target);
             environmentApplied = true;
             environmentStatus = "已切换到澳洲时区与浏览器策略";
@@ -366,6 +410,7 @@ public sealed class ClientController : IDisposable
             {
                 await environment.RestoreAsync();
                 environmentApplied = false;
+                browsersAtApply = null;
             }
             environmentStatus = (environmentSettings?.Read().Enabled ?? true) ? "未应用" : "未启用";
             return true;
@@ -671,7 +716,8 @@ public sealed class ClientController : IDisposable
             policy.Enabled, environmentApplied, policy.Target, inspection, ipv6,
             RenderedConfiguration(session),
             DateTimeOffset.UtcNow) { Routing = activeRouting,
-                Auth = sessionSource is AuthServerSessionSource ? authEndpoint : null, ServiceProcessPath = serviceProcessPath, Adapters = adapters });
+                Auth = sessionSource is AuthServerSessionSource ? authEndpoint : null, ServiceProcessPath = serviceProcessPath, Adapters = adapters,
+                BrowsersAtApply = browsersAtApply });
         selfCheckStatus = report.Summary;
         try { reportSink?.Invoke(report); }
         catch (Exception ex) when (IsOperational(ex)) { } // 写报告失败不影响已完成的检查与连接。

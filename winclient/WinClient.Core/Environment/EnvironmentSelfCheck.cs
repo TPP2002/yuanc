@@ -27,6 +27,7 @@ public sealed record SelfCheckInput(ExitProbeResult? Exit, string NodeHost, stri
     public AuthEndpoint? Auth { get; init; }
     public string? ServiceProcessPath { get; init; }
     public IReadOnlyList<AdapterInfo>? Adapters { get; init; }
+    public IReadOnlyList<string>? BrowsersAtApply { get; init; }
 }
 
 public interface IIpv6Probe
@@ -59,7 +60,7 @@ public static class EnvironmentSelfCheck
 
     public static EnvironmentReport Evaluate(SelfCheckInput input)
     {
-        var items = new List<CheckItem>(9);
+        var items = new List<CheckItem>(10);
         void Add(string id, string name, bool pass, string detail) => items.Add(new(id, name, pass ? "通过" : "未通过", detail));
         if (input.Exit is null)
             items.Add(new("exit_country", "出口归属澳洲", "无法核验", "未取得出口探测结果"));
@@ -135,7 +136,19 @@ public static class EnvironmentSelfCheck
             input.Ipv6Reachable is null ? "未取得 IPv6 探测结果" : input.Ipv6Reachable.Value ? "IPv6 可直连,可能泄漏" : "固定 IPv6 地址未能建立连接"));
         }
         items.Add(CheckTunSubnet(input.Adapters));
+        items.Add(CheckBrowsersClosed(input));
         return new(input.Now, items);
+    }
+
+    private static CheckItem CheckBrowsersClosed(SelfCheckInput input)
+    {
+        const string id = "browser_closed";
+        const string name = "浏览器在环境切换前已关闭";
+        if (!input.EnvironmentEnabled) return new(id, name, "跳过", "环境一致性未启用");
+        var list = input.BrowsersAtApply;
+        if (list is null) return new(id, name, "无法核验", "未取得浏览器进程信息");
+        if (list.Count == 0) return new(id, name, "通过", "套用环境时 Chrome / Edge 未运行");
+        return new(id, name, "未通过", $"套用环境时 {string.Join("、", list)} 仍在运行,已打开的网页可能还带着切换前的时区;关闭浏览器后重新连接一次即可通过");
     }
 
     private static CheckItem CheckTunSubnet(IReadOnlyList<AdapterInfo>? adapters)

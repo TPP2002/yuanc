@@ -1,6 +1,7 @@
 using WinClient.App;
 using WinClient.App.Presentation;
 using WinClient.Core.Ipc;
+using WinClient.Core.Client;
 using WinClient.Core.State;
 using WinClient.Core.Update;
 using Xunit;
@@ -10,6 +11,23 @@ namespace WinClient.UiTests;
 [Collection("界面线程")]
 public class ViewModelTests(UiThreadFixture ui)
 {
+    [Fact]
+    public void 浏览器提醒随快照更新且没有后台连接不能继续() => ui.Invoke(() =>
+    {
+        using var model = new MainViewModel(() => null, () => null);
+        var notified = new List<string?>();
+        model.PropertyChanged += (_, args) => notified.Add(args.PropertyName);
+        model.ApplyPreview(new ControlSnapshot(ConnectionState.Disconnected, "未连接",
+            "Chrome 正在运行:" + ClientController.BrowserWarningMarker, false), ServiceAvailability.Ready);
+        Assert.True(model.BrowserWarningShown);
+        Assert.Contains(nameof(MainViewModel.BrowserWarningShown), notified);
+        Assert.NotNull(model.ContinueAnywayCommand);
+        Assert.False(model.ContinueAnywayCommand.CanExecute(null));
+        model.ApplyPreview(new ControlSnapshot(ConnectionState.Disconnected, "未连接", "普通消息", false), ServiceAvailability.Ready);
+        Assert.False(model.BrowserWarningShown);
+        Assert.False(model.ContinueAnywayCommand.CanExecute(null));
+    });
+
     [Fact]
     public void 强制恢复在连接保护或后台不可用时禁用() => ui.Invoke(() =>
     {
