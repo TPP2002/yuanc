@@ -1,0 +1,207 @@
+{
+  "schemaVersion": 1,
+  "taskId": "SEC-WIN-KS-PATROL-REENABLED-RULES-1022",
+  "slug": "yc-ks-patrol-integrity-1022",
+  "title": "断网保护巡检两处加固:每轮停用所有已启用的第三方出站允许规则(同名重建 / 重新启用的不再漏掉;恢复名单只做并集记录)+ 本项目规则按名字到 ActiveStore 核启用 / 动作 / 方向 / 程序 / 服务 / 地址 / 协议 / 端口(套用时把期望记进状态文件 rules,不一致算缺失交既有逻辑幂等重建);同步巡检测试与文档",
+  "goal": "以主干 main(头 a1e1ce9 之后)为基点。本单合并两张红队会审卡,改同一个文件 winclient/WinClient.Core/Firewall/KillSwitchPlanner.cs 的 PowerShell 脚本生成器与其测试:\n\n【甲】SEC-WIN-KS-PATROL-REENABLED-RULES-1022(连接期间软件升级重建了放行规则,巡检不再停掉,断线时它能直连)。现状:Patrol 分支(ToPowerShellScript 里 `case Patrol patrol:`)查第三方出站允许规则时写的是 `Where-Object { $_.Name -notlike 'YuanC-KS-*' -and $state.disabledRules -notcontains $_.Name }`——名字已经在恢复名单 disabledRules 里的规则,被程序(Chrome / Steam / Zoom 更新器、安全软件自愈)同名重建或重新启用后,巡检永远不再停用它。改法:去掉 `-and $state.disabledRules -notcontains $_.Name` 这一半条件,巡检每轮停用 PersistentStore 里**所有**当前已启用、出站、允许、名字不以 YuanC-KS- 开头的规则;disabledRules 仍做并集记录(先写盘再停用的顺序不变,disableFailed 逻辑不变),newly_disabled 报告本轮实际停用的名字(重新启用的同名规则会再次出现在这里)。RestoreProfileDefault / RecoverFallback / DisableForeignAllowRules(Apply 时)一字不改。\n\n【乙】SEC-WIN-KS-PATROL-RULE-INTEGRITY-1022(巡检只看本项目规则在不在,被人停用或改了内容它看不出来)。现状:`$missing = @(@('名字'…) | Where-Object { -not (Get-NetFirewallRule -Name $_ -ErrorAction SilentlyContinue) })` 只按名字查存在性,本项目规则被 Disable、Action 被改成 Block、方向被改、Loopback / Tun / Lan 的地址范围被放宽、Node 规则的程序或端口被改,巡检都报「正常」。改法分两步:\n(1) **套用时把期望写进恢复状态文件**:AddRule 分支生成的脚本在创建规则后,若 `$null -ne $state`,把该规则的期望记进 `$state.rules`(数组,按 Name 覆盖同名项;每项字段:Name、Program、Service、LocalAddress(数组或 $null)、RemoteAddress(数组或 $null)、Protocol、LocalPort、RemotePort;AddRule 里为 null 的字段写 $null),脚本开头若 `$state` 没有 rules 属性则 Add-Member 一个空数组(与 disabledRules 的写法一致)。Apply 计划末尾既有的 `$state.applied = $true; Write-State $state` 会把它落盘。UpdateNode 计划(RemoveRulesByPrefix + 两条 AddRule,脚本里没有 SetProfileDefault / RecordState)现在根本不加载 $state:改为**当 actions 含 AddRule 且不含 SetProfileDefault 与 RecordState 时**,脚本开头 `if (Test-Path -LiteralPath $statePath) { $state = Get-Content … | ConvertFrom-Json } else { $state = $null }`,末尾 `if ($null -ne $state) { Write-State $state }`;状态文件不存在时不创建(UpdateNode 只在保护已套用后发生)。\n(2) **巡检按名字到 ActiveStore 读规则并核内容**:`$missing = @(` 这一句的位置不动(仍在 `Get-Service MpsSvc` 检查之前),判缺失的条件改为:`$rules = @(Get-NetFirewallRule -PolicyStore ActiveStore -Name $name -ErrorAction SilentlyContinue)`,`$rules.Count -ne 1` 算缺失;`[string]$r.Enabled -ne 'True'`、`[string]$r.Action -ne 'Allow'`、`[string]$r.Direction -ne 'Outbound'` 任一算缺失;若 `$state.rules` 里有同名期望(状态文件来自旧版本、没有 rules 时跳过内容核对,只做前面的检查),再核:Program(`Get-NetFirewallApplicationFilter`,期望非 $null 时不区分大小写比较;期望 $null 时实际须为 'Any' 或空)、Service(`Get-NetFirewallServiceFilter`,同上)、LocalAddress / RemoteAddress(`Get-NetFirewallAddressFilter`,把实际值与期望各自转成去空白、小写、去重、排序的字符串数组比较;期望 $null 时实际须为 'Any')、Protocol / LocalPort / RemotePort(`Get-NetFirewallPortFilter`,期望非 $null 时不区分大小写比较;期望 $null 时实际须为 'Any' 或空),任一不一致算缺失。缺失的名字照旧进 missing_rules,由控制器既有逻辑幂等重建(不改控制器)。巡检脚本仍然不创建、不删除、不启用规则、不用 Set-NetFirewallRule、不写 CreateDirectory。与分应用模式 AppendMissingAppRules 的口径对齐(那段已经核 Enabled 与 Action,本单不改它)。\n\n③ 测试(先写红;KillSwitchPatrolTests.cs 按本卡明确授权调整既有断言:`Assert.Contains(\"$state.disabledRules -notcontains\", script)` 改为 `Assert.DoesNotContain`;其余既有断言保持并仍须通过——尤其 `$missing =` 在 `Get-Service MpsSvc` 之前、`Get-Service MpsSvc` 在最后一个 `-PolicyStore ActiveStore` 之前、巡检脚本不含 New-/Remove-/Enable-NetFirewallRule、DefaultInboundAction、CreateDirectory)。KillSwitchPatrolTests.cs 新增:a) 巡检脚本含 `Get-NetFirewallRule -PolicyStore ActiveStore -Name`、`-ne 'Allow'`、`-ne 'Outbound'`、`Get-NetFirewallAddressFilter`、`Get-NetFirewallApplicationFilter`、`Get-NetFirewallPortFilter`、`Get-NetFirewallServiceFilter`、`$state.rules`,且不含 `Set-NetFirewallRule`;b) 巡检脚本里 `$foreignRules` 那一行含 `$_.Name -notlike 'YuanC-KS-*'` 且不含 `disabledRules -notcontains`;`$state.disabledRules = @(` 之后仍先 `Write-State $state` 再 `Disable-NetFirewallRule`;c) Apply 脚本(KillSwitchPlanner.Plan 六条规则 + Audit)含 `$state.rules`,且每条 AddRule 的名字都出现在 rules 记录里(按脚本文本断言 `Name = 'YuanC-KS-Lan'` 等六个名字各出现一次于 rules 记录行),`Add-Member -NotePropertyName rules`;d) UpdateNode 脚本含 `Test-Path -LiteralPath $statePath`、`$state.rules`、`if ($null -ne $state) { Write-State $state }`,不含 Set-NetFirewallProfile / Disable-NetFirewallRule / Enable-NetFirewallRule(既有 HardenTests 断言也还得过);e) 单独一条 AddRule 的脚本(如 NarrowRuleTests 那样)能正常生成不抛异常。FirewallTests / KillSwitchHardenTests / KillSwitchNarrowRuleTests / KillSwitchAppsModeTests / KillSwitchProfileTests / KillSwitchRecoveryTests / KillSwitchAuthRuleTests / ControllerTests 一字不改并必须仍绿(它们已经断言 Apply 脚本里没有 Set-NetFirewallRule、没有 -Action Block、Remove-NetFirewallRule 只出现在本项目规则行——rules 记录的写法不能触碰这些)。\n\n④ 文档 docs/winclient/断网保护加固说明.md「连接期间巡检」节:第 2 步改写为「停用 PersistentStore 中所有当前已启用的第三方出站允许规则(含被程序同名重建或重新启用的),名字并入 disabledRules,先写盘再停用」;第 3 步改写为「按名字到 ActiveStore 核对本项目规则:不存在、被停用、动作不是 Allow、方向不是 Outbound、或程序 / 服务 / 本地与远端地址 / 协议 / 端口与套用时记录(状态文件 rules)不一致都算缺失,自用六条、邀请码七条」;「停用范围与先记录的原因」节补一句「巡检每轮重新停用所有已启用的第三方允许规则,恢复名单只做并集记录,不做排除条件」;真机待验证项新增四条:连接中手动 Enable 一条已停用的第三方允许规则 → 60 秒内再次被停用且界面「已重新收紧」;手动 Disable YuanC-KS-Tun → 60 秒内「已重建」;手动把 YuanC-KS-Loopback 的 RemoteAddress 改成 Any → 60 秒内「已重建」;正常连接 10 分钟巡检结果持续「正常」、missing_rules 为空(无误判);并写明「状态文件来自旧版本(无 rules)时只核存在 / 启用 / 动作 / 方向,下次重新连接后才有内容核对」。\n\n⑤ 边界:全程中文;不新增 NuGet;不改 KillSwitchApplier.cs、ClientController.cs、状态机、协议、界面;AppendAppsPatrol / AppendMissingAppRules / PlanApps 与仅指定程序模式脚本逐字节不变;Restore / Recover / Audit / Read-UnmanagedRules 逐字节不变;所有 PowerShell 仍经既有隐藏窗口执行器;不在工位机器上执行任何防火墙 / 环境脚本;真机项写进文档不模拟成通过;拿不准停下交 blocked + forks,不猜。",
+  "background": "项目:外包,中国 Windows 客户端(.NET 9,后台服务 SYSTEM + 托盘界面,sing-box TUN)+ 澳洲出口节点。负责人总原则(2026-10-22 原话)「只要保证使用中,不管什么意外,IP 一直是澳洲宽带就行」。跑法 dotnet build/test winclient/WinClient.sln;工位无外网,第三方件缓存由派单方放进 winclient/third_party/cache/。 关键代码:KillSwitchPlanner.ToPowerShellScript(actions, statePath, auditPath) 按 FirewallAction 记录逐条生成 PowerShell;$state 只在 actions 含 SetProfileDefault 或 RecordState 时加载 / 初始化(含 profiles 快照),Apply 末尾 `$state.applied = $true; Write-State $state`;Write-State 是脚本开头定义的函数(临时文件 + Move-Item 原子写)。Patrol 分支顺序:$reenforced / $patrolErrors 初始化 → 读 ActiveStore 配置档并收紧 → 若状态文件存在:加载 $state、补 disabledRules / disableFailed 属性、取 $foreignRules(PersistentStore,Enabled True,Outbound,Allow,排除 YuanC-KS-* 与 disabledRules 已有名字)、并集写盘、逐条 Disable、写 disableFailed → `$missing = @(…)` 按名字查存在 → MpsSvc 未运行 exit 3 → 再核 ActiveStore 配置档,不合格写 verifyFailed 并 exit 3 → $patrolErrors 非空 throw → 最后一行 ConvertTo-Json -Compress @{ reenforced; newly_disabled; missing_rules } → exit 0。KillSwitchApplier.PatrolAsync 只解析最后一个非空行的 JSON 成 PatrolReport(Reenforced / NewlyDisabled / MissingRules),退出码 3 抛 FirewallIneffectiveException,其余非零或解析失败抛 InvalidOperationException(\"断网保护巡检失败,请联系管理员。\")。控制器 PatrolAsync:MissingRules 非空且有会话 → 调既有 ApplyAsync / ApplyAppsAsync 幂等重建并显示「已重建 n 条本项目规则」;否则 !Clean →「已重新收紧 n 条规则」;Clean →「正常」。本项目规则(自用六条 / 邀请码七条,ExpectedRuleNames):Node-Tcp(Program=内核路径,RemoteAddress=节点 IP 数组,TCP,RemotePort=Reality 端口)、Node-Udp(同上,UDP,RemotePort=Hy2 端口)、[Auth](Program=后台服务,RemoteAddress=鉴权 IP,TCP,RemotePort)、Tun(LocalAddress=172.19.0.1)、Loopback(RemoteAddress=127.0.0.0/8 与 ::1)、Dhcp(Program=svchost,Service=Dhcp,RemoteAddress=255.255.255.255 与 LocalSubnet,UDP,LocalPort 68,RemotePort 67)、Lan(RemoteAddress=LocalSubnet)。AddRule 分支先 `Get-NetFirewallRule -Name X -ErrorAction SilentlyContinue | Remove-NetFirewallRule` 再 New-NetFirewallRule …(-Profile Any,按字段追加 -Program/-Service/-LocalAddress @()/-RemoteAddress @()/-Protocol/-LocalPort/-RemotePort/-InterfaceAlias)| Out-Null。 既有测试对脚本文本的断言(必须继续通过):FirewallTests.ApplyHasOnlyApprovedAllowsAndAuditDoesNotModifyOtherRules(Apply 脚本不含 Set-NetFirewallRule、Enable-NetFirewallRule;所有含 Remove-NetFirewallRule 的行都形如 `Get-NetFirewallRule -Name 'YuanC-KS-…' -ErrorAction SilentlyContinue | Remove-NetFirewallRule`;`$state.disabledRules = @(` 之后先 Write-State 再 Disable;第一个 Write-State $state 在第一个 Set-NetFirewallProfile 之前;最后一个 `$state.applied = $true` 在第一个 New-NetFirewallRule 之后);KillSwitchHardenTests(Apply 脚本不含 -Direction Inbound、-Action Block;UpdateNode 脚本不含 Disable-/Enable-NetFirewallRule、Set-NetFirewallProfile;Audit 脚本不含 Write-State $state;Remove / Audit / UpdateNode 脚本的 Remove-NetFirewallRule 行同上形状);KillSwitchPatrolTests.PatrolScriptPersistsBeforeDisablingAndOnlyTightensProtection(见 goal ③);KillSwitchAppsModeTests(分应用巡检脚本含 MpsSvc、-Enabled True、Get-NetFirewallRule -PolicyStore ActiveStore、'Block'、missing_rules、newly_disabled、exit 3);KillSwitchNarrowRuleTests(单条 AddRule 脚本的 New-NetFirewallRule 行形状;UpdateNode 脚本不含 YuanC-KS-Tun / Dhcp)。红线:只动本项目自己的规则;凭据不入库不入日志;隧道断了不静默回落;Windows 子进程一律隐藏窗口;真机未测不标通过;全程中文。",
+  "nonGoals": [
+    "不改 KillSwitchApplier、控制器、状态机、IPC 协议与界面",
+    "不改仅指定程序模式的任何脚本与断言(AppendAppsPatrol / AppendMissingAppRules / PlanApps)",
+    "不改 Restore / Recover / Audit / DisableForeignAllowRules(Apply 时)的脚本",
+    "不做 WFP 过滤(另卡 SEC-WIN-WFP-KILLSWITCH-1022)",
+    "不在真机实测;真机项写进文档待验证清单"
+  ],
+  "allowedPaths": [
+    "winclient/WinClient.Core/Firewall/KillSwitchPlanner.cs",
+    "winclient/WinClient.Tests/KillSwitchPatrolTests.cs",
+    "docs/winclient/断网保护加固说明.md"
+  ],
+  "forbiddenPaths": [
+    "docs/开工须知.md",
+    "docs/口径速查表.md",
+    "docs/design/**",
+    "docs/交接/**",
+    "docs/plans/**",
+    "docs/acceptance/**",
+    "docs/node/**",
+    "docs/authserver/**",
+    "docs/winclient/自动更新说明.md",
+    "docs/winclient/打包与发布说明.md",
+    "docs/winclient/分应用代理说明.md",
+    "docs/winclient/架构说明.md",
+    "docs/winclient/服务化与自启说明.md",
+    "docs/winclient/环境一致性说明.md",
+    "docs/winclient/界面说明.md",
+    ".github/**",
+    ".codex/**",
+    ".gitignore",
+    "pyproject.toml",
+    "scripts/**",
+    "node/**",
+    "authserver/**",
+    "winclient/third_party/**",
+    "winclient/*.sln",
+    "winclient/Directory.Build.props",
+    "winclient/NuGet.Config",
+    "winclient/WinClient.Core/WinClient.Core.csproj",
+    "winclient/WinClient.Tests/WinClient.Tests.csproj",
+    "winclient/WinClient.App/**",
+    "winclient/WinClient.UiTests/**",
+    "winclient/WinClient.Core/Auth/**",
+    "winclient/WinClient.Core/Client/**",
+    "winclient/WinClient.Core/Environment/**",
+    "winclient/WinClient.Core/Hosting/**",
+    "winclient/WinClient.Core/Ipc/**",
+    "winclient/WinClient.Core/Kernel/**",
+    "winclient/WinClient.Core/Logging/**",
+    "winclient/WinClient.Core/Pairing/**",
+    "winclient/WinClient.Core/Process/**",
+    "winclient/WinClient.Core/State/**",
+    "winclient/WinClient.Core/Storage/**",
+    "winclient/WinClient.Core/Update/**",
+    "winclient/WinClient.Core/Firewall/CommandRunner.cs",
+    "winclient/WinClient.Core/Firewall/KillSwitchApplier.cs",
+    "winclient/WinClient.Tests/AuthTests.cs",
+    "winclient/WinClient.Tests/ControllerTests.cs",
+    "winclient/WinClient.Tests/DataDirectorySecurityTests.cs",
+    "winclient/WinClient.Tests/EnvironmentApplierTests.cs",
+    "winclient/WinClient.Tests/EnvironmentPlannerTests.cs",
+    "winclient/WinClient.Tests/EnvironmentPolicyTests.cs",
+    "winclient/WinClient.Tests/EnvironmentSelfCheckTests.cs",
+    "winclient/WinClient.Tests/FirewallTests.cs",
+    "winclient/WinClient.Tests/HostingTests.cs",
+    "winclient/WinClient.Tests/IpcTests.cs",
+    "winclient/WinClient.Tests/KernelInstallerTests.cs",
+    "winclient/WinClient.Tests/KillSwitchAppsModeTests.cs",
+    "winclient/WinClient.Tests/KillSwitchAuthRuleTests.cs",
+    "winclient/WinClient.Tests/KillSwitchHardenTests.cs",
+    "winclient/WinClient.Tests/KillSwitchNarrowRuleTests.cs",
+    "winclient/WinClient.Tests/KillSwitchProfileTests.cs",
+    "winclient/WinClient.Tests/KillSwitchRecoveryTests.cs",
+    "winclient/WinClient.Tests/PairingCertificateTests.cs",
+    "winclient/WinClient.Tests/PairingTests.cs",
+    "winclient/WinClient.Tests/ProcessStorageTests.cs",
+    "winclient/WinClient.Tests/RoutingTests.cs",
+    "winclient/WinClient.Tests/StateTests.cs",
+    "winclient/WinClient.Tests/TestData.cs",
+    "winclient/WinClient.Tests/UpdateApplierTests.cs",
+    "winclient/WinClient.Tests/UpdateCoordinatorTests.cs",
+    "winclient/WinClient.Tests/UpdateHttpTests.cs",
+    "winclient/WinClient.Tests/UpdateIpcTests.cs",
+    "winclient/WinClient.Tests/UpdateTests.cs",
+    "winclient/WinClient.Tests/Fixtures/**"
+  ],
+  "expectArtifacts": [
+    "winclient/WinClient.Core/Firewall/KillSwitchPlanner.cs",
+    "winclient/WinClient.Tests/KillSwitchPatrolTests.cs",
+    "docs/winclient/断网保护加固说明.md"
+  ],
+  "acceptance": [
+    {
+      "id": "BUILD",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "build",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1200
+    },
+    {
+      "id": "TEST",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "test",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--no-build",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1200
+    },
+    {
+      "id": "SHAPE-PLANNER",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;kp=pathlib.Path('winclient/WinClient.Core/Firewall/KillSwitchPlanner.cs').read_text(encoding='utf-8');p=kp[kp.index('case Patrol patrol:'):kp.index('case SetProfileDefault setting:')];bad=[k for k,ok in (('no-notcontains','disabledRules -notcontains' not in p),('bystore','-PolicyStore ActiveStore -Name' in p),('allow',\"-ne 'Allow'\" in p),('outbound',\"-ne 'Outbound'\" in p),('addr','Get-NetFirewallAddressFilter' in p),('app','Get-NetFirewallApplicationFilter' in p),('port','Get-NetFirewallPortFilter' in p),('svc','Get-NetFirewallServiceFilter' in p),('rules','$state.rules' in p),('record','$state.rules' in kp[kp.index('case AddRule rule:'):kp.index('case RemoveRulesByPrefix remove:')]),('apps-untouched','AppendMissingAppRules' in kp and \"-ne 'Block'\" in kp)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "TESTS-UPDATED",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;pt=pathlib.Path('winclient/WinClient.Tests/KillSwitchPatrolTests.cs').read_text(encoding='utf-8');bad=[k for k,ok in (('flip','Assert.DoesNotContain(\"$state.disabledRules -notcontains\"' in pt and 'Assert.Contains(\"$state.disabledRules -notcontains\"' not in pt),('addr','Get-NetFirewallAddressFilter' in pt),('app','Get-NetFirewallApplicationFilter' in pt),('port','Get-NetFirewallPortFilter' in pt),('svc','Get-NetFirewallServiceFilter' in pt),('rules','$state.rules' in pt),('bystore','-PolicyStore ActiveStore -Name' in pt),('update','UpdateNode' in pt),('lan',\"YuanC-KS-Lan\" in pt),('old','PatrolScriptPersistsBeforeDisablingAndOnlyTightensProtection' in pt and 'PatrolRejectsFailureExitCodesAndMalformedOutput' in pt)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "OLD-TESTS-UNCHANGED",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess,sys;b=subprocess.run(['git','merge-base','origin/main','HEAD'],capture_output=True,text=True).stdout.strip();out=subprocess.run(['git','diff','--name-only',b,'--','winclient/WinClient.Tests/FirewallTests.cs','winclient/WinClient.Tests/KillSwitchHardenTests.cs','winclient/WinClient.Tests/KillSwitchNarrowRuleTests.cs','winclient/WinClient.Tests/KillSwitchAppsModeTests.cs','winclient/WinClient.Tests/KillSwitchProfileTests.cs','winclient/WinClient.Tests/KillSwitchRecoveryTests.cs','winclient/WinClient.Tests/KillSwitchAuthRuleTests.cs','winclient/WinClient.Tests/ControllerTests.cs','winclient/WinClient.Core/Firewall/KillSwitchApplier.cs','winclient/WinClient.Core/Client','winclient/WinClient.Core/State','winclient/WinClient.App'],capture_output=True,text=True).stdout.split();print(out);sys.exit(1 if out else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "NOWINDOW",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;norm=lambda p:str(p).replace(chr(92),'/');files=[p for root in ('winclient/WinClient.Core','winclient/WinClient.App') for p in pathlib.Path(root).rglob('*.cs') if '/obj/' not in norm(p) and '/bin/' not in norm(p)];bad=[norm(p) for p in files if 'ProcessStartInfo' in p.read_text(encoding='utf-8') and p.parent.name!='Process' and 'CreateNoWindow = true' not in p.read_text(encoding='utf-8')];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "NOBIN",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess,sys;out=subprocess.run(['git','ls-files','winclient','build'],capture_output=True,text=True).stdout.split();bad=[f for f in out if f.endswith(('.exe','.dll','.zip','.pdb'))];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;b=pathlib.Path('docs/winclient/断网保护加固说明.md').read_text(encoding='utf-8');bad=[k for k in ('重新启用','所有当前已启用','ActiveStore','方向不是','地址','协议','rules','并集记录','Enable 一条','Disable YuanC-KS-Tun','Any','missing_rules','旧版本') if k not in b];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    }
+  ],
+  "steps": [
+    "读 KillSwitchPlanner.cs 全文(Patrol / AddRule / DisableForeignAllowRules / RestoreProfileDefault / VerifyProfiles / AppendMissingAppRules 各分支与 $state 的加载时机)、KillSwitchPatrolTests.cs、FirewallTests.cs 与 KillSwitchHardenTests.cs 里对脚本文本的断言(只读)、docs/winclient/断网保护加固说明.md「连接期间巡检」「停用范围与先记录的原因」「真机待验证清单」。先写 ③ 的红测试(含翻转的那条既有断言)。",
+    "实现 ②(1) AddRule 记录期望 + UpdateNode 加载 / 写回状态 → ②(2) 巡检核内容 → ① 去掉排除条件;每步跑 BUILD / TEST,最后跑全部形状断言与 OLD-TESTS-UNCHANGED。生成的 PowerShell 只能用 Get-NetFirewall*Filter 系列读取,不许出现 Set-NetFirewallRule、New-/Remove-/Enable-NetFirewallRule 于巡检分支。",
+    "写文档 ④;交活说明逐条列出改过的既有断言行、脚本新增的 rules 记录字段、真机待验证项。除 dotnet build/test/restore 外不跑别的命令、不改环境;不许在工位机器上执行任何防火墙 / 环境脚本。"
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "timeoutSec": 7200,
+  "repoRoot": "E:/yuanc"
+}
