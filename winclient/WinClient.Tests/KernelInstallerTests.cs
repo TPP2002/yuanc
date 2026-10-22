@@ -8,6 +8,31 @@ namespace WinClient.Tests;
 
 public sealed class KernelInstallerTests
 {
+    [Theory]
+    [InlineData("https://unit.invalid")]
+    [InlineData("https://[::1]")]
+    public void ServerSettingsRejectNonIpv4Hosts(string url)
+    {
+        using var directory = new TempDirectory();
+        File.WriteAllText(Path.Combine(directory.Path, "server.json"), JsonSerializer.Serialize(new { server_url = url }));
+        Assert.Contains("IPv4", Assert.Throws<InvalidDataException>(() => ClientSettings.Load(directory.Path)).Message);
+    }
+
+    [Theory]
+    [InlineData("https://192.0.2.1", 443)]
+    [InlineData("https://192.0.2.1:8443", 8443)]
+    public void ServerSettingsExposeServiceAuthEndpoint(string url, int port)
+    {
+        using var directory = new TempDirectory();
+        File.WriteAllText(Path.Combine(directory.Path, "server.json"), JsonSerializer.Serialize(new { server_url = url }));
+        var settings = ClientSettings.Load(directory.Path)!;
+        Assert.Equal(url, settings.ServerUrl);
+        var endpoint = Assert.IsType<WinClient.Core.Firewall.AuthEndpoint>(settings.AuthEndpoint);
+        Assert.Equal(System.Net.IPAddress.Parse("192.0.2.1"), endpoint.Address);
+        Assert.Equal(port, endpoint.Port);
+        Assert.Equal(Path.GetFullPath(Environment.ProcessPath!), endpoint.Program);
+    }
+
     [Fact]
     public void FirstRunWritesBothFilesAndReturnsFullExecutablePath()
     {

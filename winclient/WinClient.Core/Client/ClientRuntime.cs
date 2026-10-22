@@ -33,13 +33,16 @@ public sealed class ClientRuntime : IClientFacade, IDisposable
     { Controller = controller; this.firewall = firewall; this.http = http; this.pairingStore = pairingStore; this.log = log; this.storeRoot = storeRoot; this.scope = scope; }
 
     public static async Task<ClientRuntime> CreateAsync(IKernelInstaller installer, string? storeRoot = null,
-        DataProtectionScope scope = DataProtectionScope.CurrentUser)
+        DataProtectionScope scope = DataProtectionScope.CurrentUser, bool keepProtection = false)
     {
         var firewall = new KillSwitchApplier(Path.Combine(ClientSettings.DataDirectory, "run"));
-        try { await firewall.RecoverAsync(); } // 恢复先于读取服务器配置。
-        catch (InvalidOperationException)
+        if (!keepProtection)
         {
-            // 启动恢复失败由 Controller.InitializeAsync 再试并进入需人工处理，服务不得因此退出。
+            try { await firewall.RecoverAsync(); } // 恢复路径仍先于读取服务器配置。
+            catch (InvalidOperationException)
+            {
+                // 启动恢复失败由 Controller.InitializeAsync 再试并进入需人工处理，服务不得因此退出。
+            }
         }
         var pairingStore = new PairingStore(root: storeRoot, scope: scope);
         var log = new RedactingLog(new RollingFileLog(Path.Combine(ClientSettings.DataDirectory, "run", "sing-box.log")));
@@ -57,7 +60,8 @@ public sealed class ClientRuntime : IClientFacade, IDisposable
             var program = settings?.SingBoxPath ?? installer.Ensure();
             var transport = new TunnelTransport(new SingBoxProcessManager(program, ClientSettings.ProductName, logger: log));
             var controller = new ClientController(source, firewall,
-                transport, program, new DeviceInfo { Platform = "windows", Name = Environment.MachineName, Fingerprint = ClientSettings.GetDeviceFingerprint(storeRoot, scope) });
+                transport, program, new DeviceInfo { Platform = "windows", Name = Environment.MachineName, Fingerprint = ClientSettings.GetDeviceFingerprint(storeRoot, scope) },
+                authEndpoint: settings?.AuthEndpoint);
             return new(controller, firewall, http, pairingStore, log, storeRoot, scope);
         }
         catch { http?.Dispose(); throw; }
