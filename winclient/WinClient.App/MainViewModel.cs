@@ -27,6 +27,15 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
     private string code = "";
     public string Code { get => code; set { code = value; Notify(); } }
     public string Status => snapshot.Status;
+    public string ExitLine => snapshot.ExitStatus switch
+    {
+        "核验中" => "当前出口 IP:核验中…",
+        "已核验" => $"当前出口 IP:{snapshot.ExitIp}(与澳洲节点一致)",
+        "不一致" => $"⚠ 当前出口 IP:{snapshot.ExitIp},与澳洲节点不一致,请联系管理员",
+        "无法核验" => "当前出口 IP:无法核验(隧道内暂无回应)",
+        _ => "当前出口 IP:待检测"
+    };
+    public string GuardLine => snapshot.GuardStatus.Length == 0 ? "" : "断网保护巡检:" + snapshot.GuardStatus;
     public string Message => snapshot.Message + (serviceVersion.Length != 0 && serviceVersion != ControlSnapshot.CurrentVersion
         ? $" 后台已更新到 {serviceVersion}，下次打开界面将使用新版" : "");
     public string ServiceVersion => serviceVersion.Length == 0 ? "后台版本：等待连接" : "后台版本 " + serviceVersion;
@@ -180,6 +189,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         if (disposed) return;
         Notify(nameof(Status)); Notify(nameof(Message)); Notify(nameof(ConnectLabel)); Notify(nameof(Mode)); Notify(nameof(IsBusy)); Notify(nameof(CanUseConnection));
         Notify(nameof(ServiceVersion)); Notify(nameof(UpdateMessage));
+        Notify(nameof(ExitLine)); Notify(nameof(GuardLine));
         CommandManager.InvalidateRequerySuggested();
     }
     public Task ExportAuditAsync(string path) => RunAsync(async () =>

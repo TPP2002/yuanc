@@ -61,7 +61,7 @@ public sealed class ClientRuntime : IClientFacade, IDisposable
             var transport = new TunnelTransport(new SingBoxProcessManager(program, ClientSettings.ProductName, logger: log));
             var controller = new ClientController(source, firewall,
                 transport, program, new DeviceInfo { Platform = "windows", Name = Environment.MachineName, Fingerprint = ClientSettings.GetDeviceFingerprint(storeRoot, scope) },
-                authEndpoint: settings?.AuthEndpoint);
+                authEndpoint: settings?.AuthEndpoint, exitProbe: new HttpExitProbe());
             return new(controller, firewall, http, pairingStore, log, storeRoot, scope);
         }
         catch { http?.Dispose(); throw; }

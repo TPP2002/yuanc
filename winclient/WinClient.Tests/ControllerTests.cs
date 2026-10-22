@@ -12,6 +12,299 @@ namespace WinClient.Tests;
 public sealed class ControllerTests
 {
     [Theory]
+    [InlineData("192.0.2.5", "已核验")]
+    [InlineData("198.51.100.9", "不一致")]
+    public async Task ExitProbeWaitsThreeSecondsAndNeverDisconnects(string address, string status)
+    {
+        var probe = new ScriptedProbe(IPAddress.Parse(address));
+        var (controller, timers, firewall, order) = await ConnectMonitored(probe);
+        using (controller)
+        {
+            Assert.Equal("核验中", controller.Snapshot.ExitStatus);
+            Assert.Equal(0, probe.Calls);
+            Assert.Equal(TimeSpan.FromSeconds(3), Assert.Single(timers.For("出口核验")));
+            await FireAndPublish(controller, timers, "出口核验", TimeSpan.FromSeconds(3));
+            Assert.Equal(status, controller.Snapshot.ExitStatus);
+            Assert.Equal(address, controller.Snapshot.ExitIp);
+            if (status == "不一致") Assert.Contains("不一致", controller.Snapshot.Message);
+            Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
+            Assert.True(controller.Snapshot.ProtectionActive);
+            Assert.DoesNotContain("stop", order);
+            Assert.DoesNotContain("remove", order);
+            Assert.Empty(firewall.PatrolCalls);
+            Assert.Contains(TimeSpan.FromMinutes(5), timers.For("出口核验"));
+            await controller.DisconnectAsync();
+            Assert.Equal("未检测", controller.Snapshot.ExitStatus);
+            Assert.Equal("", controller.Snapshot.ExitIp);
+            Assert.Equal("", controller.Snapshot.GuardStatus);
+        }
+    }
+
+    [Fact]
+    public async Task FiveNullProbesRetryEveryFiveSecondsThenRecheckAfterFiveMinutes()
+    {
+        var probe = new ScriptedProbe(null, null, null, null, null, IPAddress.Parse(TestData.Node().Host));
+        var (controller, timers, _, order) = await ConnectMonitored(probe);
+        using (controller)
+        {
+            await FireAndPublish(controller, timers, "出口核验", TimeSpan.FromSeconds(3));
+            for (var attempt = 1; attempt < 5; attempt++)
+            {
+                Assert.Equal("核验中", controller.Snapshot.ExitStatus);
+                await FireAndPublish(controller, timers, "出口核验", TimeSpan.FromSeconds(5));
+            }
+            Assert.Equal(5, probe.Calls);
+            Assert.Equal("无法核验", controller.Snapshot.ExitStatus);
+            Assert.Equal("", controller.Snapshot.ExitIp);
+            Assert.Equal(4, timers.For("出口核验").Count(d => d == TimeSpan.FromSeconds(5)));
+            await FireAndPublish(controller, timers, "出口核验", TimeSpan.FromMinutes(5));
+            Assert.Equal("已核验", controller.Snapshot.ExitStatus);
+            Assert.Equal(TestData.Node().Host, controller.Snapshot.ExitIp);
+            Assert.Equal(new[] { "apply", "start" }, order);
+        }
+    }
+
+    [Fact]
+    public async Task NullProbeSchedulesNoExitChecks()
+    {
+        var (controller, timers, _, _) = await ConnectMonitored(null);
+        using (controller)
+        {
+            Assert.Empty(timers.For("出口核验"));
+            Assert.Equal("未检测", controller.Snapshot.ExitStatus);
+            await FireAndPublish(controller, timers, "巡检", TimeSpan.FromSeconds(60));
+            Assert.Empty(timers.For("出口核验"));
+        }
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task PatrolUsesModeSpecificRulesAfterSixtySeconds(bool authMode)
+    {
+        var order = new List<string>();
+        var timers = new Timers();
+        var firewall = new Firewall(order);
+        using var http = SessionHttp(() => TestData.Session());
+        var store = new InMemoryCredentialStore(); store.Save("refresh");
+        ISessionSource source = authMode ? new AuthServerSessionSource(new AuthApiClient(http), store)
+            : new PairingSessionSource(PairingTests.ValidPairing());
+        using var controller = new ClientController(source, firewall, new Tunnel(order), Path.GetFullPath("fake.exe"),
+            TestData.Device, timers.Delay) { DelayWithPurposeAsync = timers.Delay };
+        controller.Changed += _ => Interlocked.Increment(ref timers.Published);
+        await controller.ConnectAsync();
+        await controller.ConnectAsync();
+        await controller.RefreshSessionAsync();
+        Assert.Empty(firewall.PatrolCalls);
+        Assert.Equal(TimeSpan.FromSeconds(60), Assert.Single(timers.For("巡检")));
+        await FireAndPublish(controller, timers, "巡检", TimeSpan.FromSeconds(60));
+        var rules = Assert.Single(firewall.PatrolCalls);
+        Assert.Equal(authMode, rules.Contains("YuanC-KS-Auth"));
+        Assert.Equal(authMode ? 6 : 5, rules.Length);
+        Assert.Equal("正常", controller.Snapshot.GuardStatus);
+        Assert.Equal(2, timers.For("巡检").Length);
+    }
+
+    [Theory]
+    [InlineData("missing", "已重建 1 条本项目规则")]
+    [InlineData("profile", "已重新收紧 1 条规则")]
+    [InlineData("foreign", "已重新收紧 2 条规则")]
+    [InlineData("ineffective", "防火墙")]
+    [InlineData("failure", "巡检失败,下一轮重试")]
+    [InlineData("rebuild-failure", "巡检失败,下一轮重试")]
+    public async Task PatrolRepairsOrWarnsWithoutStoppingAndAlwaysSchedulesNext(string scenario, string expected)
+    {
+        var (controller, timers, firewall, order) = await ConnectMonitored(null);
+        using (controller)
+        {
+            firewall.PatrolResults.Enqueue(scenario switch
+            {
+                "missing" or "rebuild-failure" => new PatrolReport([], [], ["YuanC-KS-Tun"]),
+                "profile" => new PatrolReport(["Public"], [], []),
+                "foreign" => new PatrolReport(["Public"], ["third-party"], []),
+                "ineffective" => new FirewallIneffectiveException("防火墙失效"),
+                _ => new InvalidOperationException("模拟巡检失败")
+            });
+            if (scenario == "rebuild-failure") firewall.ReapplyError = new InvalidOperationException("模拟重建失败");
+            await FireAndPublish(controller, timers, "巡检", TimeSpan.FromSeconds(60));
+            Assert.Contains(expected, controller.Snapshot.GuardStatus);
+            if (scenario == "ineffective") Assert.Equal(controller.Snapshot.GuardStatus, controller.Snapshot.Message);
+            Assert.Equal(scenario is "missing" or "rebuild-failure" ? 2 : 1, order.Count(x => x == "apply"));
+            Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
+            Assert.True(controller.Snapshot.ProtectionActive);
+            Assert.DoesNotContain("stop", order);
+            Assert.DoesNotContain("remove", order);
+            await FireAndPublish(controller, timers, "巡检", TimeSpan.FromSeconds(60));
+            Assert.Equal(2, firewall.PatrolCalls.Count);
+            Assert.Equal("正常", controller.Snapshot.GuardStatus);
+            await controller.DisconnectAsync();
+            Assert.Equal("", controller.Snapshot.GuardStatus);
+        }
+    }
+
+    [Fact]
+    public async Task DisconnectedTimersCannotProbeOrPatrolEvenAfterTenMinutes()
+    {
+        var probe = new ScriptedProbe(IPAddress.Parse(TestData.Node().Host));
+        var (controller, timers, firewall, _) = await ConnectMonitored(probe);
+        using (controller)
+        {
+            await controller.DisconnectAsync();
+            timers.Advance(TimeSpan.FromMinutes(10));
+            await controller.ConnectAsync();
+            // 再连接必须重新安排首探与巡检，旧生命周期不得执行。
+            Assert.Equal(0, probe.Calls);
+            Assert.Empty(firewall.PatrolCalls);
+            Assert.Equal(2, timers.For("出口核验").Length);
+            Assert.Equal(2, timers.For("巡检").Length);
+            await FireAndPublish(controller, timers, "出口核验", TimeSpan.FromSeconds(3));
+            Assert.Equal(1, probe.Calls);
+            await controller.DisconnectAsync();
+            timers.Advance(TimeSpan.FromMinutes(10));
+            Assert.Equal(ConnectionState.Disconnected, controller.Snapshot.State);
+            Assert.Equal("未检测", controller.Snapshot.ExitStatus);
+            Assert.Equal("", controller.Snapshot.ExitIp);
+            Assert.Empty(firewall.PatrolCalls);
+        }
+    }
+
+    [Fact]
+    public async Task ReconnectKeepsOnePatrolAndInvalidatesPreviousExitCycle()
+    {
+        var order = new List<string>();
+        var timers = new Timers();
+        var firewall = new Firewall(order);
+        var tunnel = new ObservableTunnel(order);
+        var source = new ScriptedSource(); source.Enqueue(Ok(TestData.Session()));
+        var probe = new ScriptedProbe(IPAddress.Parse(TestData.Node().Host), IPAddress.Parse(TestData.Node().Host));
+        using var controller = new ClientController(source, firewall, tunnel, Path.GetFullPath("fake.exe"),
+            TestData.Device, timers.Delay, exitProbe: probe) { DelayWithPurposeAsync = timers.Delay };
+        controller.Changed += _ => Interlocked.Increment(ref timers.Published);
+        await controller.ConnectAsync();
+        await FireAndPublish(controller, timers, "出口核验", TimeSpan.FromSeconds(3));
+        tunnel.Crash();
+        await FireAndPublish(controller, timers, "", TimeSpan.Zero);
+        Assert.Equal(ConnectionState.Reconnecting, controller.Snapshot.State);
+        Assert.Equal("未检测", controller.Snapshot.ExitStatus);
+        Assert.Equal("", controller.Snapshot.ExitIp);
+        await FireAndPublish(controller, timers, "巡检", TimeSpan.FromSeconds(60));
+        Assert.Single(firewall.PatrolCalls);
+        Assert.Equal(ConnectionState.Reconnecting, controller.Snapshot.State);
+        await FireAndPublish(controller, timers, "退避", TimeSpan.FromSeconds(2));
+        Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
+        Assert.Equal("核验中", controller.Snapshot.ExitStatus);
+        Assert.Equal(2, timers.For("巡检").Length);
+        // 上一轮连接遗留的五分钟回调不能提前探测，也不能续排第二条链。
+        await FireAndPublish(controller, timers, "出口核验", TimeSpan.FromMinutes(5));
+        Assert.Equal(1, probe.Calls);
+        await FireAndPublish(controller, timers, "出口核验", TimeSpan.FromSeconds(3));
+        Assert.Equal(2, probe.Calls);
+        Assert.Equal("已核验", controller.Snapshot.ExitStatus);
+        Assert.DoesNotContain("remove", order);
+    }
+
+    [Theory]
+    [InlineData("expiry", ConnectionState.NeedsLogin)]
+    [InlineData("rejection", ConnectionState.NeedsLogin)]
+    [InlineData("failure", ConnectionState.NeedsManual)]
+    public async Task LeavingConnectedClearsExitEvenWhenStoppingThrows(string reason, ConnectionState expected)
+    {
+        var order = new List<string>();
+        var timers = new Timers();
+        var source = new ScriptedSource(); source.Enqueue(Ok(TestData.Session()));
+        var tunnel = new ObservableTunnel(order);
+        var probe = new ScriptedProbe(IPAddress.Parse(TestData.Node().Host));
+        using var controller = new ClientController(source, new Firewall(order), tunnel, Path.GetFullPath("fake.exe"),
+            TestData.Device, timers.Delay, exitProbe: probe) { DelayWithPurposeAsync = timers.Delay };
+        controller.Changed += _ => Interlocked.Increment(ref timers.Published);
+        await controller.ConnectAsync();
+        await FireAndPublish(controller, timers, "出口核验", TimeSpan.FromSeconds(3));
+        if (reason == "expiry")
+        {
+            var published = Volatile.Read(ref timers.Published);
+            timers.Fire("到期", _ => true);
+            await Until(() => Volatile.Read(ref timers.Published) > published);
+            await controller.RefreshSessionAsync(); // 等迁移回调释放串行锁，不触发重新连接。
+        }
+        else
+        {
+            source.Enqueue(new AuthResponse<SessionResponse>(AuthResult.InvalidToken));
+            tunnel.FailStop = reason == "failure";
+            await controller.RefreshSessionAsync();
+        }
+        Assert.Equal(expected, controller.Snapshot.State);
+        Assert.Equal("未检测", controller.Snapshot.ExitStatus);
+        Assert.Equal("", controller.Snapshot.ExitIp);
+        Assert.True(controller.Snapshot.ProtectionActive);
+        Assert.DoesNotContain("remove", order);
+    }
+
+    [Fact]
+    public async Task ReconnectingWithoutSessionSkipsMissingRuleRebuildAndKeepsPatrolling()
+    {
+        var order = new List<string>();
+        var timers = new Timers();
+        var firewall = new Firewall(order) { HasPendingState = true };
+        using var http = new HttpClient(new AuthTests.Handler(_ => throw new HttpRequestException()))
+        { BaseAddress = new("https://192.0.2.1") };
+        var store = new InMemoryCredentialStore(); store.Save("refresh");
+        using var controller = new ClientController(new AuthServerSessionSource(new AuthApiClient(http), store),
+            firewall, new Tunnel(order), Path.GetFullPath("fake.exe"), TestData.Device, timers.Delay)
+            { DelayWithPurposeAsync = timers.Delay };
+        controller.Changed += _ => Interlocked.Increment(ref timers.Published);
+        await controller.InitializeAsync(true, true);
+        firewall.PatrolResults.Enqueue(new PatrolReport([], [], ["YuanC-KS-Tun"]));
+        await FireAndPublish(controller, timers, "巡检", TimeSpan.FromSeconds(60));
+        Assert.Equal(ConnectionState.Reconnecting, controller.Snapshot.State);
+        Assert.Equal("巡检失败,下一轮重试", controller.Snapshot.GuardStatus);
+        Assert.DoesNotContain("apply", order);
+        Assert.DoesNotContain("remove", order);
+        Assert.Equal(2, timers.For("巡检").Length);
+    }
+
+    private sealed class ObservableTunnel(List<string> order) : ITunnelTransport
+    {
+        public bool FailStop { get; set; }
+        public event EventHandler? TunnelDown;
+        public void Crash() => TunnelDown?.Invoke(this, EventArgs.Empty);
+        public Task StartAsync(JsonElement configuration, CancellationToken token) { order.Add("start"); return Task.CompletedTask; }
+        public void Stop() { order.Add("stop"); if (FailStop) throw new IOException("模拟停止失败"); }
+        public void Dispose() { }
+    }
+
+    private static async Task<(ClientController Controller, Timers Timers, Firewall Firewall, List<string> Order)> ConnectMonitored(IExitProbe? probe)
+    {
+        var order = new List<string>();
+        var timers = new Timers();
+        var firewall = new Firewall(order);
+        var source = new ScriptedSource(); source.Enqueue(Ok(TestData.Session())); source.Enqueue(Ok(TestData.Session()));
+        var controller = new ClientController(source, firewall, new Tunnel(order), Path.GetFullPath("fake.exe"),
+            TestData.Device, timers.Delay, exitProbe: probe) { DelayWithPurposeAsync = timers.Delay };
+        controller.Changed += _ => Interlocked.Increment(ref timers.Published);
+        await controller.ConnectAsync();
+        return (controller, timers, firewall, order);
+    }
+
+    private static async Task FireAndPublish(ClientController controller, Timers timers, string purpose, TimeSpan duration)
+    {
+        var published = Volatile.Read(ref timers.Published);
+        timers.Fire(purpose, d => d == duration);
+        await Until(() => Volatile.Read(ref timers.Published) > published);
+        await controller.ConnectAsync(); // 串行锁屏障，等待本次回调完成。
+    }
+
+    private sealed class ScriptedProbe(params IPAddress?[] results) : IExitProbe
+    {
+        private readonly Queue<IPAddress?> results = new(results);
+        public int Calls { get; private set; }
+        public Task<IPAddress?> ProbeAsync(CancellationToken token)
+        {
+            Calls++;
+            return Task.FromResult(results.Dequeue());
+        }
+    }
+
+    [Theory]
     [InlineData(true)]
     [InlineData(false)]
     public async Task StartupKeepsPairingProtectionAndConnectsRegardlessOfAutoConnect(bool autoConnect)
@@ -90,14 +383,7 @@ public sealed class ControllerTests
     [Fact]
     public async Task StartupAuthNetworkRetriesExhaustWithoutEverRemovingProtection()
     {
-        var pending = System.Threading.Channels.Channel.CreateUnbounded<(TimeSpan Delay, TaskCompletionSource Completion)>();
-        Task Delay(TimeSpan duration, CancellationToken token)
-        {
-            var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-            token.Register(() => completion.TrySetCanceled(token));
-            pending.Writer.TryWrite((duration, completion));
-            return completion.Task;
-        }
+        var timers = new Timers();
         var order = new List<string>();
         var calls = 0;
         using var http = new HttpClient(new AuthTests.Handler(_ =>
@@ -105,7 +391,8 @@ public sealed class ControllerTests
         { BaseAddress = new("https://192.0.2.1") };
         var store = new InMemoryCredentialStore(); store.Save("refresh");
         using var controller = new ClientController(new AuthServerSessionSource(new AuthApiClient(http), store),
-            new Firewall(order) { HasPendingState = true }, new Tunnel(order), Path.GetFullPath("fake.exe"), TestData.Device, Delay);
+            new Firewall(order) { HasPendingState = true }, new Tunnel(order), Path.GetFullPath("fake.exe"), TestData.Device, timers.Delay)
+            { DelayWithPurposeAsync = timers.Delay };
         var snapshots = new System.Collections.Concurrent.ConcurrentQueue<ClientSnapshot>();
         var manual = new TaskCompletionSource<ClientSnapshot>(TaskCreationOptions.RunContinuationsAsynchronously);
         controller.Changed += snapshot =>
@@ -119,7 +406,7 @@ public sealed class ControllerTests
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
         foreach (var seconds in new[] { 2, 4, 8, 16, 32, 60, 60, 60, 60, 60, 60 })
         {
-            var scheduled = await pending.Reader.ReadAsync(timeout.Token);
+            var scheduled = await timers.TakeAsync("退避", timeout.Token);
             Assert.Equal(TimeSpan.FromSeconds(seconds), scheduled.Delay);
             scheduled.Completion.SetResult();
         }
@@ -182,26 +469,24 @@ public sealed class ControllerTests
     [Fact]
     public async Task PairingRetriesReachManualWithAddressHintAndKeepProtection()
     {
-        var pending = System.Threading.Channels.Channel.CreateUnbounded<(TimeSpan Delay, TaskCompletionSource Completion)>();
+        var timers = new Timers();
         var expiryTokens = new List<CancellationToken>();
-        Task Delay(TimeSpan duration, CancellationToken token)
+        Task Delay(TimeSpan duration, CancellationToken token, string purpose)
         {
-            if (duration >= TimeSpan.FromDays(1)) { expiryTokens.Add(token); return Task.Delay(Timeout.Infinite, token); }
-            var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-            token.Register(() => completion.TrySetCanceled(token));
-            pending.Writer.TryWrite((duration, completion));
-            return completion.Task;
+            if (purpose == "到期") expiryTokens.Add(token);
+            return timers.Delay(duration, token, purpose);
         }
         var order = new List<string>();
         using var controller = new ClientController(new PairingSessionSource(PairingTests.ValidPairing()),
-            new PairingTests.FakeFirewall(order), new PairingTests.FakeTunnel(order, fail: true), Path.GetFullPath("fake.exe"), TestData.Device, Delay);
+            new PairingTests.FakeFirewall(order), new PairingTests.FakeTunnel(order, fail: true), Path.GetFullPath("fake.exe"), TestData.Device, timers.Delay)
+            { DelayWithPurposeAsync = Delay };
         var manual = new TaskCompletionSource<ClientSnapshot>(TaskCreationOptions.RunContinuationsAsynchronously);
         controller.Changed += snapshot => { if (snapshot.State == ConnectionState.NeedsManual && snapshot.Message.Contains("出口地址可能已变")) manual.TrySetResult(snapshot); };
         await controller.ConnectAsync();
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
         foreach (var seconds in new[] { 2, 4, 8, 16, 32, 60, 60, 60, 60, 60, 60 })
         {
-            var scheduled = await pending.Reader.ReadAsync(timeout.Token);
+            var scheduled = await timers.TakeAsync("退避", timeout.Token);
             Assert.Equal(TimeSpan.FromSeconds(seconds), scheduled.Delay);
             scheduled.Completion.SetResult();
         }
@@ -306,14 +591,14 @@ public sealed class ControllerTests
         {
             source.Enqueue(Ok(TestData.SessionExpiringIn(TimeSpan.FromHours(7), token: "renewed-session")));
             timers.Fire(d => Near(d, TimeSpan.FromHours(4.8)));
-            await Until(() => timers.Count == 4);
+            await Until(() => timers.For("到期", "续期").Length == 4);
             Assert.Equal(new[] { "apply", "start" }, order);
             Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
             Assert.Equal("虚拟网卡已就绪。", controller.Snapshot.Message);
             Assert.Equal(2, source.Calls);
             // 新会话的到期与续期等待已重新安排，说明控制器持有的会话到期时间已更新。
-            Assert.Contains(timers.Delays.Skip(2), d => Near(d, TimeSpan.FromHours(7)));
-            Assert.Contains(timers.Delays.Skip(2), d => Near(d, TimeSpan.FromHours(7 * 0.8)));
+            Assert.Contains(timers.For("到期", "续期").Skip(2), d => Near(d, TimeSpan.FromHours(7)));
+            Assert.Contains(timers.For("到期", "续期").Skip(2), d => Near(d, TimeSpan.FromHours(7 * 0.8)));
             // 旧会话的到期回调触发时不再生效。
             await controller.ConnectAsync(); // 已连接时直接返回，用作串行锁屏障。
             var published = Volatile.Read(ref timers.Published);
@@ -332,20 +617,20 @@ public sealed class ControllerTests
         {
             source.Enqueue(new AuthResponse<SessionResponse>(AuthResult.Network));
             timers.Fire(d => Near(d, TimeSpan.FromHours(4.8)));
-            await Until(() => timers.Count == 3);
-            Assert.Equal(TimeSpan.FromMinutes(5), timers.Delays[2]);
+            await Until(() => timers.For("到期", "续期").Length == 3);
+            Assert.Equal(TimeSpan.FromMinutes(5), timers.For("到期", "续期")[2]);
             Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
             Assert.Equal(new[] { "apply", "start" }, order);
             Assert.True(controller.Snapshot.ProtectionActive);
             // 再次触发：服务器恢复，返回内容相同的新会话，回到只换会话的路径。
             source.Enqueue(Ok(TestData.SessionExpiringIn(TimeSpan.FromHours(7), token: "renewed-session")));
             timers.Fire(d => d == TimeSpan.FromMinutes(5));
-            await Until(() => timers.Count == 5);
+            await Until(() => timers.For("到期", "续期").Length == 5);
             Assert.Equal(3, source.Calls);
             Assert.Equal(new[] { "apply", "start" }, order);
             Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
-            Assert.Contains(timers.Delays.Skip(3), d => Near(d, TimeSpan.FromHours(7)));
-            Assert.Contains(timers.Delays.Skip(3), d => Near(d, TimeSpan.FromHours(7 * 0.8)));
+            Assert.Contains(timers.For("到期", "续期").Skip(3), d => Near(d, TimeSpan.FromHours(7)));
+            Assert.Contains(timers.For("到期", "续期").Skip(3), d => Near(d, TimeSpan.FromHours(7 * 0.8)));
         }
     }
 
@@ -375,7 +660,7 @@ public sealed class ControllerTests
                 node: TestData.Node(host: "192.0.2.6"))));
             timers.Fire(d => Near(d, TimeSpan.FromHours(4.8)));
             // 停内核后进入退避，并为新会话安排到期与续期等待。
-            await Until(() => timers.Count == 5);
+            await Until(() => timers.For("到期", "续期", "退避").Length == 5);
             Assert.Equal(new[] { "apply", "start", "update", "stop" }, order);
             Assert.True(controller.Snapshot.ProtectionActive);
             timers.Fire(d => d == TimeSpan.FromSeconds(2));
@@ -394,12 +679,15 @@ public sealed class ControllerTests
         var timers = new Timers();
         var order = new List<string>();
         using var controller = new ClientController(new PairingSessionSource(PairingTests.ValidPairing()),
-            new PairingTests.FakeFirewall(order), new PairingTests.FakeTunnel(order), Path.GetFullPath("fake.exe"), TestData.Device, timers.Delay);
+            new PairingTests.FakeFirewall(order), new PairingTests.FakeTunnel(order), Path.GetFullPath("fake.exe"), TestData.Device, timers.Delay)
+            { DelayWithPurposeAsync = timers.Delay };
         await controller.ConnectAsync();
         Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
-        // 只有到期等待的第一段（一天）；若安排了续期，会再多出一段等待。
-        Assert.Equal(TimeSpan.FromDays(1), Assert.Single(timers.Delays));
-        Assert.DoesNotContain(timers.Delays, d => d < TimeSpan.FromDays(1));
+        // 原有会话等待只有到期的第一段（一天）；巡检另按用途检查。
+        Assert.Equal(TimeSpan.FromDays(1), Assert.Single(timers.For("到期", "续期")));
+        Assert.DoesNotContain(timers.For("到期", "续期"), d => d < TimeSpan.FromDays(1));
+        Assert.Equal(TimeSpan.FromSeconds(60), Assert.Single(timers.For("巡检")));
+        Assert.Empty(timers.For("续期"));
     }
 
     [Fact]
@@ -409,7 +697,7 @@ public sealed class ControllerTests
         using (controller)
         {
             Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
-            var expiry = Assert.Single(timers.Delays);
+            var expiry = Assert.Single(timers.For("到期", "续期"));
             Assert.True(expiry <= TimeSpan.FromSeconds(30));
         }
     }
@@ -478,7 +766,7 @@ public sealed class ControllerTests
         var source = new ScriptedSource();
         source.Enqueue(Ok(first));
         var controller = new ClientController(source, new PairingTests.FakeFirewall(order), new PairingTests.FakeTunnel(order),
-            Path.GetFullPath("fake.exe"), TestData.Device, timers.Delay);
+            Path.GetFullPath("fake.exe"), TestData.Device, timers.Delay) { DelayWithPurposeAsync = timers.Delay };
         controller.Changed += _ => Interlocked.Increment(ref timers.Published);
         await controller.ConnectAsync();
         return (controller, timers, source, order);
@@ -501,22 +789,49 @@ public sealed class ControllerTests
     /// <summary>记录每次等待并返回可手动完成的任务；测试按需触发某个等待。</summary>
     private sealed class Timers
     {
-        private readonly List<(TimeSpan Delay, TaskCompletionSource Completion)> entries = [];
+        private readonly List<(TimeSpan Delay, TaskCompletionSource Completion, string Purpose)> entries = [];
+        private readonly Dictionary<string, System.Threading.Channels.Channel<(TimeSpan Delay, TaskCompletionSource Completion)>> queues = new();
         public int Published;
         public TimeSpan[] Delays { get { lock (entries) return entries.Select(e => e.Delay).ToArray(); } }
         public int Count { get { lock (entries) return entries.Count; } }
-        public Task Delay(TimeSpan delay, CancellationToken token)
+        public TimeSpan[] For(params string[] purposes)
+        { lock (entries) return entries.Where(e => purposes.Contains(e.Purpose)).Select(e => e.Delay).ToArray(); }
+        public Task Delay(TimeSpan delay, CancellationToken token) => Delay(delay, token, "");
+        public Task Delay(TimeSpan delay, CancellationToken token, string purpose)
         {
             var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             token.Register(() => completion.TrySetCanceled(token));
-            lock (entries) entries.Add((delay, completion));
+            lock (entries)
+            {
+                entries.Add((delay, completion, purpose));
+                QueueFor(purpose).Writer.TryWrite((delay, completion));
+            }
             return completion.Task;
         }
+        private System.Threading.Channels.Channel<(TimeSpan Delay, TaskCompletionSource Completion)> QueueFor(string purpose)
+        {
+            if (!queues.TryGetValue(purpose, out var queue))
+                queues[purpose] = queue = System.Threading.Channels.Channel.CreateUnbounded<(TimeSpan, TaskCompletionSource)>();
+            return queue;
+        }
+        public ValueTask<(TimeSpan Delay, TaskCompletionSource Completion)> TakeAsync(string purpose, CancellationToken token)
+        { lock (entries) return QueueFor(purpose).Reader.ReadAsync(token); }
         public void Fire(Func<TimeSpan, bool> match)
         {
             TaskCompletionSource target;
             lock (entries) target = entries.First(e => !e.Completion.Task.IsCompleted && match(e.Delay)).Completion;
             target.SetResult();
+        }
+        public void Fire(string purpose, Func<TimeSpan, bool> match)
+        {
+            TaskCompletionSource target;
+            lock (entries) target = entries.First(e => !e.Completion.Task.IsCompleted && e.Purpose == purpose && match(e.Delay)).Completion;
+            target.SetResult();
+        }
+        public void Advance(TimeSpan duration)
+        {
+            lock (entries)
+                foreach (var entry in entries.Where(e => e.Delay <= duration)) entry.Completion.TrySetResult();
         }
     }
 
@@ -525,6 +840,23 @@ public sealed class ControllerTests
     { BaseAddress = new("https://unit.invalid") };
     private sealed class Firewall(List<string> order) : IKillSwitch
     {
+        public List<string[]> PatrolCalls { get; } = [];
+        public Queue<object> PatrolResults { get; } = new();
+        public Exception? ReapplyError { get; set; }
+        public Task ApplyAsync(IReadOnlyList<IPAddress> ips, string program, int hy2Port, int realityPort, AuthEndpoint? auth = null)
+        {
+            if (realityPort != 443) throw new InvalidOperationException("当前断网保护不支持此出口端口。");
+            var applied = ApplyAsync(ips, program, hy2Port, auth);
+            if (order.Count(x => x == "apply") > 1 && ReapplyError is not null) throw ReapplyError;
+            return applied;
+        }
+        public Task<PatrolReport> PatrolAsync(IReadOnlyList<string> expectedRules)
+        {
+            PatrolCalls.Add(expectedRules.ToArray());
+            var next = PatrolResults.Count == 0 ? PatrolReport.Empty : PatrolResults.Dequeue();
+            if (next is Exception error) throw error;
+            return Task.FromResult((PatrolReport)next);
+        }
         public bool HasPendingState { get; set; }
         public AuthEndpoint? AppliedAuth { get; private set; }
         public string? RecoveryWarning { get; init; }

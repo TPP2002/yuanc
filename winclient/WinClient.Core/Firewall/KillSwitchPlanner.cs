@@ -18,6 +18,7 @@ public sealed record RestoreProfileDefault : FirewallAction;
 public sealed record RecoverFallback : FirewallAction;
 public sealed record VerifyProfiles : FirewallAction;
 public sealed record Audit : FirewallAction;
+public sealed record Patrol(string[] ExpectedRules) : FirewallAction;
 
 public static class KillSwitchPlanner
 {
@@ -26,6 +27,10 @@ public static class KillSwitchPlanner
     public const string TunAlias = "YuanC-TUN";
     public const string TunAddress = "172.19.0.1";
     public static string DhcpProgram => Path.Combine(Environment.SystemDirectory, "svchost.exe");
+
+    public static string[] ExpectedRuleNames(bool withAuth) =>
+        [NodePrefix + "Tcp", NodePrefix + "Udp", .. (withAuth ? new[] { Prefix + "Auth" } : []),
+            Prefix + "Tun", Prefix + "Loopback", Prefix + "Dhcp"];
 
     public static IReadOnlyList<FirewallAction> Plan(IReadOnlyList<IPAddress> nodeIps,
         string tunInterfaceName /* 接口保留并校验非空;隧道规则改按本地地址匹配,不再使用网卡名 */, string programPath, int hy2Port, KillSwitchMode mode, int realityPort = 443, AuthEndpoint? auth = null)
@@ -103,6 +108,46 @@ public static class KillSwitchPlanner
         {
             switch (action)
             {
+                case Patrol patrol:
+                    script.AppendLine("$reenforced=@()");
+                    // 管理命令失败先留存，仍检查服务和实际配置，防止把失效误报成普通查询失败。
+                    script.AppendLine("$patrolErrors = @(); $newlyDisabled = @(); $state = $null");
+                    script.AppendLine("$profiles = @(Get-NetFirewallProfile -PolicyStore ActiveStore -ErrorAction SilentlyContinue -ErrorVariable +patrolErrors)");
+                    script.AppendLine("foreach ($p in $profiles) {");
+                    script.AppendLine("  if ([string]$p.Enabled -ne 'True' -or [string]$p.DefaultOutboundAction -ne 'Block') {");
+                    script.AppendLine("    Set-NetFirewallProfile -Profile $p.Name -Enabled True -DefaultOutboundAction Block -ErrorAction SilentlyContinue -ErrorVariable +patrolErrors | Out-Null");
+                    script.AppendLine("    $reenforced += [string]$p.Name");
+                    script.AppendLine("  }\n}");
+                    script.AppendLine("if (Test-Path -LiteralPath $statePath) {");
+                    script.AppendLine("  $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json");
+                    script.AppendLine("  if ($null -eq $state.PSObject.Properties['disabledRules']) { $state | Add-Member -NotePropertyName disabledRules -NotePropertyValue @() }");
+                    script.AppendLine("  if ($null -eq $state.PSObject.Properties['disableFailed']) { $state | Add-Member -NotePropertyName disableFailed -NotePropertyValue @() }");
+                    script.AppendLine("  $foreignRules = @(Get-NetFirewallRule -PolicyStore PersistentStore -Enabled True -Direction Outbound -Action Allow -ErrorAction SilentlyContinue -ErrorVariable +patrolErrors | Where-Object { $_.Name -notlike 'YuanC-KS-*' -and $state.disabledRules -notcontains $_.Name })");
+                    script.AppendLine("  $state.disabledRules = @(@($state.disabledRules) + @($foreignRules.Name) | Where-Object { $null -ne $_ } | Sort-Object -Unique)");
+                    // 必须先落恢复名单；停用中途失败也能在主动断开时恢复。
+                    script.AppendLine("  Write-State $state");
+                    script.AppendLine("  $disableFailed = @($state.disableFailed)");
+                    script.AppendLine("  foreach ($rule in $foreignRules) {");
+                    script.AppendLine("    $disableError = @()");
+                    script.AppendLine("    try { $rule | Disable-NetFirewallRule -ErrorAction SilentlyContinue -ErrorVariable disableError | Out-Null } catch { $disableError = @($_) }");
+                    script.AppendLine("    if ($disableError) { $disableFailed += $rule.Name; $patrolErrors += $disableError } else { $newlyDisabled += [string]$rule.Name }");
+                    script.AppendLine("  }");
+                    script.AppendLine("  $state.disableFailed = @($disableFailed | Where-Object { $null -ne $_ } | Sort-Object -Unique)");
+                    script.AppendLine("  Write-State $state\n}");
+                    script.AppendLine("$missing = @(@(" + string.Join(",", patrol.ExpectedRules.Select(Quote)) + ") | Where-Object { -not (Get-NetFirewallRule -Name $_ -ErrorAction SilentlyContinue) })");
+                    script.AppendLine("if ((Get-Service MpsSvc).Status -ne 'Running') { exit 3 }");
+                    script.AppendLine("$effective = @(Get-NetFirewallProfile -PolicyStore ActiveStore -ErrorAction SilentlyContinue -ErrorVariable +patrolErrors)");
+                    script.AppendLine("$bad = @($effective | Where-Object { [string]$_.Enabled -ne 'True' -or [string]$_.DefaultOutboundAction -ne 'Block' } | Select-Object -ExpandProperty Name)");
+                    script.AppendLine("if ($effective.Count -ne 3) { $bad = @(@($bad) + @('Domain','Private','Public') | Sort-Object -Unique) }");
+                    script.AppendLine("if ($bad.Count -gt 0) {");
+                    script.AppendLine("  if ($null -ne $state) {");
+                    script.AppendLine("    if ($null -eq $state.PSObject.Properties['verifyFailed']) { $state | Add-Member -NotePropertyName verifyFailed -NotePropertyValue @() }");
+                    script.AppendLine("    $state.verifyFailed = @($bad); Write-State $state");
+                    script.AppendLine("  }\n  exit 3\n}");
+                    script.AppendLine("if ($patrolErrors.Count -gt 0) { throw '断网保护巡检失败,请联系管理员。' }");
+                    script.AppendLine("ConvertTo-Json -Compress @{ reenforced=@($reenforced); newly_disabled=@($newlyDisabled); missing_rules=@($missing) }");
+                    script.AppendLine("exit 0");
+                    break;
                 case SetProfileDefault setting:
                     if (setting.Profile is not ("Domain" or "Private" or "Public") || setting.Action != "Block")
                         throw new ArgumentException("无效的防火墙默认策略。");
