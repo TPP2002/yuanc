@@ -26,6 +26,7 @@ public sealed record SelfCheckInput(ExitProbeResult? Exit, string NodeHost, stri
     public RoutingPolicy Routing { get; init; } = RoutingPolicy.Global;
     public AuthEndpoint? Auth { get; init; }
     public string? ServiceProcessPath { get; init; }
+    public IReadOnlyList<AdapterInfo>? Adapters { get; init; }
 }
 
 public interface IIpv6Probe
@@ -52,9 +53,13 @@ public sealed class SocketIpv6Probe : IIpv6Probe
 /// <summary>只评估输入，不修改系统、连接或断网保护；报告不包含出口地址。</summary>
 public static class EnvironmentSelfCheck
 {
+    public const string TunSubnet = "172.19.0.0/30";
+    internal static readonly string[] VirtualAdapterKeywords =
+        ["vEthernet", "Hyper-V", "WSL", "Docker", "VMware", "VirtualBox", "Wi-Fi Direct", "Hosted Network"];
+
     public static EnvironmentReport Evaluate(SelfCheckInput input)
     {
-        var items = new List<CheckItem>(8);
+        var items = new List<CheckItem>(9);
         void Add(string id, string name, bool pass, string detail) => items.Add(new(id, name, pass ? "通过" : "未通过", detail));
         if (input.Exit is null)
             items.Add(new("exit_country", "出口归属澳洲", "无法核验", "未取得出口探测结果"));
@@ -129,7 +134,39 @@ public static class EnvironmentSelfCheck
         items.Add(new("ipv6_direct", "IPv6 已封堵", input.Ipv6Reachable is null ? "无法核验" : input.Ipv6Reachable.Value ? "未通过" : "通过",
             input.Ipv6Reachable is null ? "未取得 IPv6 探测结果" : input.Ipv6Reachable.Value ? "IPv6 可直连,可能泄漏" : "固定 IPv6 地址未能建立连接"));
         }
+        items.Add(CheckTunSubnet(input.Adapters));
         return new(input.Now, items);
+    }
+
+    private static CheckItem CheckTunSubnet(IReadOnlyList<AdapterInfo>? adapters)
+    {
+        if (adapters is null) return new("tun_subnet", "虚拟网卡网段", "无法核验", "未取得本机网卡清单");
+        var others = adapters.Where(adapter => adapter.Name != KillSwitchPlanner.TunAlias).ToArray();
+        var conflicts = others.SelectMany(adapter => adapter.Ipv4
+            .Where(OverlapsTunSubnet).Select(address => $"{adapter.Name}({address.Address}/{address.PrefixLength})")).ToArray();
+        if (conflicts.Length > 0)
+            return new("tun_subnet", "虚拟网卡网段", "未通过",
+                TunSubnet + " 被占用:" + string.Join("、", conflicts) + ";请关闭该虚拟网卡、热点或虚拟机后重新连接");
+
+        var detail = "隧道网段未被其他网卡占用";
+        var virtualNames = others.Where(adapter => VirtualAdapterKeywords.Any(keyword =>
+            adapter.Name.Contains(keyword, StringComparison.OrdinalIgnoreCase) ||
+            adapter.Description.Contains(keyword, StringComparison.OrdinalIgnoreCase))).Select(adapter => adapter.Name).ToArray();
+        if (virtualNames.Length > 0)
+            detail += ";本机有虚拟网卡:" + string.Join("、", virtualNames) + ",目前不冲突,它们重启后可能换到 172.16.0.0/12 里的其他网段";
+        return new("tun_subnet", "虚拟网卡网段", "通过", detail);
+    }
+
+    private static bool OverlapsTunSubnet(AdapterAddress address)
+    {
+        if (address.PrefixLength is < 0 or > 32 || !IPAddress.TryParse(address.Address, out var ip) ||
+            ip.AddressFamily != AddressFamily.InterNetwork) return false;
+        var bytes = ip.GetAddressBytes();
+        var number = ((uint)bytes[0] << 24) | ((uint)bytes[1] << 16) | ((uint)bytes[2] << 8) | bytes[3];
+        var prefix = Math.Min(address.PrefixLength, 30);
+        var mask = prefix == 0 ? 0u : uint.MaxValue << (32 - prefix);
+        const uint tunNetwork = (172u << 24) | (19u << 16);
+        return (number & mask) == (tunNetwork & mask);
     }
 
     private static bool DirectOnlyForAuth(JsonElement outbounds, JsonElement rules, AuthEndpoint? auth, string? serviceProcessPath)
