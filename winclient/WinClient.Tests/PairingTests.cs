@@ -142,7 +142,7 @@ public sealed class PairingTests
             Path.GetFullPath("fake.exe"), port, KillSwitchMode.Apply, port);
         Assert.Equal(port.ToString(), plan.OfType<AddRule>().Single(r => r.Protocol == "TCP").RemotePort);
         Assert.Equal(port.ToString(), plan.OfType<AddRule>().Single(r => r.Name == KillSwitchPlanner.NodePrefix + "Udp").RemotePort);
-        Assert.Equal(5, plan.OfType<AddRule>().Count());
+        Assert.Equal(6, plan.OfType<AddRule>().Count());
     }
 
     [Fact]

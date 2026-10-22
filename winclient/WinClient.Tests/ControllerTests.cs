@@ -572,7 +572,7 @@ public sealed class ControllerTests
         await FireAndPublish(controller, timers, "巡检", TimeSpan.FromSeconds(60));
         var rules = Assert.Single(firewall.PatrolCalls);
         Assert.Equal(authMode, rules.Contains("YuanC-KS-Auth"));
-        Assert.Equal(authMode ? 6 : 5, rules.Length);
+        Assert.Equal(authMode ? 7 : 6, rules.Length);
         Assert.Equal("正常", controller.Snapshot.GuardStatus);
         Assert.Equal(2, timers.For("巡检").Length);
     }
@@ -1034,6 +1034,146 @@ public sealed class ControllerTests
         Assert.DoesNotContain("remove", order);
     }
     [Fact]
+    public async Task HeldProtectionStartupKeepsTunnelAndWarnsWhenFirewallIsIneffective()
+    {
+        var order = new List<string>();
+        var firewall = new Firewall(order) { HasPendingState = true, ApplyError = new FirewallIneffectiveException("模拟") };
+        using var controller = new ClientController(new PairingSessionSource(PairingTests.ValidPairing()),
+            firewall, new Tunnel(order), Path.GetFullPath("fake.exe"), TestData.Device);
+
+        await controller.InitializeAsync(autoConnect: false, keepProtection: true);
+
+        Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
+        Assert.True(controller.Snapshot.ProtectionActive);
+        Assert.Equal(new[] { "apply", "start" }, order);
+        Assert.Contains("断网保护未能重新套用", controller.Snapshot.GuardStatus);
+        Assert.Contains("断网保护未能重新套用", controller.Snapshot.Message);
+        Assert.DoesNotContain("stop", order);
+        Assert.DoesNotContain("remove", order);
+    }
+
+    [Fact]
+    public async Task HeldAppsProtectionStartupKeepsTunnelAndWarnsWhenFirewallIsIneffective()
+    {
+        var order = new List<string>();
+        var firewall = new Firewall(order) { HasPendingState = true, PendingMode = "apps",
+            ApplyAppsError = new FirewallIneffectiveException("模拟") };
+        using var controller = new ClientController(new PairingSessionSource(PairingTests.ValidPairing()),
+            firewall, new Tunnel(order), Path.GetFullPath("fake.exe"), TestData.Device, routingSettings: new MemoryRouting());
+
+        await controller.InitializeAsync(autoConnect: false, keepProtection: true);
+
+        Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
+        Assert.True(controller.Snapshot.ProtectionActive);
+        Assert.Equal(new[] { "apply-apps", "start" }, order);
+        Assert.Contains("断网保护未能重新套用", controller.Snapshot.GuardStatus);
+        Assert.Contains("断网保护未能重新套用", controller.Snapshot.Message);
+        Assert.DoesNotContain("stop", order);
+        Assert.DoesNotContain("remove", order);
+    }
+
+    [Fact]
+    public async Task ReauthenticationKeepsTunnelAndWarnsWhenHeldProtectionCannotBeReapplied()
+    {
+        var order = new List<string>();
+        var timers = new Timers();
+        var firewall = new Firewall(order);
+        var source = new ScriptedSource(); source.Enqueue(Ok(TestData.Session()));
+        using var controller = new ClientController(source, firewall, new Tunnel(order), Path.GetFullPath("fake.exe"),
+            TestData.Device, timers.Delay) { DelayWithPurposeAsync = timers.Delay };
+        controller.Changed += _ => Interlocked.Increment(ref timers.Published);
+        await controller.ConnectAsync();
+        Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
+
+        firewall.ApplyError = new FirewallIneffectiveException("模拟");
+        source.Enqueue(new AuthResponse<SessionResponse>(AuthResult.Network));
+        await controller.RefreshSessionAsync();
+        Assert.Equal(ConnectionState.Reconnecting, controller.Snapshot.State);
+        source.Enqueue(Ok(TestData.Session()));
+        await FireAndPublish(controller, timers, "退避", TimeSpan.FromSeconds(2));
+
+        Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
+        Assert.Equal(new[] { "apply", "start", "stop", "apply", "start" }, order);
+        Assert.Contains("断网保护未能重新套用", controller.Snapshot.GuardStatus);
+        Assert.Contains("断网保护未能重新套用", controller.Snapshot.Message);
+        Assert.True(controller.Snapshot.ProtectionActive);
+        Assert.DoesNotContain("remove", order);
+    }
+
+    [Fact]
+    public async Task IneffectiveFirewallRejectsFirstConnectionAndRepeatedConnectionWithoutVerifiedProtection()
+    {
+        var order = new List<string>();
+        const string explanation = "系统防火墙被策略覆盖，请断开后联系管理员。";
+        var firewall = new Firewall(order) { ApplyError = new FirewallIneffectiveException(explanation) };
+        using var controller = new ClientController(new PairingSessionSource(PairingTests.ValidPairing()),
+            firewall, new Tunnel(order), Path.GetFullPath("fake.exe"), TestData.Device);
+
+        for (var attempt = 0; attempt < 2; attempt++)
+        {
+            await controller.ConnectAsync();
+            Assert.Equal(ConnectionState.NeedsManual, controller.Snapshot.State);
+            Assert.True(controller.Snapshot.ProtectionActive);
+            Assert.Equal(explanation, controller.Snapshot.Message);
+            Assert.DoesNotContain("start", order);
+            Assert.DoesNotContain("remove", order);
+        }
+        Assert.Equal(2, order.Count(item => item == "apply"));
+    }
+
+    [Fact]
+    public async Task SuccessfulPatrolClearsHeldProtectionWarningAndDisconnectStillRemovesProtection()
+    {
+        var order = new List<string>();
+        var timers = new Timers();
+        var firewall = new Firewall(order) { HasPendingState = true, ApplyError = new FirewallIneffectiveException("模拟") };
+        using var controller = new ClientController(new PairingSessionSource(PairingTests.ValidPairing()),
+            firewall, new Tunnel(order), Path.GetFullPath("fake.exe"), TestData.Device, timers.Delay)
+            { DelayWithPurposeAsync = timers.Delay };
+        controller.Changed += _ => Interlocked.Increment(ref timers.Published);
+        await controller.InitializeAsync(autoConnect: false, keepProtection: true);
+        Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
+        Assert.Contains("断网保护未能重新套用", controller.Snapshot.Message);
+
+        await FireAndPublish(controller, timers, "巡检", TimeSpan.FromSeconds(60));
+
+        Assert.Equal("正常", controller.Snapshot.GuardStatus);
+        Assert.Equal("断网保护已重新生效。", controller.Snapshot.Message);
+        Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
+        Assert.True(controller.Snapshot.ProtectionActive);
+        Assert.Equal(new[] { "apply", "start" }, order);
+        await controller.DisconnectAsync();
+        Assert.Equal(new[] { "stop", "remove" }, order.TakeLast(2));
+    }
+
+    [Fact]
+    public async Task IneffectivePatrolKeepsHeldTunnelAndExistingPatrolWarning()
+    {
+        var order = new List<string>();
+        var timers = new Timers();
+        var firewall = new Firewall(order) { HasPendingState = true, ApplyError = new FirewallIneffectiveException("模拟") };
+        using var controller = new ClientController(new PairingSessionSource(PairingTests.ValidPairing()),
+            firewall, new Tunnel(order), Path.GetFullPath("fake.exe"), TestData.Device, timers.Delay)
+            { DelayWithPurposeAsync = timers.Delay };
+        controller.Changed += _ => Interlocked.Increment(ref timers.Published);
+        await controller.InitializeAsync(autoConnect: false, keepProtection: true);
+        Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
+        Assert.Contains("断网保护未能重新套用", controller.Snapshot.Message);
+        firewall.PatrolResults.Enqueue(new FirewallIneffectiveException("x"));
+
+        await FireAndPublish(controller, timers, "巡检", TimeSpan.FromSeconds(60));
+
+        Assert.Equal("系统防火墙已被关闭或被策略覆盖,断网保护可能失效,请立即在 Windows 安全中心开启防火墙或联系管理员",
+            controller.Snapshot.GuardStatus);
+        Assert.Equal(controller.Snapshot.GuardStatus, controller.Snapshot.Message);
+        Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
+        Assert.True(controller.Snapshot.ProtectionActive);
+        Assert.Equal(new[] { "apply", "start" }, order);
+        Assert.DoesNotContain("stop", order);
+        Assert.DoesNotContain("remove", order);
+    }
+
+    [Fact]
     public async Task MissingServerIsExplicitAndClosingDoesNotRemove()
     {
         var order = new List<string>();
@@ -1315,8 +1455,9 @@ public sealed class ControllerTests
         public string? PendingMode { get; set; }
         public string[] AppliedApps { get; private set; } = [];
         public List<bool> EnforceDefaultCalls { get; } = [];
+        public Exception? ApplyAppsError { get; set; }
         public Task ApplyAppsAsync(IReadOnlyList<string> programs)
-        { AppliedApps = programs.ToArray(); order.Add("apply-apps"); return Task.CompletedTask; }
+        { AppliedApps = programs.ToArray(); order.Add("apply-apps"); if (ApplyAppsError is not null) throw ApplyAppsError; return Task.CompletedTask; }
         public Task<PatrolReport> PatrolAsync(IReadOnlyList<string> rules, bool enforceDefaultBlock)
         { EnforceDefaultCalls.Add(enforceDefaultBlock); return PatrolAsync(rules); }
         public List<string[]> PatrolCalls { get; } = [];
@@ -1341,7 +1482,7 @@ public sealed class ControllerTests
         public string? RecoveryWarning { get; init; }
         public bool FailRecovery { get; init; }
         public bool FailApply { get; init; }
-        public Exception? ApplyError { get; init; }
+        public Exception? ApplyError { get; set; }
         public Task ApplyAsync(IReadOnlyList<IPAddress> ips, string program, int hy2Port, AuthEndpoint? auth = null)
         { AppliedAuth = auth; order.Add("apply"); if (ApplyError is not null) throw ApplyError; if (FailApply) throw new InvalidOperationException(); return Task.CompletedTask; }
         public Task UpdateNodeAsync(IReadOnlyList<IPAddress> ips, string program, int hy2Port)

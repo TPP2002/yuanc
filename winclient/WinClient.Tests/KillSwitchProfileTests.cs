@@ -45,7 +45,7 @@ public sealed class KillSwitchProfileTests
     public void ApplyActionOrderIsExact()
     {
         Assert.Equal(new[] { "SetProfileDefault", "SetProfileDefault", "SetProfileDefault",
-            "DisableForeignAllowRules", "AddRule", "AddRule", "AddRule", "AddRule", "AddRule", "VerifyProfiles", "Audit" },
+            "DisableForeignAllowRules", "AddRule", "AddRule", "AddRule", "AddRule", "AddRule", "AddRule", "VerifyProfiles", "Audit" },
             ApplyPlan().Select(action => action.GetType().Name));
     }
 

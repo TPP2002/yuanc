@@ -73,6 +73,9 @@ public sealed class ClientController : IDisposable
     private CancellationTokenSource lifetime = new();
     private SessionResponse? session;
     private bool protection;
+    private bool protectionVerified;
+    private string? firewallWarning;
+    private const string KeepTunnelWarning = "断网保护未能重新套用:系统防火墙已被关闭或被策略覆盖,隧道保持但失去断网兜底;请立即在 Windows 安全中心开启防火墙或联系管理员";
     private bool disposed;
     private long generation;
     private string message = "";
@@ -135,6 +138,7 @@ public sealed class ClientController : IDisposable
                 (sessionSource is PairingSessionSource or AuthServerSessionSource { HasCredentials: true }))
             {
                 protection = true;
+                protectionVerified = true;
                 message = protectionNotice;
                 keptProtection = true;
                 environmentApplied = environment?.HasPendingState ?? false;
@@ -468,17 +472,29 @@ public sealed class ClientController : IDisposable
                         : effect.Message ?? "";
                     break;
                 case EffectKind.ApplyKillSwitch:
+                    var held = protectionVerified;
                     protection = true; // Even partial Apply must be treated as requiring explicit recovery.
-                    if (activeRouting.Mode == RoutingMode.Apps) await firewall.ApplyAppsAsync(activeRouting.Apps);
-                    else await firewall.ApplyAsync(NodeIps(session!), program, session!.Node.Hy2Port, session.Node.RealityPort,
-                            sessionSource is AuthServerSessionSource ? authEndpoint : null);
+                    try
+                    {
+                        if (activeRouting.Mode == RoutingMode.Apps) await firewall.ApplyAppsAsync(activeRouting.Apps);
+                        else await firewall.ApplyAsync(NodeIps(session!), program, session!.Node.Hy2Port, session.Node.RealityPort,
+                                sessionSource is AuthServerSessionSource ? authEndpoint : null);
+                        protectionVerified = true;
+                        firewallWarning = null;
+                    }
+                    catch (FirewallIneffectiveException) when (held)
+                    {
+                        firewallWarning = KeepTunnelWarning;
+                        guardStatus = KeepTunnelWarning;
+                        message = KeepTunnelWarning;
+                    }
                     break;
                 case EffectKind.UpdateKillSwitchNode:
                     if (activeRouting.Mode != RoutingMode.Apps)
                         await firewall.UpdateNodeAsync(effect.NewIps!, program, session!.Node.Hy2Port, session.Node.RealityPort);
                     break;
                 case EffectKind.RemoveKillSwitch:
-                    await firewall.RemoveAsync(); protection = false; break;
+                    await firewall.RemoveAsync(); protection = false; protectionVerified = false; firewallWarning = null; break;
                 case EffectKind.StopTunnel: tunnel.Stop(); break;
                 case EffectKind.StartTunnel:
                     if (session is null || session.SessionExpiresAt <= DateTimeOffset.UtcNow || session.AccountExpiresAt <= DateTimeOffset.UtcNow)
@@ -489,7 +505,7 @@ public sealed class ClientController : IDisposable
                             sessionSource is AuthServerSessionSource ? authEndpoint : null), lifetime.Token);
                         lifetime.Token.ThrowIfCancellationRequested();
                         await ExecuteAsync(machine.Handle(new(ConnectionEventKind.TunnelUp)));
-                        message = "虚拟网卡已就绪。";
+                        message = firewallWarning ?? "虚拟网卡已就绪。";
                         await ApplyEnvironmentAsync();
                     }
                     catch (FileNotFoundException ex)
@@ -638,6 +654,12 @@ public sealed class ClientController : IDisposable
             }
             else if (!report.Clean) guardStatus = $"已重新收紧 {report.Reenforced.Count + report.NewlyDisabled.Count} 条规则";
             else guardStatus = "正常";
+            if (firewallWarning is not null)
+            {
+                firewallWarning = null;
+                protectionVerified = true;
+                message = "断网保护已重新生效。";
+            }
         }
         catch (FirewallIneffectiveException)
         {

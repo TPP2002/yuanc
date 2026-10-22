@@ -7,8 +7,8 @@ namespace WinClient.Tests;
 public sealed class KillSwitchPatrolTests
 {
     [Theory]
-    [InlineData(true, 6)]
-    [InlineData(false, 5)]
+    [InlineData(true, 7)]
+    [InlineData(false, 6)]
     public void ExpectedNamesHaveExactOrderAndAuthOnlyForAuthMode(bool withAuth, int count)
     {
         var names = KillSwitchPlanner.ExpectedRuleNames(withAuth);
@@ -16,8 +16,9 @@ public sealed class KillSwitchPatrolTests
         Assert.Equal(withAuth, names.Contains("YuanC-KS-Auth"));
         var expected = new List<string> { "YuanC-KS-Node-Tcp", "YuanC-KS-Node-Udp" };
         if (withAuth) expected.Add("YuanC-KS-Auth");
-        expected.AddRange(["YuanC-KS-Tun", "YuanC-KS-Loopback", "YuanC-KS-Dhcp"]);
+        expected.AddRange(["YuanC-KS-Tun", "YuanC-KS-Loopback", "YuanC-KS-Dhcp", "YuanC-KS-Lan"]);
         Assert.Equal(expected, names);
+        Assert.Equal("YuanC-KS-Lan", names[^1]);
     }
 
     [Fact]
