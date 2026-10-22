@@ -87,8 +87,9 @@ def command(runner, argv):
 def probe(runner):
     target = current(runner)
     p1 = target is not None and release(runner, target) is not None
-    p2 = command(runner, ["env", "PYTHONPATH=" + CURRENT, "python3", "-c",
-                          "import exitnode, exitnode.cli"])
+    # -P：不把当前目录放进模块搜索路径，防止他人可写目录里的同名包被导入。
+    p2 = command(runner, ["env", "PYTHONPATH=" + CURRENT,
+                          "python3", "-P", "-c", "import exitnode, exitnode.cli"])
     p3 = command(runner, [BINARY, "version"])
     p4 = command(runner, [BINARY, "check", "-c", LIVE])
     try:

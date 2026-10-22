@@ -115,8 +115,11 @@ class _OutOfTime(Exception):
 
 def _tunnel_passes(config, runner, config_path, deadline):
     # env 确保检查的是刚切换的程序，而非安装更新器时的旧进程路径。
+    # 维护人员在 /tmp 里跑升级时，-m 会把当前目录放到 sys.path 最前，低权用户预放的
+    # /tmp/exitnode/__main__.py 会以 root 执行；-P（Python 3.11 起）关掉这一行为，
+    # PYTHONPATH 仍然生效。
     result = runner.run(["env", "PYTHONPATH=" + layout.root(config) + "/current",
-                         "python3", "-m", "exitnode", "--config", config_path,
+                         "python3", "-P", "-m", "exitnode", "--config", config_path,
                          "check", "--json"], check=False,
                         timeout=min(30, deadline - runner.now()))
     payload = json.loads(result.out)

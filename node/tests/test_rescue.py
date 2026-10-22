@@ -12,7 +12,7 @@ from exitnode.rescue import state as s
 from exitnode.rescue.__main__ import main
 from exitnode.rescue.runner import FakeRunner, RealRunner, Result
 
-IMPORT = ("env", "PYTHONPATH=" + p.CURRENT, "python3", "-c", "import exitnode, exitnode.cli")
+IMPORT = ("env", "PYTHONPATH=" + p.CURRENT, "python3", "-P", "-c", "import exitnode, exitnode.cli")
 
 
 def put(runner, directory, version="0.1.0"):
@@ -89,6 +89,15 @@ def test_fast_reruns_do_not_increment_and_success_clears_counts():
     put(runner, p.RELEASES + "/0.2.0", "0.2.0")
     assert actions.tick(runner) == 0
     assert set(s.read(runner)["counts"].values()) == {0}
+
+
+def test_p2_import_probe_puts_dash_p_right_after_python3():
+    runner = ready()
+    assert actions.tick(runner) == 0
+    sent = [c[1] for c in runner.calls if c[0] == "run" and "python3" in c[1]]
+    assert sent
+    for argv in sent:
+        assert argv[argv.index("python3") + 1] == "-P"
 
 
 def test_import_timeout_counts_as_program_failure():

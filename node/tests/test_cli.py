@@ -442,6 +442,8 @@ def test_rescue_refresh_uses_independent_runner_checks_before_replace(import_ok,
     runner = fake()
     assert main(["rescue", "refresh"], runner, rescue_runner=rescue) == (0 if import_ok else 1)
     assert not any(c[0] in {"run", "replace", "write_file", "copy_tree"} for c in runner.calls)
+    sent = [c[1] for c in rescue.calls if c[0] == "run" and c[1][0] == "python3"]
+    assert sent and all(argv[1:3] == ("-P", "-c") for argv in sent)
     if import_ok:
         check = next(i for i, c in enumerate(rescue.calls) if c[0] == "run")
         assert check < rescue.calls.index(("replace", target + ".staging", target))
