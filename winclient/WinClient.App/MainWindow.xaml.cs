@@ -1,6 +1,11 @@
 using System.ComponentModel;
 using System.Windows;
 using Microsoft.Win32;
+using System.Runtime.InteropServices;
+using System.Windows.Interop;
+using System.Windows.Input;
+using WinClient.App.Themes;
+using WinClient.App.Views;
 
 namespace WinClient.App;
 
@@ -13,7 +18,31 @@ public partial class MainWindow : Window
         InitializeComponent();
         model = new MainViewModel(ChoosePairingFile, ChooseProgram);
         DataContext = model;
+        CommandBindings.Add(new CommandBinding(MainShell.ExportDiagnosticsCommand, Export_Click,
+            (_, e) => e.CanExecute = !model.IsBusy));
+        ThemeManager.ThemeChanged += ThemeChanged;
+        Closed += (_, _) => ThemeManager.ThemeChanged -= ThemeChanged;
     }
+    protected override void OnSourceInitialized(EventArgs e)
+    {
+        base.OnSourceInitialized(e);
+        ApplyTitleBar();
+    }
+    private void ThemeChanged(object? sender, EventArgs e) => ApplyTitleBar();
+    private void ApplyTitleBar()
+    {
+        var hwnd = new WindowInteropHelper(this).Handle;
+        if (hwnd == IntPtr.Zero) return;
+        var dark = ThemeManager.Current == ThemeKind.Dark ? 1 : 0;
+        try
+        {
+            if (DwmSetWindowAttribute(hwnd, 20, ref dark, 4) != 0) _ = DwmSetWindowAttribute(hwnd, 19, ref dark, 4);
+        }
+        catch (DllNotFoundException) { }
+        catch (EntryPointNotFoundException) { }
+    }
+    [DllImport("dwmapi.dll")]
+    private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attribute, ref int value, int size);
     private string? ChoosePairingFile()
     {
         var dialog = new OpenFileDialog { Title = "导入配对文件", Filter = "配对文件 (*.ycpair)|*.ycpair", CheckFileExists = true, Multiselect = false };

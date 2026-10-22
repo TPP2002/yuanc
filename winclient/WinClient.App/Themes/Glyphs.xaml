@@ -1,0 +1,45 @@
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+                    xmlns:sys="clr-namespace:System;assembly=System.Runtime">
+  <EllipseGeometry x:Key="Yc.Glyph.Ring" Center="12,12" RadiusX="4.6" RadiusY="4.6"/>
+  <GeometryGroup x:Key="Yc.Glyph.Dots">
+    <EllipseGeometry Center="6.5,12" RadiusX="1.7" RadiusY="1.7"/>
+    <EllipseGeometry Center="12,12" RadiusX="1.7" RadiusY="1.7"/>
+    <EllipseGeometry Center="17.5,12" RadiusX="1.7" RadiusY="1.7"/>
+  </GeometryGroup>
+  <GeometryGroup x:Key="Yc.Glyph.Bars">
+    <PathGeometry Figures="M5.5 19h13"/>
+    <PathGeometry Figures="M7.5 16.5v-3.5"/>
+    <PathGeometry Figures="M12 16.5v-7"/>
+    <PathGeometry Figures="M16.5 16.5v-10.5"/>
+  </GeometryGroup>
+  <PathGeometry x:Key="Yc.Glyph.Check" Figures="m7 12.4 3.3 3.3 6.7-7.4"/>
+  <PathGeometry x:Key="Yc.Glyph.Spin" Figures="M7 12.6a5 5 0 1 0 1.6-3.7 M6.4 6.2v3.4h3.4"/>
+  <GeometryGroup x:Key="Yc.Glyph.Ask">
+    <PathGeometry Figures="M9.4 9.3a2.7 2.7 0 1 1 3.9 2.3c-1 .5-1.3 1.1-1.3 2.1"/>
+    <PathGeometry Figures="M12 17.4h.01"/>
+  </GeometryGroup>
+  <GeometryGroup x:Key="Yc.Glyph.Bang">
+    <PathGeometry Figures="M12 7v5.5"/>
+    <PathGeometry Figures="M12 16.8h.01"/>
+  </GeometryGroup>
+  <PathGeometry x:Key="Yc.Glyph.X" Figures="m8.5 8.5 7 7M15.5 8.5l-7 7"/>
+  <PathGeometry x:Key="Yc.Glyph.Plug" Figures="M12 20v-3.5 M9.5 9V5M14.5 9V5 M17 9v3.5a5 5 0 0 1-10 0V9z"/>
+  <PathGeometry x:Key="Yc.Icon.Plug" Figures="M12 22v-5 M9 8V2M15 8V2 M18 8v5a6 6 0 0 1-12 0V8z"/>
+  <GeometryGroup x:Key="Yc.Icon.Layers">
+    <PathGeometry Figures="m12 3 9 4.8-9 4.8-9-4.8z"/>
+    <PathGeometry Figures="m3 12.4 9 4.8 9-4.8"/>
+    <PathGeometry Figures="m3 17 9 4.8 9-4.8"/>
+  </GeometryGroup>
+  <GeometryGroup x:Key="Yc.Icon.Sun">
+    <EllipseGeometry Center="12,12" RadiusX="4" RadiusY="4"/>
+    <PathGeometry Figures="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>
+  </GeometryGroup>
+  <GeometryGroup x:Key="Yc.Icon.Key">
+    <EllipseGeometry Center="8,12" RadiusX="4.5" RadiusY="4.5"/>
+    <PathGeometry Figures="M12.5 12H21M18 12v3.5M15 12v3"/>
+  </GeometryGroup>
+  <GeometryGroup x:Key="Yc.Icon.Download">
+    <PathGeometry Figures="M12 3v12"/><PathGeometry Figures="m7 10 5 5 5-5"/><PathGeometry Figures="M4 21h16"/>
+  </GeometryGroup>
+</ResourceDictionary>
