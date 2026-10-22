@@ -1,0 +1,139 @@
+{
+  "schemaVersion": 1,
+  "taskId": "SEC-NODE-UPGRADE-DOWNGRADE-1022",
+  "slug": "yc-sec-node-upgrade-version-gate-1022",
+  "title": "节点更新器加版本闸门:默认只升不降(降级须显式 --allow-downgrade,状态目录记只增不减的最高已装版本作下限;GitHub 路径校 tag 与包内版本一致);已安装、未标坏、校验完整的非当前版本改走「切换+健康检查」路径,并新增 upgrade --switch <版本> 替代手工 ln/mv 回退(一并覆盖看板卡 SEC-NODE-UPGRADE-SWITCH-EXISTING-1022)",
+  "goal": "做完后(全部在 node/exitnode/updater/upgrade.py、node/exitnode/updater/layout.py、node/exitnode/cli.py 内实现,测试与文档随之):①upgrade(config, runner, *, file=None, signature=None, check=False, config_path=..., allow_downgrade=False, switch=None) 新增两个关键字参数。②版本下限 floor = max(当前版本, 最高已装版本):当前版本 = layout.current_target 目录名解析成 Version;最高已装版本读 _state_path(config, \"highest.json\")(内容 {\"version\": \"<字符串>\"}),文件不存在、JSON 损坏、版本串非法一律当作不存在(不报错、不中止)。每次 _install 或 _switch 的健康检查通过并写完 history ok 之后,把 highest.json 原子写成 max(已记录值, 切换前的旧版本, 新版本)(先写 .tmp 再 replace,0o600;没有记录时就是旧版本与新版本取大);所以降级成功后它记的是被换下的那个更高版本,永不降低(只增不减)。③包路径(--file 或 GitHub)在 package.verify 之后、既有「同版本程序已经安装」判断之前插入:candidate = Version(info.version);若 candidate == 当前版本 → 维持既有文案「同版本程序已经安装，拒绝重复升级」(exit 1,不变);否则若 candidate < floor 且 allow_downgrade 为 False → UpdateError(\"拒绝降级到 <candidate>：当前或已安装过的最高版本为 <floor>；确需回退请加 --allow-downgrade\", 1),此时 releases/ 下零写入(与既有 test_rejected_package_never_writes_releases 同一标准)。④GitHub 路径:_github 把 tag 解析出的版本一并返回(_fetch 返回三元组 (archive, signature, tag_version),本地 --file 路径 tag_version 为 None);package.verify 之后若 tag_version 不为 None 且 Version(tag_version) != Version(info.version) → UpdateError(\"发布源标签版本与升级包内版本不一致，拒绝安装\", 1),零写入。⑤「切回已装版本」(包路径):candidate 对应的 releases/<version> 目录已存在、不是当前目录时——若存在 .bad 标记 → 维持既有「此版本已有失败标记，请联系维护人员」;否则若 layout.valid_release 通过且该目录 manifest.json 的 files 与升级包 manifest 的 files 完全相等 → 不解包、不写 releases,走 _switch(见⑦);files 不相等 → UpdateError(\"同版本程序已安装但内容不同，请联系维护人员；已有版本未覆盖\", 1),零写入;valid_release 不通过(目录残缺)→ UpdateError(\"已安装的同版本目录校验失败，请联系维护人员\", 1),零写入(不自动删、不自动覆盖)。⑥显式切换(--switch <版本>):switch 非空时不取包、不读 --file(cli 层:--switch 与 --file/--signature 同时给 → 标准错误中文「--switch 不能与 --file 或 --signature 同时使用」,返回 2,零系统调用);upgrade() 内 switch 路径跳过 updater.source 判断与网络探测(不需要网络;其余锁、_recover、layout.repair、layout.cleanup 照旧);target 版本解析失败 → UpdateError(\"版本号格式不正确\", 1);目标必须出现在 layout.versions(真实目录)、不是当前目录(是当前 → \"该版本已是当前版本，无需切换\")、无 .bad(有 → 既有失败标记文案)、valid_release 通过(否则「已安装的同版本目录校验失败」文案);目标版本 < floor 且 allow_downgrade 为 False → 与③相同的拒绝降级文案;check=True 时只做上述校验并 print(\"可以切换到 <版本>，未执行。\") 返回 0。⑦_switch(config, runner, target, version, config_path):old = layout.current_target;写 pending.json {\"old\": old, \"target\": target, \"version\": version}(与 _install 同格式,先 .tmp 再 replace);layout.switch(target);_restart;_healthy 不通过 → 与 _install 一样 _rollback(标 .bad、切回 old、重启、history rolled_back)并 UpdateError(\"新版启动失败，已恢复旧版\");通过 → _history(version, \"ok\")、删 pending、更新 highest.json;成功时 print(\"切换完成，健康检查通过。\")(包路径走 _switch 时也打这句,不打「升级完成」)。_install 既有行为一字不改,只在成功末尾追加更新 highest.json。⑧cli.py:upgrade 子命令新增 --allow-downgrade(action=store_true,help「允许安装比当前版本或已安装过的最高版本更低的版本」)与 --switch <版本>(help「切换到已安装且未标记失败的版本，不下载升级包」);透传给 upgrade();既有 --version 隐藏参数与「未实现」提示不动。⑨测试(node/tests/test_updater.py 只加不改既有断言;test_cli.py 只加):(a) 当前 0.1.0、包 0.0.9 → 返回 1、输出含「降级」、release_snapshot 不变、assert_clean;(b) 同场景 allow_downgrade=True → 返回 0、current 指向 0.0.9、highest.json 为 0.1.0(被换下的旧版本);随后再推 0.0.9.post1 这类介于两者之间的包不加 flag 仍被拒绝降级;(c) 正常升到 0.2.0 后 highest.json 为 0.2.0(权限 0o600);(d) 预置 highest.json 为 0.3.0、当前 0.1.0、包 0.2.0 → 拒绝降级,allow_downgrade=True 放行;(e) highest.json 内容损坏 → 当作不存在,包 0.2.0 正常安装;(f) GitHub tag v0.3.0 但 manifest 0.2.0(复用 test_github_downloads_matching_assets_then_uses_same_verifier 的桩写法)→ 返回 1、输出含「不一致」、release_snapshot 不变;(g) put_release(runner, \"0.2.0\")(与 archive_bytes(\"0.2.0\") 内容一致)、current=0.1.0、推同一包 → 返回 0、current 指向 NEW、calls 里没有 extract_tar、有 systemctl restart 两单元与 HEALTH 命令、history 最后一条 status ok、输出含「切换完成」、pending.json 已删;(h) 同上但把 0.2.0/bin/sing-box 改成别的内容并同步改该目录 manifest(让 valid_release 仍通过但 files 不同)→ 返回 1、输出含「内容不同」、零 releases 写入;(i) 同上但目录残缺(删掉一个文件不改 manifest)→ 返回 1、输出含「校验失败」、零写入;(j) 切换路径健康检查失败 → current 回 OLD、NEW + \".bad\" 存在、history rolled_back;(k) main([\"upgrade\",\"--switch\",\"0.2.0\"]) 在 put_release 0.2.0 后 → 0、current 为 NEW、calls 中无 tcp_connect、无 curl;(l) --switch 指向不存在的版本 → 1 且输出中文;--switch 当前版本 → 1、含「已是当前」;--switch 带 .bad 的 → 1;(m) --switch 0.0.9(更低)无 flag → 1 含「降级」,加 --allow-downgrade → 0;(n) --switch 与 --file 同时 → 2、runner.calls 为空;(o) --switch --check → 0、输出含「未执行」、current 不变、无 systemctl 调用;(p) test_cli.py 加一条解析测试:parser 能解析 --allow-downgrade 与 --switch。⑩文档 docs/node/更新与回退说明.md:「怎样升级」加一段「版本只升不降」(默认拒绝低于当前版本或低于历史最高已装版本的包,原因是签名只证明包是发布者发的、不证明它是新的;确需回退加 --allow-downgrade;highest.json 的位置与只增不减语义;GitHub 标签与包内版本必须一致);「失败后机器会怎样」加:被回退或救援重装后,再推同一个完整的新版本不会再被当成重复安装,而是直接切换并做健康检查,包内容与已装目录不一致会拒绝;「手动回退与目录保留」改为首选 `exitnode upgrade --switch 0.1.0 --allow-downgrade`(写明它会做健康检查、失败自动切回并标坏),保留原 ln/mv 步骤但标注为「更新器本身坏了时的兜底」;文案全部中文。",
+  "background": "项目:外包,澳洲家宽上的 Debian 软路由跑 node/exitnode(Python,所有主机操作经 Runner,测试用 FakeRunner 内存主机),更新器在 node/exitnode/updater/:upgrade.py(事务:锁→网络探测→_recover→repair/cleanup→_fetch→package.verify→同版本/.bad/磁盘检查→_install:解包到 .staging→replace→写 pending.json→switch→_restart→_healthy→history→删 pending;失败 _rollback 标 .bad)、layout.py(root/releases/incoming/switch/versions/valid_release/repair/cleanup/bootstrap/current_target)、version.py(PEP 440 Version,total_ordering)、package.py(verify 返回 info:version/size,manifest files 哈希表)。对抗审查(看板 yuanc 卡 SECURITY-REDTEAM-1022 A2、A12)查实两处:A2 upgrade.py 只拒「同版本已装」与「.bad」,不比较版本大小,签名只覆盖 tar 包、与 GitHub tag 不绑定——发布源被控或维护人员 --file 误装旧包,节点会被装回有已知漏洞的旧版本;A12 releases/ 下只要有该版本目录就拒绝(不分是否 current),被回退或救援重装(rescue 把出厂包切回 current,较新的好版本目录仍在)之后,再升级同一个新版本被当成重复安装拒掉,只能手工 ln+mv。两卡都只动更新器与 CLI,文件完全重叠,所以合成一单;本单 taskId 填 DOWNGRADE 卡,收单时两张卡一起销。设计要点与取舍:版本下限用「当前版本与历史最高已装」取大,是因为救援重装会把 current 切回老的出厂版本,这时若只比当前版本,攻击者仍能推一个比出厂新、比实际用过的最高版本旧的包;highest.json 放 updater 状态目录(与 history.jsonl、pending.json 同级),损坏当不存在是为了不让一个坏文件把节点锁死(下限退化为当前版本,仍有保护)。切换路径复用 pending.json 与 _rollback,是为了让既有的「被杀后下次恢复」逻辑(_recover)同样覆盖切换;_recover 一律回滚标坏的既有行为本单不动(另有卡 SEC-NODE-UPGRADE-RECOVER-BOOT-1022 处理阶段化)。_healthy 现行只看 check --json 的隧道服务层,它的加强属另一张卡(SEC-NODE-UPGRADE-HEALTH-1022),本单不碰 _healthy。已有测试 test_killed_after_switch_rolls_back_before_next_package 期望恢复后再装同版本返回 1——恢复时已标 .bad,所以仍返回 1,断言不用改。先读:node/exitnode/updater/{upgrade,layout,version,package}.py、node/exitnode/cli.py 的 upgrade 子命令定义(约 62~66 行)与分发(约 351、392~404 行)、node/tests/test_updater.py 全文(夹具 archive_bytes/put_release/prepared/run/release_snapshot/assert_clean,HEALTH 常量,GitHub 桩写法)、node/tests/test_cli.py 的 upgrade 相关(约 101~106、199~210 行)、docs/node/更新与回退说明.md。环境:工位无外网;跑法 python -m ruff check node scripts authserver 与 python -m pytest -q node/tests;搜索用 rg 或 git grep。同仓同时有两单在别的工位施工:yc-sec-node-lastgood-revoke-1022(动 service.py、proxy/sync.py、watchdog/、rescue/、对应测试与看门狗/救援/隧道配置三份文档)、yc-sec-win-startup-unprotected-1022(只动 winclient/ 与 docs/winclient/),本单不得碰这些文件。硬规矩:①任何拒绝路径 releases/ 零写入、assert_clean 成立(incoming 清掉、锁释放),与既有标准一致;②_install 既有行为一字不改(只在成功末尾加 highest.json 更新);③所有报错与打印中文、不回显命令输出或第三方异常;④highest.json 只增不减,损坏当不存在;⑤--switch 不做网络探测、不读 --file;⑥既有断言只加不改;⑦拿不准(例如某条既有测试与新规则冲突)停下交 blocked + forks,不猜、不放宽断言;真机项写进文档不模拟成通过。",
+  "nonGoals": [
+    "不改 _healthy 的判定强度(另卡 SEC-NODE-UPGRADE-HEALTH-1022)",
+    "不改 _recover 的「一律回滚标坏」与开机收尾(另卡 SEC-NODE-UPGRADE-RECOVER-BOOT-1022),pending.json 格式不加字段",
+    "不改 package.verify、签名算法、manifest 格式;不给包加 tag 字段",
+    "不实现按版本号从发布源挑选(--version 仍是「未实现」)",
+    "不做定时自动升级;不动 rescue/ 独立副本",
+    "不在真机实测;真机项(真实 systemctl 重启与 check --json 健康检查、GitHub 发布源 tag 核对)写进文档"
+  ],
+  "allowedPaths": [
+    "node/exitnode/updater/upgrade.py",
+    "node/exitnode/updater/layout.py",
+    "node/exitnode/cli.py",
+    "node/tests/test_updater.py",
+    "node/tests/test_cli.py",
+    "docs/node/更新与回退说明.md"
+  ],
+  "forbiddenPaths": [
+    "winclient/**",
+    "authserver/**",
+    "scripts/**",
+    "docs/开工须知.md",
+    "docs/口径速查表.md",
+    "docs/design/**",
+    "docs/交接/**",
+    "docs/plans/**",
+    "docs/acceptance/**",
+    "docs/authserver/**",
+    "docs/winclient/**",
+    "docs/node/看门狗说明.md",
+    "docs/node/救援单元说明.md",
+    "docs/node/隧道配置说明.md",
+    "docs/node/配置说明.md",
+    "docs/node/客户端包托管说明.md",
+    "docs/node/自用配对说明.md",
+    ".github/**",
+    ".codex/**",
+    ".gitignore",
+    "pyproject.toml",
+    "node/exitnode/updater/package.py",
+    "node/exitnode/updater/version.py",
+    "node/exitnode/updater/trust.py",
+    "node/exitnode/service.py",
+    "node/exitnode/config.py",
+    "node/exitnode/runner.py",
+    "node/exitnode/watchdog/**",
+    "node/exitnode/rescue/**",
+    "node/exitnode/proxy/**",
+    "node/exitnode/templates/**",
+    "node/exitnode/admin/**",
+    "node/tests/golden/**",
+    "node/tests/test_watchdog.py",
+    "node/tests/test_rescue.py",
+    "node/tests/test_service.py",
+    "node/tests/test_proxy_sync.py",
+    "node/tests/test_device.py",
+    "node/tests/test_systemd_render.py",
+    "node/tests/test_proxy_server_render.py"
+  ],
+  "expectArtifacts": [
+    "node/exitnode/updater/upgrade.py",
+    "node/exitnode/cli.py",
+    "node/tests/test_updater.py",
+    "docs/node/更新与回退说明.md"
+  ],
+  "acceptance": [
+    {
+      "id": "RUFF",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "ruff",
+        "check",
+        "node",
+        "scripts",
+        "authserver"
+      ],
+      "required": true,
+      "timeoutSec": 300
+    },
+    {
+      "id": "PYTEST",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+        "node/tests"
+      ],
+      "required": true,
+      "timeoutSec": 900,
+      "note": "既有断言只加不改;新增用例见 goal ⑨ (a)~(p)"
+    },
+    {
+      "id": "SHAPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda p:pathlib.Path(p).read_text(encoding='utf-8');u=r('node/exitnode/updater/upgrade.py');c=r('node/exitnode/cli.py');bad=[k for k,ok in (('up.flag','allow_downgrade' in u),('up.switch','switch' in u and 'def _switch' in u),('up.highest','highest.json' in u),('up.downgrade_msg','降级' in u),('up.tag','不一致' in u),('cli.flag','--allow-downgrade' in c),('cli.switch','--switch' in c),('cli.exclusive','不能与 --file' in c)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60,
+      "note": "升级器有降级闸门、切换路径、最高版本记录、标签核对;CLI 有两个新参数与互斥提示"
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;d=pathlib.Path('docs/node/更新与回退说明.md').read_text(encoding='utf-8');bad=[k for k in ('--allow-downgrade','--switch','highest.json','降级','只增不减','兜底') if k not in d];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "model": null,
+  "timeoutSec": 5400,
+  "repoRoot": "E:/yuanc",
+  "engine": "codex",
+  "reasoningEffort": "high",
+  "steps": [
+    "读 background 列的源文件与测试;画出 upgrade() 现行判断顺序,确定③④⑤插入点与 _switch 复用 pending/_rollback 的方式。",
+    "先写 goal ⑨ 的红测试(降级拒绝、tag 不一致、切回已装、--switch 各分支),再改 upgrade.py/layout.py/cli.py。",
+    "本机跑 RUFF/PYTEST 与断言;改文档;交活说明列出未动的既有断言与真机待验证项。"
+  ]
+}

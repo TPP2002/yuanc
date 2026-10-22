@@ -1,0 +1,169 @@
+{
+  "schemaVersion": 1,
+  "taskId": "SEC-NODE-LASTGOOD-REVOKE-1022",
+  "slug": "yc-sec-node-lastgood-revoke-1022",
+  "title": "节点侧「上次可用配置」不再复活已吊销设备:每次发布隧道配置(设备增删、放行名单同步)校验并重载成功后同步原子更新 last-good 副本;看门狗回滚与救援恢复/重装在套用 last-good 之前,按设备登记表 devices.json 的未吊销名单剔除副本里不在名单上的用户,登记表损坏则拒绝恢复",
+  "goal": "做完后:①node/exitnode/service.py 新增常量 LAST_GOOD = LIVE.replace(\".json\", \".last-good.json\")(与现行 watchdog/ladder.py 的 LAST_GOOD 值相同);watchdog/ladder.py 改为 from ..service import LAST_GOOD, LIVE(保留 ladder.LAST_GOOD 这个名字,测试从它导入);rescue/probes.py 的 LAST_GOOD 字面量不变,新增 DEVICES = \"/var/lib/exitnode/secrets/devices.json\"。②_publish_checked(service.py):在 runner.replace(temporary, LIVE) 之后——registry 为 None 时紧接着;registry 不为 None 时在 registry.save 成功且 reload 成功之后——用同一份 text 原子写 LAST_GOOD(先写 LAST_GOOD + \".tmp\" 0o600 再 runner.replace 到 LAST_GOOD);校验失败、registry.save 失败(LIVE 已回退)、reload 失败三条路径都不写、不改 LAST_GOOD。③proxy/sync.py 的 apply_sync 新增关键字参数 last_good_path: str | None = None,缺省为 live_path 去掉结尾 .json 再加 .last-good.json(live_path 不以 .json 结尾则加 .last-good),经 secret_path 校验且不得等于 registry.path 或 live_path(否则 ValueError 中文);在 reload(runner) 成功之后 runner.write_file(last_good_path, text, 0o600)(该 Runner 协议的 write_file 已是原子替换);校验失败、登记表写入失败、reload 抛错都不写。④新增纯函数模块 node/exitnode/proxy/lastgood.py:prune_revoked(text: str, devices_text: str | None) -> tuple[str, int]——devices_text 为 None(登记表不存在)按空名单处理;devices_text 解析失败、不是列表、任一项缺 device_id/uuid 或 revoked_at 字段类型不对 → raise ValueError(\"设备登记表损坏，无法核对上次可用配置\");未吊销名单 = revoked_at is None 的项的 device_id 集合与 uuid 集合;text 不是 JSON 对象、没有 inbounds 列表、或 inbounds 项没有 users 列表 → 原样返回 (text, 0)(不是本程序渲染的格式就交给 sing-box check 去判,既有用非 JSON 占位内容的测试不受影响);否则对每个 inbound 的 users 逐项过滤:含 uuid 键的用户保留当且仅当 uuid 在未吊销 uuid 集合;不含 uuid 的用户保留当且仅当 name 在未吊销 device_id 集合;返回 (json.dumps(过滤后, ensure_ascii=False, indent=2) + \"\\n\", 剔除条数);剔除条数为 0 时返回原 text 原样(不重排、不重新序列化)。模块只 import 标准库。⑤watchdog/ladder.py 的 rollback_config 执行段:读 LAST_GOOD 后、写 temporary 之前,调用 prune_revoked(文本, runner.read_file(SECRETS + \"/devices.json\") if runner.exists(...) else None)(SECRETS 从 ..service 导入);ValueError → 当作既有的 ValueError 分支处理(state 转 manual,reason 固定为「设备登记表损坏，无法核对上次可用配置，请联系维护人员」,不碰 LIVE、不重启);剔除条数 > 0 时 reason 末尾追加「；已剔除 N 个不在登记表上的设备」(只写数字,不写任何标识或凭据);写入 temporary 的是过滤后的文本,之后 sing-box check → replace → restart 的顺序与既有一致。tick 里「探测全部通过才复制 LIVE 到 LAST_GOOD」的快照逻辑一行不改。⑥rescue(独立副本,只许 import 标准库与 rescue 包内模块):在 rescue 包内新增 lastgood.py(与④同名同语义的 prune_revoked,bytes 进 bytes 出或自行 decode,实现可复制④的代码)并在 actions.restore 里套用:读 p.LAST_GOOD 后、第一次 sing-box check 之前先 prune_revoked(内容, runner.read(p.DEVICES) if runner.exists(p.DEVICES) else None);ValueError → required 为 True 时 raise ValueError(\"设备登记表损坏，无法核对上次可用配置\")(tick 既有 except 会把它原样写进 reason 并转 manual),required 为 False(reinstall 调用)时返回 False 不恢复、不抛;两次 check(先查副本再查临时文件)都对过滤后的内容做,写入 LIVE 的是过滤后的内容;restore 需把剔除条数带出来(改返回 (bool, int) 或其他清晰方式,调用点同步),tick 在 reason 后追加「；已剔除 N 个不在登记表上的设备」;history 不新增动作名,状态与历史里不出现任何标识或凭据。p.probe 不改。⑦测试(既有断言只加不改):test_service.py 加:设备发布(device add 路径或直接 _publish_checked 带 registry)成功后 LAST_GOOD 内容 == LIVE、模式 0o600、写入顺序在 reload 之后;check 失败 / 登记表写入失败 / reload 失败三种情况 LAST_GOOD 不被创建或保持原值;registry 为 None 的 init 发布也写 LAST_GOOD。test_device.py 加一条:add 两台后 revoke 一台 → LAST_GOOD 与 LIVE 相同、被吊销设备的 uuid 与 hy2 密码都不在 LAST_GOOD 里。test_proxy_sync.py 加:apply_sync 成功后缺省 last-good 路径存在且内容 == live、mode 0o600;check 失败不写;自定义 last_good_path 生效;last_good_path 等于 registry 路径 → ValueError。test_watchdog.py 加:(a) LAST_GOOD 为合法渲染格式(两个 inbound,各含一个在登记表上的用户与一个已吊销的用户;可用 render_server 或手写 JSON)、devices.json 一台未吊销一台已吊销 → 耗尽预算后回滚:写入 .watchdog.tmp 与 LIVE 的内容只含未吊销用户、check 命令针对 .watchdog.tmp、restart 发生、reason 含「已剔除 1 个」;(b) devices.json 损坏 → state manual、reason 含「登记表损坏」、LIVE 不变、无 restart;(c) devices.json 不存在且 LAST_GOOD 有用户 → 用户全部剔除后仍走 check/replace/restart;(d) prune_revoked 单测:非 JSON 原样返回且条数 0、无需剔除时返回原字符串对象(is 同一对象或字符串相等且未重排)、含 uuid 与不含 uuid 两种用户各自按规则过滤、登记表项缺字段抛 ValueError。test_rescue.py 加:(e) LAST_GOOD 为合法格式含已吊销用户 + devices.json → P4 连续两轮失败后 restore:写入 LIVE 的内容不含已吊销用户,两次 check 都对过滤后内容,reason 含「已剔除」;(f) devices.json 损坏 → tick 返回 2、reason 含「登记表损坏」、LIVE 不变、无 systemctl;(g) reinstall 路径(P1 两轮失败)遇登记表损坏 → 不恢复配置(LIVE 不变)但重装照常完成(其余断言与既有 test_two_rounds_reinstall 一致);(h) rescue 包内新模块只 import 标准库(可用 ast 扫 rescue/*.py 的 import 不出现 exitnode. 前缀,若已有同类测试就加进去)。⑧文档:docs/node/看门狗说明.md「每分钟检查什么」段「当前隧道配置与保留副本不同才更新副本」后补一句:设备增删或放行名单同步发布成功时也会同步更新该副本,所以副本不会停在吊销之前;「什么情况会重启服务」回滚那句后补:回滚前按设备登记表剔除副本里已吊销或不在名单上的设备,登记表损坏则不回滚、转需人工处理;「真机待验证」加:吊销一台设备后人为触发一次回滚(或 rescue 恢复),被吊销设备仍连不上。docs/node/救援单元说明.md「动手具体做什么」恢复配置那段补同样的核对规则(登记表路径、损坏时的行为、重装时不恢复配置的后果),「真机待验证」加同一项。docs/node/隧道配置说明.md 第 62 行附近「名单文件已更新不等于运行中的服务已生效」段后补一小段「吊销与自动恢复」:吊销后 last-good 同步更新,看门狗/救援恢复不会把吊销设备带回来;文案全部中文,不写任何凭据示例。",
+  "background": "项目:外包,澳洲家宽 Debian 软路由跑 node/exitnode(Python,主机操作全部经 Runner,测试用 FakeRunner;rescue/ 子包是可独立复制为 exitnode_rescue 的救援程序,只能 import 标准库与自己包内模块,有自己的 runner 协议 read/write/exists/list/replace 等,文件内容是 bytes)。隧道配置发布链:service._publish_checked(设备 add/revoke 与 init 发布;写 LIVE=/var/lib/exitnode/secrets/sing-box.json,校验→替换→登记表保存→reload)与 proxy/sync.apply_sync(鉴权服务器放行名单同步,同样校验→发布→登记表→reload,live_path 由调用方传)。last-good 副本 /var/lib/exitnode/secrets/sing-box.last-good.json 现在只有一个写入点:watchdog.tick 在本轮全部探测通过(含 L-public 公网地址查询)且 L-proxy 通过时复制 LIVE。三个读取点都把它原样写回 LIVE 并重启:watchdog/ladder.execute 的 rollback_config、rescue/actions.restore(配置连续两轮失败)、rescue/actions.reinstall 末尾的 restore(required=False)。对抗审查(看板 yuanc 卡 SECURITY-REDTEAM-1022 A6)查实:吊销设备只改 LIVE 与 devices.json,不更新 last-good;公网探测(ipify/1.1.1.1)不通在家宽上很常见,这时 last-good 会长期停在吊销之前;之后任何一次回滚或救援恢复都把已吊销设备原样带回来,且无告警,device list 仍显示已吊销。修法两层:发布即更新副本(治本);恢复前按登记表剔除(兜底,防止发布写 LIVE 后崩在写副本之前、以及任何旧副本)。为什么是「剔除」不是「拒绝」:回滚发生时服务已经坏了,拒绝恢复等于把节点留在故障里;剔除后的配置仍要过 sing-box check 才会上线。为什么登记表损坏就拒绝:没有名单就无法判断谁被吊销,宁可转人工。为什么不改 tick 的快照条件(L-public 失败也快照):既有测试 test_public_failure_only_degrades_even_after_thirty_minutes 断言公网失败时不写 LAST_GOOD,且有了发布即更新后不再需要。设备登记表 devices.json 格式:JSON 列表,每项 device_id/account_id/platform/name/uuid/hy2_password/created_at/revoked_at(null 为未吊销),由 proxy/registry.py 的 DeviceRegistry 原子写入;渲染出的 LIVE 里 in-hy2 的 users 为 {name: device_id, password},in-reality 的 users 为 {name: device_id, uuid, flow}(name 字段 2026-10-22 PR #24 起才有,旧配置可能没有,所以含 uuid 的按 uuid 判)。先读:node/exitnode/service.py(SECRETS/LIVE/_publish_checked/publish/check)、node/exitnode/proxy/{sync,registry,runner_proto,reload,server_config}.py、node/exitnode/watchdog/{__init__,ladder}.py、node/exitnode/rescue/{__init__,actions,probes,runner,state}.py、node/tests/{test_service,test_device,test_proxy_sync,test_watchdog,test_rescue}.py(夹具 setup/exhausted/ready/put/damage,LAST_GOOD 在测试里常是非 JSON 占位内容)、docs/node/{看门狗说明,救援单元说明,隧道配置说明}.md。环境:工位无外网;跑法 python -m ruff check node scripts authserver 与 python -m pytest -q node/tests;搜索用 rg 或 git grep。同仓同时有两单在别的工位施工:yc-sec-node-upgrade-version-gate-1022(只动 updater/upgrade.py、updater/layout.py、cli.py、test_updater.py、test_cli.py、docs/node/更新与回退说明.md)、yc-sec-win-startup-unprotected-1022(只动 winclient/ 与 docs/winclient/),本单不得碰这些文件。硬规矩:①发布路径三种失败(校验失败、登记表写入失败、重载失败)绝不写 last-good;②剔除后的内容必须经过与既有一致的 sing-box check 再替换 LIVE,check 失败不碰 LIVE;③任何状态、历史、日志里不出现 uuid、密码、device_id,只写数字;④rescue 包只 import 标准库与本包;⑤watchdog.tick 的快照条件与既有断言不改;⑥所有文案中文;⑦拿不准停下交 blocked + forks,不猜、不放宽断言;真机项写进文档不模拟成通过。",
+  "nonGoals": [
+    "不改 watchdog.tick 的快照条件,不改回滚/重装的额度与阶梯",
+    "不改设备登记表结构、不改 render_server 输出、不改黄金文件",
+    "不给 rescue 加网络或鉴权服务器访问;不做吊销时主动踢掉在线连接(sing-box reload 的既有语义)",
+    "不动 updater/、cli.py、templates/",
+    "不在真机实测;真机项写进两份文档的待验证清单"
+  ],
+  "allowedPaths": [
+    "node/exitnode/service.py",
+    "node/exitnode/proxy/sync.py",
+    "node/exitnode/proxy/lastgood.py",
+    "node/exitnode/watchdog/ladder.py",
+    "node/exitnode/watchdog/__init__.py",
+    "node/exitnode/rescue/actions.py",
+    "node/exitnode/rescue/probes.py",
+    "node/exitnode/rescue/lastgood.py",
+    "node/tests/test_service.py",
+    "node/tests/test_device.py",
+    "node/tests/test_proxy_sync.py",
+    "node/tests/test_watchdog.py",
+    "node/tests/test_rescue.py",
+    "docs/node/看门狗说明.md",
+    "docs/node/救援单元说明.md",
+    "docs/node/隧道配置说明.md"
+  ],
+  "forbiddenPaths": [
+    "winclient/**",
+    "authserver/**",
+    "scripts/**",
+    "docs/开工须知.md",
+    "docs/口径速查表.md",
+    "docs/design/**",
+    "docs/交接/**",
+    "docs/plans/**",
+    "docs/acceptance/**",
+    "docs/authserver/**",
+    "docs/winclient/**",
+    "docs/node/更新与回退说明.md",
+    "docs/node/配置说明.md",
+    "docs/node/客户端包托管说明.md",
+    "docs/node/自用配对说明.md",
+    ".github/**",
+    ".codex/**",
+    ".gitignore",
+    "pyproject.toml",
+    "node/exitnode/updater/**",
+    "node/exitnode/cli.py",
+    "node/exitnode/config.py",
+    "node/exitnode/runner.py",
+    "node/exitnode/device.py",
+    "node/exitnode/templates/**",
+    "node/exitnode/admin/**",
+    "node/exitnode/proxy/server_config.py",
+    "node/exitnode/proxy/client_config.py",
+    "node/exitnode/proxy/registry.py",
+    "node/exitnode/proxy/context.py",
+    "node/exitnode/proxy/reload.py",
+    "node/exitnode/proxy/runner_proto.py",
+    "node/exitnode/rescue/__init__.py",
+    "node/exitnode/rescue/__main__.py",
+    "node/exitnode/rescue/runner.py",
+    "node/exitnode/rescue/state.py",
+    "node/exitnode/watchdog/probes.py",
+    "node/exitnode/watchdog/state.py",
+    "node/tests/golden/**",
+    "node/tests/test_updater.py",
+    "node/tests/test_cli.py",
+    "node/tests/test_systemd_render.py",
+    "node/tests/test_proxy_server_render.py",
+    "node/tests/test_config.py"
+  ],
+  "expectArtifacts": [
+    "node/exitnode/service.py",
+    "node/exitnode/proxy/sync.py",
+    "node/exitnode/proxy/lastgood.py",
+    "node/exitnode/watchdog/ladder.py",
+    "node/exitnode/rescue/actions.py",
+    "node/exitnode/rescue/lastgood.py",
+    "node/tests/test_watchdog.py",
+    "node/tests/test_rescue.py",
+    "docs/node/看门狗说明.md"
+  ],
+  "acceptance": [
+    {
+      "id": "RUFF",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "ruff",
+        "check",
+        "node",
+        "scripts",
+        "authserver"
+      ],
+      "required": true,
+      "timeoutSec": 300
+    },
+    {
+      "id": "PYTEST",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+        "node/tests"
+      ],
+      "required": true,
+      "timeoutSec": 900,
+      "note": "既有断言只加不改;新增用例见 goal ⑦"
+    },
+    {
+      "id": "SHAPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda p:pathlib.Path(p).read_text(encoding='utf-8');sv=r('node/exitnode/service.py');sy=r('node/exitnode/proxy/sync.py');la=r('node/exitnode/watchdog/ladder.py');ra=r('node/exitnode/rescue/actions.py');bad=[k for k,ok in (('svc.const','LAST_GOOD' in sv),('sync.param','last_good_path' in sy),('ladder.import','from ..service import LAST_GOOD' in la),('ladder.prune','prune_revoked' in la),('rescue.prune','prune_revoked' in ra),('rescue.devices','DEVICES' in ra),('pure.main',pathlib.Path('node/exitnode/proxy/lastgood.py').exists()),('pure.rescue',pathlib.Path('node/exitnode/rescue/lastgood.py').exists())) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60,
+      "note": "发布写副本的常量与参数、回滚与救援恢复前剔除、两份纯函数模块都在"
+    },
+    {
+      "id": "RESCUE-STDLIB",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import ast,pathlib,sys;bad=[];\nfor p in pathlib.Path('node/exitnode/rescue').glob('*.py'):\n  for n in ast.walk(ast.parse(p.read_text(encoding='utf-8'))):\n    names=[a.name for a in n.names] if isinstance(n,ast.Import) else ([n.module or ''] if isinstance(n,ast.ImportFrom) and n.level==0 else [])\n    bad+=[p.name+':'+x for x in names if x.startswith('exitnode')]\nprint(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60,
+      "note": "救援包仍不依赖主程序任何模块"
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda p:pathlib.Path(p).read_text(encoding='utf-8');a=r('docs/node/看门狗说明.md');b=r('docs/node/救援单元说明.md');c=r('docs/node/隧道配置说明.md');bad=[k for k in ('登记表','剔除','吊销') if k not in a]+[k for k in ('登记表','剔除','吊销') if k not in b]+[k for k in ('吊销与自动恢复','last-good') if k not in c];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "model": null,
+  "timeoutSec": 5400,
+  "repoRoot": "E:/yuanc",
+  "engine": "codex",
+  "reasoningEffort": "high",
+  "steps": [
+    "读 background 列的源文件与测试;列出 last-good 的全部写入点与读取点,确认两条发布路径的成功判定点。",
+    "先写 goal ⑦ 的红测试(发布写副本、三种失败不写、回滚与救援恢复前剔除、登记表损坏拒绝),再写两份 prune_revoked 并接入 service/sync/ladder/rescue。",
+    "本机跑 RUFF/PYTEST 与断言;改三份文档;交活说明列出 restore 带出剔除条数的方式、未动的既有断言与真机待验证项。"
+  ]
+}
