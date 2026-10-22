@@ -21,7 +21,7 @@ public partial class MainWindow : Window
     }
     private async void Export_Click(object sender, RoutedEventArgs e)
     {
-        var dialog = new SaveFileDialog { Title = "导出防火墙审计", Filter = "诊断文件 (*.json)|*.json", FileName = "防火墙审计.json" };
+        var dialog = new SaveFileDialog { Title = "导出诊断", Filter = "诊断文件 (*.json)|*.json", FileName = "诊断报告.json" };
         if (!model.IsBusy && dialog.ShowDialog(this) == true) await model.ExportAuditAsync(dialog.FileName);
     }
     protected override void OnClosing(CancelEventArgs e)

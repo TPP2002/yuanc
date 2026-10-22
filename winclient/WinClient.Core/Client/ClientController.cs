@@ -25,6 +25,7 @@ public sealed record ClientSnapshot(ConnectionState State, string Status, string
     public string GuardStatus { get; init; } = "";
     public bool EnvironmentEnabled { get; init; } = true;
     public string EnvironmentStatus { get; init; } = "未应用";
+    public string SelfCheckStatus { get; init; } = "未检测";
 }
 
 /// <summary>Owns the serialized user flow, effects and session lifetime; no UI dependencies.</summary>
@@ -40,6 +41,9 @@ public sealed class ClientController : IDisposable
     private readonly IExitProbe? exitProbe;
     private readonly IEnvironmentEnforcer? environment;
     private readonly IEnvironmentSettingsStore? environmentSettings;
+    private readonly IIpv6Probe? ipv6Probe;
+    private readonly Action<EnvironmentReport>? reportSink;
+    private string selfCheckStatus = "未检测";
     private bool environmentApplied;
     private string environmentStatus = "未应用";
     private string exitStatus = "未检测";
@@ -69,19 +73,23 @@ public sealed class ClientController : IDisposable
     private string message = "";
     public ClientSnapshot Snapshot => new(machine.State, machine.StatusText, message, protection)
     { Mode = sessionSource?.Mode ?? "未配置", ExitStatus = exitStatus, ExitIp = exitIp, GuardStatus = guardStatus,
-        EnvironmentEnabled = environmentSettings?.Read().Enabled ?? true, EnvironmentStatus = environmentStatus };
+        EnvironmentEnabled = environmentSettings?.Read().Enabled ?? true, EnvironmentStatus = environmentStatus,
+        SelfCheckStatus = selfCheckStatus };
     public event Action<ClientSnapshot>? Changed;
 
     public ClientController(AuthApiClient? auth, ICredentialStore credentials, IKillSwitch firewall,
         ITunnelTransport tunnel, string program, DeviceInfo device, AuthEndpoint? authEndpoint = null, IExitProbe? exitProbe = null,
-        IEnvironmentEnforcer? environment = null, IEnvironmentSettingsStore? environmentSettings = null)
+        IEnvironmentEnforcer? environment = null, IEnvironmentSettingsStore? environmentSettings = null,
+        IIpv6Probe? ipv6Probe = null, Action<EnvironmentReport>? reportSink = null)
         : this(auth is null ? null : new AuthServerSessionSource(auth, credentials), firewall, tunnel, program, device,
-            authEndpoint: authEndpoint, exitProbe: exitProbe, environment: environment, environmentSettings: environmentSettings) { }
+            authEndpoint: authEndpoint, exitProbe: exitProbe, environment: environment, environmentSettings: environmentSettings,
+            ipv6Probe: ipv6Probe, reportSink: reportSink) { }
 
     public ClientController(ISessionSource? sessionSource, IKillSwitch firewall,
         ITunnelTransport tunnel, string program, DeviceInfo device, Func<TimeSpan, CancellationToken, Task>? delayAsync = null,
         AuthEndpoint? authEndpoint = null, IExitProbe? exitProbe = null,
-        IEnvironmentEnforcer? environment = null, IEnvironmentSettingsStore? environmentSettings = null)
+        IEnvironmentEnforcer? environment = null, IEnvironmentSettingsStore? environmentSettings = null,
+        IIpv6Probe? ipv6Probe = null, Action<EnvironmentReport>? reportSink = null)
     {
         this.sessionSource = sessionSource;
         this.delayAsync = delayAsync ?? ((delay, token) => Task.Delay(delay, token));
@@ -93,6 +101,8 @@ public sealed class ClientController : IDisposable
         this.exitProbe = exitProbe;
         this.environment = environment;
         this.environmentSettings = environmentSettings;
+        this.ipv6Probe = ipv6Probe;
+        this.reportSink = reportSink;
         tunnel.TunnelDown += OnTunnelDown;
     }
 
@@ -453,6 +463,7 @@ public sealed class ClientController : IDisposable
     {
         if (machine.State != ConnectionState.Connected)
         {
+            selfCheckStatus = "未检测";
             exitStatus = "未检测";
             exitIp = "";
             exitCycle = null;
@@ -486,10 +497,11 @@ public sealed class ClientController : IDisposable
         if (!ReferenceEquals(cycle, exitCycle) || machine.State != ConnectionState.Connected || session is null) return;
         exitStatus = "核验中";
         Publish();
-        IPAddress? address;
-        try { address = await exitProbe!.ProbeAsync(lifetime.Token); }
-        catch (Exception ex) when (IsOperational(ex) || ex is HttpRequestException) { address = null; }
+        ExitProbeResult? exit;
+        try { exit = await exitProbe!.ProbeDetailedAsync(lifetime.Token); }
+        catch (Exception ex) when (IsOperational(ex) || ex is HttpRequestException) { exit = null; }
         if (lifetime.IsCancellationRequested || disposed) return;
+        var address = exit?.Address;
         if (address is not null)
         {
             exitIp = address.ToString();
@@ -507,7 +519,31 @@ public sealed class ClientController : IDisposable
             exitStatus = "无法核验";
             exitIp = "";
         }
-        ScheduleExitCheck(ExitRecheckInterval, cycle, 1);
+        await CheckEnvironmentAsync(exit);
+        if (!lifetime.IsCancellationRequested && !disposed) ScheduleExitCheck(ExitRecheckInterval, cycle, 1);
+    }
+
+    private async Task CheckEnvironmentAsync(ExitProbeResult? exit)
+    {
+        selfCheckStatus = "检测中";
+        Publish();
+        var policy = environmentSettings?.Read() ?? EnvironmentSettingsStore.Default;
+        EnvironmentInspection? inspection = null;
+        if (policy.Enabled && environment is not null)
+        {
+            try { inspection = await environment.InspectAsync(); }
+            catch (Exception ex) when (IsOperational(ex)) { }
+        }
+        if (lifetime.IsCancellationRequested || disposed) return;
+        bool? ipv6 = null;
+        try { if (ipv6Probe is not null) ipv6 = await ipv6Probe.CanReachAsync(lifetime.Token); }
+        catch (Exception) { } // 探测异常仅代表本项无法核验，不进入连接失败路径。
+        if (lifetime.IsCancellationRequested || disposed) return;
+        var report = EnvironmentSelfCheck.Evaluate(new(exit, session!.Node.Host, policy.ExpectedCountry,
+            policy.Enabled, environmentApplied, policy.Target, inspection, ipv6, session.SingboxConfig, DateTimeOffset.UtcNow));
+        selfCheckStatus = report.Summary;
+        try { reportSink?.Invoke(report); }
+        catch (Exception ex) when (IsOperational(ex)) { } // 写报告失败不影响已完成的检查与连接。
     }
 
     private void SchedulePatrol(object cycle)

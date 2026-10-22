@@ -3,6 +3,7 @@ using System.IO;
 using System.IO.Pipes;
 using System.Runtime.CompilerServices;
 using System.ServiceProcess;
+using System.Text.Json;
 using System.Windows;
 using System.Windows.Input;
 using WinClient.App.Hosting;
@@ -36,6 +37,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         _ => "当前出口 IP:待检测"
     };
     public string GuardLine => snapshot.GuardStatus.Length == 0 ? "" : "断网保护巡检:" + snapshot.GuardStatus;
+    public string SelfCheckLine => "环境自检:" + snapshot.SelfCheckStatus;
     public string EnvironmentLine => "环境一致性:" + snapshot.EnvironmentStatus;
     public bool EnvironmentEnabled
     {
@@ -197,17 +199,32 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         Notify(nameof(ServiceVersion)); Notify(nameof(UpdateMessage));
         Notify(nameof(EnvironmentLine)); Notify(nameof(EnvironmentEnabled));
         Notify(nameof(ExitLine)); Notify(nameof(GuardLine));
+        Notify(nameof(SelfCheckLine));
         CommandManager.InvalidateRequerySuggested();
     }
     public Task ExportAuditAsync(string path) => RunAsync(async () =>
     {
         var response = await (client ?? throw new IOException()).SendAsync("read_audit", cancellationToken: lifetime.Token);
-        if (!response.Ok || response.Audit is null)
+        if (!response.Ok)
         {
-            Update(snapshot with { Message = response.Error ?? "尚无可导出的审计记录，请完成一次连接后重试。" }); return;
+            Update(snapshot with { Message = response.Error ?? "诊断读取失败，请联系管理员。" }); return;
         }
-        await File.WriteAllTextAsync(path, response.Audit, lifetime.Token);
-        Update(snapshot with { Message = "已导出防火墙审计；完整诊断功能尚未提供。" });
+        var selfCheck = await client.SendAsync("read_selfcheck", cancellationToken: lifetime.Token);
+        if (!selfCheck.Ok)
+        {
+            Update(snapshot with { Message = selfCheck.Error ?? "诊断读取失败，请联系管理员。" }); return;
+        }
+        if (response.Audit is null && selfCheck.SelfCheck is null)
+        {
+            Update(snapshot with { Message = "尚无可导出的诊断记录,请完成一次连接后重试。" }); return;
+        }
+        // 验证两段都是 JSON，再原样嵌入，避免把对象变成转义字符串。
+        using var auditJson = response.Audit is null ? null : JsonDocument.Parse(response.Audit);
+        using var selfCheckJson = selfCheck.SelfCheck is null ? null : JsonDocument.Parse(selfCheck.SelfCheck);
+        var diagnostics = "{\"firewall_audit\":" + (auditJson?.RootElement.GetRawText() ?? "null")
+            + ",\"self_check\":" + (selfCheckJson?.RootElement.GetRawText() ?? "null") + "}";
+        await File.WriteAllTextAsync(path, diagnostics, lifetime.Token);
+        Update(snapshot with { Message = "已导出诊断(防火墙审计 + 环境自检)。" });
     });
     private void Notify([CallerMemberName] string? property = null) => PropertyChanged?.Invoke(this, new(property));
     private void DropClient()

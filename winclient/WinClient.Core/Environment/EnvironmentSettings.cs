@@ -1,10 +1,11 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
 using WinClient.Core.Client;
 
 namespace WinClient.Core.EnvironmentSupport;
 
-public sealed record EnvironmentPolicy(bool Enabled, EnvironmentTarget Target);
+public sealed record EnvironmentPolicy(bool Enabled, EnvironmentTarget Target, string ExpectedCountry = "AU");
 public interface IEnvironmentSettingsStore
 {
     EnvironmentPolicy Read();
@@ -20,7 +21,11 @@ public sealed class EnvironmentSettingsStore(string? runRoot = null) : IEnvironm
     private static EnvironmentPolicy Parse(JsonObject json) => new(
         json["enabled"]?.GetValue<bool>() ?? throw new JsonException(),
         new(json["time_zone"]?.GetValue<string>() ?? throw new JsonException(),
-            json["languages"]?.AsArray().Select(item => item?.GetValue<string>() ?? throw new JsonException()).ToArray() ?? throw new JsonException()));
+            json["languages"]?.AsArray().Select(item => item?.GetValue<string>() ?? throw new JsonException()).ToArray() ?? throw new JsonException()),
+        ParseCountry(json["country"]));
+
+    private static string ParseCountry(JsonNode? value) => value is JsonValue json && json.TryGetValue<string>(out var country)
+        && country is not null && country.Length == 2 && Regex.IsMatch(country, "^[A-Z]{2}$") ? country : "AU";
 
     private JsonObject? ReadObject()
     {
@@ -45,7 +50,7 @@ public sealed class EnvironmentSettingsStore(string? runRoot = null) : IEnvironm
         {
             var json = ReadObject() ?? new JsonObject
             {
-                ["enabled"] = true, ["time_zone"] = Default.Target.TimeZoneId,
+                ["enabled"] = true, ["time_zone"] = Default.Target.TimeZoneId, ["country"] = Default.ExpectedCountry,
                 ["languages"] = new JsonArray(Default.Target.Languages.Select(value => (JsonNode?)JsonValue.Create(value)).ToArray())
             };
             json["enabled"] = enabled;

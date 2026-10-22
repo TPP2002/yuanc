@@ -60,5 +60,6 @@ public sealed class UpdateIpcTests
         public Task ImportPairingAsync(string json) => Task.CompletedTask;
         public Task ClearPairingAsync() => Task.CompletedTask;
         public string? ReadAudit() => null;
+        public string? ReadSelfCheck() => null;
     }
 }

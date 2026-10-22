@@ -11,4 +11,5 @@ public interface IClientFacade
     Task ImportPairingAsync(string json);
     Task ClearPairingAsync();
     string? ReadAudit();
+    string? ReadSelfCheck();
 }
