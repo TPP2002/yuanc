@@ -14,6 +14,12 @@
    </StackPanel></ToggleButton>
    <TextBlock Text="后台服务未就绪,暂时不能改" Style="{DynamicResource Yc.Hint}" Visibility="{Binding CanUseConnection, Converter={x:Static t:VisibilityConverter.Instance}, ConverterParameter=Invert}"/>
   </StackPanel></Border>
+  <Border Style="{DynamicResource Yc.Card}" Margin="0,12,0,0"><StackPanel>
+   <TextBlock Text="澳洲专用浏览器" FontWeight="Bold"/>
+   <TextBlock Text="给 Chrome 或 Edge 各建一个独立的配置档和桌面快捷方式:账号、历史、插件与日常上网分开,首选语言固定 en-AU,关闭 QUIC。专用档只登录目标平台账号。" FontSize="{DynamicResource Yc.FontSize.Sm}" Foreground="{DynamicResource Yc.Text2}" TextWrapping="Wrap" Margin="0,4,0,0"/>
+   <Button Content="创建澳洲专用浏览器快捷方式" Style="{DynamicResource Yc.Button.Secondary}" Command="{Binding CreateBrowserProfileCommand}" HorizontalAlignment="Left" Margin="0,12,0,0" AutomationProperties.Name="创建澳洲专用浏览器快捷方式"/>
+   <TextBlock Text="{Binding BrowserProfileMessage}" Style="{DynamicResource Yc.Hint}" Visibility="{Binding BrowserProfileMessage, Converter={x:Static t:VisibilityConverter.Instance}}"/>
+  </StackPanel></Border>
   <StackPanel Orientation="Horizontal" Margin="0,24,0,8"><TextBlock Text="环境自检" FontWeight="Bold"/>
    <Border Margin="12,0,0,0"><Border.Style><Style TargetType="Border" BasedOn="{StaticResource Yc.Badge}"><Style.Triggers>
     <DataTrigger Binding="{Binding SelfCheckTone}" Value="Ok"><Setter Property="Background" Value="{DynamicResource Yc.OkBg}"/></DataTrigger>

@@ -10,6 +10,22 @@ namespace WinClient.UiTests;
 [Collection("界面线程")]
 public class ViewModelTests(UiThreadFixture ui)
 {
+    [Fact]
+    public void 专用浏览器无需后台且不修改主消息() => ui.Invoke(() =>
+    {
+        using var model = new MainViewModel(() => null, () => null,
+            (_, _) => Task.FromResult<string?>("{\"created\":[\"Chrome\"],\"missing\":[\"Edge\"],\"kept\":[]}"));
+        var message = model.Message;
+        Assert.True(model.CreateBrowserProfileCommand.CanExecute(null));
+        model.CreateBrowserProfileAsync().GetAwaiter().GetResult();
+        Assert.Contains("澳洲专用 Chrome", model.BrowserProfileMessage);
+        Assert.Contains("未找到 Edge", model.BrowserProfileMessage);
+        Assert.Equal(message, model.Message);
+        using var failed = new MainViewModel(() => null, () => null, (_, _) => Task.FromResult<string?>(null));
+        failed.CreateBrowserProfileAsync().GetAwaiter().GetResult();
+        Assert.Contains("未完成", failed.BrowserProfileMessage);
+    });
+
     [Theory]
     [InlineData("通过", Tone.Ok, Glyph.Check, false)]
     [InlineData("未通过", Tone.Bad, Glyph.X, false)]

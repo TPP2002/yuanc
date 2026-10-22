@@ -9,6 +9,8 @@ using System.Windows.Input;
 using WinClient.App.Hosting;
 using WinClient.App.Presentation;
 using WinClient.Core.Client;
+using WinClient.Core.EnvironmentSupport;
+using WinClient.Core.Firewall;
 using WinClient.Core.Ipc;
 using WinClient.Core.State;
 using WinClient.Core.Update;
@@ -22,6 +24,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
     private ControlClient? client;
     private bool disposed;
     private readonly CancellationTokenSource lifetime = new();
+    private readonly Func<string, CancellationToken, Task<string?>> runScript;
     private ClientSnapshot snapshot = new(ConnectionState.Disconnected, "正在检查后台服务", "", false);
     private string serviceVersion = "";
     private string updateMessage = "";
@@ -68,6 +71,8 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
     public ICommand ClearPairingCommand { get; }
     public ICommand CheckUpdateCommand { get; }
     public ICommand GoToAccountCommand { get; }
+    public ICommand CreateBrowserProfileCommand { get; }
+    public string BrowserProfileMessage { get; private set; } = "";
     public HeroPresentation Hero { get; private set; } = null!;
     private PageKind currentPage;
     public PageKind CurrentPage
@@ -111,8 +116,11 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
     public string ClearPairingDisabledReason => PairingDisabledReason.Length > 0 ? PairingDisabledReason : snapshot.Mode != "自用模式" ? "尚无可清除的本机配对文件。" : "";
     public event PropertyChangedEventHandler? PropertyChanged;
 
-    public MainViewModel(Func<string?> choosePairingFile, Func<string?> chooseProgram)
+    public MainViewModel(Func<string?> choosePairingFile, Func<string?> chooseProgram,
+        Func<string, CancellationToken, Task<string?>>? runScript = null)
     {
+        this.runScript = runScript ?? RunBrowserScriptAsync;
+        CreateBrowserProfileCommand = new AsyncCommand(CreateBrowserProfileAsync, () => !IsBusy);
         GoToAccountCommand = new AsyncCommand(() => { CurrentPage = PageKind.Account; return Task.CompletedTask; }, () => true);
         AddRoutingAppCommand = new AsyncCommand(() => RunAsync(async () =>
         {
@@ -137,6 +145,25 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         Refresh();
     }
     private bool CanChangePairing() => CanUseConnection && !ShouldDisconnect;
+    private static async Task<string?> RunBrowserScriptAsync(string script, CancellationToken token)
+    {
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
+        timeout.CancelAfter(TimeSpan.FromSeconds(60));
+        var result = await new CommandRunner().RunAsync(KillSwitchApplier.CreateStartInfo(script), timeout.Token);
+        return result.ExitCode == 0 ? result.Output : null;
+    }
+    internal Task CreateBrowserProfileAsync() => RunAsync(async () =>
+    {
+        try
+        {
+            var output = await runScript(BrowserProfilePlanner.Script(), lifetime.Token);
+            BrowserProfileMessage = BrowserProfilePlanner.Describe(output);
+        }
+        catch (Exception ex) when (ex is IOException or InvalidOperationException or Win32Exception or
+            OperationCanceledException or UnauthorizedAccessException or JsonException)
+        { BrowserProfileMessage = BrowserProfilePlanner.Describe(null); }
+        Notify(nameof(BrowserProfileMessage));
+    });
     public Task InitializeAsync() => RunAsync(InitializeCoreAsync);
     private async Task InitializeCoreAsync()
     {
