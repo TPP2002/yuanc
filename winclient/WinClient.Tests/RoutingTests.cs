@@ -61,6 +61,31 @@ public sealed class RoutingTests
         Assert.Equal(input.GetRawText(), RoutingRenderer.Render(input, RoutingPolicy.Global, Service).GetRawText());
     }
 
+    [Fact]
+    public void GlobalAddsAuthDirectRuleForServiceOnly()
+    {
+        var input = LocalConfigRenderer.Render(TestData.Node());
+        var auth = new AuthEndpoint(IPAddress.Parse("192.0.2.5"), 8080, Service);
+        var result = RoutingRenderer.Render(input, RoutingPolicy.Global, Service, auth);
+        var outbounds = result.GetProperty("outbounds");
+        Assert.Equal(input.GetProperty("outbounds").GetArrayLength() + 1, outbounds.GetArrayLength());
+        Assert.Equal("direct", outbounds[outbounds.GetArrayLength() - 1].GetProperty("type").GetString());
+        Assert.Equal("direct", outbounds[outbounds.GetArrayLength() - 1].GetProperty("tag").GetString());
+        var rules = result.GetProperty("route").GetProperty("rules");
+        Assert.Equal(RoutingRenderer.PathPattern(Service), Assert.Single(rules[0].GetProperty("process_path_regex").EnumerateArray()).GetString());
+        Assert.Equal("192.0.2.5/32", Assert.Single(rules[0].GetProperty("ip_cidr").EnumerateArray()).GetString());
+        Assert.Equal(8080, Assert.Single(rules[0].GetProperty("port").EnumerateArray()).GetInt32());
+        Assert.Equal("direct", rules[0].GetProperty("outbound").GetString());
+        Assert.Equal(input.GetProperty("route").GetProperty("rules").EnumerateArray().Select(x => x.GetRawText()),
+            rules.EnumerateArray().Skip(1).Select(x => x.GetRawText()));
+        Assert.Equal("proxy", result.GetProperty("route").GetProperty("final").GetString());
+        foreach (var key in new[] { "dns", "inbounds" })
+            Assert.Equal(input.GetProperty(key).GetRawText(), result.GetProperty(key).GetRawText());
+        var again = RoutingRenderer.Render(result, RoutingPolicy.Global, Service, auth);
+        Assert.Equal(outbounds.GetArrayLength(), again.GetProperty("outbounds").GetArrayLength());
+        Assert.Equal(rules.GetArrayLength(), again.GetProperty("route").GetProperty("rules").GetArrayLength());
+    }
+
     [Theory]
     [InlineData(false)]
     [InlineData(true)]

@@ -1,5 +1,8 @@
 using System.Net;
 using System.Text.Json;
+using System.Text.Json.Nodes;
+using WinClient.Core.Firewall;
+using WinClient.Core.Pairing;
 using WinClient.Core.Client;
 using WinClient.Core.EnvironmentSupport;
 using Xunit;
@@ -8,6 +11,41 @@ namespace WinClient.Tests;
 
 public sealed class EnvironmentSelfCheckTests
 {
+    private static SelfCheckInput AuthInput()
+    {
+        var auth = new AuthEndpoint(IPAddress.Parse("192.0.2.5"), 8080, RoutingTests.Service);
+        return Good with { Auth = auth, ServiceProcessPath = RoutingTests.Service,
+            SingboxConfig = RoutingRenderer.Render(LocalConfigRenderer.Render(TestData.Node()), RoutingPolicy.Global, RoutingTests.Service, auth) };
+    }
+
+    [Fact]
+    public void GlobalAuthDirectRuleIsTheOnlyAllowedDirectPath()
+    {
+        var report = EnvironmentSelfCheck.Evaluate(AuthInput());
+        Assert.Equal("通过", report.Items[6].Result);
+        Assert.Equal("符合目标要求", report.Items[6].Detail);
+        Assert.Equal("8 项通过", report.Summary);
+    }
+
+    [Fact]
+    public void DirectWithoutAuthEndpointFails()
+    {
+        var report = EnvironmentSelfCheck.Evaluate(AuthInput() with { Auth = null });
+        Assert.Equal("未通过", report.Items[6].Result);
+        Assert.Contains("outbounds", report.Items[6].Detail);
+    }
+
+    [Fact]
+    public void AuthDirectRuleMustBeFullyScoped()
+    {
+        var input = AuthInput();
+        var config = JsonNode.Parse(input.SingboxConfig.GetRawText())!;
+        config["route"]!["rules"]![0]!.AsObject().Remove("port");
+        var report = EnvironmentSelfCheck.Evaluate(input with { SingboxConfig = JsonSerializer.SerializeToElement(config) });
+        Assert.Equal("未通过", report.Items[6].Result);
+        Assert.Contains("outbounds", report.Items[6].Detail);
+    }
+
     [Fact]
     public void AppsChecksScopedRoutesAndSkipsWholeMachineIpv6()
     {

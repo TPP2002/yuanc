@@ -622,7 +622,8 @@ public sealed class ClientController : IDisposable
         var report = EnvironmentSelfCheck.Evaluate(new(exit, session!.Node.Host, policy.ExpectedCountry,
             policy.Enabled, environmentApplied, policy.Target, inspection, ipv6,
             RenderedConfiguration(session),
-            DateTimeOffset.UtcNow) { Routing = activeRouting });
+            DateTimeOffset.UtcNow) { Routing = activeRouting,
+                Auth = sessionSource is AuthServerSessionSource ? authEndpoint : null, ServiceProcessPath = serviceProcessPath });
         selfCheckStatus = report.Summary;
         try { reportSink?.Invoke(report); }
         catch (Exception ex) when (IsOperational(ex)) { } // 写报告失败不影响已完成的检查与连接。

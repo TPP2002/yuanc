@@ -2,6 +2,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text.Json;
 using WinClient.Core.Client;
+using WinClient.Core.Firewall;
 
 namespace WinClient.Core.EnvironmentSupport;
 
@@ -23,6 +24,8 @@ public sealed record SelfCheckInput(ExitProbeResult? Exit, string NodeHost, stri
     bool? Ipv6Reachable, JsonElement SingboxConfig, DateTimeOffset Now)
 {
     public RoutingPolicy Routing { get; init; } = RoutingPolicy.Global;
+    public AuthEndpoint? Auth { get; init; }
+    public string? ServiceProcessPath { get; init; }
 }
 
 public interface IIpv6Probe
@@ -122,11 +125,30 @@ public static class EnvironmentSelfCheck
                 Property(rule, "ip_version") is var version && version.ValueKind == JsonValueKind.Number && version.TryGetInt32(out var number)
                 && number == 6 && Text(Property(rule, "outbound")) == "block")),
             ("dns.servers detour", servers.ValueKind == JsonValueKind.Array && servers.EnumerateArray().All(server => Text(Property(server, "detour")) == "proxy")),
-            ("outbounds 无 direct", outbounds.ValueKind == JsonValueKind.Array && outbounds.EnumerateArray().All(outbound => Text(Property(outbound, "type")) != "direct"))));
+            ("outbounds direct 只限后台服务到鉴权端口", DirectOnlyForAuth(outbounds, rules, input.Auth, input.ServiceProcessPath))));
         items.Add(new("ipv6_direct", "IPv6 已封堵", input.Ipv6Reachable is null ? "无法核验" : input.Ipv6Reachable.Value ? "未通过" : "通过",
             input.Ipv6Reachable is null ? "未取得 IPv6 探测结果" : input.Ipv6Reachable.Value ? "IPv6 可直连,可能泄漏" : "固定 IPv6 地址未能建立连接"));
         }
         return new(input.Now, items);
+    }
+
+    private static bool DirectOnlyForAuth(JsonElement outbounds, JsonElement rules, AuthEndpoint? auth, string? serviceProcessPath)
+    {
+        if (outbounds.ValueKind != JsonValueKind.Array || rules.ValueKind != JsonValueKind.Array) return false;
+        var directOutbounds = outbounds.EnumerateArray().Where(value => Text(Property(value, "type")) == "direct").ToArray();
+        var directRules = rules.EnumerateArray().Where(value => Text(Property(value, "outbound")) == "direct").ToArray();
+        if (directOutbounds.Length == 0 && directRules.Length == 0) return true;
+        if (auth is null || string.IsNullOrEmpty(serviceProcessPath)) return false;
+        bool SingleString(JsonElement rule, string key, string expected)
+        {
+            var values = Property(rule, key);
+            return values.ValueKind == JsonValueKind.Array && values.GetArrayLength() == 1 && Text(values[0]) == expected;
+        }
+        return directOutbounds.All(value => Text(Property(value, "tag")) == "direct") && directRules.Length > 0
+            && directRules.All(rule => SingleString(rule, "process_path_regex", RoutingRenderer.PathPattern(serviceProcessPath))
+                && SingleString(rule, "ip_cidr", auth.Address + "/32")
+                && Property(rule, "port") is var ports && ports.ValueKind == JsonValueKind.Array && ports.GetArrayLength() == 1
+                && ports[0].ValueKind == JsonValueKind.Number && ports[0].TryGetInt32(out var port) && port == auth.Port);
     }
 
     private static string? Value(IReadOnlyDictionary<string, string?> values, string key) => values.TryGetValue(key, out var value) ? value : null;
