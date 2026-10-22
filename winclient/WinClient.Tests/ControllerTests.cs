@@ -11,6 +11,129 @@ namespace WinClient.Tests;
 
 public sealed class ControllerTests
 {
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task StartupKeepsPairingProtectionAndConnectsRegardlessOfAutoConnect(bool autoConnect)
+    {
+        var order = new List<string>();
+        var firewall = new Firewall(order) { HasPendingState = true };
+        using var controller = new ClientController(new PairingSessionSource(PairingTests.ValidPairing()),
+            firewall, new Tunnel(order), Path.GetFullPath("fake.exe"), TestData.Device);
+        var snapshots = new List<ClientSnapshot>();
+        controller.Changed += snapshots.Add;
+        await controller.InitializeAsync(autoConnect, keepProtection: true);
+        Assert.Equal(new[] { "apply", "start" }, order);
+        Assert.True(controller.Snapshot.ProtectionActive);
+        Assert.Contains("保持", controller.Snapshot.Message);
+        Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
+        Assert.Contains(snapshots, snapshot => snapshot.Message == "后台服务已重新启动，断网保护保持，正在恢复连接。");
+        Assert.All(snapshots, snapshot => Assert.True(snapshot.ProtectionActive));
+    }
+
+    [Fact]
+    public async Task StartupPendingProtectionWithoutServerRecovers()
+    {
+        var order = new List<string>();
+        using var controller = new ClientController((ISessionSource?)null,
+            new Firewall(order) { HasPendingState = true }, new Tunnel(order), Path.GetFullPath("fake.exe"), TestData.Device);
+        await controller.InitializeAsync(true, true);
+        Assert.Equal(new[] { "recover" }, order);
+        Assert.False(controller.Snapshot.ProtectionActive);
+        Assert.Contains("未配置服务器", controller.Snapshot.Message);
+    }
+
+    [Fact]
+    public async Task StartupPendingProtectionWithoutCredentialsRecovers()
+    {
+        var order = new List<string>();
+        using var http = new HttpClient(new AuthTests.Handler(_ => throw new InvalidOperationException("不应请求会话")))
+        { BaseAddress = new("https://192.0.2.1") };
+        using var controller = new ClientController(new AuthServerSessionSource(new AuthApiClient(http), new InMemoryCredentialStore()),
+            new Firewall(order) { HasPendingState = true }, new Tunnel(order), Path.GetFullPath("fake.exe"), TestData.Device);
+        await controller.InitializeAsync(true, true);
+        Assert.Equal(new[] { "recover" }, order);
+        Assert.False(controller.Snapshot.ProtectionActive);
+    }
+
+    [Fact]
+    public async Task StartupWithoutPendingStateStillRecoversThenAutomaticallyConnects()
+    {
+        var order = new List<string>();
+        using var controller = new ClientController(new PairingSessionSource(PairingTests.ValidPairing()),
+            new Firewall(order), new Tunnel(order), Path.GetFullPath("fake.exe"), TestData.Device);
+        await controller.InitializeAsync(true, true);
+        Assert.Equal(new[] { "recover", "apply", "start" }, order);
+        Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
+        Assert.True(controller.Snapshot.ProtectionActive);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task OnlyAuthModePassesAuthEndpointToFirewall(bool authMode)
+    {
+        var order = new List<string>();
+        var firewall = new Firewall(order);
+        using var http = SessionHttp(() => TestData.Session());
+        var store = new InMemoryCredentialStore(); store.Save("refresh");
+        ISessionSource source = authMode ? new AuthServerSessionSource(new AuthApiClient(http), store)
+            : new PairingSessionSource(PairingTests.ValidPairing());
+        var endpoint = new AuthEndpoint(IPAddress.Parse("192.0.2.1"), 8443, Path.GetFullPath("service.exe"));
+        using var controller = new ClientController(source, firewall, new Tunnel(order), Path.GetFullPath("fake.exe"),
+            TestData.Device, authEndpoint: endpoint);
+        await controller.ConnectAsync();
+        Assert.Equal(new[] { "apply", "start" }, order);
+        Assert.Equal(authMode ? endpoint : null, firewall.AppliedAuth);
+    }
+
+    [Fact]
+    public async Task StartupAuthNetworkRetriesExhaustWithoutEverRemovingProtection()
+    {
+        var pending = System.Threading.Channels.Channel.CreateUnbounded<(TimeSpan Delay, TaskCompletionSource Completion)>();
+        Task Delay(TimeSpan duration, CancellationToken token)
+        {
+            var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            token.Register(() => completion.TrySetCanceled(token));
+            pending.Writer.TryWrite((duration, completion));
+            return completion.Task;
+        }
+        var order = new List<string>();
+        var calls = 0;
+        using var http = new HttpClient(new AuthTests.Handler(_ =>
+        { Interlocked.Increment(ref calls); throw new HttpRequestException("测试网络不可达"); }))
+        { BaseAddress = new("https://192.0.2.1") };
+        var store = new InMemoryCredentialStore(); store.Save("refresh");
+        using var controller = new ClientController(new AuthServerSessionSource(new AuthApiClient(http), store),
+            new Firewall(order) { HasPendingState = true }, new Tunnel(order), Path.GetFullPath("fake.exe"), TestData.Device, Delay);
+        var snapshots = new System.Collections.Concurrent.ConcurrentQueue<ClientSnapshot>();
+        var manual = new TaskCompletionSource<ClientSnapshot>(TaskCreationOptions.RunContinuationsAsynchronously);
+        controller.Changed += snapshot =>
+        {
+            snapshots.Enqueue(snapshot);
+            if (snapshot.State == ConnectionState.NeedsManual && snapshot.Message.Contains("多次重连仍未成功")) manual.TrySetResult(snapshot);
+        };
+        await controller.InitializeAsync(true, true);
+        Assert.Equal(ConnectionState.Reconnecting, controller.Snapshot.State);
+        Assert.True(controller.Snapshot.ProtectionActive);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        foreach (var seconds in new[] { 2, 4, 8, 16, 32, 60, 60, 60, 60, 60, 60 })
+        {
+            var scheduled = await pending.Reader.ReadAsync(timeout.Token);
+            Assert.Equal(TimeSpan.FromSeconds(seconds), scheduled.Delay);
+            scheduled.Completion.SetResult();
+        }
+        var result = await manual.Task.WaitAsync(timeout.Token);
+        Assert.Equal(ConnectionState.NeedsManual, result.State);
+        Assert.True(result.ProtectionActive);
+        Assert.All(snapshots, snapshot => Assert.True(snapshot.ProtectionActive));
+        Assert.Equal(12, Volatile.Read(ref calls));
+        Assert.DoesNotContain("recover", order);
+        Assert.DoesNotContain("remove", order);
+        Assert.DoesNotContain("apply", order);
+        Assert.DoesNotContain("start", order);
+    }
+
     [Fact]
     public async Task RecoveryWarningRemainsVisibleAfterAutomaticConnect()
     {
@@ -166,12 +289,14 @@ public sealed class ControllerTests
     { BaseAddress = new("https://unit.invalid") };
     private sealed class Firewall(List<string> order) : IKillSwitch
     {
+        public bool HasPendingState { get; set; }
+        public AuthEndpoint? AppliedAuth { get; private set; }
         public string? RecoveryWarning { get; init; }
         public bool FailRecovery { get; init; }
         public bool FailApply { get; init; }
         public Exception? ApplyError { get; init; }
-        public Task ApplyAsync(IReadOnlyList<IPAddress> ips, string program, int hy2Port)
-        { order.Add("apply"); if (ApplyError is not null) throw ApplyError; if (FailApply) throw new InvalidOperationException(); return Task.CompletedTask; }
+        public Task ApplyAsync(IReadOnlyList<IPAddress> ips, string program, int hy2Port, AuthEndpoint? auth = null)
+        { AppliedAuth = auth; order.Add("apply"); if (ApplyError is not null) throw ApplyError; if (FailApply) throw new InvalidOperationException(); return Task.CompletedTask; }
         public Task UpdateNodeAsync(IReadOnlyList<IPAddress> ips, string program, int hy2Port)
         { order.Add("update:" + ips[0]); return Task.CompletedTask; }
         public Task RemoveAsync() { order.Add("remove"); return Task.CompletedTask; }

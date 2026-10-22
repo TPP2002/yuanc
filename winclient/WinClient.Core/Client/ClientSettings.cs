@@ -1,6 +1,8 @@
+using System.Net;
 using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using WinClient.Core.Firewall;
 
 namespace WinClient.Core.Client;
 
@@ -9,6 +11,15 @@ public sealed class ClientSettings
     public const string ProductName = "YuanC";
     [JsonPropertyName("server_url")] public required string ServerUrl { get; init; }
     [JsonPropertyName("sing_box_path")] public string? SingBoxPath { get; init; }
+    [JsonIgnore] public AuthEndpoint? AuthEndpoint
+    {
+        get
+        {
+            if (Environment.ProcessPath is not { Length: > 0 } program) return null;
+            var uri = new Uri(ServerUrl);
+            return new(IPAddress.Parse(uri.Host), uri.Port, Path.GetFullPath(program));
+        }
+    }
     public static string DataDirectory => Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), ProductName);
     public static ClientSettings? Load(string? dataDirectory = null, Func<string, bool>? ownerIsTrusted = null, string? kernelRoot = null)
     {
@@ -21,6 +32,8 @@ public sealed class ClientSettings
         if (!Uri.TryCreate(settings.ServerUrl, UriKind.Absolute, out var uri) || uri.Scheme != Uri.UriSchemeHttps ||
             !string.IsNullOrEmpty(uri.UserInfo) || !string.IsNullOrEmpty(uri.Query) || !string.IsNullOrEmpty(uri.Fragment))
             throw new InvalidDataException("服务器必须配置为不含凭据的 HTTPS 地址。");
+        if (uri.HostNameType != UriHostNameType.IPv4)
+            throw new InvalidDataException("服务器地址必须是 IPv4 数字地址，不使用域名。");
         if (settings.SingBoxPath is not null && !Path.IsPathFullyQualified(settings.SingBoxPath))
             throw new InvalidDataException("连接内核必须配置为绝对路径。");
         if (!string.IsNullOrEmpty(settings.SingBoxPath))

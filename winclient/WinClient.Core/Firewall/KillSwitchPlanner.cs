@@ -5,6 +5,7 @@ using System.Text;
 namespace WinClient.Core.Firewall;
 
 public enum KillSwitchMode { Apply, Remove, Audit }
+public sealed record AuthEndpoint(IPAddress Address, int Port, string Program);
 public abstract record FirewallAction;
 public sealed record SetProfileDefault(string Profile, string Action) : FirewallAction;
 public sealed record DisableForeignAllowRules : FirewallAction;
@@ -24,7 +25,7 @@ public static class KillSwitchPlanner
     public const string TunAlias = "YuanC-TUN";
 
     public static IReadOnlyList<FirewallAction> Plan(IReadOnlyList<IPAddress> nodeIps,
-        string tunInterfaceName, string programPath, int hy2Port, KillSwitchMode mode, int realityPort = 443)
+        string tunInterfaceName, string programPath, int hy2Port, KillSwitchMode mode, int realityPort = 443, AuthEndpoint? auth = null)
     {
         if (mode == KillSwitchMode.Remove) return [new RemoveRulesByPrefix(Prefix), new RestoreProfileDefault()];
         if (mode == KillSwitchMode.Audit) return [new Audit()];
@@ -37,6 +38,18 @@ public static class KillSwitchPlanner
             new DisableForeignAllowRules()
         };
         actions.AddRange(NodeRules(nodeIps, programPath, hy2Port, realityPort));
+        if (auth is not null)
+        {
+            if (auth.Address is null || auth.Address.AddressFamily != AddressFamily.InterNetwork)
+                throw new ArgumentException("鉴权服务器必须是 IPv4 数字地址。", nameof(auth));
+            if (auth.Port is < 1 or > 65535)
+                throw new ArgumentException("鉴权服务器端口必须在 1 到 65535 之间。", nameof(auth));
+            if (string.IsNullOrWhiteSpace(auth.Program) || !Path.IsPathFullyQualified(auth.Program))
+                throw new ArgumentException("后台服务程序必须是绝对路径。", nameof(auth));
+            actions.Add(new AddRule(Prefix + "Auth", "Outbound", "Allow", Program: auth.Program,
+                RemoteAddress: [auth.Address.ToString()], Protocol: "TCP",
+                RemotePort: auth.Port.ToString(System.Globalization.CultureInfo.InvariantCulture)));
+        }
         actions.Add(new AddRule(Prefix + "Tun", "Outbound", "Allow", InterfaceAlias: tunInterfaceName));
         actions.Add(new AddRule(Prefix + "Loopback", "Outbound", "Allow", RemoteAddress: ["127.0.0.0/8", "::1"]));
         actions.Add(new AddRule(Prefix + "Dhcp", "Outbound", "Allow", Protocol: "UDP", LocalPort: "68", RemotePort: "67"));

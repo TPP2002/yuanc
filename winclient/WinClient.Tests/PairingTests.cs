@@ -192,7 +192,7 @@ public sealed class PairingTests
         if (!OperatingSystem.IsWindows()) return;
         using var directory = new TempDirectory(); var store = new PairingStore(directory.Path);
         var serverPath = Path.Combine(directory.Path, "server.json");
-        File.WriteAllText(serverPath, JsonSerializer.Serialize(new { server_url = "https://unit.invalid", sing_box_path = Path.Combine(directory.Path, "fake.exe") }));
+        File.WriteAllText(serverPath, JsonSerializer.Serialize(new { server_url = "https://192.0.2.1", sing_box_path = Path.Combine(directory.Path, "fake.exe") }));
         using var http = new HttpClient(new AuthTests.Handler(_ => throw new InvalidOperationException())) { BaseAddress = new("https://unit.invalid") };
         var server = new AuthServerSessionSource(new AuthApiClient(http), new WinClient.Core.Storage.InMemoryCredentialStore());
         var fallbackCalls = 0;
@@ -228,7 +228,8 @@ public sealed class PairingTests
 
     internal sealed class FakeFirewall(List<string> order) : IKillSwitch
     {
-        public Task ApplyAsync(IReadOnlyList<IPAddress> ips, string program, int hy2Port) { order.Add("apply"); return Task.CompletedTask; }
+        public bool HasPendingState { get; set; }
+        public Task ApplyAsync(IReadOnlyList<IPAddress> ips, string program, int hy2Port, AuthEndpoint? auth = null) { order.Add("apply"); return Task.CompletedTask; }
         public Task UpdateNodeAsync(IReadOnlyList<IPAddress> ips, string program, int hy2Port) { order.Add("update"); return Task.CompletedTask; }
         public Task RemoveAsync() { order.Add("remove"); return Task.CompletedTask; }
         public Task<string?> RecoverAsync() { order.Add("recover"); return Task.FromResult<string?>(null); }

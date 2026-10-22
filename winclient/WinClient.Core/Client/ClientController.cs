@@ -20,6 +20,7 @@ public sealed class ClientController : IDisposable
     private readonly IKillSwitch firewall;
     private readonly ITunnelTransport tunnel;
     private readonly string program;
+    private readonly AuthEndpoint? authEndpoint;
     private readonly DeviceInfo device;
     private readonly ConnectionStateMachine machine = new();
     private readonly SemaphoreSlim gate = new(1, 1);
@@ -33,30 +34,44 @@ public sealed class ClientController : IDisposable
     public event Action<ClientSnapshot>? Changed;
 
     public ClientController(AuthApiClient? auth, ICredentialStore credentials, IKillSwitch firewall,
-        ITunnelTransport tunnel, string program, DeviceInfo device)
-        : this(auth is null ? null : new AuthServerSessionSource(auth, credentials), firewall, tunnel, program, device) { }
+        ITunnelTransport tunnel, string program, DeviceInfo device, AuthEndpoint? authEndpoint = null)
+        : this(auth is null ? null : new AuthServerSessionSource(auth, credentials), firewall, tunnel, program, device, authEndpoint: authEndpoint) { }
 
     public ClientController(ISessionSource? sessionSource, IKillSwitch firewall,
-        ITunnelTransport tunnel, string program, DeviceInfo device, Func<TimeSpan, CancellationToken, Task>? delayAsync = null)
+        ITunnelTransport tunnel, string program, DeviceInfo device, Func<TimeSpan, CancellationToken, Task>? delayAsync = null,
+        AuthEndpoint? authEndpoint = null)
     {
         this.sessionSource = sessionSource;
         this.delayAsync = delayAsync ?? ((delay, token) => Task.Delay(delay, token));
         this.firewall = firewall;
         this.tunnel = tunnel;
         this.program = program;
+        this.authEndpoint = authEndpoint;
         this.device = device;
         tunnel.TunnelDown += OnTunnelDown;
     }
 
-    public async Task InitializeAsync(bool autoConnect = true)
+    public async Task InitializeAsync(bool autoConnect = true, bool keepProtection = false)
     {
+        const string protectionNotice = "后台服务已重新启动，断网保护保持，正在恢复连接。";
+        var keptProtection = false;
         string? warning = null;
         await gate.WaitAsync();
         try
         {
-            warning = await firewall.RecoverAsync();
-            if (warning is not null) message = warning + (sessionSource is null ? " 未配置服务器。" : "");
-            else if (sessionSource is null) message = "未配置服务器";
+            if (keepProtection && firewall.HasPendingState &&
+                (sessionSource is PairingSessionSource or AuthServerSessionSource { HasCredentials: true }))
+            {
+                protection = true;
+                message = protectionNotice;
+                keptProtection = true;
+            }
+            else
+            {
+                warning = await firewall.RecoverAsync();
+                if (warning is not null) message = warning + (sessionSource is null ? " 未配置服务器。" : "");
+                else if (sessionSource is null) message = "未配置服务器";
+            }
         }
         catch (Exception ex) when (IsOperational(ex))
         {
@@ -64,6 +79,17 @@ public sealed class ClientController : IDisposable
             message = "启动时未能恢复上次的断网保护设置，恢复记录已保留；请联系管理员处理后重新启动后台服务。";
         }
         finally { Publish(); gate.Release(); }
+        if (keptProtection)
+        {
+            await ConnectAsync();
+            // 连接过程会更新消息；保留重启时的保护提示，不覆盖既有失败原因。
+            if (!message.Contains("保持", StringComparison.Ordinal))
+            {
+                message = protectionNotice + " " + message;
+                Publish();
+            }
+            return;
+        }
         if (autoConnect && sessionSource is not null && machine.State != ConnectionState.NeedsManual)
         {
             try { if (sessionSource is PairingSessionSource || sessionSource is AuthServerSessionSource { HasCredentials: true }) await ConnectAsync(); }
@@ -181,7 +207,8 @@ public sealed class ClientController : IDisposable
                     break;
                 case EffectKind.ApplyKillSwitch:
                     protection = true; // Even partial Apply must be treated as requiring explicit recovery.
-                    await firewall.ApplyAsync(NodeIps(session!), program, session!.Node.Hy2Port, session.Node.RealityPort);
+                    await firewall.ApplyAsync(NodeIps(session!), program, session!.Node.Hy2Port, session.Node.RealityPort,
+                        sessionSource is AuthServerSessionSource ? authEndpoint : null);
                     break;
                 case EffectKind.UpdateKillSwitchNode:
                     await firewall.UpdateNodeAsync(effect.NewIps!, program, session!.Node.Hy2Port, session.Node.RealityPort);

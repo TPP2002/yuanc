@@ -5,12 +5,13 @@ namespace WinClient.Core.Firewall;
 
 public interface IKillSwitch
 {
-    Task ApplyAsync(IReadOnlyList<IPAddress> ips, string program, int hy2Port);
+    bool HasPendingState { get; }
+    Task ApplyAsync(IReadOnlyList<IPAddress> ips, string program, int hy2Port, AuthEndpoint? auth = null);
     Task UpdateNodeAsync(IReadOnlyList<IPAddress> ips, string program, int hy2Port);
     Task RemoveAsync();
     Task<string?> RecoverAsync();
-    Task ApplyAsync(IReadOnlyList<IPAddress> ips, string program, int hy2Port, int realityPort) =>
-        realityPort == 443 ? ApplyAsync(ips, program, hy2Port) : throw new InvalidOperationException("当前断网保护不支持此出口端口。");
+    Task ApplyAsync(IReadOnlyList<IPAddress> ips, string program, int hy2Port, int realityPort, AuthEndpoint? auth = null) =>
+        realityPort == 443 ? ApplyAsync(ips, program, hy2Port, auth) : throw new InvalidOperationException("当前断网保护不支持此出口端口。");
     Task UpdateNodeAsync(IReadOnlyList<IPAddress> ips, string program, int hy2Port, int realityPort) =>
         realityPort == 443 ? UpdateNodeAsync(ips, program, hy2Port) : throw new InvalidOperationException("当前断网保护不支持此出口端口。");
 }
@@ -23,6 +24,7 @@ public sealed class KillSwitchApplier : IKillSwitch
     private readonly ICommandRunner runner;
     private readonly SemaphoreSlim gate = new(1, 1);
     public string StatePath { get; }
+    public bool HasPendingState => File.Exists(StatePath);
     public string AuditPath { get; }
     public string? LastRecoveryWarning { get; private set; }
     public KillSwitchApplier(string runDirectory, ICommandRunner? runner = null)
@@ -32,12 +34,12 @@ public sealed class KillSwitchApplier : IKillSwitch
         AuditPath = Path.Combine(runDirectory, "firewall-audit.json");
     }
 
-    public Task ApplyAsync(IReadOnlyList<IPAddress> ips, string program, int hy2Port) =>
-        ExecuteAsync(KillSwitchPlanner.Plan(ips, KillSwitchPlanner.TunAlias, program, hy2Port, KillSwitchMode.Apply));
+    public Task ApplyAsync(IReadOnlyList<IPAddress> ips, string program, int hy2Port, AuthEndpoint? auth = null) =>
+        ExecuteAsync(KillSwitchPlanner.Plan(ips, KillSwitchPlanner.TunAlias, program, hy2Port, KillSwitchMode.Apply, auth: auth));
     public Task UpdateNodeAsync(IReadOnlyList<IPAddress> ips, string program, int hy2Port) =>
         ExecuteAsync(KillSwitchPlanner.UpdateNode(ips, program, hy2Port));
-    public Task ApplyAsync(IReadOnlyList<IPAddress> ips, string program, int hy2Port, int realityPort) =>
-        ExecuteAsync(KillSwitchPlanner.Plan(ips, KillSwitchPlanner.TunAlias, program, hy2Port, KillSwitchMode.Apply, realityPort));
+    public Task ApplyAsync(IReadOnlyList<IPAddress> ips, string program, int hy2Port, int realityPort, AuthEndpoint? auth = null) =>
+        ExecuteAsync(KillSwitchPlanner.Plan(ips, KillSwitchPlanner.TunAlias, program, hy2Port, KillSwitchMode.Apply, realityPort, auth));
     public Task UpdateNodeAsync(IReadOnlyList<IPAddress> ips, string program, int hy2Port, int realityPort) =>
         ExecuteAsync(KillSwitchPlanner.UpdateNode(ips, program, hy2Port, realityPort));
     public Task RemoveAsync() => ExecuteAsync([new RemoveRulesByPrefix(KillSwitchPlanner.Prefix), new RestoreProfileDefault()]);

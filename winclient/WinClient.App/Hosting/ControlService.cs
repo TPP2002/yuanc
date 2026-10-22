@@ -53,12 +53,13 @@ public sealed class ControlService : ServiceBase
                 var updateStore = new UpdateStore();
                 UpdateRecovery.Run(updateStore, InstallerRunner.CurrentExecutable, new UpdateWindowsHost(), UpdatePlanner.DefaultAppRoot, UpdateWindowsHost.Log);
                 var secure = Path.Combine(ClientSettings.DataDirectory, "secure");
-                runtime = await ClientRuntime.CreateAsync(new KernelInstaller(new EmbeddedKernelSource()), secure, DataProtectionScope.LocalMachine).ConfigureAwait(false);
+                var desired = new DesiredStateStore();
+                var keep = desired.Read() != false;
+                runtime = await ClientRuntime.CreateAsync(new KernelInstaller(new EmbeddedKernelSource()), secure, DataProtectionScope.LocalMachine, keepProtection: keep).ConfigureAwait(false);
                 if (runtime.RecoveryWarning is { } warning) Log.Write("启动时断网保护降级恢复：" + warning);
                 if (lifetime.IsCancellationRequested) return;
-                var desired = new DesiredStateStore();
                 // Expose status while connecting: network delay must not look like a dead new service.
-                var initializing = InitializeRuntimeAsync(desired);
+                var initializing = InitializeRuntimeAsync(keep);
                 if (lifetime.IsCancellationRequested) return;
                 var version = ServiceInstaller.ReleaseVersion(Assembly.GetExecutingAssembly().GetCustomAttribute<AssemblyInformationalVersionAttribute>()!.InformationalVersion);
                 updateSource = new HttpUpdateSource();
@@ -73,9 +74,9 @@ public sealed class ControlService : ServiceBase
         });
     }
 
-    private async Task InitializeRuntimeAsync(DesiredStateStore desired)
+    private async Task InitializeRuntimeAsync(bool keep)
     {
-        try { await runtime!.Controller.InitializeAsync(autoConnect: desired.Read() != false).ConfigureAwait(false); }
+        try { await runtime!.Controller.InitializeAsync(autoConnect: keep, keepProtection: keep).ConfigureAwait(false); }
         catch (Exception) { Fatal(); }
     }
 

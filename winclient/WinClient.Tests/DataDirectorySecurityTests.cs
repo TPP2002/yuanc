@@ -101,7 +101,7 @@ public sealed class DataDirectorySecurityTests
         var called = false;
         var settings = ClientSettings.Load(directory.Path, ownerIsTrusted: _ => { called = true; return true; });
         Assert.True(called);
-        Assert.Equal("https://unit.invalid", settings!.ServerUrl);
+        Assert.Equal("https://192.0.2.1", settings!.ServerUrl);
     }
 
     [Fact]
@@ -147,7 +147,7 @@ public sealed class DataDirectorySecurityTests
     }
 
     private static void WriteSettings(string root, string? kernel) => File.WriteAllText(Path.Combine(root, "server.json"),
-        JsonSerializer.Serialize(new { server_url = "https://unit.invalid", sing_box_path = kernel }));
+        JsonSerializer.Serialize(new { server_url = "https://192.0.2.1", sing_box_path = kernel }));
 }
 
 public sealed class AdministratorFactAttribute : FactAttribute
