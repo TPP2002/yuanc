@@ -9,6 +9,8 @@ node_key = "<独立生成的节点密钥>"
 token_salt = "<独立生成且备份的服务器盐>"
 
 [node]
+time_zone = "<节点所在城市的 IANA 时区名,如 Australia/Sydney;留空则客户端用本机配置>"
+country = "<两位大写国家码,如 AU;留空则客户端按 AU>"
 host = "<节点地址>"
 reality_port = "<主通道端口>"
 hy2_port = "<备用通道端口>"

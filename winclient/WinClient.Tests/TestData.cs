@@ -19,12 +19,12 @@ internal static class TestData
     public static NodeInfo Node(string host = "192.0.2.5", int realityPort = 443, int hy2Port = 8443,
         string sni = "unit.invalid", string realityPublicKey = "test-key", string shortId = "test-short",
         string uuid = "test-uuid", string hy2Password = "test-password", string hy2ServerName = "exitnode",
-        string[]? hy2Certificate = null, string hy2ObfsPassword = "") => new()
+        string[]? hy2Certificate = null, string hy2ObfsPassword = "", string timeZone = "", string country = "") => new()
     {
         Host = host, RealityPort = realityPort, Hy2Port = hy2Port, Sni = sni, RealityPublicKey = realityPublicKey,
         ShortId = shortId, Uuid = uuid, Hy2Password = hy2Password, Hy2ServerName = hy2ServerName,
         Hy2Certificate = hy2Certificate ?? ["-----BEGIN CERTIFICATE-----", "test-cert", "-----END CERTIFICATE-----"],
-        Hy2ObfsPassword = hy2ObfsPassword
+        Hy2ObfsPassword = hy2ObfsPassword, TimeZone = timeZone, Country = country
     };
 
     /// <summary>构造在指定时长后到期的会话；账号到期时间默认晚于会话。</summary>

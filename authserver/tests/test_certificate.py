@@ -80,7 +80,9 @@ def test_session_has_eleven_node_keys_and_explicit_backup_trust(client, enrolled
     node = body["node"]
     assert set(node) == {"host", "reality_port", "hy2_port", "sni", "reality_public_key",
                          "short_id", "uuid", "hy2_password", "hy2_server_name", "hy2_certificate",
-                         "hy2_obfs_password"}
+                         "hy2_obfs_password", "time_zone", "country"}
+    assert node["time_zone"] == ""
+    assert node["country"] == ""
     assert node["hy2_certificate"] == settings.node.hy2_certificate
     backup = next(o for o in body["singbox_config"]["outbounds"] if o["type"] == "hysteria2")
     assert backup["tls"] == {"enabled": True, "server_name": "backup.example.test",

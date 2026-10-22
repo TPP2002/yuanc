@@ -13,6 +13,34 @@ def issue(client, enrolled):
     return client.post("/client/session", json={"refresh_token": enrolled["refresh_token"]})
 
 
+def test_node_environment_defaults_empty(settings):
+    assert settings.node.time_zone == ""
+    assert settings.node.country == ""
+
+
+@pytest.mark.parametrize("zone,country", [("Australia/Perth", "AU"), ("", "")])
+def test_session_node_environment_fields(client, enrolled, settings, app, zone, country):
+    baseline = issue(client, enrolled).json()
+    app.state.service.settings = Settings.model_validate(node_values(settings, time_zone=zone, country=country))
+    response = issue(client, enrolled)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["node"]["time_zone"] == zone
+    assert body["node"]["country"] == country
+    assert body["singbox_config"] == baseline["singbox_config"]
+
+
+@pytest.mark.parametrize("field,value,reason", [
+    ("time_zone", "bad;zone", "时区"),
+    ("time_zone", "a" * 65, "时区"),
+    ("country", "au", "国家码"),
+    ("country", "AUS", "国家码"),
+])
+def test_invalid_node_environment_config(settings, field, value, reason):
+    with pytest.raises(ValueError, match=reason):
+        Settings.model_validate(node_values(settings, **{field: value}))
+
+
 def test_session_credentials_and_config(client, enrolled, settings, app):
     response = issue(client, enrolled)
     assert response.status_code == 200

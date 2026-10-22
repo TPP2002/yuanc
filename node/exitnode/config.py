@@ -20,6 +20,8 @@ class Node:
     data_dir: str = "/var/lib/exitnode"
     secrets_dir: str = "/var/lib/exitnode/secrets"
     log_level: str = "INFO"
+    time_zone: str = ""
+    country: str = ""
 
 
 @dataclass
@@ -143,10 +145,16 @@ def load(path: str, runner: Runner | None = None) -> Config:
             if not valid:
                 invalid(f"{name}.{key}", "字段类型不正确")
             if (isinstance(value, str) and (not value or any(ord(c) < 32 for c in value))
-                    and not (name == "updater" and key == "github_repo" and value == "")):
+                    and not (name == "updater" and key == "github_repo" and value == "")
+                    # 可选环境字段的空串与格式由下方专用校验处理，保留对应中文错误。
+                    and not (name == "node" and key in {"time_zone", "country"})):
                 invalid(f"{name}.{key}", "不能为空或含控制字符")
         values[name] = model(**section)
     config = Config(**values)
+    if config.node.time_zone and not re.fullmatch(r"[A-Za-z0-9 ._+/()-]{1,64}", config.node.time_zone):
+        invalid("node.time_zone", "须为 IANA 时区名(如 Australia/Sydney)或 Windows 时区标识")
+    if config.node.country and not re.fullmatch(r"[A-Z]{2}", config.node.country):
+        invalid("node.country", "须为两位大写国家码(如 AU)")
     for key in ("restart_limit_per_hour", "rollback_min_interval_hours",
                 "reboot_min_interval_hours", "retry_interval_seconds", "max_backoff_seconds"):
         if getattr(config.watchdog, key) <= 0:

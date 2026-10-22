@@ -35,6 +35,10 @@ def test_revoke_updates_last_good_without_either_credential(installed):
 @pytest.fixture
 def installed():
     runner = fake(pairing=True)
+    # 旧配对测试继续使用未设置可选环境字段的配置，黄金输入不随示例改变。
+    runner.files[CONFIG] = "\n".join(
+        line for line in runner.files[CONFIG].splitlines()
+        if not line.startswith(("time_zone =", "country =")))
     config = load(CONFIG, runner)
     service.ensure_credentials(config, runner)
     service.publish(config, runner)
@@ -44,6 +48,28 @@ def installed():
 
 def commands(runner):
     return [c[1] for c in runner.calls if c[0] == "run"]
+
+
+@pytest.mark.parametrize("configured", [False, True])
+@pytest.mark.parametrize("obfs", [False, True])
+def test_pair_optional_node_environment_fields(installed, configured, obfs):
+    config, runner = installed
+    if configured:
+        text = runner.files[CONFIG].replace(
+            "[node]", '[node]\ntime_zone = "Australia/Perth"\ncountry = "AU"')
+        runner.files[CONFIG] = text
+        config = load(CONFIG, runner)
+    if not obfs:
+        del runner.files[service.SECRETS + "/hy2.obfs"]
+    device.add(config, runner, name="环境测试", host=HOST)
+    pair = json.loads(runner.files[config.node.data_dir + "/export/环境测试.ycpair"])
+    assert pair["format"] == ("ycpair/3" if obfs else "ycpair/2")
+    if configured:
+        assert pair["node"]["time_zone"] == "Australia/Perth"
+        assert pair["node"]["country"] == "AU"
+    else:
+        assert "time_zone" not in pair["node"]
+        assert "country" not in pair["node"]
 
 
 def test_add_credentials_permissions_and_checked_reload(installed, capsys):

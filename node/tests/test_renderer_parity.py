@@ -49,7 +49,12 @@ def test_pair_session_and_tls_parity(tmp_path):
     expected = {"host", "reality_port", "hy2_port", "sni", "reality_public_key", "short_id",
                 "uuid", "hy2_password", "hy2_server_name", "hy2_certificate",
                 "hy2_obfs_password"}
-    assert set(pair["node"]) == set(session["node"]) == expected
+    assert set(pair["node"]) == expected
+    assert "time_zone" not in pair["node"]
+    assert "country" not in pair["node"]
+    assert set(session["node"]) == expected | {"time_zone", "country"}
+    assert session["node"]["time_zone"] == ""
+    assert session["node"]["country"] == ""
     assert pair["format"] == "ycpair/3"
     client = render_client_windows(ctx, device)
     auth = render(session["node"], session["node"])

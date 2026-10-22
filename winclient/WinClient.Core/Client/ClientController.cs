@@ -264,7 +264,7 @@ public sealed class ClientController : IDisposable
         if (environment is null) return;
         try
         {
-            var policy = environmentSettings?.Read() ?? EnvironmentSettingsStore.Default;
+            var policy = (environmentSettings?.Read() ?? EnvironmentSettingsStore.Default).ForNode(session?.Node);
             if (!policy.Enabled) { environmentStatus = "未启用"; return; }
             if (machine.State != ConnectionState.Connected || environmentApplied) return;
             await environment.ApplyAsync(policy.Target);
@@ -317,6 +317,21 @@ public sealed class ClientController : IDisposable
         _ = TunnelTransport.RenderConfiguration(next.SingboxConfig); // Validate before installing rules.
         var previous = session;
         session = next;
+        if (environmentApplied)
+        {
+            try
+            {
+                var policy = environmentSettings?.Read() ?? EnvironmentSettingsStore.Default;
+                if (policy.ForNode(previous?.Node).Target.TimeZoneId != policy.ForNode(next.Node).Target.TimeZoneId &&
+                    await RestoreEnvironmentAsync())
+                    await ApplyEnvironmentAsync();
+            }
+            catch (Exception ex) when (ex is EnvironmentVerifyException || IsOperational(ex))
+            {
+                // 环境配置读取与重套用失败不进入隧道故障分路，也不覆盖连接消息。
+                environmentStatus = "设置失败,请联系管理员;连接与断网保护不受影响";
+            }
+        }
         if (protection && previous is not null && machine.HasSession && SameSession(previous, next))
         {
             // 内容没变（只换了令牌与到期时间）：只换会话并重新安排定时器，不重启隧道。
@@ -359,14 +374,8 @@ public sealed class ClientController : IDisposable
             var next = response.Value;
             if (next.SessionExpiresAt <= DateTimeOffset.UtcNow || next.AccountExpiresAt <= DateTimeOffset.UtcNow)
             { await ExecuteAsync(machine.Handle(new(ConnectionEventKind.SessionExpired))); return; }
-            if (SameSession(value, next))
-            {
-                // 只换会话：不产生状态机事件，不动隧道与防火墙，提示文字不变。
-                session = next;
-                ScheduleExpiry(next);
-                ScheduleRenewal(next);
-            }
-            else await ApplySessionAsync(next);
+            // 同内容会话也经过环境策略更新；是否重启隧道仍由既有比较集合决定。
+            await ApplySessionAsync(next);
             return;
         }
         if (response.Result is AuthResult.InvalidToken or AuthResult.Expired or AuthResult.InviteNotFound
@@ -527,7 +536,7 @@ public sealed class ClientController : IDisposable
     {
         selfCheckStatus = "检测中";
         Publish();
-        var policy = environmentSettings?.Read() ?? EnvironmentSettingsStore.Default;
+        var policy = (environmentSettings?.Read() ?? EnvironmentSettingsStore.Default).ForNode(session?.Node);
         EnvironmentInspection? inspection = null;
         if (policy.Enabled && environment is not null)
         {

@@ -34,6 +34,14 @@ public sealed class PairingFile
             // v3 must carry the obfuscation password; v1/v2 are checked by the same rule only when the key is present.
             if (isV3 || nodeElement.TryGetProperty("hy2_obfs_password", out _))
                 ValidateObfs(nodeElement);
+            if (nodeElement.TryGetProperty("time_zone", out var timeZone) &&
+                (timeZone.ValueKind != JsonValueKind.String ||
+                 !Regex.IsMatch(timeZone.GetString()!, @"\A[A-Za-z0-9 ._+/()-]{1,64}\z")))
+                throw new InvalidDataException("配对文件的时区标识格式不正确,请重新导出。");
+            if (nodeElement.TryGetProperty("country", out var country) &&
+                (country.ValueKind != JsonValueKind.String ||
+                 !Regex.IsMatch(country.GetString()!, @"\A[A-Z]{2}\z")))
+                throw new InvalidDataException("配对文件的国家码格式不正确,请重新导出。");
             var node = nodeElement.Deserialize<NodeInfo>(Json) ?? throw new InvalidDataException("配对文件缺少出口信息。");
             bool isV2 = version == "ycpair/2";
             if (isV2 || isV3 || nodeElement.TryGetProperty("hy2_server_name", out _) || nodeElement.TryGetProperty("hy2_certificate", out _))

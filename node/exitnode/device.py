@@ -26,6 +26,8 @@ class PairNode(TypedDict):
     hy2_certificate: list[str]
     # ycpair/2 没有这个键；ycpair/3 多一个节点级混淆密码，绝不写空串。
     hy2_obfs_password: NotRequired[str]
+    time_zone: NotRequired[str]
+    country: NotRequired[str]
 
 
 class PairFile(TypedDict):
@@ -55,6 +57,10 @@ def render_pair(ctx, device, host, exported_at) -> PairFile:
         uuid=device.uuid, hy2_password=device.hy2_password,
         hy2_server_name=ctx.hy2_server_name, hy2_certificate=list(ctx.hy2_certificate),
     )
+    if ctx.time_zone:
+        node["time_zone"] = ctx.time_zone
+    if ctx.country:
+        node["country"] = ctx.country
     if not ctx.hy2_obfs_password:
         return PairFile(format="ycpair/2", exported_at=exported_at, node=node)
     node["hy2_obfs_password"] = ctx.hy2_obfs_password

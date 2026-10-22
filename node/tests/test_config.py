@@ -7,6 +7,43 @@ from exitnode.runner import FakeRunner
 EXAMPLE = Path(__file__).parents[1] / "examples" / "config.example.toml"
 
 
+def environment_config(**values):
+    text = EXAMPLE.read_text(encoding="utf-8")
+    text = "\n".join(line for line in text.splitlines()
+                     if not line.startswith(("time_zone =", "country =")))
+    fields = "\n".join(f'{key} = "{value}"' for key, value in values.items())
+    return text.replace("[node]", "[node]\n" + fields)
+
+
+@pytest.mark.parametrize("values", [{}, {"time_zone": "", "country": ""}])
+def test_node_environment_defaults_empty(values):
+    config = load("/config", FakeRunner(files={"/config": environment_config(**values)}))
+    assert config.node.time_zone == ""
+    assert config.node.country == ""
+
+
+@pytest.mark.parametrize("zone", ["Australia/Perth", "W. Australia Standard Time"])
+def test_node_environment_accepts_valid_fields(zone):
+    text = environment_config(time_zone=zone, country="AU")
+    config = load("/config", FakeRunner(files={"/config": text}))
+    assert config.node.time_zone == zone
+    assert config.node.country == "AU"
+
+
+@pytest.mark.parametrize("field,value,reason", [
+    ("time_zone", "bad;zone", "须为 IANA 时区名"),
+    ("time_zone", "a" * 65, "须为 IANA 时区名"),
+    ("time_zone", r"Australia/Perth\n", "须为 IANA 时区名"),
+    ("country", "au", "须为两位大写国家码"),
+    ("country", "AUS", "须为两位大写国家码"),
+    ("country", r"AU\n", "须为两位大写国家码"),
+])
+def test_node_environment_rejects_invalid_fields(field, value, reason):
+    text = environment_config(**{field: value})
+    with pytest.raises(ConfigError, match=f"node.{field}.*{reason}"):
+        load("/config", FakeRunner(files={"/config": text}))
+
+
 def test_example_and_default_secret_path():
     text = EXAMPLE.read_text(encoding="utf-8")
     text = text.replace('secrets_dir = "/var/lib/exitnode/secrets"\n', "")
