@@ -16,6 +16,8 @@ public interface IUpdateHost
     Task<bool> WaitServiceAsync(bool running, TimeSpan timeout, CancellationToken token);
     Task<ControlResponse?> ReadStatusAsync(CancellationToken token);
     void SetRunValue(string executable);
+    /// <summary>服务正在运行且能查到服务进程的程序完整路径时返回规范化路径，否则 null。</summary>
+    string? RunningServiceExecutable();
 }
 
 /// <summary>Transaction logic is tested with fake commands and pipe responses; Windows adapters live separately.</summary>
@@ -76,7 +78,16 @@ public sealed class UpdateApplier(UpdateStore store, ICommandRunner runner, IUpd
                 var pause = Math.Min((deadline - host.Now).TotalSeconds, (probeStarted + TimeSpan.FromSeconds(2) - host.Now).TotalSeconds);
                 if (pause > 0) await host.DelayAsync(TimeSpan.FromSeconds(pause), token).ConfigureAwait(false);
             }
-            if (healthy is null) { badProcess = true; throw new InvalidOperationException(); }
+            if (healthy is null)
+            {
+                // 管道 60 秒不通不一定是新版坏了（管道可能被别的程序占满）：服务进程确实是新版就只回滚、下次再试，不标坏。
+                if (SameExecutable(host.RunningServiceExecutable(), pending.NewExe))
+                {
+                    log.Write("新版后台已在运行但本机管道暂不可用，本次不标记坏版本，下次再试。");
+                    throw new InvalidOperationException();
+                }
+                badProcess = true; throw new InvalidOperationException();
+            }
             if (host.DesiredConnection && healthy.State != ConnectionState.Connected)
             {
                 deadline = host.Now + TimeSpan.FromSeconds(120);
@@ -128,6 +139,12 @@ public sealed class UpdateApplier(UpdateStore store, ICommandRunner runner, IUpd
             }
             return 1;
         }
+    }
+    private static bool SameExecutable(string? running, string expected)
+    {
+        if (string.IsNullOrEmpty(running)) return false;
+        try { return string.Equals(Path.GetFullPath(running), Path.GetFullPath(expected), StringComparison.OrdinalIgnoreCase); }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or IOException) { return false; }
     }
     internal static void Complete(UpdateStore store, UpdatePending pending, IUpdateHost host, string appRoot, ILog log)
     {

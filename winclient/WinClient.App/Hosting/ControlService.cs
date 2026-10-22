@@ -19,6 +19,12 @@ namespace WinClient.App.Hosting;
 public sealed class ControlService : ServiceBase
 {
     public const string PipeName = "YuanC-Control";
+    // 管道实例数与监听任务数一致；每个客户端进程最多占 2 条，单个程序占不满全部实例。
+    public const int MaxInstances = 16;
+    public const int MaxPerClient = 2;
+    private static readonly TimeSpan RejectLogInterval = TimeSpan.FromMinutes(5);
+    private readonly ConnectionBudget budget = new(MaxInstances, MaxPerClient);
+    private readonly Dictionary<uint, DateTime> rejectLogged = [];
     private readonly CancellationTokenSource lifetime = new();
     private readonly ConcurrentDictionary<NamedPipeServerStream, byte> pipes = new();
     private static readonly RedactingLog Log = new(new RollingFileLog(Path.Combine(ClientSettings.DataDirectory, "run", "service.log")));
@@ -66,8 +72,18 @@ public sealed class ControlService : ServiceBase
                 updates = new UpdateCoordinator(updateSource, updateStore, () => runtime.Snapshot, () => DateTimeOffset.UtcNow, version, Log);
                 updates.Start();
                 var server = new ControlServer(runtime, desired, updates, version);
+                // 首实例独占管道名：若已有别的程序先建了同名管道，创建失败，服务拒绝启动而不是与冒名者共用名字。
+                NamedPipeServerStream first;
+                try { first = CreatePipe(PipeOptions.Asynchronous | PipeOptions.FirstPipeInstance); }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    try { Log.Write("管道名已被其他程序占用，后台服务拒绝启动"); }
+                    finally { Fatal(); }
+                    return;
+                }
+                if (lifetime.IsCancellationRequested) { first.Dispose(); return; }
                 Log.Write("后台服务已启动。");
-                await Task.WhenAll(Enumerable.Range(0, 4).Select(_ => ListenAsync(server)).Append(initializing)).ConfigureAwait(false);
+                await Task.WhenAll(Enumerable.Range(0, MaxInstances).Select(i => ListenAsync(server, i == 0 ? first : null)).Append(initializing)).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (lifetime.IsCancellationRequested) { }
             catch (Exception) { Fatal(); }
@@ -91,19 +107,33 @@ public sealed class ControlService : ServiceBase
         return security;
     }
 
-    private async Task ListenAsync(ControlServer server)
+    private static NamedPipeServerStream CreatePipe(PipeOptions options) =>
+        NamedPipeServerStreamAcl.Create(PipeName, PipeDirection.InOut, MaxInstances,
+            PipeTransmissionMode.Byte, options, 4096, 4096, CreatePipeSecurity());
+
+    private async Task ListenAsync(ControlServer server, NamedPipeServerStream? first)
     {
         try
         {
             while (!lifetime.IsCancellationRequested)
             {
-                using var pipe = NamedPipeServerStreamAcl.Create(PipeName, PipeDirection.InOut, 4,
-                    PipeTransmissionMode.Byte, PipeOptions.Asynchronous, 4096, 4096, CreatePipeSecurity());
+                // 只有服务启动时同步建好的首实例带独占标志，之后的实例都不带。
+                var created = first ?? CreatePipe(PipeOptions.Asynchronous);
+                first = null;
+                using var pipe = created;
                 pipes.TryAdd(pipe, 0);
                 try
                 {
                     await pipe.WaitForConnectionAsync(lifetime.Token).ConfigureAwait(false);
-                    await server.ServeAsync(pipe, lifetime.Token).ConfigureAwait(false);
+                    var clientProcessId = PipePeer.ClientProcessId(pipe);
+                    if (clientProcessId is not { } admitted || !budget.TryAdmit(admitted))
+                    {
+                        // 取不到进程号或超额：直接断开，不交给协议层。
+                        LogRejected(clientProcessId);
+                        continue;
+                    }
+                    try { await server.ServeAsync(pipe, lifetime.Token).ConfigureAwait(false); }
+                    finally { budget.Release(admitted); }
                 }
                 catch (IOException) { /* A client may disappear before completing its connection. */ }
                 finally { pipes.TryRemove(pipe, out _); }
@@ -111,6 +141,23 @@ public sealed class ControlService : ServiceBase
         }
         catch (Exception ex) when (lifetime.IsCancellationRequested && ex is OperationCanceledException or ObjectDisposedException or IOException) { }
         catch (Exception) { Fatal(); }
+        finally { first?.Dispose(); }
+    }
+
+    private void LogRejected(uint? clientProcessId)
+    {
+        // 同一进程五分钟内只记一次，防止恶意程序反复连接刷满日志。
+        var key = clientProcessId ?? 0;
+        var now = DateTime.UtcNow;
+        lock (rejectLogged)
+        {
+            if (rejectLogged.TryGetValue(key, out var last) && now - last < RejectLogInterval) return;
+            foreach (var stale in rejectLogged.Where(item => now - item.Value >= RejectLogInterval).Select(item => item.Key).ToList())
+                rejectLogged.Remove(stale);
+            rejectLogged[key] = now;
+        }
+        try { Log.Write($"同一程序的管道连接数超限，已拒绝（进程 {(clientProcessId is { } id ? id.ToString(System.Globalization.CultureInfo.InvariantCulture) : "未知")}）"); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { /* 日志写不进不能让监听循环退出。 */ }
     }
 
     protected override void OnStop() { RequestAdditionalTime(30000); StopRuntime(); }

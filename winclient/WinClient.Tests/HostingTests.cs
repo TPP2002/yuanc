@@ -1,5 +1,6 @@
 using System.Xml.Linq;
 using WinClient.Core.Hosting;
+using WinClient.Core.Ipc;
 using Xunit;
 
 namespace WinClient.Tests;
@@ -50,6 +51,25 @@ public sealed class HostingTests
             Assert.True(info.RedirectStandardOutput); Assert.True(info.RedirectStandardError);
             Assert.Equal(command, info.ArgumentList);
         }
+    }
+
+    [Fact]
+    public void ConnectionBudgetLimitsPerClientAndTotal()
+    {
+        var budget = new ConnectionBudget(4, 2);
+        Assert.True(budget.TryAdmit(10)); Assert.True(budget.TryAdmit(10));
+        Assert.False(budget.TryAdmit(10));
+        Assert.Equal(2, budget.Active);
+        budget.Release(10);
+        Assert.Equal(1, budget.Active);
+        Assert.True(budget.TryAdmit(10));
+        Assert.True(budget.TryAdmit(20)); Assert.True(budget.TryAdmit(20));
+        Assert.Equal(4, budget.Active);
+        Assert.False(budget.TryAdmit(30));
+        Assert.Equal(4, budget.Active);
+        budget.Release(20);
+        Assert.True(budget.TryAdmit(30));
+        Assert.Equal(4, budget.Active);
     }
 
     [Fact]

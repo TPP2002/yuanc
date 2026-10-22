@@ -9,6 +9,7 @@ using WinClient.App.Hosting;
 using WinClient.Core.Client;
 using WinClient.Core.Ipc;
 using WinClient.Core.State;
+using WinClient.Core.Update;
 using TimeoutException = System.TimeoutException;
 
 namespace WinClient.App;
@@ -88,6 +89,14 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
             try
             {
                 await pipe.ConnectAsync(3000, lifetime.Token);
+                // 发第一条指令前核验服务端身份；不过就断开且不再重试——重试只会再连到同一个冒名者。
+                if (!PipePeer.VerifyServer(pipe, UpdatePlanner.DefaultAppRoot))
+                {
+                    pipe.Dispose();
+                    availability = Availability.Unavailable;
+                    Update(snapshot with { Status = "后台服务身份核验失败", Message = "连接到的不是本产品的后台服务，已断开；请联系管理员。" });
+                    return;
+                }
                 client = new ControlClient(pipe);
                 client.SnapshotChanged += UpdateProtocol;
                 client.ConnectionClosed += OnConnectionClosed;
