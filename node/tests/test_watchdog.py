@@ -149,6 +149,8 @@ def test_exhausted_plain_budget_rolls_back_immediately_with_independent_restart(
                        ("replace", LIVE + ".watchdog.tmp", LIVE))
     restart = next(i for i, c in enumerate(calls) if c[0] == "run" and c[1] == RESTART)
     assert validation < replacement < restart
+    assert runner.modes[LIVE] == 0o640
+    assert runner.owners[LIVE] == ("root", "exitnode")
     saved = state.read(config, runner)
     assert saved["last_rollback_at"] == NOW.isoformat()
     assert saved["restart_count_window"] == 3
@@ -409,6 +411,11 @@ def test_rollback_prunes_before_check_replace_and_restart(missing):
     replaced = runner.calls.index(("replace", LIVE + ".watchdog.tmp", LIVE))
     restarted = next(i for i, c in enumerate(runner.calls) if c[:2] == ("run", RESTART))
     assert checked < replaced < restarted
+    # 线上配置保持 0640 root:exitnode，属主在校验通过后、替换之前设好。
+    chowned = runner.calls.index(("chown", LIVE + ".watchdog.tmp", "root", "exitnode"))
+    assert checked < chowned < replaced
+    assert runner.modes[LIVE] == 0o640
+    assert runner.owners[LIVE] == ("root", "exitnode")
     assert f"已剔除 {4 if missing else 2} 条" in state.read(config, runner)["reason"]
     for secret in ("保留设备", "保留凭据", "吊销设备", "吊销凭据", "测试密码"):
         assert secret not in runner.files[state.path(config)]

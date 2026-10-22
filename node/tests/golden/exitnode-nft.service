@@ -1,0 +1,15 @@
+[Unit]
+Description=出口节点防火墙规则表(开机重新加载)
+DefaultDependencies=no
+After=local-fs.target
+Before=network-pre.target exitnode-proxy.service
+Wants=network-pre.target
+ConditionPathExists=/var/lib/exitnode/exitnode.nft
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /var/lib/exitnode/exitnode.nft
+
+[Install]
+WantedBy=multi-user.target

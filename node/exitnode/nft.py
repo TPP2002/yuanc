@@ -2,7 +2,9 @@
 
 import ipaddress
 import json
-from uuid import uuid4
+
+# 规则表文件由 exitnode-nft.service 开机重新加载。
+RULES = "/var/lib/exitnode/exitnode.nft"
 
 
 def render_ruleset(ctx):
@@ -12,7 +14,9 @@ def render_ruleset(ctx):
     bind = ipaddress.ip_address(ctx.get("admin_bind", "127.0.0.1"))
     family = "ip6" if bind.version == 6 else "ip"
     return (
-        "# 仅维护本项目规则；管理入口限配置的监听地址。\n"
+        "# 占位规则表:policy accept,只放行本项目端口,不限制其他流量;"
+        "开机由 exitnode-nft.service 重新加载。"
+        "管理入口只收本机连接由 exitnode-admin.service 的 IPAddressAllow 保证,不靠本表。\n"
         "table inet exitnode {\n"
         "    chain input {\n"
         "        type filter hook input priority 0; policy accept;\n"
@@ -45,18 +49,16 @@ def _exists(runner):
 
 def apply(runner, ctx=None):
     ctx = ctx or {"reality_port": 443, "hy2_port": 24443, "admin_port": 8443}
-    text = render_ruleset(ctx)
-    if _exists(runner):
-        # 同一个批次原子提交：重复安装不会累加规则。
-        text = "delete table inet exitnode\n" + text
-    path = f"/run/exitnode-{uuid4().hex}.nft"
-    runner.write_file(path, text, 0o600)
-    try:
-        runner.run(["nft", "-f", path])
-    finally:
-        runner.remove(path)
+    # 先声明再删除：表不存在也不报错，同一批次原子提交，重复加载不会累加规则。
+    text = "table inet exitnode\ndelete table inet exitnode\n" + render_ruleset(ctx)
+    temporary = RULES + ".tmp"
+    runner.write_file(temporary, text, 0o600)
+    runner.replace(temporary, RULES)
+    runner.run(["nft", "-f", RULES])
 
 
 def remove(runner):
     if _exists(runner):
         runner.run(["nft", "delete", "table", "inet", "exitnode"])
+    if runner.exists(RULES):
+        runner.remove(RULES)

@@ -36,6 +36,7 @@ def fake(*, pairing=False):
             {"ifname": "eth0", "ifindex": 2, "flags": ["UP"],
              "addr_info": [{"family": "inet", "scope": "global", "local": "192.0.2.2"}]}])),
         ("systemctl",): CompletedResult(),
+        ("useradd",): CompletedResult(),
         ("nft", "-j"): CompletedResult(out='{"nftables":[]}'),
         ("nft", "-f"): CompletedResult(),
         ("/usr/bin/sing-box", "check"): CompletedResult(),
@@ -95,13 +96,45 @@ def test_check_unintegrated_layers_are_not_passed(capsys, monkeypatch):
     runner.files[rescue_state.STATE] = json.dumps({"state": "normal", "reason": "正常",
                                                 "updated_at": rescue_state.iso(runner.now())})
     runner.responses[("systemctl", "is-active", "exitnode-rescue.timer")] = CompletedResult(out="active")
+    harden(runner)
     assert main(["check", "--json"], runner) == 0
     layers = json.loads(capsys.readouterr().out)["layers"]
-    assert [layer["result"] for layer in layers] == ["通过", "通过", "未接入", "未接入", "未接入", "通过", "通过", "通过", "通过"]
-    assert layers[-4]["name"] == "看门狗"
-    assert layers[-3]["name"] == "救援单元"
+    assert [layer["result"] for layer in layers] == [
+        "通过", "通过", "未接入", "未接入", "未接入", "通过", "通过", "通过", "通过", "通过"]
+    assert layers[-5]["name"] == "看门狗"
+    assert layers[-4]["name"] == "救援单元"
+    assert layers[-3]["name"] == "服务加固"
+    assert layers[-3]["layer"] == "hardening"
     assert layers[-2]["name"] == "隧道服务"
     assert layers[-1]["name"] == "客户端托管服务"
+
+
+def harden(runner, user="exitnode\n", code=0, active="active"):
+    runner.responses[("systemctl", "show", "exitnode-proxy.service", "-p", "User")] = (
+        CompletedResult(out=user))
+    runner.responses[("systemctl", "is-active", "exitnode-nft.service")] = CompletedResult(
+        code, active)
+
+
+@pytest.mark.parametrize("user,code,active,expected", [
+    ("exitnode\n", 0, "active\n", "通过"),
+    ("\n", 0, "active", "失败"),
+    ("root\n", 0, "active", "失败"),
+    ("exitnode\n", 3, "inactive", "失败"),
+    ("exitnode\n", 0, "inactive", "失败"),
+])
+def test_hardening_layer_requires_service_account_and_loaded_rules(user, code, active,
+                                                                  expected, capsys):
+    runner = fake()
+    harden(runner, user, code, active)
+    main(["check", "--json"], runner)
+    layers = json.loads(capsys.readouterr().out)["layers"]
+    layer = next(v for v in layers if v["name"] == "服务加固")
+    assert layer["result"] == expected
+    assert layer["reason"] == ("隧道服务以 exitnode 账户运行且防火墙规则单元已加载"
+                               if expected == "通过" else "隧道服务未降权或防火墙规则单元未加载")
+    assert ("run", ("systemctl", "show", "exitnode-proxy.service", "-p", "User", "--value"),
+            False, None) in runner.calls
 
 
 def test_upgrade_is_explicit_failure_without_config_or_system(capsys):
@@ -189,10 +222,41 @@ def test_repeated_init_does_not_repeat_commands_and_uninstall_keeps_secrets():
     assert rescue["undo"] == {"kind": "remove_file", "path": "/opt/exitnode-rescue", "preserve": True}
     saved_rescue = {p: v for p, v in runner.files.items() if p.startswith("/opt/exitnode-rescue/")}
     assert saved_rescue
+    assert names.index("创建服务账户") < names.index("配置文件权限") < names.index("安装程序目录")
+    assert (names.index("安装网络规则") < names.index("启用防火墙规则单元")
+            < names.index("检查 sing-box 二进制"))
+    assert (names.index("渲染隧道配置") < names.index("设置凭据文件权限")
+            < names.index("写入exitnode-proxy.service"))
+    assert (names.index("写入exitnode-admin.service") < names.index("写入exitnode-nft.service")
+            < names.index("重载服务定义"))
+    account = next(s for s in steps if s["step"] == "创建服务账户")
+    assert account["undo"] == {"kind": "user", "name": "exitnode"}
+    assert next(s for s in steps if s["step"] == "配置文件权限")["undo"] == {
+        "kind": "remove_file", "path": CONFIG, "preserve": True}
+    assert next(s for s in steps if s["step"] == "设置凭据文件权限")["undo"] == {
+        "kind": "remove_file", "path": "/var/lib/exitnode/secrets", "preserve": True}
+    assert next(s for s in steps if s["step"] == "启用防火墙规则单元")["undo"] == {
+        "kind": "systemctl", "unit": "exitnode-nft.service"}
+    assert runner.modes[CONFIG] == 0o644
+    sent = [c[1] for c in runner.calls if c[0] == "run"]
+    assert ("systemctl", "enable", "exitnode-nft.service") in sent
+    assert not any(c[:2] == ("systemctl", "enable") and "exitnode-nft.service" in c
+                   and "--now" in c for c in sent)
+    assert sent.index(("nft", "-f", "/var/lib/exitnode/exitnode.nft")) < sent.index(
+        ("systemctl", "enable", "exitnode-nft.service"))
+    assert "/var/lib/exitnode/exitnode.nft" in runner.files
+    assert "/etc/systemd/system/exitnode-nft.service" in runner.files
     before = [c for c in runner.calls if c[0] == "run"]
     assert main(["init"], runner) == 0
     assert [c for c in runner.calls if c[0] == "run"] == before
+    boundary = len(runner.calls)
     assert main(["uninstall"], runner) == 0
+    undo = runner.calls[boundary:]
+    userdel = undo.index(("run", ("userdel", "exitnode"), False, None))
+    last_unit = max(i for i, c in enumerate(undo)
+                    if c[0] == "remove" and c[1].startswith("/etc/systemd/system/exitnode-"))
+    assert last_unit < userdel
+    assert ("remove", "/var/lib/exitnode/exitnode.nft") in undo
     assert runner.files["/var/lib/exitnode/secrets/identity"] == "保留"
     assert not any(p.startswith("/etc/systemd/system/exitnode-") for p in runner.files)
     assert main(["uninstall"], runner) == 0
@@ -564,6 +628,37 @@ def test_existing_unowned_recover_unit_is_not_overwritten():
     assert main(["init"], runner) == 1
     assert main(["rollback"], runner) == 0
     assert runner.files[path] == "已有服务定义"
+
+
+USERADD = ("useradd", "--system", "--no-create-home", "--home-dir", "/nonexistent",
+           "--shell", "/usr/sbin/nologin", "--user-group", "exitnode")
+
+
+@pytest.mark.parametrize("exists", [False, True])
+def test_service_account_created_only_when_missing(exists):
+    runner = fake(pairing=True)
+    if exists:
+        runner.responses[("getent", "passwd", "exitnode")] = CompletedResult(out="exitnode:x:999\n")
+    assert main(["init"], runner) == 0
+    sent = [c for c in runner.calls if c[0] == "run"]
+    assert ("run", ("getent", "passwd", "exitnode"), False, None) in sent
+    assert any(c[1] == USERADD for c in sent) is not exists
+    if not exists:
+        assert ("run", USERADD, True, None) in sent
+
+
+@pytest.mark.parametrize("old,new", [("port = 8443", "port = 999"),
+                                     ('bind = "127.0.0.1"', 'bind = "192.0.2.2"')])
+def test_admin_must_be_unprivileged_port_and_loopback_before_any_write(old, new, capsys):
+    runner = fake(pairing=True)
+    assert old in runner.files[CONFIG]
+    runner.files[CONFIG] = runner.files[CONFIG].replace(old, new)
+    assert main(["init"], runner) == 1
+    output = capsys.readouterr().out
+    assert ("不小于 1024" in output) if "999" in new else ("回环" in output)
+    assert not any(p.startswith("/etc/systemd/system/") for p in runner.files)
+    assert "/var/lib/exitnode/manifest.json" not in runner.files
+    assert not any(c[0] in {"run", "chown", "chmod"} for c in runner.calls)
 
 
 @pytest.mark.parametrize("argv", [["admin", "serve"], ["--placeholder", "admin"]])

@@ -1,4 +1,4 @@
-# 仅维护本项目规则；管理入口限配置的监听地址。
+# 占位规则表:policy accept,只放行本项目端口,不限制其他流量;开机由 exitnode-nft.service 重新加载。管理入口只收本机连接由 exitnode-admin.service 的 IPAddressAllow 保证,不靠本表。
 table inet exitnode {
     chain input {
         type filter hook input priority 0; policy accept;
