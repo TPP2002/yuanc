@@ -51,6 +51,7 @@ public sealed class UpdateIpcTests
     }
     private sealed class Facade : IClientFacade
     {
+        public Task SetEnvironmentEnabledAsync(bool enabled) => Task.CompletedTask;
         public ClientSnapshot Snapshot => new(ConnectionState.Connected, "已连接", "", true);
         public event Action<ClientSnapshot>? Changed { add { } remove { } }
         public Task ConnectAsync() => Task.CompletedTask;

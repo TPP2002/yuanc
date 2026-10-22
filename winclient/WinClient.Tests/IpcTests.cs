@@ -14,6 +14,57 @@ namespace WinClient.Tests;
 public sealed class IpcTests
 {
     [Fact]
+    public void EnvironmentSnapshotRoundTripsAndLegacyDefaultsRemainEnabled()
+    {
+        var snapshot = new ClientSnapshot(ConnectionState.Connected, "已连接", "", true)
+        { EnvironmentEnabled = false, EnvironmentStatus = "未启用" };
+        ControlSnapshot control = snapshot;
+        var encoded = ControlProtocol.Encode(new ControlResponse(1, true, Snapshot: control));
+        Assert.Contains("environment_enabled", encoded);
+        Assert.Contains("environment_status", encoded);
+        var decoded = ControlProtocol.DecodeResponse(encoded).Snapshot!;
+        Assert.False(decoded.EnvironmentEnabled);
+        Assert.Equal("未启用", decoded.EnvironmentStatus);
+        ClientSnapshot restored = decoded;
+        Assert.Equal(snapshot, restored);
+        var legacy = ControlProtocol.DecodeResponse("{\"id\":1,\"ok\":true,\"snapshot\":{\"state\":\"Disconnected\",\"status\":\"\",\"message\":\"\",\"protection_active\":false}}").Snapshot!;
+        Assert.True(legacy.EnvironmentEnabled);
+        Assert.Equal("未应用", legacy.EnvironmentStatus);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task EnvironmentCommandRequiresEnabledAndTrustedCaller(bool trusted)
+    {
+        using var temp = new TempDirectory();
+        using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var facade = new FakeFacade();
+        var desired = new DesiredStateStore(temp.Path);
+        var server = new ControlServer(facade, desired);
+        var (peer, host) = DuplexStream.Pair();
+        var serving = server.ServeAsync(host, stop.Token, callerTrusted: trusted);
+        using (var client = new ControlClient(peer))
+        {
+            var missing = await client.SendAsync("set_environment", cancellationToken: stop.Token);
+            Assert.False(missing.Ok);
+            Assert.Equal(trusted ? "指令缺少 enabled" : ControlServer.UntrustedCallerError, missing.Error);
+            Assert.Empty(facade.Actions);
+            var response = await client.SendAsync("set_environment", enabled: false, cancellationToken: stop.Token);
+            Assert.Equal(trusted, response.Ok);
+            if (trusted)
+            {
+                Assert.Equal(new[] { "environment:False" }, facade.Actions);
+                Assert.False(response.Snapshot!.EnvironmentEnabled);
+                Assert.Equal("未启用", response.Snapshot.EnvironmentStatus);
+            }
+            else { Assert.Equal(ControlServer.UntrustedCallerError, response.Error); Assert.Empty(facade.Actions); }
+            Assert.Null(desired.Read());
+        }
+        await serving.WaitAsync(stop.Token);
+    }
+
+    [Fact]
     public void ExitAndGuardFieldsRoundTripThroughBothSnapshotConversions()
     {
         var snapshot = new ClientSnapshot(ConnectionState.Connected, "已连接", "", true)
@@ -391,6 +442,13 @@ public sealed class IpcTests
 
     private sealed class FakeFacade : IClientFacade
     {
+        public Task SetEnvironmentEnabledAsync(bool enabled)
+        {
+            Actions.Add("environment:" + enabled);
+            Snapshot = Snapshot with { EnvironmentEnabled = enabled, EnvironmentStatus = enabled ? "未应用" : "未启用" };
+            Changed?.Invoke(Snapshot);
+            return Task.CompletedTask;
+        }
         public List<string> Actions { get; } = [];
         public ClientSnapshot Snapshot { get; private set; } = new(ConnectionState.Disconnected, "未连接", "", false);
         public event Action<ClientSnapshot>? Changed;

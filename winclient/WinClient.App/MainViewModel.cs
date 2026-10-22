@@ -36,6 +36,12 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         _ => "当前出口 IP:待检测"
     };
     public string GuardLine => snapshot.GuardStatus.Length == 0 ? "" : "断网保护巡检:" + snapshot.GuardStatus;
+    public string EnvironmentLine => "环境一致性:" + snapshot.EnvironmentStatus;
+    public bool EnvironmentEnabled
+    {
+        get => snapshot.EnvironmentEnabled;
+        set { if (value != snapshot.EnvironmentEnabled) _ = RunAsync(() => SendAsync("set_environment", enabled: value)); }
+    }
     public string Message => snapshot.Message + (serviceVersion.Length != 0 && serviceVersion != ControlSnapshot.CurrentVersion
         ? $" 后台已更新到 {serviceVersion}，下次打开界面将使用新版" : "");
     public string ServiceVersion => serviceVersion.Length == 0 ? "后台版本：等待连接" : "后台版本 " + serviceVersion;
@@ -141,9 +147,9 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
     }
     public Task ConnectFromTrayAsync() => CanUseConnection ? RunAsync(() => SendAsync("connect")) : Task.CompletedTask;
     public Task DisconnectFromTrayAsync() => CanUseConnection ? RunAsync(() => SendAsync("disconnect")) : Task.CompletedTask;
-    private async Task SendAsync(string op, string? code = null, string? pairingJson = null)
+    private async Task SendAsync(string op, string? code = null, string? pairingJson = null, bool? enabled = null)
     {
-        var response = await (client ?? throw new IOException()).SendAsync(op, code, pairingJson, lifetime.Token);
+        var response = await (client ?? throw new IOException()).SendAsync(op, code, pairingJson, lifetime.Token, enabled);
         if (response.Snapshot is not null) UpdateProtocol(response.Snapshot);
         if (!response.Ok) Update(snapshot with { Message = response.Error ?? "操作未完成，请联系管理员。" });
     }
@@ -189,6 +195,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         if (disposed) return;
         Notify(nameof(Status)); Notify(nameof(Message)); Notify(nameof(ConnectLabel)); Notify(nameof(Mode)); Notify(nameof(IsBusy)); Notify(nameof(CanUseConnection));
         Notify(nameof(ServiceVersion)); Notify(nameof(UpdateMessage));
+        Notify(nameof(EnvironmentLine)); Notify(nameof(EnvironmentEnabled));
         Notify(nameof(ExitLine)); Notify(nameof(GuardLine));
         CommandManager.InvalidateRequerySuggested();
     }

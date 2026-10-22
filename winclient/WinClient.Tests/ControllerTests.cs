@@ -5,12 +5,184 @@ using WinClient.Core.Client;
 using WinClient.Core.Firewall;
 using WinClient.Core.State;
 using WinClient.Core.Storage;
+using WinClient.Core.EnvironmentSupport;
 using Xunit;
 
 namespace WinClient.Tests;
 
 public sealed class ControllerTests
 {
+    [Fact]
+    public async Task EnvironmentAppliesAfterTunnelAndRestoresAfterNetwork()
+    {
+        var order = new List<string>();
+        var env = new FakeEnvironment(order);
+        using var controller = EnvironmentController(order, env, new MemoryEnvironmentSettings());
+        await controller.ConnectAsync();
+        Assert.Equal(new[] { "apply", "start", "env-apply" }, order);
+        Assert.Contains("已切换", controller.Snapshot.EnvironmentStatus);
+        Assert.True(controller.Snapshot.EnvironmentEnabled);
+        await controller.DisconnectAsync();
+        Assert.Equal(new[] { "stop", "remove", "env-restore" }, order.TakeLast(3));
+        Assert.Equal("未应用", controller.Snapshot.EnvironmentStatus);
+        await controller.ConnectAsync();
+        Assert.Equal(2, order.Count(x => x == "env-apply"));
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task EnvironmentApplyFailureCannotStopTunnelOrChangeConnectionMessage(bool verify)
+    {
+        var order = new List<string>();
+        var env = new FakeEnvironment(order) { ApplyError = verify ? new EnvironmentVerifyException("模拟锁定") : new IOException("模拟失败") };
+        using var controller = EnvironmentController(order, env, new MemoryEnvironmentSettings());
+        await controller.ConnectAsync();
+        Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
+        Assert.True(controller.Snapshot.ProtectionActive);
+        Assert.Equal(new[] { "apply", "start", "env-apply" }, order);
+        Assert.Contains("设置失败", controller.Snapshot.EnvironmentStatus);
+        Assert.Equal("虚拟网卡已就绪。", controller.Snapshot.Message);
+        // 套用部分失败留下的原值也必须在主动断开后恢复。
+        await controller.DisconnectAsync();
+        Assert.Equal("env-restore", order.Last());
+    }
+
+    [Fact]
+    public async Task ReconnectingKeepsEnvironmentWithoutSecondApply()
+    {
+        var order = new List<string>();
+        var timers = new Timers();
+        var tunnel = new ObservableTunnel(order);
+        using var controller = EnvironmentController(order, new FakeEnvironment(order), new MemoryEnvironmentSettings(), tunnel, timers);
+        controller.Changed += _ => Interlocked.Increment(ref timers.Published);
+        await controller.ConnectAsync();
+        tunnel.Crash();
+        await FireAndPublish(controller, timers, "", TimeSpan.Zero);
+        Assert.Equal(ConnectionState.Reconnecting, controller.Snapshot.State);
+        Assert.DoesNotContain("env-restore", order);
+        await FireAndPublish(controller, timers, "退避", TimeSpan.FromSeconds(2));
+        Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
+        Assert.Equal(1, order.Count(x => x == "env-apply"));
+    }
+
+    [Fact]
+    public async Task EnvironmentToggleAppliesOnlyWhenConnectedAndRestoresImmediately()
+    {
+        var order = new List<string>();
+        var settings = new MemoryEnvironmentSettings { Enabled = false };
+        using var controller = EnvironmentController(order, new FakeEnvironment(order), settings);
+        await controller.ConnectAsync();
+        Assert.DoesNotContain("env-apply", order);
+        Assert.Equal("未启用", controller.Snapshot.EnvironmentStatus);
+        Assert.False(controller.Snapshot.EnvironmentEnabled);
+        await controller.SetEnvironmentEnabledAsync(true);
+        Assert.Equal("env-apply", order.Last());
+        await controller.SetEnvironmentEnabledAsync(false);
+        Assert.Equal("env-restore", order.Last());
+        Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
+        Assert.True(controller.Snapshot.ProtectionActive);
+        Assert.Equal("未启用", controller.Snapshot.EnvironmentStatus);
+        await controller.DisconnectAsync();
+        await controller.SetEnvironmentEnabledAsync(true);
+        Assert.Equal(1, order.Count(x => x == "env-apply"));
+        Assert.Equal("未应用", controller.Snapshot.EnvironmentStatus);
+    }
+
+    [Fact]
+    public async Task EnvironmentRestoreFailureDoesNotUndoCompletedDisconnect()
+    {
+        var order = new List<string>();
+        var env = new FakeEnvironment(order) { RestoreError = new IOException("模拟恢复失败") };
+        using var controller = EnvironmentController(order, env, new MemoryEnvironmentSettings());
+        await controller.ConnectAsync();
+        await controller.DisconnectAsync();
+        Assert.Equal(ConnectionState.Disconnected, controller.Snapshot.State);
+        Assert.False(controller.Snapshot.ProtectionActive);
+        Assert.Contains("未能恢复", controller.Snapshot.Message);
+        Assert.Contains("恢复失败", controller.Snapshot.EnvironmentStatus);
+        Assert.Equal(new[] { "apply", "start", "env-apply", "stop", "remove", "env-restore" }, order);
+        Assert.True(env.HasPendingState);
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task StartupEnvironmentFollowsProtectionBranch(bool keep)
+    {
+        var order = new List<string>();
+        var env = new FakeEnvironment(order) { HasPendingState = true };
+        using var controller = new ClientController(new PairingSessionSource(PairingTests.ValidPairing()),
+            new Firewall(order) { HasPendingState = true }, new Tunnel(order), Path.GetFullPath("fake.exe"), TestData.Device,
+            environment: env, environmentSettings: new MemoryEnvironmentSettings());
+        await controller.InitializeAsync(autoConnect: false, keepProtection: keep);
+        if (keep)
+        {
+            Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
+            Assert.Equal(new[] { "apply", "start" }, order);
+            await controller.DisconnectAsync();
+            Assert.Equal("env-restore", order.Last());
+        }
+        else Assert.Equal(new[] { "recover", "env-restore" }, order);
+    }
+
+    [Fact]
+    public async Task StartupEnvironmentRestoreFailureStillAutoConnectsAndRetainsWarning()
+    {
+        var order = new List<string>();
+        var env = new FakeEnvironment(order) { HasPendingState = true, RestoreError = new IOException("模拟恢复失败") };
+        using var controller = EnvironmentController(order, env, new MemoryEnvironmentSettings());
+        await controller.InitializeAsync();
+        Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
+        Assert.True(controller.Snapshot.ProtectionActive);
+        Assert.Contains("启动时未能恢复", controller.Snapshot.Message);
+        Assert.Equal(new[] { "recover", "env-restore", "apply", "start", "env-apply" }, order);
+    }
+
+    [Fact]
+    public async Task MissingEnvironmentOnlyPersistsSwitchAndDisposeNeverRestores()
+    {
+        var order = new List<string>();
+        var settings = new MemoryEnvironmentSettings();
+        using (var controller = EnvironmentController(order, null, settings))
+        {
+            await controller.SetEnvironmentEnabledAsync(false);
+            Assert.False(settings.Enabled);
+            Assert.False(controller.Snapshot.EnvironmentEnabled);
+        }
+        var active = EnvironmentController(order, new FakeEnvironment(order), new MemoryEnvironmentSettings());
+        await active.ConnectAsync();
+        active.Dispose();
+        Assert.DoesNotContain("env-restore", order);
+    }
+
+    private static ClientController EnvironmentController(List<string> order, IEnvironmentEnforcer? environment,
+        IEnvironmentSettingsStore settings, ITunnelTransport? tunnel = null, Timers? timers = null)
+    {
+        timers ??= new Timers();
+        return new ClientController(new PairingSessionSource(PairingTests.ValidPairing()), new Firewall(order),
+            tunnel ?? new Tunnel(order), Path.GetFullPath("fake.exe"), TestData.Device, timers.Delay,
+            environment: environment, environmentSettings: settings) { DelayWithPurposeAsync = timers.Delay };
+    }
+
+    private sealed class FakeEnvironment(List<string> order) : IEnvironmentEnforcer
+    {
+        public bool HasPendingState { get; set; }
+        public Exception? ApplyError { get; set; }
+        public Exception? RestoreError { get; set; }
+        public Task ApplyAsync(EnvironmentTarget target)
+        { order.Add("env-apply"); HasPendingState = true; if (ApplyError is not null) throw ApplyError; return Task.CompletedTask; }
+        public Task RestoreAsync()
+        { order.Add("env-restore"); if (RestoreError is not null) throw RestoreError; HasPendingState = false; return Task.CompletedTask; }
+    }
+
+    private sealed class MemoryEnvironmentSettings : IEnvironmentSettingsStore
+    {
+        public bool Enabled { get; set; } = true;
+        public EnvironmentPolicy Read() => new(Enabled, new("AUS Eastern Standard Time", ["en-AU", "en"]));
+        public void WriteEnabled(bool enabled) => Enabled = enabled;
+    }
+
     [Theory]
     [InlineData("192.0.2.5", "已核验")]
     [InlineData("198.51.100.9", "不一致")]

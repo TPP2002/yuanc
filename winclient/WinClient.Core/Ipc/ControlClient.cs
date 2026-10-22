@@ -17,7 +17,8 @@ public sealed class ControlClient : IDisposable
     public event Action? ConnectionClosed;
     public ControlClient(Stream stream) { this.stream = stream; receiving = ReceiveAsync(); }
 
-    public async Task<ControlResponse> SendAsync(string op, string? code = null, string? pairingJson = null, CancellationToken cancellationToken = default)
+    public async Task<ControlResponse> SendAsync(string op, string? code = null, string? pairingJson = null, CancellationToken cancellationToken = default,
+        bool? enabled = null)
     {
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token, cancellationToken);
         var id = Interlocked.Increment(ref nextId);
@@ -26,7 +27,7 @@ public sealed class ControlClient : IDisposable
         try
         {
             await writes.WaitAsync(linked.Token).ConfigureAwait(false);
-            try { await ControlProtocol.WriteAsync(stream, new ControlRequest(id, op, code, pairingJson), linked.Token).ConfigureAwait(false); }
+            try { await ControlProtocol.WriteAsync(stream, new ControlRequest(id, op, code, pairingJson, enabled), linked.Token).ConfigureAwait(false); }
             finally { writes.Release(); }
             return await completion.Task.WaitAsync(linked.Token).ConfigureAwait(false);
         }
