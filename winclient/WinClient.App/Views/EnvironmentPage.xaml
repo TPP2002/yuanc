@@ -13,6 +13,11 @@
     <TextBlock Text="开着:连上后把系统时区设为澳洲东部、关闭自动时区,给 Chrome 与 Edge 设首选语言;断开按原值恢复。只覆盖 Chrome 与 Edge。" FontSize="{DynamicResource Yc.FontSize.Sm}" Foreground="{DynamicResource Yc.Text2}" TextWrapping="Wrap" Margin="0,4,0,0"/>
    </StackPanel></ToggleButton>
    <TextBlock Text="后台服务未就绪,暂时不能改" Style="{DynamicResource Yc.Hint}" Visibility="{Binding CanUseConnection, Converter={x:Static t:VisibilityConverter.Instance}, ConverterParameter=Invert}"/>
+   <TextBlock Text="断开后仍显示「恢复失败」时用:有恢复记录就按记录恢复原值;没有记录只恢复自动时区并清除本产品写入的浏览器策略,不改系统时区。" FontSize="{DynamicResource Yc.FontSize.Sm}" Foreground="{DynamicResource Yc.Text2}" TextWrapping="Wrap" Margin="0,12,0,0"/>
+   <Button Content="强制恢复默认环境" Style="{DynamicResource Yc.Button.Secondary}" Command="{Binding RestoreEnvironmentCommand}" HorizontalAlignment="Left" Margin="0,12,0,0" AutomationProperties.Name="强制恢复默认环境"/>
+   <StackPanel Visibility="{Binding CanUseConnection, Converter={x:Static t:VisibilityConverter.Instance}}">
+    <TextBlock Text="连接中不能恢复,请先断开" Style="{DynamicResource Yc.Hint}" Visibility="{Binding CanRestoreEnvironment, Converter={x:Static t:VisibilityConverter.Instance}, ConverterParameter=Invert}"/>
+   </StackPanel>
   </StackPanel></Border>
   <Border Style="{DynamicResource Yc.Card}" Margin="0,12,0,0"><StackPanel>
    <TextBlock Text="澳洲专用浏览器" FontWeight="Bold"/>

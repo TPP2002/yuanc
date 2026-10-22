@@ -30,6 +30,7 @@ public sealed class ClientRuntime : IClientFacade, IDisposable
     public Task DisconnectAsync() => Controller.DisconnectAsync();
     public Task SetRoutingAsync(string mode, IReadOnlyList<string> apps) => Controller.SetRoutingAsync(mode, apps);
     public Task SetEnvironmentEnabledAsync(bool enabled) => Controller.SetEnvironmentEnabledAsync(enabled);
+    public Task RestoreEnvironmentAsync() => Controller.ForceRestoreEnvironmentAsync();
     public Task RedeemAsync(string code) => Controller.RedeemAsync(code);
     public string? ReadAudit() => File.Exists(firewall.AuditPath) ? File.ReadAllText(firewall.AuditPath) : null;
     public string? ReadSelfCheck()

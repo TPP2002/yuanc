@@ -229,6 +229,65 @@ public static class EnvironmentPlanner
         return script.ToString();
     }
 
+    public static string ForceRestoreScript(EnvironmentTarget target)
+    {
+        var script = Header();
+        script.AppendLine("""
+            function Remove-IfWritten($path, $name, $expected) {
+              if (-not (Test-Path -LiteralPath $path)) { return }
+              $item = Get-Item -LiteralPath $path
+              if ($item.GetValueNames() -notcontains $name) { return }
+              if ([string]$item.GetValue($name) -eq [string]$expected) {
+                Remove-ItemProperty -LiteralPath $path -Name $name
+              }
+            }
+            function Remove-EmptyKey($path) {
+              if (Test-Path -LiteralPath $path) {
+                $key = Get-Item -LiteralPath $path
+                if ($key.ValueCount -eq 0 -and $key.SubKeyCount -eq 0) { Remove-Item -LiteralPath $path }
+              }
+            }
+            $failed = @()
+            try {
+              if (Test-Path -LiteralPath $tzServiceKey) {
+                Set-ItemProperty -LiteralPath $tzServiceKey -Name Start -Value 3 -Type DWord
+              }
+              Start-Service tzautoupdate -ErrorAction SilentlyContinue
+            } catch { $failed += 'tzautoupdate' }
+            """);
+        var languages = target.Languages;
+        script.AppendLine($$"""
+            try {
+              Remove-IfWritten $chromeKey 'WebRtcIPHandling' {{Quote("default_public_interface_only")}}
+              Remove-IfWritten $chromeKey 'DefaultGeolocationSetting' {{Quote("2")}}
+              Remove-IfWritten $chromeKey 'DnsOverHttpsMode' {{Quote(DohMode)}}
+              Remove-IfWritten $chromeKey 'DnsOverHttpsTemplates' {{Quote(DohTemplate)}}
+            } catch { $failed += 'chrome' }
+            try {
+              Remove-IfWritten $edgeKey 'DefinePreferredLanguages' {{Quote(string.Join(",", languages))}}
+              Remove-IfWritten $edgeKey 'WebRtcLocalhostIpHandling' {{Quote("default_public_interface_only")}}
+              Remove-IfWritten $edgeKey 'DefaultGeolocationSetting' {{Quote("2")}}
+              Remove-IfWritten $edgeKey 'DnsOverHttpsMode' {{Quote(DohMode)}}
+              Remove-IfWritten $edgeKey 'DnsOverHttpsTemplates' {{Quote(DohTemplate)}}
+            } catch { $failed += 'edge' }
+            try {
+            """);
+        for (var i = 0; i < languages.Length; i++)
+            script.AppendLine($"  Remove-IfWritten $forcedKey '{i + 1}' {Quote(languages[i])}");
+        script.AppendLine("""
+              Remove-EmptyKey $forcedKey
+            } catch { $failed += 'forced_languages' }
+            try {
+              Remove-EmptyKey $chromeKey
+              Remove-EmptyKey $edgeKey
+            } catch { $failed += 'cleanup' }
+            if ($failed.Count -gt 0) { throw ('默认环境未能完全恢复:' + ($failed -join ',')) }
+            ConvertTo-Json -Compress @{ time_zone_untouched=$true; auto_time_zone_start=3 }
+            exit 0
+            """);
+        return script.ToString();
+    }
+
     public static string InspectScript()
     {
         var script = Header();

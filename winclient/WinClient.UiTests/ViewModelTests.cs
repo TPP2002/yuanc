@@ -11,6 +11,25 @@ namespace WinClient.UiTests;
 public class ViewModelTests(UiThreadFixture ui)
 {
     [Fact]
+    public void 强制恢复在连接保护或后台不可用时禁用() => ui.Invoke(() =>
+    {
+        using var model = new MainViewModel(() => null, () => null);
+        Assert.NotNull(model.RestoreEnvironmentCommand);
+        foreach (var snapshot in new[] {
+            new ControlSnapshot(ConnectionState.Connected, "已连接", "", false),
+            new ControlSnapshot(ConnectionState.Disconnected, "未连接", "", true),
+            new ControlSnapshot(ConnectionState.Disconnected, "未连接", "", false) })
+        {
+            model.ApplyPreview(snapshot, ServiceAvailability.Ready);
+            Assert.False(model.RestoreEnvironmentCommand.CanExecute(null));
+            Assert.False(model.CanRestoreEnvironment);
+        }
+        model.ApplyPreview(new ControlSnapshot(ConnectionState.Disconnected, "未连接", "", false), ServiceAvailability.Unavailable);
+        Assert.False(model.RestoreEnvironmentCommand.CanExecute(null));
+        Assert.False(model.CanRestoreEnvironment);
+    });
+
+    [Fact]
     public void 浏览器复核无需后台且保留主消息() => ui.Invoke(() =>
     {
         string? received = null;

@@ -12,6 +12,60 @@ namespace WinClient.Tests;
 
 public sealed class ControllerTests
 {
+    [Fact]
+    public async Task ForceRestoreRejectsConnectedWithoutChangingEnvironmentOrFirewall()
+    {
+        var order = new List<string>(); var environment = new ForceRestoreEnvironment();
+        using var controller = new ClientController(new PairingSessionSource(PairingTests.ValidPairing()),
+            new Firewall(order), new Tunnel(order), Path.GetFullPath("fake.exe"), TestData.Device, environment: environment);
+        await controller.ConnectAsync();
+        var before = controller.Snapshot; var actions = order.ToArray();
+        await controller.ForceRestoreEnvironmentAsync();
+        Assert.Equal("请先断开连接,再强制恢复默认环境。", controller.Snapshot.Message);
+        Assert.Equal(0, environment.Calls);
+        Assert.Equal(before.State, controller.Snapshot.State);
+        Assert.Equal(before.ProtectionActive, controller.Snapshot.ProtectionActive);
+        Assert.Equal(before.EnvironmentStatus, controller.Snapshot.EnvironmentStatus);
+        Assert.Equal(actions, order);
+    }
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    public async Task ForceRestoreDisconnectedReportsResultWithoutFirewallActions(bool record, bool fail)
+    {
+        var order = new List<string>();
+        var environment = new ForceRestoreEnvironment { HasPendingState = record, Fail = fail };
+        using var controller = new ClientController(new PairingSessionSource(PairingTests.ValidPairing()),
+            new Firewall(order), new Tunnel(order), Path.GetFullPath("fake.exe"), TestData.Device, environment: environment);
+        await controller.ForceRestoreEnvironmentAsync();
+        Assert.Equal(1, environment.Calls);
+        Assert.Equal(ConnectionState.Disconnected, controller.Snapshot.State);
+        Assert.False(controller.Snapshot.ProtectionActive);
+        Assert.Empty(order);
+        Assert.Equal(fail ? "恢复失败,请联系管理员" : "未应用", controller.Snapshot.EnvironmentStatus);
+        if (fail) Assert.Equal("强制恢复未完成,请联系管理员。", controller.Snapshot.Message);
+        else Assert.Contains(record ? "已按恢复记录" : "没有恢复记录", controller.Snapshot.Message);
+        Assert.Equal(EnvironmentSettingsStore.Default.Target.Languages, environment.Target!.Languages);
+    }
+
+    private sealed class ForceRestoreEnvironment : IEnvironmentEnforcer
+    {
+        public bool HasPendingState { get; set; }
+        public bool Fail { get; init; }
+        public int Calls { get; private set; }
+        public EnvironmentTarget? Target { get; private set; }
+        public Task ApplyAsync(EnvironmentTarget target) => Task.CompletedTask;
+        public Task RestoreAsync() => Task.CompletedTask;
+        public Task ForceRestoreAsync(EnvironmentTarget target)
+        {
+            Calls++; Target = target;
+            if (Fail) throw new InvalidOperationException("测试恢复失败");
+            return Task.CompletedTask;
+        }
+    }
+
     private sealed class MemoryRouting : IRoutingSettingsStore
     {
         public RoutingPolicy Policy = RoutingTests.Apps;

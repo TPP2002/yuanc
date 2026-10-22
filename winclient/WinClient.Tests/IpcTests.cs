@@ -15,6 +15,25 @@ namespace WinClient.Tests;
 public sealed class IpcTests
 {
     [Fact]
+    public async Task TrustedCallerCanRestoreEnvironmentAndReceivesSnapshot()
+    {
+        using var temp = new TempDirectory();
+        using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var facade = new FakeFacade(); var desired = new DesiredStateStore(temp.Path);
+        var server = new ControlServer(facade, desired); var (peer, host) = DuplexStream.Pair();
+        var serving = server.ServeAsync(host, stop.Token, callerTrusted: true);
+        using (var client = new ControlClient(peer))
+        {
+            var response = await client.SendAsync("restore_environment", cancellationToken: stop.Token);
+            Assert.True(response.Ok);
+            Assert.Equal(new[] { "restore_environment" }, facade.Actions);
+            Assert.Equal(facade.Snapshot, (ClientSnapshot)response.Snapshot!);
+            Assert.Null(desired.Read());
+        }
+        await serving.WaitAsync(stop.Token);
+    }
+
+    [Fact]
     public void RoutingFieldsRoundTripAndOldSnapshotsDefaultToGlobal()
     {
         var value = new ClientSnapshot(ConnectionState.Disconnected, "", "", false)
@@ -383,7 +402,7 @@ public sealed class IpcTests
         using (var client = new ControlClient(peer))
         {
             // 改状态与受限的只读指令一律被拒：不调门面、不写期望状态。
-            foreach (var (op, code, pairing) in new (string, string?, string?)[] { ("connect", null, null), ("disconnect", null, null), ("redeem", "邀请码", null), ("import_pairing", null, "配对正文"), ("clear_pairing", null, null), ("check_update", null, null), ("read_audit", null, null), ("read_selfcheck", null, null) })
+            foreach (var (op, code, pairing) in new (string, string?, string?)[] { ("connect", null, null), ("disconnect", null, null), ("redeem", "邀请码", null), ("import_pairing", null, "配对正文"), ("clear_pairing", null, null), ("restore_environment", null, null), ("check_update", null, null), ("read_audit", null, null), ("read_selfcheck", null, null) })
             {
                 var rejected = await client.SendAsync(op, code: code, pairingJson: pairing, cancellationToken: stop.Token);
                 Assert.False(rejected.Ok);
@@ -584,6 +603,7 @@ public sealed class IpcTests
 
     private sealed class FakeFacade : IClientFacade
     {
+        public Task RestoreEnvironmentAsync() { Actions.Add("restore_environment"); return Task.CompletedTask; }
         public Task SetRoutingAsync(string mode, IReadOnlyList<string> apps)
         {
             Actions.Add("routing:" + mode); Snapshot = Snapshot with { RoutingMode = mode, RoutingApps = apps.ToArray() };

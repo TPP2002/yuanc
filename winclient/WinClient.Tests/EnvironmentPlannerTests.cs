@@ -7,6 +7,34 @@ namespace WinClient.Tests;
 public sealed class EnvironmentPlannerTests
 {
     [Fact]
+    public void ForceRestoreOnlyRemovesWrittenPoliciesAndLeavesTimeZoneUntouched()
+    {
+        var script = EnvironmentPlanner.ForceRestoreScript(new("UTC", ["en-AU", "en"]));
+        foreach (var value in new[] { "Start-Service tzautoupdate", "-Value 3 -Type DWord", "Remove-IfWritten",
+            "WebRtcIPHandling", "WebRtcLocalhostIpHandling", "DefaultGeolocationSetting", "DnsOverHttpsMode",
+            "DnsOverHttpsTemplates", "DefinePreferredLanguages", "ForcedLanguages", "default_public_interface_only",
+            EnvironmentPlanner.DohTemplate, "[string]$item.GetValue($name) -eq [string]$expected",
+            "ValueCount -eq 0", "SubKeyCount -eq 0", "time_zone_untouched=$true", "$failed -join" })
+            Assert.Contains(value, script);
+        Assert.DoesNotContain("tzutil /s", script);
+        Assert.Equal(1, Regex.Matches(script, "Set-ItemProperty").Count);
+        Assert.DoesNotContain("Write-State", script);
+        Assert.DoesNotContain("$statePath", script);
+        Assert.DoesNotContain("Set-Content", script);
+    }
+
+    [Fact]
+    public void ForceRestoreQuotesEveryLanguageLiteralAndOrdinalComparison()
+    {
+        var script = EnvironmentPlanner.ForceRestoreScript(new("UTC", ["en-AU", "en"]));
+        Assert.Contains("Remove-IfWritten $forcedKey '1' 'en-AU'", script);
+        Assert.Contains("Remove-IfWritten $forcedKey '2' 'en'", script);
+        Assert.Contains("Remove-IfWritten $edgeKey 'DefinePreferredLanguages' 'en-AU,en'", script);
+        Assert.DoesNotMatch(@"(?<!['\w-])en-AU(?![\w,-]*')", script);
+        Assert.DoesNotContain("'2' en", script);
+    }
+
+    [Fact]
     public void ApplyRecordsOriginalBeforeAnySystemWriteAndUsesOnlyApprovedPolicies()
     {
         var script = EnvironmentPlanner.ApplyScript(new("AUS Eastern Standard Time", ["en-AU", "en"]), "state's.json");
