@@ -1,0 +1,5 @@
+拍板:选「授权将两条断言限定为 admin/proxy」。
+
+具体写法:test_unit_matches_golden 里 `assert "StartLimitIntervalSec=" in text` 与 `assert "StartLimitBurst=" in text` 两行,改为只对 name 以 "exitnode-admin.service" / "exitnode-proxy.service" 开头的单元断言存在;对 exitnode-watchdog.service / exitnode-watchdog.timer 反过来断言 `"StartLimit" not in text`。黄金整文件比对那一行、Restart= 与 PYTHONPATH 两行一律不动。
+
+这是契约漏列的既有断言(契约只点名了 test_watchdog_service_timer_and_context 与 test_check_requires_timer_and_record_younger_than_one_day),属本次授权范围,交活说明里把改动的这两行列出来即可。其余既有断言仍只加不改。

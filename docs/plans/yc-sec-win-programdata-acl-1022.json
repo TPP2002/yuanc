@@ -1,0 +1,202 @@
+{
+  "schemaVersion": 1,
+  "taskId": "SEC-WIN-PROGRAMDATA-ACL-1022",
+  "slug": "yc-sec-win-programdata-acl-1022",
+  "title": "Windows 客户端数据目录整体收权限:%ProgramData%\\YuanC 及 run/secure/updates 断继承、只给 SYSTEM 与管理员、所有者设为管理员;服务启动先核所有者/权限/非重解析点,不合格就地修正、修不了拒绝启动并记日志;server.json 读取前核所有者,sing_box_path 只认程序安装目录下的路径",
+  "goal": "做完后:①新建 winclient/WinClient.Core/Hosting/DataDirectorySecurity.cs(public static class),提供:a) Harden(string path):Directory.CreateDirectory 后设 DirectorySecurity——SetAccessRuleProtection(true,false);SetOwner(BUILTIN\\Administrators);只两条 Allow ACE:LocalSystem 与 BuiltinAdministrators 各 FullControl、ContainerInherit|ObjectInherit、PropagationFlags.None;无其他任何 ACE;b) Evaluate(SecurityIdentifier? owner, IEnumerable<FileSystemAccessRule> rules, bool isReparsePoint) → 返回 string? 原因(null=合格):重解析点(目录联接/符号链接)不合格;所有者不是 S-1-5-18(SYSTEM)也不是 S-1-5-32-544(Administrators)不合格;任一 Allow ACE 的身份不是这两个 SID 不合格;任一 Deny ACE 针对这两个 SID 不合格;c) Verify(string path) → string?:用 Directory.GetAccessControl(AccessControlSections.Owner|Access) 读所有者与显式+继承的 ACE 交给 Evaluate,目录不存在返回原因;d) EnsureHardened(string root):对 root、root\\run、root\\secure、root\\updates 依次:Verify 合格就跳过;不合格且不是重解析点就 Harden 一次再 Verify;仍不合格或是重解析点 → 抛 InvalidOperationException(\"数据目录权限异常，已拒绝启动：<目录相对名> <原因>\",不含完整路径以外的私有信息);root\\bin 存在时同样核(不存在不建);e) IsTrustedOwner(string filePath) → bool:文件所有者 SID 是 SYSTEM 或 Administrators。所有 SID 用 WellKnownSidType 构造,不写死字符串比对以外的常量。②InstallerRunner:InstallAsync 在复制程序之后、配置服务之前调用 DataDirectorySecurity.EnsureHardened(ClientSettings.DataDirectory);--repair(StartAsync 路径)启动服务之前同样调用;失败按 SafeError 文案「数据目录权限设置失败，请以管理员身份重试或联系管理员。」返回 1。③ControlService.OnStart 的 Task 里第一句改为 DataDirectorySecurity.EnsureHardened(ClientSettings.DataDirectory)(在 UpdateStore/UpdateRecovery/ClientRuntime 之前),原来两处 PrepareSecureDirectory 调用删掉,PrepareSecureDirectory 方法删除或改为直接转调 Harden;EnsureHardened 抛错时写一行日志「数据目录权限异常，后台服务拒绝启动：<异常文案>」再走既有 Fatal(ExitCode=1、Environment.Exit)。④ClientSettings.Load 签名改为 Load(string? dataDirectory = null, Func<string, bool>? ownerIsTrusted = null, string? kernelRoot = null):server.json 存在且 ownerIsTrusted 非空时先调它,返回 false 抛 InvalidDataException(\"服务器配置文件的所有者不是系统或管理员，已拒绝读取。\");sing_box_path 非空时,除既有「绝对路径」校验外,Path.GetFullPath 后必须位于 kernelRoot(默认 Path.Combine(ProgramFiles 特殊目录, \"YuanC\"))之下(大小写不敏感、目录分隔符归一、带尾分隔符前缀比较、不含 ..),否则抛 InvalidDataException(\"连接内核必须位于程序安装目录之下。\");ClientRuntime.CreateAsync 与 ClearPairingAsync 两处 ClientSettings.Load() 改为 Load(ownerIsTrusted: DataDirectorySecurity.IsTrustedOwner)。⑤测试:新建 winclient/WinClient.Tests/DataDirectorySecurityTests.cs:(a) Evaluate 纯函数用例——合格(SYSTEM 所有者+两条 Allow)、Administrators 所有者合格、Users 所有者不合格、多一条 Users Allow 不合格、针对 SYSTEM 的 Deny 不合格、重解析点不合格、owner 为 null 不合格;(b) Harden 真目录用例:在临时目录 Harden 后 Verify 为 null、Access 规则只含两条且身份正确、所有者是 Administrators——此用例在当前进程不是管理员时用 Skip 跳过(写明原因),是管理员时必须跑;(c) 临时目录给 BUILTIN\\Users 加一条 Modify Allow 后 EnsureHardened 能修正并 Verify 通过(同样管理员才跑);(d) ClientSettings.Load:ownerIsTrusted 返回 false 抛 InvalidDataException 且文案含「所有者」;返回 true 正常读;sing_box_path 在 kernelRoot 外抛 InvalidDataException 且文案含「安装目录」,在 kernelRoot 内通过,相对路径仍抛既有文案。KernelInstallerTests.cs 第 109~114 行与 PairingTests.cs 第 195~199 行既有用例给 Load 补 kernelRoot 参数(指向用例自己的临时目录)属接口适配,断言不改;ProcessStorageTests.cs 第 84 行不用动。HostingTests 若有「App/Core 不直接引用某类」的禁令测试,新文件须同样遵守。⑥文档:docs/winclient/服务化与自启说明.md 「安全存储与期望状态」改写为整目录口径(root/run/secure/updates 全部断继承、SYSTEM 与管理员完全控制、所有者管理员、普通用户无任何访问;安装与服务启动都核、能修就修、重解析点或修不了拒绝启动并记 service.log;为什么普通用户不需要读该目录——界面只经管道);「卸载」段保留目录的说法不变;「真机待验证清单」加:普通用户对 %ProgramData%\\YuanC 及子目录 Get-Acl 看不到 Users 项、icacls 显示所有者 Administrators;普通用户预先建好带 Users 写权限的目录后安装,安装后权限被修正;把 run 目录换成联接后启动服务应拒绝启动且日志有「数据目录权限异常」;docs/winclient/架构说明.md 第 19 行把 sing_box_path 口径改为「必须位于 %ProgramFiles%\\YuanC 之下,文件所有者须为系统或管理员」,第 41 行末尾补一句「2026-10-22 起目录 ACL 由安装与启动核验,见服务化与自启说明」;docs/winclient/打包与发布说明.md 第 62 行「已有绝对路径仍优先使用,兼容手工部署」改为「已有路径须位于 %ProgramFiles%\\YuanC 之下才使用」。",
+  "background": "项目:外包,中国客户端经加密隧道到澳洲家宽出口;Windows 客户端 .NET 9 在 winclient/,后台服务以 LocalSystem 运行(ServiceInstaller.Configure 写 obj= LocalSystem),数据根目录 ClientSettings.DataDirectory = %ProgramData%\\YuanC,子目录 run(防火墙状态/审计/desired.json/三份日志/sing-box 的 config.json)、secure(DPAPI 密文:凭据、配对文件、设备标识)、updates(更新暂存与 pending.json)、bin\\<内核版本>(内嵌内核解包)。现状(对抗审查 看板 yuanc 卡 SECURITY-REDTEAM-1022 B1/B2/B3,负责人本机 2026-10-22 实测):ControlService.PrepareSecureDirectory 只对 secure 与 updates 设 DACL,不设所有者;根目录与 run、bin 从未收权限,BUILTIN\\Users 继承了 %ProgramData% 默认的建文件/建目录权限。后果:自用模式 server.json 本来不存在,同机任意普通用户写一份 server.json 把 sing_box_path 指向自己的 exe,服务下次启动就以 SYSTEM 运行它——本地提权整机失陷;普通用户预先建好 secure 目录就是所有者,随时能把 ACL 改回来读 DPAPI 密文(LocalMachine 范围本机任何进程都能解,目录权限是唯一防线);run 目录被普通用户控制时能左右恢复脚本读到的状态文件与自动连接意愿。本卡一次覆盖 SEC-WIN-PROGRAMDATA-ACL-1022(根目录)、SEC-WIN-SECURE-OWNER-1022(所有者+启动校验)、SEC-WIN-RUN-DIR-ACL-1022(run 同等加固)三张卡的同一机制;后两张收单时核。为什么普通用户可以完全不给权限:grep 过 DataDirectory 的全部使用处(ControlService、UpdateWindowsHost、ClientRuntime、ClientSettings、DesiredStateStore、KernelInstaller、SingBoxProcessManager、UpdateStore)都在服务或提权的 --apply-update 进程里跑;界面(普通用户)只经命名管道与服务通信,设备标识用 %LOCALAPPDATA%;导出审计由服务拷到用户指定路径。为什么不只检查而要修正:客户要常年自动运行,SYSTEM 能把所有者改成管理员、把 ACL 设回来,能修就修;修不了(重解析点、SetAccessControl 失败)才拒绝启动——拒绝启动会让 SCM 按 5/10/30 秒重启三次后停在最后一个动作,这是有意的:权限不对就不该带着 SYSTEM 权限跑。.NET 设所有者:DirectorySecurity.SetOwner 到 Administrators 在管理员进程与 SYSTEM 都可行(Administrators 在这两类令牌里都是可当所有者的组);测试进程不是管理员时 Harden 可能失败,所以真目录用例要按是否管理员 Skip,Evaluate 做成纯函数单测。先读:winclient/WinClient.App/Hosting/{ControlService,InstallerRunner}.cs、winclient/WinClient.Core/Client/{ClientSettings,ClientRuntime}.cs、winclient/WinClient.Core/Hosting/ServiceInstaller.cs、winclient/WinClient.Core/Kernel/KernelInstaller.cs、winclient/WinClient.Tests/{HostingTests,KernelInstallerTests,PairingTests,ProcessStorageTests}.cs、docs/winclient/{服务化与自启说明,架构说明,打包与发布说明}.md。环境:工位无外网,只用框架自带与 NuGet 缓存已有的包(不新增包;System.IO.FileSystem.AccessControl 与 System.Security.Principal.Windows 在 .NET 9 Windows 目标里自带);CI 是本机自托管 Windows runner 跑 dotnet test winclient;首轮 dotnet build 会生成 winclient/third_party/bin 让自测指纹漂一次属正常;构建报 Access denied 先 dotnet build-server shutdown;Windows 子进程一律 CreateNoWindow=true,本卡不起任何子进程(不用 icacls/takeown 命令,全部走 .NET API)。同仓同时有 yc-sec-win-firewall-disabled-1022 在别的工位施工,动 Core/Firewall/{KillSwitchPlanner,KillSwitchApplier}.cs、Core/Client/ClientController.cs 与 FirewallTests/KillSwitchHardenTests/KillSwitchRecoveryTests/ControllerTests/断网保护加固说明.md,本卡不得碰这些文件。硬规矩:①不删任何已有文件、不动 secure 里的密文;②不改管道 ACL(另有卡);③ownerIsTrusted/kernelRoot 为 null 时 Load 行为与现在完全一致(既有调用方不传就不受影响);④所有文案中文、不含凭据;⑤拿不准(例如 GetAccessControl 返回的继承 ACE 怎么判、SetOwner 需要的特权)停下交 blocked + forks,不猜;真机验证写进文档清单,不模拟成通过。",
+  "nonGoals": [
+    "不改命名管道的 ACL/实例数/FirstPipeInstance(SEC-WIN-PIPE-* 卡)",
+    "不给 DPAPI 加服务私有熵(SECURE-OWNER 卡的可选项,另议)",
+    "不处理安装前被普通用户预先放进 run/secure 的文件内容(加固后他们改不了,但旧文件仍在;写进观察项)",
+    "不改期望状态与启动连接顺序(SEC-WIN-STARTUP-UNPROTECTED-1022 另派,须在本卡之后)",
+    "不在真机实测:普通用户视角的 Get-Acl/icacls 核对与联接拒启写进真机清单"
+  ],
+  "allowedPaths": [
+    "winclient/WinClient.Core/Hosting/DataDirectorySecurity.cs",
+    "winclient/WinClient.App/Hosting/ControlService.cs",
+    "winclient/WinClient.App/Hosting/InstallerRunner.cs",
+    "winclient/WinClient.Core/Client/ClientSettings.cs",
+    "winclient/WinClient.Core/Client/ClientRuntime.cs",
+    "winclient/WinClient.Tests/DataDirectorySecurityTests.cs",
+    "winclient/WinClient.Tests/HostingTests.cs",
+    "winclient/WinClient.Tests/KernelInstallerTests.cs",
+    "winclient/WinClient.Tests/PairingTests.cs",
+    "winclient/WinClient.Tests/ProcessStorageTests.cs",
+    "docs/winclient/服务化与自启说明.md",
+    "docs/winclient/架构说明.md",
+    "docs/winclient/打包与发布说明.md"
+  ],
+  "forbiddenPaths": [
+    "node/**",
+    "authserver/**",
+    "scripts/**",
+    "docs/开工须知.md",
+    "docs/口径速查表.md",
+    "docs/design/**",
+    "docs/交接/**",
+    "docs/node/**",
+    "docs/plans/**",
+    "docs/acceptance/**",
+    "docs/authserver/**",
+    "docs/winclient/断网保护加固说明.md",
+    "docs/winclient/自动更新说明.md",
+    ".github/**",
+    ".codex/**",
+    ".gitignore",
+    "pyproject.toml",
+    "winclient/third_party/**",
+    "winclient/Directory.Build.props",
+    "winclient/NuGet.Config",
+    "winclient/WinClient.Core/Firewall/**",
+    "winclient/WinClient.Core/Auth/**",
+    "winclient/WinClient.Core/Client/ClientController.cs",
+    "winclient/WinClient.Core/Client/IClientFacade.cs",
+    "winclient/WinClient.Core/Client/PairingSessionSource.cs",
+    "winclient/WinClient.Core/Client/AuthServerSessionSource.cs",
+    "winclient/WinClient.Core/Client/ISessionSource.cs",
+    "winclient/WinClient.Core/Client/DesiredStateStore.cs",
+    "winclient/WinClient.Core/Hosting/ServiceInstaller.cs",
+    "winclient/WinClient.Core/Ipc/**",
+    "winclient/WinClient.Core/Kernel/**",
+    "winclient/WinClient.Core/Logging/**",
+    "winclient/WinClient.Core/Pairing/**",
+    "winclient/WinClient.Core/Process/**",
+    "winclient/WinClient.Core/State/**",
+    "winclient/WinClient.Core/Storage/**",
+    "winclient/WinClient.Core/Update/**",
+    "winclient/WinClient.Core/WinClient.Core.csproj",
+    "winclient/WinClient.App/Hosting/ControlServer.cs",
+    "winclient/WinClient.App/Hosting/UpdateApplier.cs",
+    "winclient/WinClient.App/Hosting/UpdateRecovery.cs",
+    "winclient/WinClient.App/Hosting/UpdateWindowsHost.cs",
+    "winclient/WinClient.App/MainViewModel.cs",
+    "winclient/WinClient.App/MainWindow.xaml",
+    "winclient/WinClient.App/MainWindow.xaml.cs",
+    "winclient/WinClient.App/App.xaml.cs",
+    "winclient/WinClient.App/Program.cs",
+    "winclient/WinClient.App/WinClient.App.csproj",
+    "winclient/WinClient.Tests/AuthTests.cs",
+    "winclient/WinClient.Tests/ControllerTests.cs",
+    "winclient/WinClient.Tests/FirewallTests.cs",
+    "winclient/WinClient.Tests/KillSwitch*.cs",
+    "winclient/WinClient.Tests/IpcTests.cs",
+    "winclient/WinClient.Tests/PairingCertificateTests.cs",
+    "winclient/WinClient.Tests/StateTests.cs",
+    "winclient/WinClient.Tests/Update*.cs",
+    "winclient/WinClient.Tests/TestData.cs",
+    "winclient/WinClient.Tests/Fixtures/**",
+    "winclient/WinClient.Tests/WinClient.Tests.csproj"
+  ],
+  "expectArtifacts": [
+    "winclient/WinClient.Core/Hosting/DataDirectorySecurity.cs",
+    "winclient/WinClient.App/Hosting/ControlService.cs",
+    "winclient/WinClient.App/Hosting/InstallerRunner.cs",
+    "winclient/WinClient.Core/Client/ClientSettings.cs",
+    "winclient/WinClient.Tests/DataDirectorySecurityTests.cs",
+    "docs/winclient/服务化与自启说明.md"
+  ],
+  "acceptance": [
+    {
+      "id": "BUILD",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "build",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1200,
+      "note": "首轮会生成 third_party/bin 让指纹漂一次,正常"
+    },
+    {
+      "id": "TEST",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "test",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--no-build",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 900,
+      "note": "既有测试全过;Load 的两处适配只补参数不改断言"
+    },
+    {
+      "id": "SHAPE-SEC",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;d=pathlib.Path('winclient/WinClient.Core/Hosting/DataDirectorySecurity.cs').read_text(encoding='utf-8');bad=[k for k,ok in (('owner','SetOwner' in d),('admins','BuiltinAdministratorsSid' in d),('system','LocalSystemSid' in d),('reparse','ReparsePoint' in d),('protect','SetAccessRuleProtection' in d),('api',all(k in d for k in ('EnsureHardened','Evaluate','IsTrustedOwner'))),('no_shell',not any(k in d for k in ('icacls','takeown','ProcessStartInfo')))) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60,
+      "note": "新类:设所有者、两类 SID、重解析点、断继承、三项 API、不起子进程"
+    },
+    {
+      "id": "SHAPE-WIRE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda p:pathlib.Path(p).read_text(encoding='utf-8');cs=r('winclient/WinClient.App/Hosting/ControlService.cs');ir=r('winclient/WinClient.App/Hosting/InstallerRunner.cs');st=r('winclient/WinClient.Core/Client/ClientSettings.cs');rt=r('winclient/WinClient.Core/Client/ClientRuntime.cs');bad=[k for k,ok in (('svc.wire','EnsureHardened' in cs),('svc.fatal','Environment.Exit(1)' in cs),('inst.wire','EnsureHardened' in ir),('cfg.owner','ownerIsTrusted' in st),('cfg.root','kernelRoot' in st and 'ProgramFiles' in st),('rt.wire','IsTrustedOwner' in rt)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60,
+      "note": "服务与安装器接线;配置两项校验;运行时传所有者核查;Fatal 语义仍在"
+    },
+    {
+      "id": "NOWINDOW",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;norm=lambda p:str(p).replace(chr(92),'/');files=[p for root in ('winclient/WinClient.Core','winclient/WinClient.App') for p in pathlib.Path(root).rglob('*.cs') if '/obj/' not in norm(p) and '/bin/' not in norm(p)];bad=[norm(p) for p in files if 'ProcessStartInfo' in p.read_text(encoding='utf-8') and p.parent.name!='Process' and 'CreateNoWindow = true' not in p.read_text(encoding='utf-8')];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda p:pathlib.Path(p).read_text(encoding='utf-8');a=r('docs/winclient/服务化与自启说明.md');b=r('docs/winclient/架构说明.md');c=r('docs/winclient/打包与发布说明.md');bad=[k for k in ('所有者','重解析','拒绝启动','run','icacls','联接') if k not in a]+([] if ('安装目录' in b and 'ACL' in b) else ['架构说明'])+(['打包说明仍写兼容手工部署'] if '兼容手工部署' in c else []);print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    },
+    {
+      "id": "NOBIN",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess,sys;out=subprocess.run(['git','ls-files','winclient','build'],capture_output=True,text=True).stdout.split();bad=[f for f in out if f.endswith(('.exe','.dll','.zip','.pdb'))];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 60
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "model": null,
+  "timeoutSec": 7200,
+  "repoRoot": "E:/yuanc",
+  "engine": "codex",
+  "reasoningEffort": "high",
+  "steps": [
+    "读 background 列的源文件、测试与三份文档;确认 DataDirectory 全部使用处都在服务/提权进程,界面不读该目录。",
+    "先写 DataDirectorySecurityTests(Evaluate 纯函数、Load 两项校验)跑红;再写 DataDirectorySecurity、改 ClientSettings/ClientRuntime、接线 ControlService 与 InstallerRunner;补两处 Load 的 kernelRoot 适配。",
+    "本机跑 BUILD/TEST 与断言(说明测试进程是否管理员、真目录用例跑了还是跳过);改三份文档;交活说明列真机待验证清单。"
+  ]
+}
