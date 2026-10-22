@@ -11,7 +11,8 @@ public sealed record SetProfileDefault(string Profile, string Action) : Firewall
 public sealed record DisableForeignAllowRules : FirewallAction;
 public sealed record AddRule(string Name, string Direction, string Action, string? Program = null,
     string[]? RemoteAddress = null, string? Protocol = null, string? LocalPort = null,
-    string? RemotePort = null, string? InterfaceAlias = null) : FirewallAction;
+    string? RemotePort = null, string? InterfaceAlias = null,
+    string? Service = null, string[]? LocalAddress = null) : FirewallAction;
 public sealed record RemoveRulesByPrefix(string Prefix) : FirewallAction;
 public sealed record RestoreProfileDefault : FirewallAction;
 public sealed record RecoverFallback : FirewallAction;
@@ -23,9 +24,11 @@ public static class KillSwitchPlanner
     public const string Prefix = "YuanC-KS-";
     public const string NodePrefix = Prefix + "Node-";
     public const string TunAlias = "YuanC-TUN";
+    public const string TunAddress = "172.19.0.1";
+    public static string DhcpProgram => Path.Combine(Environment.SystemDirectory, "svchost.exe");
 
     public static IReadOnlyList<FirewallAction> Plan(IReadOnlyList<IPAddress> nodeIps,
-        string tunInterfaceName, string programPath, int hy2Port, KillSwitchMode mode, int realityPort = 443, AuthEndpoint? auth = null)
+        string tunInterfaceName /* 接口保留并校验非空;隧道规则改按本地地址匹配,不再使用网卡名 */, string programPath, int hy2Port, KillSwitchMode mode, int realityPort = 443, AuthEndpoint? auth = null)
     {
         if (mode == KillSwitchMode.Remove) return [new RemoveRulesByPrefix(Prefix), new RestoreProfileDefault()];
         if (mode == KillSwitchMode.Audit) return [new Audit()];
@@ -50,9 +53,9 @@ public static class KillSwitchPlanner
                 RemoteAddress: [auth.Address.ToString()], Protocol: "TCP",
                 RemotePort: auth.Port.ToString(System.Globalization.CultureInfo.InvariantCulture)));
         }
-        actions.Add(new AddRule(Prefix + "Tun", "Outbound", "Allow", InterfaceAlias: tunInterfaceName));
+        actions.Add(new AddRule(Prefix + "Tun", "Outbound", "Allow", LocalAddress: [TunAddress]));
         actions.Add(new AddRule(Prefix + "Loopback", "Outbound", "Allow", RemoteAddress: ["127.0.0.0/8", "::1"]));
-        actions.Add(new AddRule(Prefix + "Dhcp", "Outbound", "Allow", Protocol: "UDP", LocalPort: "68", RemotePort: "67"));
+        actions.Add(new AddRule(Prefix + "Dhcp", "Outbound", "Allow", Program: DhcpProgram, Service: "Dhcp", RemoteAddress: ["255.255.255.255", "LocalSubnet"], Protocol: "UDP", LocalPort: "68", RemotePort: "67"));
         actions.Add(new VerifyProfiles());
         actions.Add(new Audit());
         return actions.AsReadOnly();
@@ -130,6 +133,9 @@ public static class KillSwitchPlanner
                     script.Append("New-NetFirewallRule -Name ").Append(Quote(rule.Name))
                         .Append(" -DisplayName ").Append(Quote(rule.Name)).Append(" -Direction Outbound -Action Allow -Profile Any");
                     AddArgument(script, "Program", rule.Program);
+                    AddArgument(script, "Service", rule.Service);
+                    if (rule.LocalAddress is not null)
+                        script.Append(" -LocalAddress @(").Append(string.Join(",", rule.LocalAddress.Select(Quote))).Append(')');
                     if (rule.RemoteAddress is not null)
                         script.Append(" -RemoteAddress @(").Append(string.Join(",", rule.RemoteAddress.Select(Quote))).Append(')');
                     AddArgument(script, "Protocol", rule.Protocol);
