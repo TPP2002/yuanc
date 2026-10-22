@@ -7,10 +7,14 @@ using WinClient.Core.Update;
 
 namespace WinClient.Core.Ipc;
 
-public sealed class ControlServer(IClientFacade facade, DesiredStateStore desired, IUpdateCoordinator? updates = null, string? serviceVersion = null)
+public sealed class ControlServer(IClientFacade facade, DesiredStateStore desired, IUpdateCoordinator? updates = null, string? serviceVersion = null,
+    TimeSpan? idleTimeout = null)
 {
+    public static readonly TimeSpan DefaultIdleTimeout = TimeSpan.FromSeconds(30);
     // One ordering across connections keeps persisted intent consistent with completed commands.
     private readonly SemaphoreSlim commands = new(1, 1);
+    // 未订阅连接的空闲上限；零或负数表示不限。已订阅连接靠推送保活，不受此限。
+    private readonly TimeSpan idleLimit = idleTimeout ?? DefaultIdleTimeout;
     private ControlSnapshot Snapshot() => ((ControlSnapshot)facade.Snapshot) with
     { ServiceVersion = serviceVersion ?? ControlSnapshot.CurrentVersion, Update = updates?.Status ?? new() };
 
@@ -18,9 +22,16 @@ public sealed class ControlServer(IClientFacade facade, DesiredStateStore desire
     {
         using (stream)
         using (var closed = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
+        using (var idle = new CancellationTokenSource())
+        using (idle.Token.Register(static state => ((CancellationTokenSource)state!).Cancel(), closed))
         {
             var queue = Channel.CreateBounded<object>(64);
             var subscribed = false;
+            var limitIdle = idleLimit > TimeSpan.Zero;
+            // 只用 CancelAfter 计时与重置，不开线程；计时到点即取消 closed，读循环退出后关流。
+            void ArmIdle() { if (limitIdle && !subscribed) idle.CancelAfter(idleLimit); }
+            // 指令执行期间连接并不空闲（可能在排队等前一条指令），暂停计时，回完响应再重新计时。
+            void PauseIdle() { if (limitIdle) idle.CancelAfter(Timeout.InfiniteTimeSpan); }
             var sendGate = new object();
             var active = true;
             void Enqueue(object value)
@@ -43,21 +54,27 @@ public sealed class ControlServer(IClientFacade facade, DesiredStateStore desire
                 finally { closed.Cancel(); }
             }
             var writing = WriteLoop();
+            ArmIdle();
             try
             {
                 var reader = new ControlLineReader(stream);
                 while (await reader.ReadAsync(closed.Token).ConfigureAwait(false) is { } line)
                 {
-                    ControlRequest request;
-                    try { request = ControlProtocol.DecodeRequest(line); }
-                    catch (Exception ex) when (ex is JsonException or InvalidOperationException)
-                    { Enqueue(new ControlResponse(null, false, "指令格式错误")); continue; }
-                    if (request.Op == "subscribe")
+                    PauseIdle();
+                    try
                     {
-                        if (!subscribed) { facade.Changed += Changed; if (updates is not null) updates.Changed += UpdateChanged; subscribed = true; }
-                        Enqueue(new ControlResponse(request.Id, true, Snapshot: Snapshot()));
+                        ControlRequest request;
+                        try { request = ControlProtocol.DecodeRequest(line); }
+                        catch (Exception ex) when (ex is JsonException or InvalidOperationException)
+                        { Enqueue(new ControlResponse(null, false, "指令格式错误")); continue; }
+                        if (request.Op == "subscribe")
+                        {
+                            if (!subscribed) { facade.Changed += Changed; if (updates is not null) updates.Changed += UpdateChanged; subscribed = true; }
+                            Enqueue(new ControlResponse(request.Id, true, Snapshot: Snapshot()));
+                        }
+                        else Enqueue(await ExecuteAsync(request, closed.Token).ConfigureAwait(false));
                     }
-                    else Enqueue(await ExecuteAsync(request, closed.Token).ConfigureAwait(false));
+                    finally { ArmIdle(); }
                 }
             }
             catch (Exception ex) when (ex is IOException or InvalidDataException or OperationCanceledException or DecoderFallbackException or ObjectDisposedException) { }
@@ -84,12 +101,13 @@ public sealed class ControlServer(IClientFacade facade, DesiredStateStore desire
             if (updates is not null) _ = updates.CheckNowAsync();
             return new(request.Id, true, Snapshot: Snapshot());
         }
+        // status 只读快照，不进指令信号量：长指令执行期间探活与界面刷新也能立即拿到状态。
+        if (request.Op == "status") return new(request.Id, true, Snapshot: Snapshot());
         await commands.WaitAsync(token).ConfigureAwait(false);
         try
         {
             switch (request.Op)
             {
-                case "status": break;
                 case "connect":
                     await facade.ConnectAsync().ConfigureAwait(false);
                     desired.Write(true);

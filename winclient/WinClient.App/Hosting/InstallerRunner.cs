@@ -12,6 +12,7 @@ using WinClient.Core.Client;
 using WinClient.Core.Hosting;
 using WinClient.Core.Ipc;
 using WinClient.Core.State;
+using WinClient.Core.Update;
 using TimeoutException = System.TimeoutException;
 
 namespace WinClient.App.Hosting;
@@ -107,8 +108,14 @@ public sealed class InstallerRunner
         using var pipe = new NamedPipeClientStream(".", ControlService.PipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
         var connected = false;
         try { await pipe.ConnectAsync(3000); connected = true; }
-        catch (Exception ex) when (ex is TimeoutException or IOException or UnauthorizedAccessException)
-        { Console.Error.WriteLine("无法联系后台服务，已跳过主动断开；已有断网保护可能仍在，请联系管理员处理。"); }
+        catch (Exception ex) when (ex is TimeoutException or IOException or UnauthorizedAccessException) { }
+        if (connected && !PipePeer.VerifyServer(pipe, UpdatePlanner.DefaultAppRoot))
+        {
+            // 连到的不是本产品的后台服务：不向它发任何指令，断开后按未联系上处理。
+            Console.Error.WriteLine("后台服务身份核验失败，按未联系上处理。");
+            pipe.Dispose();
+            connected = false;
+        }
         if (connected)
         {
             using var client = new ControlClient(pipe);
@@ -116,19 +123,30 @@ public sealed class InstallerRunner
             var response = await client.SendAsync("disconnect", cancellationToken: timeout.Token);
             if (!response.Ok || response.Snapshot is not { ProtectionActive: false, State: ConnectionState.Disconnected })
                 throw SafeError("未能撤销断网保护，卸载已停止，请联系管理员。");
+            await StopServiceAsync();
         }
-        var status = ServiceStatus();
-        if (status is not null)
+        else
         {
-            if (status != ServiceControllerStatus.Stopped)
+            // 管道被占满或被冒名时服务不可达：先停服务（避免它再加规则），再由卸载程序自己撤掉断网保护。
+            Console.Error.WriteLine("无法联系后台服务，将在停止服务后直接恢复网络。");
+            await StopServiceAsync();
+            try { await new KillSwitchApplier(Path.Combine(ClientSettings.DataDirectory, "run")).RemoveAsync(); }
+            catch (Exception)
             {
-                if (status != ServiceControllerStatus.StopPending) await RunCommandAsync(ServiceInstaller.Stop(), "停止后台服务失败。");
-                await WaitForAsync(ServiceControllerStatus.Stopped);
+                // 撤防失败时保留服务与自启值：下次开机服务仍能按期望状态接管保护，比留一套没人管的阻止规则安全。
+                throw SafeError("未能撤销断网保护，卸载已停止，请联系管理员。");
             }
-            await RunCommandAsync(ServiceInstaller.Delete(), "删除后台服务失败。");
         }
+        if (ServiceStatus() is not null) await RunCommandAsync(ServiceInstaller.Delete(), "删除后台服务失败。");
         using var key = Registry.LocalMachine.OpenSubKey(ServiceInstaller.RunKey, writable: true);
         key?.DeleteValue(ServiceInstaller.RunValueName, throwOnMissingValue: false);
+    }
+    private async Task StopServiceAsync()
+    {
+        var status = ServiceStatus();
+        if (status is null || status == ServiceControllerStatus.Stopped) return;
+        if (status != ServiceControllerStatus.StopPending) await RunCommandAsync(ServiceInstaller.Stop(), "停止后台服务失败。");
+        await WaitForAsync(ServiceControllerStatus.Stopped);
     }
     private async Task RunCommandAsync(string[] arguments, string error)
     {

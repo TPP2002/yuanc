@@ -45,6 +45,35 @@ public sealed class UpdateApplierTests
         Assert.True(File.Exists(pending.OldExe));
     }
 
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task SilentPipeChecksRunningServiceImageBeforeMarkingBad(bool newVersionRunning)
+    {
+        using var temp = new TempDirectory();
+        var root = Path.Combine(temp.Path, "app");
+        var store = new UpdateStore(Path.Combine(temp.Path, "updates"));
+        var host = new Host("silent");
+        var pending = Pending(root, host.Now);
+        store.WritePending(pending);
+        // 管道不通但服务进程确实是新版：只回滚并下次再试，不写坏版本标记。
+        host.RunningExe = newVersionRunning ? pending.NewExe : pending.OldExe;
+        var commands = new Runner(pending, false);
+        var applier = new UpdateApplier(store, commands, host, root, Path.GetFullPath("Windows/System32"));
+        Assert.Equal(1, await applier.RunAsync());
+        var last = store.ReadHistory().Last();
+        Assert.Equal("rolled_back", last.Status);
+        Assert.Equal(!newVersionRunning, store.IsBad("1.0.0"));
+        Assert.False(store.HasPending);
+        Assert.Equal(ServiceInstaller.Configure(pending.OldExe, true), commands.Commands[4]);
+        Assert.Equal(pending.OldExe, host.RunExe);
+        if (newVersionRunning)
+        {
+            Assert.Contains("下次再试", last.Reason);
+            Assert.Empty(Directory.GetFiles(store.Root, "*.bad"));
+        }
+    }
+
     [Fact]
     public async Task LogWriteFailureCannotUndoSuccessfulServiceSwitch()
     {
@@ -113,5 +142,8 @@ public sealed class UpdateApplierTests
             new(1, true, Snapshot: new ControlSnapshot(mode == "network" ? ConnectionState.Reconnecting : ConnectionState.Connected, "", "", true)
             { ServiceVersion = mode == "wrong_version" ? "0.1.0" : "1.0.0" }));
         public void SetRunValue(string exe) => RunExe = exe;
+        // 默认 null：既有数据行仍按「服务进程查不到」处理，行为不变。
+        public string? RunningExe { get; set; }
+        public string? RunningServiceExecutable() => RunningExe;
     }
 }

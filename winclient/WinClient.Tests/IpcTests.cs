@@ -105,6 +105,116 @@ public sealed class IpcTests
     }
 
     [Fact]
+    public async Task StatusDoesNotWaitBehindQueuedCommand()
+    {
+        using var temp = new TempDirectory();
+        using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var facade = new FakeFacade { ConnectGate = gate };
+        var server = new ControlServer(facade, new DesiredStateStore(temp.Path));
+        var (first, firstHost) = DuplexStream.Pair();
+        var (second, secondHost) = DuplexStream.Pair();
+        var serving = Task.WhenAll(server.ServeAsync(firstHost, stop.Token), server.ServeAsync(secondHost, stop.Token));
+        using (var a = new ControlClient(first))
+        using (var b = new ControlClient(second))
+        {
+            var connecting = a.SendAsync("connect", cancellationToken: stop.Token);
+            await facade.ConnectEntered.Task.WaitAsync(stop.Token);
+            // connect 占着指令信号量时，另一条连接的 status 仍须在 1 秒内拿到快照。
+            var status = await b.SendAsync("status", cancellationToken: stop.Token).WaitAsync(TimeSpan.FromSeconds(1), stop.Token);
+            Assert.True(status.Ok); Assert.NotNull(status.Snapshot);
+            Assert.False(connecting.IsCompleted);
+            gate.SetResult();
+            Assert.True((await connecting.WaitAsync(stop.Token)).Ok);
+        }
+        await serving.WaitAsync(stop.Token);
+    }
+
+    [Fact]
+    public async Task IdleUnsubscribedConnectionIsClosedButSubscribedOneStays()
+    {
+        using var temp = new TempDirectory();
+        using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var server = new ControlServer(new FakeFacade(), new DesiredStateStore(temp.Path), idleTimeout: TimeSpan.FromMilliseconds(200));
+        var (idle, idleHost) = DuplexStream.Pair();
+        var (subscribed, subscribedHost) = DuplexStream.Pair();
+        var idleServing = server.ServeAsync(idleHost, stop.Token);
+        var subscribedServing = server.ServeAsync(subscribedHost, stop.Token);
+        using (idle)
+        using (var client = new ControlClient(subscribed))
+        {
+            Assert.True((await client.SendAsync("subscribe", cancellationToken: stop.Token)).Ok);
+            var waited = Task.Delay(600, stop.Token);
+            await idleServing.WaitAsync(TimeSpan.FromMilliseconds(600), stop.Token);
+            Assert.Equal(0, await idle.ReadAsync(new byte[1], stop.Token));
+            await waited;
+            Assert.False(subscribedServing.IsCompleted);
+            var status = await client.SendAsync("status", cancellationToken: stop.Token);
+            Assert.True(status.Ok); Assert.NotNull(status.Snapshot);
+        }
+        await subscribedServing.WaitAsync(stop.Token);
+    }
+
+    [Fact]
+    public async Task RequestsResetIdleTimer()
+    {
+        using var temp = new TempDirectory();
+        using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var server = new ControlServer(new FakeFacade(), new DesiredStateStore(temp.Path), idleTimeout: TimeSpan.FromMilliseconds(200));
+        var (peer, host) = DuplexStream.Pair();
+        var serving = server.ServeAsync(host, stop.Token);
+        using (var client = new ControlClient(peer))
+        {
+            for (var i = 0; i < 6; i++)
+            {
+                Assert.True((await client.SendAsync("status", cancellationToken: stop.Token)).Ok);
+                await Task.Delay(100, stop.Token);
+            }
+            Assert.False(serving.IsCompleted);
+        }
+        await serving.WaitAsync(stop.Token);
+    }
+
+    [Fact]
+    public async Task ZeroIdleTimeoutNeverClosesIdleConnection()
+    {
+        using var temp = new TempDirectory();
+        using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var server = new ControlServer(new FakeFacade(), new DesiredStateStore(temp.Path), idleTimeout: TimeSpan.Zero);
+        var (peer, host) = DuplexStream.Pair();
+        var serving = server.ServeAsync(host, stop.Token);
+        using (var client = new ControlClient(peer))
+        {
+            await Task.Delay(600, stop.Token);
+            Assert.False(serving.IsCompleted);
+            Assert.True((await client.SendAsync("status", cancellationToken: stop.Token)).Ok);
+        }
+        await serving.WaitAsync(stop.Token);
+    }
+
+    [Fact]
+    public void TrustedServerRequiresServiceSessionAndImageUnderAppRoot()
+    {
+        var root = Path.GetFullPath("Program Files/YuanC/app");
+        var exe = Path.Combine(root, "1.0.0", "YuanC-Client.exe");
+        Assert.True(ServerIdentity.IsTrusted(0, 0, exe, root));
+        // 大小写与 appRoot 尾部斜杠差异不影响判定。
+        Assert.True(ServerIdentity.IsTrusted(0, 0, exe.ToUpperInvariant(), root.ToLowerInvariant()));
+        Assert.True(ServerIdentity.IsTrusted(0, 0, exe, root + Path.DirectorySeparatorChar));
+        Assert.False(ServerIdentity.IsTrusted(1, 0, exe, root));
+        Assert.False(ServerIdentity.IsTrusted(0, 1, exe, root));
+        Assert.False(ServerIdentity.IsTrusted(0, 0, Path.GetFullPath("Program Files/Evil/YuanC-Client.exe"), root));
+        Assert.False(ServerIdentity.IsTrusted(0, 0, Path.GetFullPath("Program Files/YuanC/app-evil/YuanC-Client.exe"), root));
+        Assert.False(ServerIdentity.IsTrusted(0, 0, root, root));
+        Assert.False(ServerIdentity.IsTrusted(0, 0, root + Path.DirectorySeparatorChar, root));
+        Assert.False(ServerIdentity.IsTrusted(0, 0, root + @"\1.0.0\..\..\Evil\YuanC-Client.exe", root));
+        Assert.False(ServerIdentity.IsTrusted(0, 0, root + @"\1.0.0\..\2.0.0\YuanC-Client.exe", root));
+        Assert.False(ServerIdentity.IsTrusted(0, 0, @"YuanC\app\1.0.0\YuanC-Client.exe", root));
+        Assert.False(ServerIdentity.IsTrusted(0, 0, null, root));
+        Assert.False(ServerIdentity.IsTrusted(0, 0, "", root));
+    }
+
+    [Fact]
     public void DesiredStateMissingCorruptAndAtomicRoundTrip()
     {
         using var temp = new TempDirectory();
@@ -181,7 +291,16 @@ public sealed class IpcTests
         public ClientSnapshot Snapshot { get; private set; } = new(ConnectionState.Disconnected, "未连接", "", false);
         public event Action<ClientSnapshot>? Changed;
         public Action<ClientSnapshot>? CaptureChanged() => Changed;
-        public Task ConnectAsync() { Actions.Add("connect"); Snapshot = new(ConnectionState.Connected, "已连接", "", true); Changed?.Invoke(Snapshot); return Task.CompletedTask; }
+        // 为空时行为与原来一致；测试 status 不排队时用它把 connect 卡住。
+        public TaskCompletionSource? ConnectGate { get; init; }
+        public TaskCompletionSource ConnectEntered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public async Task ConnectAsync()
+        {
+            Actions.Add("connect");
+            ConnectEntered.TrySetResult();
+            if (ConnectGate is { } gate) await gate.Task;
+            Snapshot = new(ConnectionState.Connected, "已连接", "", true); Changed?.Invoke(Snapshot);
+        }
         public Task DisconnectAsync() { Actions.Add("disconnect"); Snapshot = new(ConnectionState.Disconnected, "未连接", "", false); Changed?.Invoke(Snapshot); return Task.CompletedTask; }
         public Task RedeemAsync(string code) { Actions.Add("redeem:" + code); return Task.CompletedTask; }
         public Task ImportPairingAsync(string json) { Actions.Add("import:" + json); return Task.CompletedTask; }
