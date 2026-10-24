@@ -93,12 +93,17 @@ public sealed class WfpEngine(Guid providerKey, Guid sublayerKey, string display
             Check(FwpmFilterDeleteById0(engine, filter.Id), nameof(FwpmFilterDeleteById0), FWP_E_FILTER_NOT_FOUND);
     }
 
-    private List<(ulong Id, string Name)> Enumerate(IntPtr engine)
+    // 枚举模板的 layerKey 不能留空(实测 FWP_E_LAYER_NOT_FOUND),逐层列举。
+    private List<(ulong Id, string Name)> Enumerate(IntPtr engine) =>
+        Enum.GetValues<WfpLayer>().SelectMany(layer => Enumerate(engine, LayerKey(layer))).ToList();
+
+    private List<(ulong Id, string Name)> Enumerate(IntPtr engine, Guid layerKey)
     {
         using var memory = new NativeMemory();
         var template = new FWPM_FILTER_ENUM_TEMPLATE0
         {
             providerKey = memory.Struct(providerKey),
+            layerKey = layerKey,
             enumType = FWP_FILTER_ENUM_FULLY_CONTAINED,
             flags = FWP_FILTER_ENUM_FLAG_INCLUDE_DISABLED,
             actionMask = uint.MaxValue
