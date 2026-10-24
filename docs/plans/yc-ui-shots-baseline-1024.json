@@ -1,0 +1,189 @@
+{
+  "schemaVersion": 1,
+  "taskId": "WINCLIENT-UI-SHOTS-NO-BASELINE-1024",
+  "slug": "yc-ui-shots-baseline-1024",
+  "title": "界面截图与入库基准图逐像素比对(容差 16、像素占比 0.1%),失败出差异图;CI 上传截图构件",
+  "goal": "以派单时 origin/main 头为基点(基点已含 36 张基准图 winclient/WinClient.UiTests/Baselines/*.png,由派单方在主干 fb0c512 上用现有 RenderTests 渲染,本机连拍两次逐字节一致)。\n\n现象(看板卡 WINCLIENT-UI-SHOTS-NO-BASELINE-1024):RenderTests 每次生成 36 张截图写 build/ui-shots,只断言主按钮位置尺寸、非纯色与「未就绪」提示可见性,没有和任何基准比对——页面样式改坏了 CI 也是绿的;而且自托管检查机上 Python 与 Windows 两个作业共用一个工作目录,后跑作业的 checkout 清理会删掉 build/ui-shots,CI 跑完后截图也找不到。\n\n做完后:\n\n① 新文件 winclient/WinClient.UiTests/ScreenshotBaseline.cs(internal static class ScreenshotBaseline,命名空间 WinClient.UiTests,纯计算部分不依赖 WPF 窗口):\n  - `internal const int ChannelTolerance = 16;`(单个颜色通道差 ≤16 视为相同,吸收抗锯齿细差)、`internal const double MaxDifferentRatio = 0.001;`(不同像素占比上限 0.1%)。\n  - `internal sealed record CompareResult(bool SizeMatches, int DifferentPixels, int TotalPixels) { public double Ratio => TotalPixels == 0 ? 1 : (double)DifferentPixels / TotalPixels; public bool Passed => SizeMatches && Ratio <= MaxDifferentRatio; }`\n  - `internal static CompareResult Compare(int width, int height, int[] actualBgra, int baseWidth, int baseHeight, int[] baselineBgra, int[]? diffOut = null)`:尺寸不同 → SizeMatches=false、DifferentPixels=TotalPixels;否则逐像素比较 B/G/R/A 四个通道,任一通道绝对差 > ChannelTolerance 记为不同;diffOut 非空时把不同像素写成不透明纯红 0xFFFF0000、相同像素写成原像素亮度减半的灰(只用于排查图)。\n  - `internal static (int Width, int Height, int[] Pixels) ReadPng(string path)`:PngBitmapDecoder 解第一帧,FormatConvertedBitmap 转 Pbgra32 后 CopyPixels。\n  - `internal static string BaselineDirectory(string repositoryRoot) => Path.Combine(repositoryRoot, \"winclient\", \"WinClient.UiTests\", \"Baselines\");`\n  - `internal static bool UpdateRequested => Environment.GetEnvironmentVariable(\"YC_UPDATE_UI_BASELINE\") == \"1\";`\n② RenderTests.cs 的 WritePng 在保存截图之后调用比对(新增私有方法即可,方法签名可调整,主按钮/未就绪/非纯色等既有断言一个不删不放宽):\n  - 基准图 = BaselineDirectory/<与截图同名>.png。\n  - UpdateRequested 为真:若环境变量 CI 为 \"true\" → Assert.Fail(\"检查机上不许更新基准图\");否则把本次截图复制为基准图(覆盖),本张不比对。\n  - 基准图不存在 → 记一条失败「缺少基准图 <名>,本机设 YC_UPDATE_UI_BASELINE=1 跑一次 UiTests 生成后连同界面改动一起提交」。\n  - 存在 → Compare;不通过 → 把 diff 图写到 build/ui-shots/diff/<名>.png,记一条失败「<名> 与基准不同:尺寸一致=<真/假>,不同像素 <n>/<总数>(<百分比,保留三位小数>%),差异图 build/ui-shots/diff/<名>.png」。\n  - 36 张全部渲染、比对完之后,若有失败记录,一次性 Assert.Fail 列出全部失败行(不要第一张失败就中断,便于一次看清改动影响面)。\n③ 新文件 winclient/WinClient.UiTests/ScreenshotBaselineTests.cs(至少 5 个 [Fact]/[Theory],纯数组构造,不读写真实基准图):a) 完全相同 → Passed、DifferentPixels=0;b) 每个像素每通道 ±16 噪声 → Passed;c) 一块 30×30 区域通道差 40 的 100×100 图 → 不通过且 DifferentPixels=900;d) 尺寸不同 → SizeMatches 假、不通过;e) 不同像素恰好等于 0.1% → 通过、多一个 → 不通过(用 1000×10 的图,10 个不同像素通过、11 个不通过);f) diffOut 中不同像素为 unchecked((int)0xFFFF0000)。\n④ .github/workflows/ci.yml 的 dotnet 作业:在「运行客户端测试」之后加一步「保存界面截图」:`if: always() && hashFiles('winclient/**/*.sln') != ''`、`continue-on-error: true`、`uses: actions/upload-artifact@v4`、`with: name: ui-shots-${{ github.run_id }}, path: build/ui-shots, retention-days: 7, if-no-files-found: ignore`。其余步骤、Python 作业、触发条件一字不改。\n⑤ docs/winclient/界面说明.md「## 界面测试与截图」一节补一小段「### 基准图比对」:基准图在 winclient/WinClient.UiTests/Baselines/,每张截图与同名基准逐像素比对(单通道差 ≤16 视为相同,不同像素超过 0.1% 判失败),失败时差异图写 build/ui-shots/diff/;界面有意改动时本机设 YC_UPDATE_UI_BASELINE=1 跑一次 UiTests 更新基准,并在 PR 里说明哪些图变了;检查机上设了该变量会直接失败;CI 把 build/ui-shots 上传为构件 ui-shots-<运行号>,保留 7 天(账户存储不可用时上传失败不影响检查结论)。基准图只代表本机(自托管检查机)渲染结果,换机器字体或缩放不同会整体不同,届时须在新机器上重建基准。原有内容不删。",
+  "background": "项目:外包 Windows 客户端 .NET 9 WPF(winclient/WinClient.sln:Core + App + Tests + UiTests)。UiTests 用 UiThreadFixture 在独立 STA 线程跑 WPF;RenderTests.浅深三十六张截图与主按钮位置固定 用 RenderTargetBitmap(880×600、96dpi、Pbgra32)离屏绘制 MainShell,WritePng 存到仓库根 build/ui-shots/<名>.png(名如 connect-connected、connect-connected-dark、page-update-unavailable-dark,共 36 张),另写 primary-button.json。RepositoryRoot() 从运行目录向上找含 winclient/WinClient.sln 的目录。CI(.github/workflows/ci.yml)跑在负责人本机的自托管 runner(NETWORK SERVICE 服务账户、非交互),Windows 作业就是 `dotnet test winclient --nologo`。\n\n先读:winclient/WinClient.UiTests/RenderTests.cs 全文、UiThreadFixture.cs、.github/workflows/ci.yml、docs/winclient/界面说明.md「## 界面测试与截图」一节;ls winclient/WinClient.UiTests/Baselines/ 确认 36 张基准图都在(文件名与 RenderTests 生成的截图同名)。\n\n关键风险(写进代码与文档,不要回避):基准图是派单方在交互会话渲染的;检查机以服务账户在非交互会话渲染,字体平滑可能有细差——这正是设通道容差 16 与 0.1% 像素占比的原因。若派单器的 TEST 验收在你的工位里因为比对失败而红,先看失败行列出的不同像素占比:全部 36 张都超标且占比相近 = 渲染环境整体差异,停下交 blocked + forks 报告各张占比(不许擅自放宽容差、不许改基准图、不许跳过比对);只有个别张超标 = 真差异,同样停下报告,不许改基准。\n\n同仓同时有别的工单可能在改 winclient/WinClient.Core、node、authserver——本单一律不碰。\n\n硬规矩:①既有断言一个不删不放宽,RenderTests 仍渲染 36 张、主按钮位置断言照旧;②不许修改或新增 Baselines/ 下任何文件(基准由派单方管理);③不许用环境变量或 Skip 让比对在 CI 上不跑;④工人不许 git 写操作,不许自己跑 dotnet build/test/restore(用派单器自测通道按验收编号申请);不往受测目录写临时文件;⑤工位无外网,缺依赖停下交 blocked;⑥所有新增文案与注释中文;⑦拿不准停下交 blocked + forks,不猜。",
+  "nonGoals": [
+    "不改界面本身(App)、不改 Core、不改其他测试文件",
+    "不新增或修改 Baselines/ 下任何图片",
+    "不放宽既有断言,不加 Skip 或环境变量跳过"
+  ],
+  "allowedPaths": [
+    "winclient/WinClient.UiTests/RenderTests.cs",
+    "winclient/WinClient.UiTests/ScreenshotBaseline.cs",
+    "winclient/WinClient.UiTests/ScreenshotBaselineTests.cs",
+    ".github/workflows/ci.yml",
+    "docs/winclient/界面说明.md"
+  ],
+  "forbiddenPaths": [
+    ".codex/**",
+    ".gitignore",
+    "node/**",
+    "authserver/**",
+    "scripts/**",
+    "pyproject.toml",
+    "requirements-dev.txt",
+    "docs/design/**",
+    "docs/plans/**",
+    "docs/acceptance/**",
+    "docs/node/**",
+    "docs/交接/**",
+    "docs/authserver/**",
+    "docs/口径速查表.md",
+    "docs/开工须知.md",
+    "winclient/*.sln",
+    "winclient/Directory.Build.props",
+    "winclient/third_party/**",
+    "winclient/WinClient.App/**",
+    "winclient/WinClient.Core/**",
+    "winclient/WinClient.Tests/**",
+    "winclient/WinClient.UiTests/Baselines/**",
+    "winclient/WinClient.UiTests/WinClient.UiTests.csproj",
+    "winclient/WinClient.UiTests/UiThreadFixture.cs",
+    "winclient/WinClient.UiTests/ViewModelTests.cs",
+    "winclient/WinClient.UiTests/MonoTextTests.cs",
+    "winclient/WinClient.UiTests/StatusPresentationTests.cs",
+    "winclient/WinClient.UiTests/ThemeAndMotionTests.cs"
+  ],
+  "expectArtifacts": [
+    "winclient/WinClient.UiTests/ScreenshotBaseline.cs",
+    "winclient/WinClient.UiTests/ScreenshotBaselineTests.cs",
+    "winclient/WinClient.UiTests/RenderTests.cs",
+    ".github/workflows/ci.yml",
+    "docs/winclient/界面说明.md"
+  ],
+  "acceptance": [
+    {
+      "id": "BUILD",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "build",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1200
+    },
+    {
+      "id": "TEST",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "test",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--no-build",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1200
+    },
+    {
+      "id": "SHAPE-CMP",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;p=pathlib.Path('winclient/WinClient.UiTests/ScreenshotBaseline.cs');s=p.read_text(encoding='utf-8') if p.exists() else '';bad=[k for k,ok in (('consts','ChannelTolerance = 16' in s and 'MaxDifferentRatio = 0.001' in s),('api','CompareResult' in s and 'static CompareResult Compare(' in s and 'ReadPng' in s and 'BaselineDirectory' in s and 'YC_UPDATE_UI_BASELINE' in s),('decode','PngBitmapDecoder' in s and 'FormatConvertedBitmap' in s)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "SHAPE-RENDER",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;s=pathlib.Path('winclient/WinClient.UiTests/RenderTests.cs').read_text(encoding='utf-8');bad=[k for k,ok in (('use','ScreenshotBaseline.Compare' in s and 'ScreenshotBaseline.UpdateRequested' in s and 'ScreenshotBaseline.ReadPng' in s),('msgs','缺少基准图' in s and '与基准不同' in s and '检查机上不许更新基准图' in s and 'diff' in s),('kept','Assert.Equal(36, count)' in s and '截图不得为纯色' in s and 'Assert.Equal(10, bounds.Count)' in s and 'UserInteractive' not in s),('noskip','Skip' not in s)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "TESTS-NEW",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;p=pathlib.Path('winclient/WinClient.UiTests/ScreenshotBaselineTests.cs');s=p.read_text(encoding='utf-8') if p.exists() else '';n=s.count('[Fact]')+s.count('[Theory]');bad=[k for k,ok in (('count',n>=5),('cases','900' in s and '0xFFFF0000' in s and '1000' in s and 'SizeMatches' in s)) if not ok];print(n,bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "CI-YML",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;s=pathlib.Path('.github/workflows/ci.yml').read_text(encoding='utf-8');bad=[k for k,ok in (('upload','actions/upload-artifact@v4' in s and 'ui-shots-${{ github.run_id }}' in s and 'path: build/ui-shots' in s and 'retention-days: 7' in s and 'continue-on-error: true' in s and 'always()' in s),('kept','dotnet test winclient --nologo' in s and 'ruff' in s and 'CI_RUNS_ON' in s),('order',s.find('dotnet test winclient')<s.find('upload-artifact'))) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;s=pathlib.Path('docs/winclient/界面说明.md').read_text(encoding='utf-8');i=s.find('## 界面测试与截图');bad=[k for k,ok in (('section','### 基准图比对' in s and s.find('### 基准图比对')>i>0),('content','YC_UPDATE_UI_BASELINE' in s and 'build/ui-shots/diff' in s and '0.1%' in s and 'Baselines' in s and 'ui-shots-' in s and '重建基准' in s),('kept','固定的八项自检明细样本' in s and '真机' in s)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "BASELINES-UNTOUCHED",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess as sp,sys;mb=sp.check_output(['git','merge-base','origin/main','HEAD'],text=True).strip();ch=sp.check_output(['git','diff','--name-only',mb,'--','winclient/WinClient.UiTests/Baselines'],text=True).split()+sp.check_output(['git','ls-files','--others','--exclude-standard','winclient/WinClient.UiTests/Baselines'],text=True).split();n=len(sp.check_output(['git','ls-files','winclient/WinClient.UiTests/Baselines'],text=True).split());print(ch,n);sys.exit(1 if ch or n!=36 else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "SCOPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess as sp,sys;g=lambda *a:sp.check_output(['git','-c','core.quotepath=false']+list(a)).decode('utf-8').split(chr(10));mb=g('merge-base','origin/main','HEAD')[0].strip();ch={p.strip() for p in g('diff','--name-only',mb)+g('ls-files','--others','--exclude-standard') if p.strip()};ok=set(['winclient/WinClient.UiTests/RenderTests.cs', 'winclient/WinClient.UiTests/ScreenshotBaseline.cs', 'winclient/WinClient.UiTests/ScreenshotBaselineTests.cs', '.github/workflows/ci.yml', 'docs/winclient/界面说明.md']);bad=sorted(ch-ok);print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "NOBIN",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess,sys;out=subprocess.run(['git','ls-files','winclient','build'],capture_output=True,text=True).stdout.split();bad=[f for f in out if f.endswith(('.exe','.dll','.zip','.pdb'))];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "model": null,
+  "timeoutSec": 7200,
+  "repoRoot": "E:/yuanc",
+  "engine": "codex",
+  "reasoningEffort": "medium",
+  "steps": [
+    "读 BACKGROUND 列出的文件;先写 ScreenshotBaselineTests.cs(纯数组),再写 ScreenshotBaseline.cs。",
+    "改 RenderTests.cs 接入比对;BUILD / TEST / SHAPE-CMP / SHAPE-RENDER / TESTS-NEW / BASELINES-UNTOUCHED 全绿(TEST 比对失败按 BACKGROUND 风险段处理,停下报告)。",
+    "改 ci.yml 与界面说明;CI-YML / DOCS / SCOPE / NOBIN 绿。"
+  ]
+}
