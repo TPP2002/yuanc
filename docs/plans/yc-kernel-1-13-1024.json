@@ -1,0 +1,264 @@
+{
+  "schemaVersion": 1,
+  "taskId": "SEC-TUNNEL-KERNEL-UPGRADE-1024",
+  "slug": "yc-kernel-1-13-1024",
+  "title": "sing-box 内核 1.10.7 → 1.13.21:节点与客户端配置改 1.13 写法、节点拒绝旧内核、内核配置自检脚本与握手复核工具",
+  "goal": "以派单时 origin/main 头为基点。看板卡 SEC-TUNNEL-KERNEL-UPGRADE-1024:把 sing-box 内核从 1.10.7 升到 1.13.21,节点与 Windows 客户端同时切换,配置全部改成 1.13 写法。\n\n为什么必须一次切完(派单方已实测,写进文档):1.13.21 读旧配置直接报错退出(旧 DNS 服务器写法 1.12 废弃,`check` 输出 `legacy DNS servers is deprecated ... FATAL`);block/dns 两种特殊出站、入站 sniff、出站 override_address 在 1.13 已删除;而 1.10.7 不认新 DNS 写法。所以不存在两版都认的写法,节点与客户端要同时升级。派单方已用 1.13.21 对按下面写法改好的两份配置跑 `sing-box check`,退出码 0、零输出。\n\n做完后:\n\n① winclient/third_party/manifest.json 的 sing-box 项改为:version \"1.13.21\";url \"https://github.com/SagerNet/sing-box/releases/download/v1.13.21/sing-box-1.13.21-windows-amd64.zip\";zip_sha256 \"a03291793d3a3c6e266447a58140657ac099ff278abf3b8ff678932356a62ced\";zip_member \"sing-box-1.13.21-windows-amd64/sing-box.exe\";file \"sing-box.exe\";file_sha256 \"ccb2fad603c89efcbc14358ab40b2c7000a5bb4e3bffa170d5c355cda90757ba\"。wintun 项不动。(压缩包里另有 libcronet.dll,本产品不用;派单方实测只拷 sing-box.exe 一个文件 version 与 check 都正常,不要把 dll 加进清单。)\n\n② node/exitnode/proxy/client_config.py 的 render_client_windows 输出改成下面这样(键顺序照写,C# 与 Python 共用一份黄金文件比对):\n  - \"dns\": {\"servers\": [{\"type\": \"https\", \"tag\": \"dns-remote\", \"server\": \"1.1.1.1\", \"detour\": \"proxy\"}], \"final\": \"dns-remote\", \"strategy\": \"ipv4_only\"} —— 删掉 dns.rules(只有一台 DNS 服务器,final 已指向它;DNS 规则里的 outbound 条件 1.12 起废弃)。\n  - 入站 tun 删掉 \"sniff\",其余字段与顺序不变。\n  - outbounds 只剩 main、backup、proxy(urltest)三个,删掉 block 与 dns 两项。\n  - \"route\": {\"final\": \"proxy\", \"rules\": [{\"action\": \"sniff\"}, {\"ip_version\": 6, \"action\": \"reject\"}, {\"protocol\": \"dns\", \"action\": \"hijack-dns\"}], \"auto_detect_interface\": True} —— sniff 必须是第一条,否则 hijack-dns 认不出 DNS 流量。\n  - 模块文档串改成「sing-box 1.13 格式」。subscription.py 若无需改动可不动(安卓 SFA 须 1.13 及以上,写进文档)。\n\n③ node/exitnode/proxy/server_config.py 的 render_server:\n  - \"dns\": {\"servers\": [{\"type\": \"udp\", \"tag\": \"upstream\", \"server\": \"1.1.1.1\"}], \"final\": \"upstream\"}。\n  - \"outbounds\": [{\"type\": \"direct\", \"tag\": \"direct\"}](删 block、删 admin-local)。\n  - 规则第一条改为 {\"ip_cidr\": [\"198.18.255.1/32\"], \"action\": \"route\", \"outbound\": \"direct\", \"override_address\": ctx.admin_bind, \"override_port\": ctx.admin_port};维护规则(auth_user…port 22…outbound direct)不变;两条封堵改为 {\"ip_is_private\": True, \"action\": \"reject\"} 与 {\"ip_cidr\": [\"198.18.0.0/15\"], \"action\": \"reject\"};顺序不变。文档串改成 1.13。\n\n④ 黄金文件 node/tests/golden/proxy/client-windows.json 与 server.json 按②③同步改(\"_comment\" 保留;inputs.json 不动)。node/tests/test_proxy_client_render.py、test_proxy_server_render.py 按新写法改断言,并新增断言:客户端 outbounds 类型集合 == {vless, hysteria2, urltest};rules[0] == {\"action\": \"sniff\"};tun 入站没有 sniff 键;dns 服务器没有 address 键;服务端 outbounds == [{\"type\":\"direct\",\"tag\":\"direct\"}],没有任何 outbound 值为 block 或 admin-local 的规则。\n\n⑤ winclient/WinClient.Core/Pairing/LocalConfigRenderer.cs 与②逐字段同构,输出与黄金文件逐字节一致(既有 PairingTests 等黄金比对必须仍绿)。\n\n⑥ winclient/WinClient.Core/Client/RoutingRenderer.cs:\n  - 仅指定程序模式:从原规则里按原顺序保留 action 为 \"sniff\" 的规则和 protocol 为 \"dns\" 的规则(原来只保留后者),再接鉴权直连规则(有 auth 时)、IPv6 规则 {\"process_path_regex\": [...], \"ip_version\": 6, \"action\": \"reject\"}(原 outbound block)、代理规则 {\"process_path_regex\": [...], \"outbound\": \"proxy\"};route.final 仍为 direct。\n  - 全部流量模式(WriteGlobalRoute):先写原规则开头连续的 action 为 \"sniff\" 的规则,再写鉴权直连规则,再写其余原规则(仍跳过 outbound 为 \"direct\" 的旧规则)。\n  - WinClient.Tests/RoutingTests.cs 相应改断言并新增:两种模式下 rules[0] 都是 {\"action\":\"sniff\"};仅指定程序模式里 IPv6 规则 action == \"reject\" 且没有 outbound 键;两种模式输出里都找不到值为 \"block\" 或 \"dns-out\" 的 outbound。\n\n⑦ winclient/WinClient.Core/Environment/EnvironmentSelfCheck.cs:「IPv6 阻断」两处判据(仅指定程序模式的 HasRule(\"block\", true) 与全部流量模式的 outbound==\"block\")改为认 action == \"reject\";dns.servers detour 判据不变。EnvironmentSelfCheckTests.cs 的配置样例改新写法,并新增一条:旧写法(outbound block)不再算 IPv6 阻断通过。检查项名字与文案不变。\n\n⑧ 节点内核版本下限:新文件 node/exitnode/proxy/kernel.py:`MIN_KERNEL = (1, 13, 0)`;`def kernel_version(runner, path) -> tuple[int, int, int] | None`:执行 [path, \"version\"](check=False,输出不进日志),从标准输出用正则 `sing-box version (\\d+)\\.(\\d+)\\.(\\d+)` 取版本,取不到或退出码非 0 返回 None;`def require_kernel(runner, path) -> None`:版本为 None 或低于 MIN_KERNEL 时 raise ValueError(\"sing-box 内核版本过低或无法识别(当前 <版本或「未知」>),需要 1.13.0 及以上;请先升级内核\")。cli.py 的 init 在「未找到 sing-box」检查之后、任何写入之前,对按同一顺序找到的第一个存在的内核路径调 require_kernel。Runner 接口以 node/exitnode/proxy/runner_proto.py 为准。新增 node/tests/test_proxy_kernel.py 覆盖:1.13.0 通过、1.13.21 通过、1.12.9 拒绝、输出无法解析拒绝、退出码非 0 拒绝,且拒绝时 init 不写任何服务文件。既有 test_cli.py 等的假 Runner 若因新增 version 调用缺返回值,按持续授权最小补齐夹具(让假内核报 1.13.21),不改原断言。\n\n⑨ 新文件 scripts/kernel/check_configs.py(无参数,仓库根 = 本文件上两级):读 manifest 的 sing-box 项 → 缓存包 winclient/third_party/cache/<url 文件名>,不存在则打印「缺少内核缓存 <路径>,先跑 scripts/release/fetch-third-party.ps1」并退出 2 → 校验 zip_sha256 → 把 zip_member 解到 tempfile.TemporaryDirectory()(不写进仓库)→ 校验 file_sha256 → 跑 `version`,输出须含 manifest 的版本号 → 对三份配置各跑一次 `check -c <文件>`:黄金 client-windows.json、黄金 server.json、client-windows 加上 inbounds[0].platform = {\"http_proxy\": {\"enabled\": false}}(即安卓订阅形态)。三份都先删掉以 \"_\" 开头的顶层键写到临时目录;server 的 hysteria2 入站证书用 `sing-box generate tls-keypair <该入站 tls.server_name>` 生成到临时目录(输出里 PRIVATE KEY 与 CERTIFICATE 两段 PEM)并替换 certificate_path/key_path。每份要求退出码 0 且标准输出与标准错误合起来为空(有废弃提示也算不过)。每份打印一行「通过 <名>」或「未通过 <名>:<输出前 500 字>」,有不过的退出 1。所有子进程在 Windows 上带 creationflags=subprocess.CREATE_NO_WINDOW。\n\n⑩ 新文件 scripts/kernel/capture_clienthello.py:以派单方放进工位的 build/utls-check/capture.py 为蓝本(那份不入库;逻辑照搬:全在 127.0.0.1,本地 Reality 出站与本机 Chrome 各发一次握手,解析 ClientHello 算 JA4),改为 argparse 参数 --sing-box、--chrome、--out(结果 JSON 路径,必填);结果键改为 \"singbox\"(另加 \"singbox_version\" 取自 `version` 输出首行)与 \"chrome_local\";新增结果字段 \"has_mlkem\"(key_share 或 supported_groups 含 0x11ec)与 \"has_ech\"(扩展含 0xfe0d)。只作人工复核工具,不进 CI、不进验收运行(本单只验 py_compile 与 --help)。\n\n⑪ 文档(全中文,不出现「伪装、反追踪、风控、指纹浏览器」这类说法):\n  - docs/node/握手特征核对记录.md 新增一节「## 内核 1.13.21 复核(2026-10-24)」,如实写派单方实测:1.13.21 utls=chrome 首包 JA4 `t13d1516h2_8daaf6152771_d8a2da3f94cd`、500 字节;比 1.10.7 多了新 ALPS 编号 0x44cd 与 ECH 扩展 0xfe0d;**仍没有 X25519MLKEM768(0x11ec)**,TLS 选项里加 curve_preferences 也带不出来;本机 Chrome 155 为 `t13d1517h2_…_cb7bf5808d99`、1984 字节;sing-box 官方更新记录查到 1.14.x 为止没有 uTLS/Reality 支持该项的条目;结论「升级缩小了差距但仍对不上,抗量子密钥交换这一项目前内核做不到」。原文末尾「立卡 SEC-TUNNEL-KERNEL-UPGRADE-1024 … 要求至少带上 X25519MLKEM768」那条改写为已执行、并注明该要求未能满足及原因。复核方法改为 `python scripts/kernel/capture_clienthello.py --sing-box … --chrome … --out …`。\n  - docs/node/隧道配置说明.md:第 138 行一带「按 sing-box 1.10 格式」改为 1.13 格式,依据链接换成 v1.13.21 的 raw 文档;新增「节点与客户端必须同时升级」段(写清上面的实测原因);写明节点要求内核 1.13.0 及以上、init 会拒绝旧内核;安卓 SFA 须 1.13 及以上;写明 `python scripts/kernel/check_configs.py` 的用法。\n  - docs/node/更新与回退说明.md 或隧道配置说明的安装段写 Linux 内核来源:https://github.com/SagerNet/sing-box/releases/download/v1.13.21/sing-box-1.13.21-linux-amd64.tar.gz,压缩包 sha256 24f9ef8e7234e13e71e74c3598a4164c5fe07b7b67ccc6e96cf68b54789f72cd,包内 sing-box-1.13.21-linux-amd64/sing-box 的 sha256 ddf3a5c6f7594b18992c1b374e1694d12fe0e3e37accef7b97c6f987dd7b7479;写明「回退到 1.10.7 内核要连同节点程序一起回退,单换内核会读不了配置」。\n  - docs/winclient/打包与发布说明.md 第 46、51 行一带的表格换成 1.13.21 的地址、成员名与两个哈希。\n  - scripts/release/README.md 例子里的 `--sing-box-version 1.12.0` 改成 1.13.21。\n  - docs/winclient/分应用代理说明.md、环境一致性说明.md 中若写到 outbound block / dns-out / sniff 的,改成新写法(没有就不动)。",
+  "background": "项目:外包「澳洲出口节点 + Windows 一键客户端」。节点端 Python 3.11(node/exitnode,pytest 在 node/tests);客户端 .NET 9(winclient/WinClient.sln:Core + App + Tests + UiTests)。sing-box 是隧道内核:节点用 Linux 版(维护人员手装,init 不自动下载),客户端把 Windows 版 sing-box.exe 嵌进安装包(winclient/third_party/manifest.json 钉版本与哈希,打包脚本从 winclient/third_party/cache/ 取压缩包)。客户端每次连接时由 LocalConfigRenderer 按配对信息现渲染配置、再经 RoutingRenderer 按代理范围改写,不落盘旧配置,所以没有「旧配置迁移」问题。\n\n先读:node/exitnode/proxy/{client_config,server_config,subscription,runner_proto}.py、node/exitnode/cli.py 的 init(找「未找到 sing-box」)、node/tests/golden/proxy/*、node/tests/test_proxy_client_render.py、test_proxy_server_render.py、test_renderer_parity.py、winclient/WinClient.Core/Pairing/LocalConfigRenderer.cs、Client/RoutingRenderer.cs、Environment/EnvironmentSelfCheck.cs 第 100~140 行、WinClient.Tests/RoutingTests.cs、EnvironmentSelfCheckTests.cs、docs/node/握手特征核对记录.md、docs/node/隧道配置说明.md。派单方已把 1.13.21 的 Windows 压缩包放进工位 winclient/third_party/cache/(不入库),并把抓包蓝本放在工位 build/utls-check/capture.py(不入库)。\n\n1.13 配置写法要点(以官方迁移说明为准):特殊出站 block → 路由规则 \"action\": \"reject\";dns 出站 → \"action\": \"hijack-dns\",且前面要有 \"action\": \"sniff\" 规则;入站 sniff 字段删除;出站 override_address/override_port → 路由规则 \"action\": \"route\" 上的同名字段;DNS 服务器改 type/server 写法(\"address\" 不再用)。\n\n同仓可能有别的工单在改 authserver、winclient/WinClient.App、UiTests——本单一律不碰。\n\n硬规矩:①既有测试断言只在本单明确改变的写法处改,其余不删不放宽;黄金文件 C#/Python 双边比对必须仍成立;②凭据不进日志、不进输出(kernel_version 不打印子进程输出);③Windows 子进程一律 CREATE_NO_WINDOW;④工人不许 git 写操作,不许自己跑 dotnet / pytest(用派单器自测通道按验收编号申请);不往受测目录写临时文件;⑤工位无外网,缺依赖或缺缓存包停下交 blocked;⑥新增文案与注释中文;⑦拿不准(例如某个 1.13 字段 check 不过、或 RoutingRenderer 某条既有测试的意图与本单冲突)停下交 blocked + forks,不猜、不擅自换写法。",
+  "nonGoals": [
+    "不改 authserver、WinClient.App、WinClient.UiTests、.github",
+    "不改配对文件格式与凭据处理",
+    "不追求首包与 Chrome 完全一致;不引入别的内核或 TLS 库",
+    "不把 libcronet.dll 加进清单;不提交任何二进制"
+  ],
+  "allowedPaths": [
+    "winclient/third_party/manifest.json",
+    "node/exitnode/proxy/client_config.py",
+    "node/exitnode/proxy/server_config.py",
+    "node/exitnode/proxy/subscription.py",
+    "node/exitnode/proxy/kernel.py",
+    "node/exitnode/cli.py",
+    "node/tests/golden/proxy/client-windows.json",
+    "node/tests/golden/proxy/server.json",
+    "winclient/WinClient.Core/Pairing/LocalConfigRenderer.cs",
+    "winclient/WinClient.Core/Client/RoutingRenderer.cs",
+    "winclient/WinClient.Core/Environment/EnvironmentSelfCheck.cs",
+    "scripts/kernel/check_configs.py",
+    "scripts/kernel/capture_clienthello.py",
+    "scripts/release/README.md",
+    "docs/node/握手特征核对记录.md",
+    "docs/node/隧道配置说明.md",
+    "docs/node/更新与回退说明.md",
+    "docs/winclient/打包与发布说明.md",
+    "docs/winclient/分应用代理说明.md",
+    "docs/winclient/环境一致性说明.md",
+    "node/tests/test_*.py",
+    "winclient/WinClient.Tests/*.cs"
+  ],
+  "forbiddenPaths": [
+    ".codex/**",
+    ".github/**",
+    ".gitignore",
+    "authserver/**",
+    "pyproject.toml",
+    "requirements-dev.txt",
+    "docs/design/**",
+    "docs/plans/**",
+    "docs/acceptance/**",
+    "docs/交接/**",
+    "docs/authserver/**",
+    "docs/口径速查表.md",
+    "docs/开工须知.md",
+    "winclient/*.sln",
+    "winclient/Directory.Build.props",
+    "winclient/third_party/cache/**",
+    "winclient/WinClient.App/**",
+    "winclient/WinClient.UiTests/**",
+    "winclient/WinClient.Tests/WinClient.Tests.csproj",
+    "winclient/WinClient.Core/WinClient.Core.csproj",
+    "node/tests/golden/proxy/inputs.json",
+    "scripts/release/*.py",
+    "scripts/release/*.ps1"
+  ],
+  "expectArtifacts": [
+    "winclient/third_party/manifest.json",
+    "node/exitnode/proxy/kernel.py",
+    "node/tests/test_proxy_kernel.py",
+    "scripts/kernel/check_configs.py",
+    "scripts/kernel/capture_clienthello.py",
+    "docs/node/握手特征核对记录.md"
+  ],
+  "acceptance": [
+    {
+      "id": "BUILD",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "build",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1200
+    },
+    {
+      "id": "TEST",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "test",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--no-build",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1500
+    },
+    {
+      "id": "PYTEST",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+        "node/tests"
+      ],
+      "required": true,
+      "timeoutSec": 900
+    },
+    {
+      "id": "RUFF",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "ruff",
+        "check",
+        "node",
+        "scripts/kernel"
+      ],
+      "required": true,
+      "timeoutSec": 300
+    },
+    {
+      "id": "KERNEL-CHECK",
+      "kind": "command",
+      "argv": [
+        "python",
+        "scripts/kernel/check_configs.py"
+      ],
+      "required": true,
+      "timeoutSec": 300
+    },
+    {
+      "id": "MANIFEST",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,json,sys;m=json.loads(pathlib.Path('winclient/third_party/manifest.json').read_text(encoding='utf-8'));s=[i for i in m['items'] if i['name']=='sing-box'][0];w=[i for i in m['items'] if i['name']=='wintun'][0];bad=[k for k,ok in (('ver',s['version']=='1.13.21'),('zip',s['zip_sha256']=='a03291793d3a3c6e266447a58140657ac099ff278abf3b8ff678932356a62ced'),('file',s['file_sha256']=='ccb2fad603c89efcbc14358ab40b2c7000a5bb4e3bffa170d5c355cda90757ba'),('member',s['zip_member']=='sing-box-1.13.21-windows-amd64/sing-box.exe'),('url',s['url'].endswith('/v1.13.21/sing-box-1.13.21-windows-amd64.zip')),('wintun',w['version']=='0.14.1'),('count',len(m['items'])==2)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "SHAPE-GOLDEN-C",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,json,sys;c=json.loads(pathlib.Path('node/tests/golden/proxy/client-windows.json').read_text(encoding='utf-8'));r=c['route']['rules'];t=json.dumps(c);bad=[k for k,ok in (('out',[o['type'] for o in c['outbounds']]==['vless','hysteria2','urltest']),('rules',r==[{'action':'sniff'},{'ip_version':6,'action':'reject'},{'protocol':'dns','action':'hijack-dns'}]),('dns',c['dns']['servers']==[{'type':'https','tag':'dns-remote','server':'1.1.1.1','detour':'proxy'}] and 'rules' not in c['dns']),('tun','sniff' not in c['inbounds'][0]),('old','dns-out' not in t and '\"block\"' not in t)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "SHAPE-GOLDEN-S",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,json,sys;v=json.loads(pathlib.Path('node/tests/golden/proxy/server.json').read_text(encoding='utf-8'));sr=v['route']['rules'];t=json.dumps(v);bad=[k for k,ok in (('out',v['outbounds']==[{'type':'direct','tag':'direct'}]),('admin',sr[0].get('action')=='route' and sr[0].get('outbound')=='direct' and 'override_address' in sr[0] and 'override_port' in sr[0]),('reject',sum(1 for x in sr if x.get('action')=='reject')==2),('dns',v['dns']['servers']==[{'type':'udp','tag':'upstream','server':'1.1.1.1'}]),('old','admin-local' not in t and '\"block\"' not in t)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "SHAPE-CS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,json,sys;r=lambda f:pathlib.Path('winclient/WinClient.Core/'+f).read_text(encoding='utf-8');a=r('Pairing/LocalConfigRenderer.cs');b=r('Client/RoutingRenderer.cs');e=r('Environment/EnvironmentSelfCheck.cs');bad=[k for k,ok in (('local','hijack-dns' in a and 'reject' in a and 'sniff' in a and 'dns-out' not in a and '\"block\"' not in a and 'address = \"https' not in a),('routing','reject' in b and 'sniff' in b and '\"block\"' not in b),('self','reject' in e and 'HasRule(\"block\"' not in e and '== \"block\"' not in e)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "SHAPE-NODE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,json,sys;r=lambda f:pathlib.Path(f).read_text(encoding='utf-8') if pathlib.Path(f).exists() else '';k=r('node/exitnode/proxy/kernel.py');c=r('node/exitnode/cli.py');t=r('node/tests/test_proxy_kernel.py');bad=[x for x,ok in (('kernel','MIN_KERNEL = (1, 13, 0)' in k and 'def kernel_version(' in k and 'def require_kernel(' in k and '1.13.0 及以上' in k),('cli','require_kernel' in c),('tests','1.12.9' in t and '1.13.21' in t and '1.13.0' in t)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "TOOLS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,json,sys;import subprocess;p='scripts/kernel/capture_clienthello.py';s=pathlib.Path(p).read_text(encoding='utf-8');c=pathlib.Path('scripts/kernel/check_configs.py').read_text(encoding='utf-8');h=subprocess.run([sys.executable,p,'--help'],capture_output=True,text=True);bad=[x for x,ok in (('help',h.returncode==0 and '--sing-box' in h.stdout and '--chrome' in h.stdout and '--out' in h.stdout),('cap','has_mlkem' in s and 'has_ech' in s and '0x11ec' in s.lower() and ('CREATE_NO_WINDOW' in s or '0x08000000' in s)),('chk','CREATE_NO_WINDOW' in c and 'tls-keypair' in c and 'TemporaryDirectory' in c and 'fetch-third-party.ps1' in c)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "TESTS-NEW",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,json,sys;r=lambda f:pathlib.Path(f).read_text(encoding='utf-8');a=r('winclient/WinClient.Tests/RoutingTests.cs');e=r('winclient/WinClient.Tests/EnvironmentSelfCheckTests.cs');pc=r('node/tests/test_proxy_client_render.py');ps=r('node/tests/test_proxy_server_render.py');bad=[x for x,ok in (('routing','sniff' in a and 'reject' in a and 'dns-out' in a),('self','reject' in e),('py-client','hijack-dns' in pc and 'sniff' in pc),('py-server','reject' in ps and 'override_address' in ps)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,json,sys;r=lambda f:pathlib.Path(f).read_text(encoding='utf-8');h=r('docs/node/握手特征核对记录.md');t=r('docs/node/隧道配置说明.md');u=r('docs/node/更新与回退说明.md');p=r('docs/winclient/打包与发布说明.md');x=r('scripts/release/README.md');nu=t+u;bad=[k for k,ok in (('hs','## 内核 1.13.21 复核' in h and 't13d1516h2_8daaf6152771_d8a2da3f94cd' in h and '0x11ec' in h and '0x44cd' in h and '0xfe0d' in h and 'capture_clienthello.py' in h),('tunnel','1.13' in t and 'v1.13.21' in t and '同时升级' in t and 'check_configs.py' in t and 'SFA' in t),('linux','24f9ef8e7234e13e71e74c3598a4164c5fe07b7b67ccc6e96cf68b54789f72cd' in nu and 'ddf3a5c6f7594b18992c1b374e1694d12fe0e3e37accef7b97c6f987dd7b7479' in nu),('pack','a03291793d3a3c6e266447a58140657ac099ff278abf3b8ff678932356a62ced' in p and '1.10.7-windows' not in p),('readme','1.13.21' in x and '1.12.0' not in x),('words',not any(w in h+t+u+p for w in ('反追踪','风控','指纹浏览器')))) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "SCOPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess as sp,sys;g=lambda *a:sp.check_output(['git','-c','core.quotepath=false']+list(a)).decode('utf-8').split(chr(10));mb=g('merge-base','origin/main','HEAD')[0].strip();ch={p.strip() for p in g('diff','--name-only',mb)+g('ls-files','--others','--exclude-standard') if p.strip()};ok=set([\"winclient/third_party/manifest.json\", \"node/exitnode/cli.py\", \"winclient/WinClient.Core/Pairing/LocalConfigRenderer.cs\", \"winclient/WinClient.Core/Client/RoutingRenderer.cs\", \"winclient/WinClient.Core/Environment/EnvironmentSelfCheck.cs\", \"scripts/release/README.md\", \"docs/winclient/打包与发布说明.md\", \"docs/winclient/分应用代理说明.md\", \"docs/winclient/环境一致性说明.md\"]);pre=[\"node/exitnode/proxy/\", \"node/tests/\", \"scripts/kernel/\", \"winclient/WinClient.Tests/\", \"docs/node/\"];bad=sorted(p for p in ch if p not in ok and not any(p.startswith(x) for x in pre));print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "NOBIN",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess,sys;out=subprocess.run(['git','ls-files','winclient','build','scripts','node'],capture_output=True,text=True).stdout.split();bad=[f for f in out if f.endswith(('.exe','.dll','.zip','.pdb','.tar.gz','.so'))];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "model": null,
+  "timeoutSec": 10800,
+  "repoRoot": "E:/yuanc",
+  "engine": "codex",
+  "reasoningEffort": "medium",
+  "steps": [
+    "读 BACKGROUND 列出的文件;先改 Python 渲染器与黄金文件、节点测试,PYTEST / RUFF / SHAPE-GOLDEN-C / SHAPE-GOLDEN-S 绿。",
+    "改 LocalConfigRenderer / RoutingRenderer / EnvironmentSelfCheck 与 C# 测试,BUILD / TEST / SHAPE-CS / TESTS-NEW 绿。",
+    "写 kernel.py 与 init 接入、test_proxy_kernel.py,SHAPE-NODE / PYTEST 绿。",
+    "改 manifest,写 scripts/kernel 两个脚本,MANIFEST / KERNEL-CHECK / TOOLS 绿。",
+    "改文档,DOCS / SCOPE / NOBIN 绿。"
+  ]
+}
