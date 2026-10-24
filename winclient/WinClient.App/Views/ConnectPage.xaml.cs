@@ -29,7 +29,7 @@ public partial class ConnectPage : UserControl
     private void RowTextUpdated(object sender, DataTransferEventArgs e)
     {
         if (sender is not TextBlock text || text.DataContext is not StatusRow { Label: "出口 IP" }) return;
-        if (previousExit is not null && previousExit != text.Text) EntranceMotion.Play(text, 300, 4);
-        previousExit = text.Text;
+        if (previousExit is not null && previousExit != MonoText.GetText(text)) EntranceMotion.Play(text, 300, 4);
+        previousExit = MonoText.GetText(text);
     }
 }
