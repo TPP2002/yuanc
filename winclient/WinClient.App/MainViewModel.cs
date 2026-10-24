@@ -22,6 +22,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
 {
     private ServiceAvailability availability;
     private ControlClient? client;
+    private bool previewConnection;
     private bool disposed;
     private readonly CancellationTokenSource lifetime = new();
     private readonly Func<string, CancellationToken, Task<string?>> runScript;
@@ -63,7 +64,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
     public string UpdateMessage => updateMessage;
 
     public bool IsBusy { get; private set; }
-    public bool CanUseConnection => client is not null && availability == ServiceAvailability.Ready && !IsBusy;
+    public bool CanUseConnection => (client is not null || previewConnection) && availability == ServiceAvailability.Ready && !IsBusy;
     public bool CanRestoreEnvironment => CanUseConnection && !ShouldDisconnect;
     public ICommand RestoreEnvironmentCommand { get; }
     private bool ShouldDisconnect => snapshot.ProtectionActive || snapshot.State is ConnectionState.Connected or ConnectionState.Connecting or ConnectionState.Reconnecting;
@@ -317,8 +318,9 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         serviceVersion = value.ServiceVersion; updateMessage = value.Update.Message; updateStatus = value.Update;
         Update(value);
     }
-    public void ApplyPreview(ControlSnapshot snapshot, ServiceAvailability availability)
+    public void ApplyPreview(ControlSnapshot snapshot, ServiceAvailability availability, bool connectionUsable = false)
     {
+        previewConnection = connectionUsable;
         this.availability = availability;
         this.snapshot = snapshot;
         serviceVersion = snapshot.ServiceVersion; updateMessage = snapshot.Update.Message; updateStatus = snapshot.Update;
