@@ -13,6 +13,22 @@ public sealed class RoutingTests
     internal const string Chrome = @"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe";
     internal const string Service = @"C:\Program Files\YuanC\WinClient.App.exe";
     internal static RoutingPolicy Apps => RoutingPolicy.Create("apps", [Chrome]);
+
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(false, true)]
+    [InlineData(true, false)]
+    [InlineData(true, true)]
+    public void 两种模式均先识别协议且不使用旧特殊出站(bool apps, bool authenticated)
+    {
+        var auth = authenticated ? new AuthEndpoint(IPAddress.Parse("192.0.2.5"), 8080, Service) : null;
+        var result = RoutingRenderer.Render(LocalConfigRenderer.Render(TestData.Node()),
+            apps ? Apps : RoutingPolicy.Global, Service, auth);
+        var rules = result.GetProperty("route").GetProperty("rules");
+        Assert.Equal("{\"action\":\"sniff\"}", rules[0].GetRawText());
+        Assert.DoesNotContain(rules.EnumerateArray(), rule => rule.TryGetProperty("outbound", out var outbound)
+            && outbound.GetString() is "block" or "dns-out");
+    }
     [Theory]
     [InlineData("bad", "C:\\app.exe", "代理范围只能是全部流量或仅指定程序。")]
     [InlineData("apps", "app.exe", "程序路径必须是以 .exe 结尾的完整路径。")]
@@ -72,12 +88,12 @@ public sealed class RoutingTests
         Assert.Equal("direct", outbounds[outbounds.GetArrayLength() - 1].GetProperty("type").GetString());
         Assert.Equal("direct", outbounds[outbounds.GetArrayLength() - 1].GetProperty("tag").GetString());
         var rules = result.GetProperty("route").GetProperty("rules");
-        Assert.Equal(RoutingRenderer.PathPattern(Service), Assert.Single(rules[0].GetProperty("process_path_regex").EnumerateArray()).GetString());
-        Assert.Equal("192.0.2.5/32", Assert.Single(rules[0].GetProperty("ip_cidr").EnumerateArray()).GetString());
-        Assert.Equal(8080, Assert.Single(rules[0].GetProperty("port").EnumerateArray()).GetInt32());
-        Assert.Equal("direct", rules[0].GetProperty("outbound").GetString());
+        Assert.Equal(RoutingRenderer.PathPattern(Service), Assert.Single(rules[1].GetProperty("process_path_regex").EnumerateArray()).GetString());
+        Assert.Equal("192.0.2.5/32", Assert.Single(rules[1].GetProperty("ip_cidr").EnumerateArray()).GetString());
+        Assert.Equal(8080, Assert.Single(rules[1].GetProperty("port").EnumerateArray()).GetInt32());
+        Assert.Equal("direct", rules[1].GetProperty("outbound").GetString());
         Assert.Equal(input.GetProperty("route").GetProperty("rules").EnumerateArray().Select(x => x.GetRawText()),
-            rules.EnumerateArray().Skip(1).Select(x => x.GetRawText()));
+            rules.EnumerateArray().Where((_, index) => index != 1).Select(x => x.GetRawText()));
         Assert.Equal("proxy", result.GetProperty("route").GetProperty("final").GetString());
         foreach (var key in new[] { "dns", "inbounds" })
             Assert.Equal(input.GetProperty(key).GetRawText(), result.GetProperty(key).GetRawText());
@@ -100,17 +116,18 @@ public sealed class RoutingTests
         Assert.Equal("direct", result.GetProperty("route").GetProperty("final").GetString());
         Assert.True(result.GetProperty("route").GetProperty("auto_detect_interface").GetBoolean());
         var rules = result.GetProperty("route").GetProperty("rules").EnumerateArray().ToArray();
-        Assert.Equal(authenticated ? 4 : 3, rules.Length);
-        Assert.Equal("dns", rules[0].GetProperty("protocol").GetString());
+        Assert.Equal(authenticated ? 5 : 4, rules.Length);
+        Assert.Equal("dns", rules[1].GetProperty("protocol").GetString());
         if (authenticated)
         {
-            Assert.Equal("direct", rules[1].GetProperty("outbound").GetString());
-            Assert.Equal("192.0.2.5/32", rules[1].GetProperty("ip_cidr")[0].GetString());
-            Assert.Equal(8080, rules[1].GetProperty("port")[0].GetInt32());
-            Assert.Equal(RoutingRenderer.PathPattern(Service), Assert.Single(rules[1].GetProperty("process_path_regex").EnumerateArray()).GetString());
+            Assert.Equal("direct", rules[2].GetProperty("outbound").GetString());
+            Assert.Equal("192.0.2.5/32", rules[2].GetProperty("ip_cidr")[0].GetString());
+            Assert.Equal(8080, rules[2].GetProperty("port")[0].GetInt32());
+            Assert.Equal(RoutingRenderer.PathPattern(Service), Assert.Single(rules[2].GetProperty("process_path_regex").EnumerateArray()).GetString());
         }
         Assert.Equal(6, rules[^2].GetProperty("ip_version").GetInt32());
-        Assert.Equal("block", rules[^2].GetProperty("outbound").GetString());
+        Assert.Equal("reject", rules[^2].GetProperty("action").GetString());
+        Assert.False(rules[^2].TryGetProperty("outbound", out _));
         Assert.Equal("proxy", rules[^1].GetProperty("outbound").GetString());
         var expected = new[] { Chrome, Service }.Order(StringComparer.Ordinal).Select(RoutingRenderer.PathPattern);
         foreach (var rule in rules.TakeLast(2)) Assert.Equal(expected, rule.GetProperty("process_path_regex").EnumerateArray().Select(x => x.GetString()));

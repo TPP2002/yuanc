@@ -30,6 +30,9 @@ def fake(*, pairing=False):
         "/var/lib/exitnode/secrets/hy2.crt": "测试证书",
         "/var/lib/exitnode/secrets/hy2.key": "测试私钥占位",
     }, responses={
+        ("/usr/bin/sing-box", "version"): CompletedResult(out="sing-box version 1.13.21\n"),
+        ("/usr/local/bin/sing-box", "version"): CompletedResult(out="sing-box version 1.13.21\n"),
+        ("/opt/exitnode/current/bin/sing-box", "version"): CompletedResult(out="sing-box version 1.13.21\n"),
         ("openssl", "x509"): CompletedResult(out="X509v3 Subject Alternative Name:\n    DNS:exitnode\n"),
         ("ip", "-j", "route"): CompletedResult(out='[{"dst":"default","dev":"eth0","gateway":"192.0.2.1"}]'),
         ("ip", "-j", "addr"): CompletedResult(out=json.dumps([
@@ -250,7 +253,9 @@ def test_repeated_init_does_not_repeat_commands_and_uninstall_keeps_secrets():
     assert "/etc/systemd/system/exitnode-nft.service" in runner.files
     before = [c for c in runner.calls if c[0] == "run"]
     assert main(["init"], runner) == 0
-    assert [c for c in runner.calls if c[0] == "run"] == before
+    # 重复安装只新增一次只读版本查询，不重复执行写入类系统命令。
+    assert [c for c in runner.calls if c[0] == "run"] == before + [
+        ("run", ("/opt/exitnode/current/bin/sing-box", "version"), False, None)]
     boundary = len(runner.calls)
     assert main(["uninstall"], runner) == 0
     undo = runner.calls[boundary:]
@@ -378,7 +383,9 @@ def test_timer_hardware_init_is_idempotent_and_undo_is_reverse(command, capsys):
     first_device = next(i for i, c in enumerate(calls) if c[1] == ("systemctl", "reload", "exitnode-proxy.service"))
     assert timer_index < first_device
     assert main(["init"], runner) == 0
-    assert [c for c in runner.calls if c[0] == "run"] == calls
+    # 重复安装只新增一次只读版本查询，不重复执行写入类系统命令。
+    assert [c for c in runner.calls if c[0] == "run"] == calls + [
+        ("run", ("/opt/exitnode/current/bin/sing-box", "version"), False, None)]
     boundary = len(runner.calls)
     assert main([command], runner) == 0
     undo = runner.calls[boundary:]
@@ -660,7 +667,9 @@ def test_admin_must_be_unprivileged_port_and_loopback_before_any_write(old, new,
     assert ("不小于 1024" in output) if "999" in new else ("回环" in output)
     assert not any(p.startswith("/etc/systemd/system/") for p in runner.files)
     assert "/var/lib/exitnode/manifest.json" not in runner.files
-    assert not any(c[0] in {"run", "chown", "chmod"} for c in runner.calls)
+    # 拒绝安装前只允许一次只读内核版本查询，权限修改仍不允许。
+    assert [c for c in runner.calls if c[0] in {"run", "chown", "chmod"}] == [
+        ("run", ("/usr/bin/sing-box", "version"), False, None)]
 
 
 @pytest.mark.parametrize("argv", [["admin", "serve"], ["--placeholder", "admin"]])

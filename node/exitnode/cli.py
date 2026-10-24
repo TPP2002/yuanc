@@ -16,6 +16,7 @@ from .config import ConfigError, load
 from .log import redact
 from .manifest import UNITS, Manifest
 from .netinfo import check, public_ipv4
+from .proxy.kernel import require_kernel
 from .rescue import probes as rescue_probes
 from .rescue import state as rescue_state
 from .rescue.runner import RealRunner as RescueRealRunner
@@ -195,12 +196,15 @@ def _install(config, config_path, runner, manifest):
     try:
         from .updater import layout
 
-        layout.repair(config, runner)
         program_path = layout.root(config) + "/current"
-        # 先做无命令的前置核对，缺内核时不得写入任何服务单元。
-        if not any(runner.exists(path) for path in (program_path + "/bin/sing-box",
-                   config.proxy.binary, "/usr/bin/sing-box", "/usr/local/bin/sing-box")):
+        # 先核对内核存在和版本，拒绝时不得写入任何服务单元。
+        kernel_path = next((path for path in (program_path + "/bin/sing-box",
+                           config.proxy.binary, "/usr/bin/sing-box", "/usr/local/bin/sing-box")
+                            if runner.exists(path)), None)
+        if kernel_path is None:
             raise ValueError("未找到 sing-box，请先安装 sing-box 内核；不会自动下载")
+        require_kernel(service.ProxyRunner(runner), kernel_path)
+        layout.repair(config, runner)
         # 托管服务以动态账户运行、没有任何能力，只能监听高端口并只收本机连接。
         if config.admin.port < 1024:
             raise ValueError("托管服务已降权运行，admin.port 须不小于 1024")

@@ -24,20 +24,22 @@ def inputs():
 
 def assert_no_fallback(config):
     outbounds = {o["tag"]: o for o in config["outbounds"]}
-    assert {o["type"] for o in outbounds.values()} == {"vless", "hysteria2", "urltest", "block", "dns"}
+    assert {o["type"] for o in outbounds.values()} == {"vless", "hysteria2", "urltest"}
     assert outbounds["proxy"]["outbounds"] == ["main", "backup"]
     assert config["route"]["final"] == "proxy"
     assert config["route"]["auto_detect_interface"] is True
-    assert {"ip_version": 6, "outbound": "block"} in config["route"]["rules"]
-    assert {"protocol": "dns", "outbound": "dns-out"} in config["route"]["rules"]
+    assert config["route"]["rules"][0] == {"action": "sniff"}
+    assert {"ip_version": 6, "action": "reject"} in config["route"]["rules"]
+    assert {"protocol": "dns", "action": "hijack-dns"} in config["route"]["rules"]
     assert config["dns"]["strategy"] == "ipv4_only"
     assert config["dns"]["final"] == "dns-remote"
-    assert all(s["detour"] == "proxy" and s["address"] == "https://1.1.1.1/dns-query"
+    assert all(s["detour"] == "proxy" and s["type"] == "https" and s["server"] == "1.1.1.1"
                for s in config["dns"]["servers"])
-    assert all(rule["server"] == "dns-remote" for rule in config["dns"]["rules"])
+    assert all("address" not in s for s in config["dns"]["servers"])
+    assert "rules" not in config["dns"]
     tun = config["inbounds"][0]
     assert tun["auto_route"] is True and tun["strict_route"] is True
-    assert tun["sniff"] is True and tun["stack"] == "system"
+    assert "sniff" not in tun and tun["stack"] == "system"
     assert "172.19.0.1/30" in tun["address"]
     assert any(ipaddress.ip_interface(a).version == 6 for a in tun["address"])
     assert not tun.get("route_exclude_address")

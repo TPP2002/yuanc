@@ -291,7 +291,9 @@ def test_init_issues_first_pair_once_and_second_run_is_unchanged(capsys):
     assert path in text and "请把这个文件拷到 U 盘带去电脑" in text
     before, calls = dict(runner.files), commands(runner)
     assert main(["init"], runner) == 0
-    assert runner.files == before and commands(runner) == calls
+    # 重复安装只新增一次只读版本查询，文件与其余系统命令保持不变。
+    assert runner.files == before and commands(runner) == calls + [
+        ("/opt/exitnode/current/bin/sing-box", "version")]
 
 
 def test_registry_write_failure_restores_live_without_reload(installed, monkeypatch):

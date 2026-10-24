@@ -71,11 +71,12 @@ def test_admin_route_uses_configured_listener(inputs):
     ctx, device = inputs
     config = render_server(replace(ctx, admin_bind="127.0.0.2", admin_port=9443), [device])
     assert config["route"]["rules"][0] == {
-        "ip_cidr": ["198.18.255.1/32"], "outbound": "admin-local"}
+        "ip_cidr": ["198.18.255.1/32"], "action": "route", "outbound": "direct",
+        "override_address": "127.0.0.2", "override_port": 9443}
     assert config["route"]["final"] == "direct"
-    assert next(v for v in config["outbounds"] if v["tag"] == "admin-local") == {
-        "type": "direct", "tag": "admin-local", "override_address": "127.0.0.2",
-        "override_port": 9443}
+    assert config["outbounds"] == [{"type": "direct", "tag": "direct"}]
+    assert not any(rule.get("outbound") in {"block", "admin-local"}
+                   for rule in config["route"]["rules"])
 
 
 def test_private_route_order_without_maintenance(inputs):
@@ -83,14 +84,15 @@ def test_private_route_order_without_maintenance(inputs):
     config = render_server(ctx, [device])
     assert config["route"] == {
         "rules": [
-            {"ip_cidr": ["198.18.255.1/32"], "outbound": "admin-local"},
-            {"ip_is_private": True, "outbound": "block"},
-            {"ip_cidr": ["198.18.0.0/15"], "outbound": "block"},
+            {"ip_cidr": ["198.18.255.1/32"], "action": "route", "outbound": "direct",
+             "override_address": ctx.admin_bind, "override_port": ctx.admin_port},
+            {"ip_is_private": True, "action": "reject"},
+            {"ip_cidr": ["198.18.0.0/15"], "action": "reject"},
         ],
         "final": "direct",
     }
-    assert [outbound["tag"] for outbound in config["outbounds"]] == [
-        "direct", "block", "admin-local"]
+    assert config["outbounds"] == [{"type": "direct", "tag": "direct"}]
+    assert all("address" not in server for server in config["dns"]["servers"])
 
 
 def test_maintenance_only_allows_active_registered_device_ssh(inputs):
@@ -101,11 +103,12 @@ def test_maintenance_only_allows_active_registered_device_ssh(inputs):
     config = render_server(ctx, [revoked, device])
     assert config["route"] == {
         "rules": [
-            {"ip_cidr": ["198.18.255.1/32"], "outbound": "admin-local"},
+            {"ip_cidr": ["198.18.255.1/32"], "action": "route", "outbound": "direct",
+             "override_address": ctx.admin_bind, "override_port": ctx.admin_port},
             {"auth_user": [device.device_id], "ip_is_private": True,
              "port": [22], "outbound": "direct"},
-            {"ip_is_private": True, "outbound": "block"},
-            {"ip_cidr": ["198.18.0.0/15"], "outbound": "block"},
+            {"ip_is_private": True, "action": "reject"},
+            {"ip_cidr": ["198.18.0.0/15"], "action": "reject"},
         ],
         "final": "direct",
     }

@@ -224,7 +224,7 @@ public sealed class ControllerTests
         Assert.Equal(RoutingRenderer.Render(WinClient.Core.Pairing.LocalConfigRenderer.Render(session.Node),
             RoutingPolicy.Global, RoutingTests.Service, new(IPAddress.Parse("192.0.2.5"), 8080, RoutingTests.Service)).GetRawText(), tunnel.Config.GetRawText());
         var direct = Assert.Single(tunnel.Config.GetProperty("route").GetProperty("rules").EnumerateArray(),
-            rule => rule.GetProperty("outbound").GetString() == "direct");
+            rule => rule.TryGetProperty("outbound", out var outbound) && outbound.GetString() == "direct");
         Assert.Equal("192.0.2.5/32", Assert.Single(direct.GetProperty("ip_cidr").EnumerateArray()).GetString());
         Assert.Equal(8080, Assert.Single(direct.GetProperty("port").EnumerateArray()).GetInt32());
     }
@@ -247,7 +247,8 @@ public sealed class ControllerTests
         Assert.Equal(new[] { RoutingTests.Chrome }, firewall.AppliedApps);
         var rules = tunnel.Config.GetProperty("route").GetProperty("rules").EnumerateArray().ToArray();
         Assert.Contains(RoutingRenderer.PathPattern(RoutingTests.Service), rules[^1].GetProperty("process_path_regex").EnumerateArray().Select(x => x.GetString()));
-        Assert.Equal(distribution, rules.Any(r => r.GetProperty("outbound").GetString() == "direct"));
+        Assert.Equal(distribution, rules.Any(r => r.TryGetProperty("outbound", out var outbound)
+            && outbound.GetString() == "direct"));
     }
 
     [Theory]

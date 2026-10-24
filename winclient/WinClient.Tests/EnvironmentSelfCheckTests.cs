@@ -11,6 +11,19 @@ namespace WinClient.Tests;
 
 public sealed class EnvironmentSelfCheckTests
 {
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void 旧出站写法不再通过阻断检查(bool apps)
+    {
+        var routing = apps ? RoutingTests.Apps : RoutingPolicy.Global;
+        var config = RoutingRenderer.Render(Good.SingboxConfig, routing, RoutingTests.Service);
+        var old = config.GetRawText().Replace("\"action\":\"reject\"", "\"outbound\":\"block\"");
+        var report = EnvironmentSelfCheck.Evaluate(Good with {
+            Routing = routing, SingboxConfig = JsonSerializer.Deserialize<JsonElement>(old) });
+        Assert.Equal("未通过", report.Items[6].Result);
+        Assert.Contains("IPv6 阻断", report.Items[6].Detail);
+    }
     [Fact]
     public void 未取得浏览器信息时无法核验()
     {
@@ -146,7 +159,7 @@ public sealed class EnvironmentSelfCheckTests
     {
         var input = AuthInput();
         var config = JsonNode.Parse(input.SingboxConfig.GetRawText())!;
-        config["route"]!["rules"]![0]!.AsObject().Remove("port");
+        config["route"]!["rules"]![1]!.AsObject().Remove("port");
         var report = EnvironmentSelfCheck.Evaluate(input with { SingboxConfig = JsonSerializer.SerializeToElement(config) });
         Assert.Equal("未通过", report.Items[6].Result);
         Assert.Contains("outbounds", report.Items[6].Detail);
@@ -167,8 +180,8 @@ public sealed class EnvironmentSelfCheckTests
         Assert.Equal("未通过", report.Items[6].Result); Assert.Contains("dns.servers", report.Items[6].Detail);
     }
     internal const string GoodConfig = """
-        {"inbounds":[{"type":"tun"}],"route":{"final":"proxy","rules":[{"ip_version":6,"outbound":"block"}]},
-         "dns":{"servers":[{"detour":"proxy"}]},"outbounds":[{"type":"vless","tag":"proxy"}]}
+        {"inbounds":[{"type":"tun"}],"route":{"final":"proxy","rules":[{"action":"sniff"},{"ip_version":6,"action":"reject"}]},
+         "dns":{"servers":[{"type":"https","tag":"dns-remote","server":"1.1.1.1","detour":"proxy"}]},"outbounds":[{"type":"vless","tag":"proxy"}]}
         """;
     internal static EnvironmentInspection GoodInspection => new("AUS Eastern Standard Time", 4,
         new Dictionary<string, string?> { ["WebRtcIPHandling"] = "default_public_interface_only", ["DefaultGeolocationSetting"] = "2", ["DnsOverHttpsMode"] = "secure", ["DnsOverHttpsTemplates"] = "https://1.1.1.1/dns-query" },
