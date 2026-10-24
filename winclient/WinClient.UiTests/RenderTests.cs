@@ -44,13 +44,8 @@ public sealed class RenderTests(UiThreadFixture ui, ITestOutputHelper output)
     ];
 
     [Fact]
-    public void 浅深二十八张截图与主按钮位置固定()
+    public void 浅深三十六张截图与主按钮位置固定()
     {
-        if (!System.Environment.UserInteractive)
-        {
-            output.WriteLine("跳过渲染：Environment.UserInteractive 为 false，当前不是交互式用户会话。");
-            return;
-        }
         ui.Invoke(() =>
         {
             var directory = Path.Combine(RepositoryRoot(), "build", "ui-shots");
@@ -70,7 +65,8 @@ public sealed class RenderTests(UiThreadFixture ui, ITestOutputHelper output)
                     var suffix = theme == ThemeKind.Dark ? "-dark" : "";
                     foreach (var preview in Cases())
                     {
-                        using var model = Model(preview.Snapshot, preview.Availability);
+                        var connectionUsable = preview.Availability == ServiceAvailability.Ready;
+                        using var model = Model(preview.Snapshot, preview.Availability, connectionUsable);
                         var shell = Arrange(model);
                         try
                         {
@@ -85,6 +81,7 @@ public sealed class RenderTests(UiThreadFixture ui, ITestOutputHelper output)
                             Assert.Equal(expected, actual);
                             Assert.Equal(144, actual.W); Assert.Equal(40, actual.H);
                             bounds[preview.Name] = actual;
+                            if (connectionUsable) AssertConnectionState(shell, model, connectionUsable);
                             WritePng(shell, Path.Combine(directory, "connect-" + preview.Name + suffix + ".png")); count++;
                         }
                         finally { Unload(shell); }
@@ -97,27 +94,35 @@ public sealed class RenderTests(UiThreadFixture ui, ITestOutputHelper output)
                             SelfCheckStatus = "8 项通过", EnvironmentStatus = "已切换到澳洲时区与浏览器策略",
                             Update = new UpdateStatus("idle", Message: "已是最新", CheckedAt: new DateTimeOffset(2026, 10, 22, 9, 12, 0, TimeSpan.FromHours(8)))
                         };
-                        using var model = Model(snapshot, ServiceAvailability.Ready);
-                        model.CurrentPage = page;
-                        if (page == PageKind.Environment) model.ApplySelfCheckJson(SelfCheckReport());
-                        var shell = Arrange(model);
-                        try { WritePng(shell, Path.Combine(directory, "page-" + page.ToString().ToLowerInvariant() + suffix + ".png")); count++; }
-                        finally { Unload(shell); }
+                        foreach (var connectionUsable in new[] { true, false })
+                        {
+                            using var model = Model(snapshot, connectionUsable ? ServiceAvailability.Ready : ServiceAvailability.Unavailable, connectionUsable);
+                            model.CurrentPage = page;
+                            if (page == PageKind.Environment) model.ApplySelfCheckJson(SelfCheckReport());
+                            var shell = Arrange(model);
+                            try
+                            {
+                                AssertConnectionState(shell, model, connectionUsable);
+                                var stateSuffix = connectionUsable ? "" : "-unavailable";
+                                WritePng(shell, Path.Combine(directory, "page-" + page.ToString().ToLowerInvariant() + stateSuffix + suffix + ".png")); count++;
+                            }
+                            finally { Unload(shell); }
+                        }
                     }
                 }
-                Assert.Equal(28, count); Assert.Equal(10, bounds.Count);
+                Assert.Equal(36, count); Assert.Equal(10, bounds.Count);
                 File.WriteAllText(Path.Combine(directory, "primary-button.json"), JsonSerializer.Serialize(bounds,
                     new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase, WriteIndented = true }));
-                output.WriteLine("已渲染 28 张 PNG；浅深主题十种连接状态下主按钮坐标与尺寸完全相同。");
+                output.WriteLine("已渲染 36 张 PNG；浅深主题十种连接状态下主按钮坐标与尺寸完全相同。");
             }
             finally { MotionSettings.Override = null; }
         });
     }
 
-    private static MainViewModel Model(ControlSnapshot snapshot, ServiceAvailability availability)
+    private static MainViewModel Model(ControlSnapshot snapshot, ServiceAvailability availability, bool connectionUsable)
     {
         var model = new MainViewModel(() => throw new InvalidOperationException("渲染不允许弹出对话框"), () => throw new InvalidOperationException("渲染不允许选择程序"));
-        model.ApplyPreview(snapshot, availability);
+        model.ApplyPreview(snapshot, availability, connectionUsable);
         return model;
     }
     private static MainShell Arrange(MainViewModel model)
@@ -142,6 +147,24 @@ public sealed class RenderTests(UiThreadFixture ui, ITestOutputHelper output)
             foreach (var descendant in Descendants(child)) yield return descendant;
         }
     }
+    private static int VisibleNotReadyHints(DependencyObject root) => Descendants(root).OfType<TextBlock>()
+        .Count(text => text.Text.Contains("未就绪", StringComparison.Ordinal) && AncestorsVisible(text));
+
+    private static bool AncestorsVisible(DependencyObject element)
+    {
+        for (DependencyObject? current = element; current is not null; current = VisualTreeHelper.GetParent(current))
+            if (current is UIElement visual && visual.Visibility != Visibility.Visible) return false;
+        return true;
+    }
+
+    private static void AssertConnectionState(MainShell shell, MainViewModel model, bool connectionUsable)
+    {
+        Assert.Equal(connectionUsable, model.CanUseConnection);
+        var hints = VisibleNotReadyHints(shell);
+        if (connectionUsable) Assert.Equal(0, hints);
+        else Assert.True(hints >= 1, "禁用态必须显示未就绪提示");
+    }
+
     private static void WritePng(MainShell shell, string path)
     {
         var bitmap = new RenderTargetBitmap(880, 600, 96, 96, PixelFormats.Pbgra32); bitmap.Render(shell);

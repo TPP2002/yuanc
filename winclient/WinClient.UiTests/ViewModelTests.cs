@@ -55,6 +55,23 @@ public class ViewModelTests(UiThreadFixture ui)
     });
 
     [Fact]
+    public void 预览声明连接可用时按钮启用且可用性仍受后台状态约束() => ui.Invoke(() =>
+    {
+        using var model = new MainViewModel(() => null, () => null);
+        var snapshot = new ControlSnapshot(ConnectionState.Disconnected, "未连接", "", false);
+        model.ApplyPreview(snapshot, ServiceAvailability.Ready, connectionUsable: true);
+        Assert.True(model.CanUseConnection);
+        Assert.True(model.CheckUpdateCommand.CanExecute(null));
+        Assert.True(model.CanRestoreEnvironment);
+        Assert.Equal("", model.ConnectionDisabledReason);
+        model.ApplyPreview(snapshot, ServiceAvailability.Unavailable, connectionUsable: true);
+        Assert.False(model.CanUseConnection);
+        Assert.Contains("未就绪", model.ConnectionDisabledReason);
+        model.ApplyPreview(snapshot, ServiceAvailability.Ready);
+        Assert.False(model.CanUseConnection);
+    });
+
+    [Fact]
     public void 浏览器提醒随快照更新且没有后台连接不能继续() => ui.Invoke(() =>
     {
         using var model = new MainViewModel(() => null, () => null);
