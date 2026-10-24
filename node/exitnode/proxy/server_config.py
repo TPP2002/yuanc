@@ -1,4 +1,4 @@
-"""Server configuration in the official sing-box 1.10 JSON format."""
+"""服务端配置采用官方 sing-box 1.13 格式。"""
 
 from .context import ProxyContext, validate_context
 from .registry import Device, validate_devices
@@ -11,13 +11,14 @@ def render_server(ctx: ProxyContext, devices: list[Device]) -> dict:
     secret_path(ctx.hy2_key_path)
     active = sorted((d for d in devices if d.revoked_at is None), key=lambda d: d.device_id)
     maintenance = [d.device_id for d in active if d.device_id in ctx.maintenance_device_ids]
-    rules = [{"ip_cidr": ["198.18.255.1/32"], "outbound": "admin-local"}]
+    rules = [{"ip_cidr": ["198.18.255.1/32"], "action": "route", "outbound": "direct",
+              "override_address": ctx.admin_bind, "override_port": ctx.admin_port}]
     if maintenance:
         rules.append({"auth_user": maintenance, "ip_is_private": True,
                       "port": [22], "outbound": "direct"})
     rules.extend([
-        {"ip_is_private": True, "outbound": "block"},
-        {"ip_cidr": ["198.18.0.0/15"], "outbound": "block"},
+        {"ip_is_private": True, "action": "reject"},
+        {"ip_cidr": ["198.18.0.0/15"], "action": "reject"},
     ])
     hy2 = {
         "type": "hysteria2", "tag": "in-hy2", "listen": "::", "listen_port": ctx.hy2_port,
@@ -33,7 +34,8 @@ def render_server(ctx: ProxyContext, devices: list[Device]) -> dict:
         hy2["masquerade"] = ctx.masquerade
     return {
         "log": {"disabled": True},
-        "dns": {"servers": [{"tag": "upstream", "address": "1.1.1.1"}], "final": "upstream"},
+        "dns": {"servers": [{"type": "udp", "tag": "upstream", "server": "1.1.1.1"}],
+                "final": "upstream"},
         "inbounds": [
             {
                 "type": "vless", "tag": "in-reality", "listen": "::",
@@ -52,10 +54,6 @@ def render_server(ctx: ProxyContext, devices: list[Device]) -> dict:
             },
             hy2,
         ],
-        "outbounds": [
-            {"type": "direct", "tag": "direct"}, {"type": "block", "tag": "block"},
-            {"type": "direct", "tag": "admin-local", "override_address": ctx.admin_bind,
-             "override_port": ctx.admin_port},
-        ],
+        "outbounds": [{"type": "direct", "tag": "direct"}],
         "route": {"rules": rules, "final": "direct"},
     }

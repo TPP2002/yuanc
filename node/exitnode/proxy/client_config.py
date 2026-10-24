@@ -1,4 +1,4 @@
-"""Client settings: only two tunnels, no direct outbound or local DNS."""
+"""客户端配置采用 sing-box 1.13 格式，只使用两条隧道。"""
 
 from .context import ProxyContext, ipv4_host, validate_context
 from .registry import Device, validate_devices
@@ -24,16 +24,15 @@ def render_client_windows(ctx: ProxyContext, device: Device) -> dict:
         "log": {"disabled": True},
         "dns": {
             "servers": [{
-                "tag": "dns-remote", "address": "https://1.1.1.1/dns-query", "detour": "proxy",
+                "type": "https", "tag": "dns-remote", "server": "1.1.1.1", "detour": "proxy",
             }],
-            "rules": [{"outbound": "any", "server": "dns-remote"}],
             "final": "dns-remote", "strategy": "ipv4_only",
         },
         "inbounds": [{
             "type": "tun", "tag": "tun-in",
-            # Capture IPv6 too so the block rule can see it; never forward it.
+            # 同时接入 IPv6，让拒绝规则处理，绝不转发。
             "address": ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
-            "auto_route": True, "strict_route": True, "stack": "system", "sniff": True,
+            "auto_route": True, "strict_route": True, "stack": "system",
         }],
         "outbounds": [
             {
@@ -54,14 +53,13 @@ def render_client_windows(ctx: ProxyContext, device: Device) -> dict:
                 "url": ctx.urltest_url, "interval": ctx.urltest_interval,
                 "tolerance": ctx.urltest_tolerance_ms,
             },
-            {"type": "block", "tag": "block"},
-            {"type": "dns", "tag": "dns-out"},
         ],
         "route": {
             "final": "proxy",
             "rules": [
-                {"ip_version": 6, "outbound": "block"},
-                {"protocol": "dns", "outbound": "dns-out"},
+                {"action": "sniff"},
+                {"ip_version": 6, "action": "reject"},
+                {"protocol": "dns", "action": "hijack-dns"},
             ],
             "auto_detect_interface": True,
         },

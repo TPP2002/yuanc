@@ -112,13 +112,13 @@ public static class EnvironmentSelfCheck
                 return patterns.ValueKind == JsonValueKind.Array && input.Routing.Apps.All(path =>
                     patterns.EnumerateArray().Any(pattern => Text(pattern) == RoutingRenderer.PathPattern(path)));
             }
-            bool HasRule(string outbound, bool ipv6) => rules.ValueKind == JsonValueKind.Array && rules.EnumerateArray().Any(rule =>
-                HasPrograms(rule) && Text(Property(rule, "outbound")) == outbound && (!ipv6 ||
+            bool HasRule(string target, bool ipv6) => rules.ValueKind == JsonValueKind.Array && rules.EnumerateArray().Any(rule =>
+                HasPrograms(rule) && Text(Property(rule, ipv6 ? "action" : "outbound")) == target && (!ipv6 ||
                     (Property(rule, "ip_version") is var version && version.ValueKind == JsonValueKind.Number && version.TryGetInt32(out var number) && number == 6)));
             var scoped = Policy("no_direct_path", "配置无直连路径",
                 ("route.final direct", Text(Property(route, "final")) == "direct"),
                 ("route.rules 指定程序→proxy", HasRule("proxy", false)),
-                ("route.rules 指定程序 IPv6 阻断", HasRule("block", true)),
+                ("route.rules 指定程序 IPv6 阻断", HasRule("reject", true)),
                 ("dns.servers detour", servers.ValueKind == JsonValueKind.Array && servers.EnumerateArray().All(server => Text(Property(server, "detour")) == "proxy")));
             items.Add(scoped with { Detail = "仅指定程序模式:" + scoped.Detail });
             items.Add(new("ipv6_direct", "IPv6 已封堵", "跳过", "仅指定程序模式不检测整机 IPv6;指定程序的 IPv6 已由配置与防火墙阻断"));
@@ -129,7 +129,7 @@ public static class EnvironmentSelfCheck
             ("route.final", Text(Property(route, "final")) == "proxy"),
             ("route.rules IPv6 阻断", rules.ValueKind == JsonValueKind.Array && rules.EnumerateArray().Any(rule =>
                 Property(rule, "ip_version") is var version && version.ValueKind == JsonValueKind.Number && version.TryGetInt32(out var number)
-                && number == 6 && Text(Property(rule, "outbound")) == "block")),
+                && number == 6 && Text(Property(rule, "action")) == "reject")),
             ("dns.servers detour", servers.ValueKind == JsonValueKind.Array && servers.EnumerateArray().All(server => Text(Property(server, "detour")) == "proxy")),
             ("outbounds direct 只限后台服务到鉴权端口", DirectOnlyForAuth(outbounds, rules, input.Auth, input.ServiceProcessPath))));
         items.Add(new("ipv6_direct", "IPv6 已封堵", input.Ipv6Reachable is null ? "无法核验" : input.Ipv6Reachable.Value ? "未通过" : "通过",

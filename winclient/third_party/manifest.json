@@ -2,12 +2,12 @@
   "items": [
     {
       "name": "sing-box",
-      "version": "1.10.7",
-      "url": "https://github.com/SagerNet/sing-box/releases/download/v1.10.7/sing-box-1.10.7-windows-amd64.zip",
-      "zip_sha256": "3561fbbbc0e556159e642567f3643e11bd841c8136bc0a6683a80b94a4e5bde0",
-      "zip_member": "sing-box-1.10.7-windows-amd64/sing-box.exe",
+      "version": "1.13.21",
+      "url": "https://github.com/SagerNet/sing-box/releases/download/v1.13.21/sing-box-1.13.21-windows-amd64.zip",
+      "zip_sha256": "a03291793d3a3c6e266447a58140657ac099ff278abf3b8ff678932356a62ced",
+      "zip_member": "sing-box-1.13.21-windows-amd64/sing-box.exe",
       "file": "sing-box.exe",
-      "file_sha256": "c111bdc414ec498613ca9e347cf658f20fda77f2d4d575ac0fe364c5e0dd99d1"
+      "file_sha256": "ccb2fad603c89efcbc14358ab40b2c7000a5bb4e3bffa170d5c355cda90757ba"
     },
     {
       "name": "wintun",

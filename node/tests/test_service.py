@@ -112,7 +112,8 @@ def test_install_manifest_order_permissions_and_repeat(monkeypatch, capsys):
     assert runner.files[LIVE + ".check.tmp"] == ""
     before = dict(runner.files)
     assert main(["init"], runner) == 0
-    assert commands(runner) == calls
+    # 重复安装只新增一次只读版本查询，不重复执行写入类系统命令。
+    assert commands(runner) == calls + [("/opt/exitnode/current/bin/sing-box", "version")]
     assert runner.files == before
     assert keys["private_key"] not in capsys.readouterr().out
 
@@ -170,7 +171,8 @@ def test_failed_republication_keeps_live_config(monkeypatch):
     boundary = len(commands(runner))
     assert main(["init"], runner) == 1
     assert runner.files[LIVE] == live
-    assert commands(runner)[boundary:] == [CHECK]
+    # 每次安装先查内核版本，再校验待发布配置，失败后仍不得重载。
+    assert commands(runner)[boundary:] == [("/opt/exitnode/current/bin/sing-box", "version"), CHECK]
     assert runner.files[LIVE + ".check.tmp"] == ""
 
 
@@ -235,6 +237,7 @@ def test_context_and_custom_binary_reach_service_and_check():
     runner = fake()
     runner.files[CONFIG] = runner.files[CONFIG].replace("/usr/bin/sing-box", "/opt/sing-box")
     runner.files["/opt/sing-box"] = "测试内核"
+    runner.responses[("/opt/sing-box", "version")] = CompletedResult(out="sing-box version 1.13.21\n")
     runner.responses[("/opt/sing-box", "check")] = CompletedResult()
     assert main(["init"], runner) == 0
     config = load(CONFIG, runner)

@@ -36,11 +36,11 @@ public static class RoutingRenderer
             .Order(StringComparer.Ordinal).Select(PathPattern).ToArray();
         var rules = new JsonArray();
         if (route["rules"] is JsonArray previous)
-            foreach (var rule in previous.OfType<JsonObject>().Where(rule => Text(rule["protocol"]) == "dns"))
+            foreach (var rule in previous.OfType<JsonObject>().Where(rule => Text(rule["action"]) == "sniff" || Text(rule["protocol"]) == "dns"))
                 rules.Add(rule.DeepClone());
         if (auth is not null)
             rules.Add(AuthDirectRule(serviceProcessPath, auth));
-        rules.Add(new JsonObject { ["process_path_regex"] = Strings(patterns), ["ip_version"] = 6, ["outbound"] = "block" });
+        rules.Add(new JsonObject { ["process_path_regex"] = Strings(patterns), ["ip_version"] = 6, ["action"] = "reject" });
         rules.Add(new JsonObject { ["process_path_regex"] = Strings(patterns), ["outbound"] = "proxy" });
         route["rules"] = rules;
         route["final"] = "direct";
@@ -75,9 +75,13 @@ public static class RoutingRenderer
         void WriteRules(JsonElement previous)
         {
             writer.WriteStartArray();
+            var original = previous.ValueKind == JsonValueKind.Array ? previous.EnumerateArray().ToArray() : [];
+            var leadingSniff = original.TakeWhile(rule => rule.ValueKind == JsonValueKind.Object
+                && rule.TryGetProperty("action", out var action) && action.ValueKind == JsonValueKind.String
+                && action.GetString() == "sniff").Count();
+            foreach (var rule in original.Take(leadingSniff)) writer.WriteRawValue(rule.GetRawText());
             AuthDirectRule(serviceProcessPath, auth).WriteTo(writer);
-            if (previous.ValueKind == JsonValueKind.Array)
-                foreach (var rule in previous.EnumerateArray())
+                foreach (var rule in original.Skip(leadingSniff))
                 {
                     if (rule.ValueKind == JsonValueKind.Object && rule.TryGetProperty("outbound", out var outbound)
                         && outbound.ValueKind == JsonValueKind.String && outbound.GetString() == "direct") continue;

@@ -16,7 +16,7 @@
    先创建仓库外的安全目录。私钥文件不得存在，脚本以 0600 创建；Windows 还应使用仅维护人员可访问的目录权限。
    把输出的公开 `PUBLIC_KEY` 常量填入 `node/exitnode/updater/trust.py`，然后安装初始可信节点。
    默认空公钥会拒绝升级。不要把私钥、私钥内容或含私钥的目录复制到仓库。
-2. **打包签名**：`python scripts/release/build-node-package.py --version 0.2.0 --sing-box C:/release-input/sing-box --sing-box-version 1.12.0 --key C:/secure/exitnode-signing.pem --out C:/release-output`。
+2. **打包签名**：`python scripts/release/build-node-package.py --version 0.2.0 --sing-box C:/release-input/sing-box --sing-box-version 1.13.21 --key C:/secure/exitnode-signing.pem --out C:/release-output`。
    二进制必须是目标节点架构的 Linux 版本。脚本不猜测内核版本；未传 `--sing-box-version` 时清单如实写 `unknown`。
    `--min-config-version` 默认 1，配置格式发生不兼容变化时显式指定最低要求。包内程序版本会更新为发布版本，工作区原文件不改。
    生成完整程序、模板、内核和逐文件哈希清单，以及对整个压缩包的独立签名。

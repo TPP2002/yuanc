@@ -31,12 +31,11 @@ public static class LocalConfigRenderer
         log = new { disabled = true },
         dns = new
         {
-            servers = new[] { new { tag = "dns-remote", address = "https://1.1.1.1/dns-query", detour = "proxy" } },
-            rules = new[] { new { outbound = "any", server = "dns-remote" } },
+            servers = new[] { new { type = "https", tag = "dns-remote", server = "1.1.1.1", detour = "proxy" } },
             final = "dns-remote", strategy = "ipv4_only"
         },
         inbounds = new[] { new { type = "tun", tag = "tun-in", address = new[] { "172.19.0.1/30", "fdfe:dcba:9876::1/126" },
-            auto_route = true, strict_route = true, stack = "system", sniff = true } },
+            auto_route = true, strict_route = true, stack = "system" } },
         outbounds = new object[]
         {
             new { type = "vless", tag = "main", server = node.Host, server_port = node.RealityPort, uuid = node.Uuid,
@@ -46,9 +45,8 @@ public static class LocalConfigRenderer
             Backup(node),
             new { type = "urltest", tag = "proxy", outbounds = new[] { "main", "backup" },
                 url = "https://www.gstatic.com/generate_204", interval = "1m", tolerance = 300 },
-            new { type = "block", tag = "block" }, new { type = "dns", tag = "dns-out" }
         },
         route = new { final = "proxy", rules = new object[] {
-            new { ip_version = 6, outbound = "block" }, new { protocol = "dns", outbound = "dns-out" } }, auto_detect_interface = true }
+            new { action = "sniff" }, new { ip_version = 6, action = "reject" }, new { protocol = "dns", action = "hijack-dns" } }, auto_detect_interface = true }
     });
 }

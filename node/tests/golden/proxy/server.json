@@ -6,8 +6,9 @@
   "dns": {
     "servers": [
       {
+        "type": "udp",
         "tag": "upstream",
-        "address": "1.1.1.1"
+        "server": "1.1.1.1"
       }
     ],
     "final": "upstream"
@@ -68,16 +69,6 @@
     {
       "type": "direct",
       "tag": "direct"
-    },
-    {
-      "type": "block",
-      "tag": "block"
-    },
-    {
-      "type": "direct",
-      "tag": "admin-local",
-      "override_address": "127.0.0.1",
-      "override_port": 8443
     }
   ],
   "route": {
@@ -86,17 +77,20 @@
         "ip_cidr": [
           "198.18.255.1/32"
         ],
-        "outbound": "admin-local"
+        "action": "route",
+        "outbound": "direct",
+        "override_address": "127.0.0.1",
+        "override_port": 8443
       },
       {
         "ip_is_private": true,
-        "outbound": "block"
+        "action": "reject"
       },
       {
         "ip_cidr": [
           "198.18.0.0/15"
         ],
-        "outbound": "block"
+        "action": "reject"
       }
     ],
     "final": "direct"
