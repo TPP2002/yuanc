@@ -6,6 +6,7 @@ using System.ServiceProcess;
 using System.Text.Json;
 using System.Windows;
 using System.Windows.Input;
+using System.Windows.Threading;
 using WinClient.App.Hosting;
 using WinClient.App.Presentation;
 using WinClient.Core.Client;
@@ -23,6 +24,11 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
     private ServiceAvailability availability;
     private ControlClient? client;
     private bool disposed;
+    internal static readonly TimeSpan UpdateIndicatorDelay = TimeSpan.FromSeconds(1);
+    internal Func<DateTimeOffset> NowProvider { get; set; } = () => DateTimeOffset.UtcNow;
+    private DateTimeOffset? updateInProgressSince;
+    private DispatcherTimer? updateIndicatorTimer;
+    public bool IsUpdateIndicatorVisible { get; private set; }
     private readonly CancellationTokenSource lifetime = new();
     private readonly Func<string, CancellationToken, Task<string?>> runScript;
     private readonly Func<string, string?> publishVerifyPage;
@@ -370,6 +376,47 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         SelfCheckItems = items; SelfCheckCheckedAtText = checkedAt; SelfCheckSummary = summary;
         Notify(nameof(SelfCheckItems)); Notify(nameof(SelfCheckCheckedAtText)); Notify(nameof(SelfCheckSummary));
     }
+    internal void RefreshUpdateIndicator()
+    {
+        if (disposed) return;
+        var visible = false;
+        if (!IsUpdateInProgress)
+        {
+            updateInProgressSince = null;
+            updateIndicatorTimer?.Stop();
+            updateIndicatorTimer = null;
+        }
+        else
+        {
+            updateInProgressSince ??= NowProvider();
+            var elapsed = NowProvider() - updateInProgressSince.Value;
+            visible = elapsed >= UpdateIndicatorDelay;
+            if (visible)
+            {
+                updateIndicatorTimer?.Stop();
+                updateIndicatorTimer = null;
+            }
+            else if (Application.Current?.Dispatcher is { } dispatcher && updateIndicatorTimer?.IsEnabled != true)
+            {
+                var remaining = UpdateIndicatorDelay - elapsed;
+                var timer = new DispatcherTimer(DispatcherPriority.Normal, dispatcher)
+                {
+                    Interval = remaining < TimeSpan.FromMilliseconds(1) ? TimeSpan.FromMilliseconds(1) : remaining
+                };
+                timer.Tick += (_, _) =>
+                {
+                    timer.Stop();
+                    if (!disposed) RefreshUpdateIndicator();
+                };
+                updateIndicatorTimer = timer;
+                timer.Start();
+            }
+        }
+        if (IsUpdateIndicatorVisible == visible) return;
+        IsUpdateIndicatorVisible = visible;
+        Notify(nameof(IsUpdateIndicatorVisible));
+    }
+
     private void Refresh()
     {
         if (disposed) return;
@@ -379,6 +426,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         Notify(nameof(Hero)); Notify(nameof(Status)); Notify(nameof(Message)); Notify(nameof(ConnectLabel)); Notify(nameof(ModeText)); Notify(nameof(IsBusy)); Notify(nameof(CanUseConnection));
         Notify(nameof(ServiceVersionText)); Notify(nameof(ServiceVersionDisplay)); Notify(nameof(ServiceStateText)); Notify(nameof(ServiceStateTone));
         Notify(nameof(UpdateMessage)); Notify(nameof(UpdateCheckedAtText)); Notify(nameof(IsUpdateInProgress));
+        RefreshUpdateIndicator();
         Notify(nameof(EnvironmentEnabled)); Notify(nameof(EnvironmentBadgeText)); Notify(nameof(SelfCheckStatus)); Notify(nameof(SelfCheckTone));
         Notify(nameof(ConnectionDisabledReason)); Notify(nameof(PairingDisabledReason)); Notify(nameof(ClearPairingDisabledReason));
         Notify(nameof(RoutingIsGlobal)); Notify(nameof(RoutingIsApps));
@@ -423,7 +471,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         client.SnapshotChanged -= UpdateProtocol; client.ConnectionClosed -= OnConnectionClosed;
         client.Dispose(); client = null;
     }
-    public void Dispose() { disposed = true; lifetime.Cancel(); DropClient(); }
+    public void Dispose() { disposed = true; updateIndicatorTimer?.Stop(); updateIndicatorTimer = null; lifetime.Cancel(); DropClient(); }
 
     private sealed class AsyncCommand(Func<Task> execute, Func<bool> canExecute) : ICommand
     {

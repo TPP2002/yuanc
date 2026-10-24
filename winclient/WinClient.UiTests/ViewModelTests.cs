@@ -12,6 +12,49 @@ namespace WinClient.UiTests;
 public class ViewModelTests(UiThreadFixture ui)
 {
     [Fact]
+    public void 更新提示超过一秒才出现() => ui.Invoke(() =>
+    {
+        using var model = new MainViewModel(() => null, () => null);
+        var now = DateTimeOffset.Parse("2026-10-23T10:00:00Z");
+        model.NowProvider = () => now;
+        var notified = new List<string?>();
+        model.PropertyChanged += (_, args) => notified.Add(args.PropertyName);
+        model.ApplyPreview(new ControlSnapshot(ConnectionState.Disconnected, "未连接", "", false)
+            { Update = new UpdateStatus("downloading", Message: "正在下载 1.3.1…") }, ServiceAvailability.Ready);
+        Assert.True(model.IsUpdateInProgress);
+        Assert.False(model.IsUpdateIndicatorVisible);
+        now += TimeSpan.FromMilliseconds(999);
+        model.RefreshUpdateIndicator();
+        Assert.False(model.IsUpdateIndicatorVisible);
+        Assert.DoesNotContain(nameof(MainViewModel.IsUpdateIndicatorVisible), notified);
+        now += TimeSpan.FromMilliseconds(1);
+        model.RefreshUpdateIndicator();
+        Assert.True(model.IsUpdateIndicatorVisible);
+        Assert.Contains(nameof(MainViewModel.IsUpdateIndicatorVisible), notified);
+    });
+
+    [Fact]
+    public void 更新结束立即隐藏且再开始重新计时() => ui.Invoke(() =>
+    {
+        using var model = new MainViewModel(() => null, () => null);
+        var now = DateTimeOffset.Parse("2026-10-23T10:00:00Z");
+        model.NowProvider = () => now;
+        var active = new ControlSnapshot(ConnectionState.Disconnected, "未连接", "", false)
+            { Update = new UpdateStatus("downloading", Message: "正在下载 1.3.1…") };
+        model.ApplyPreview(active, ServiceAvailability.Ready);
+        now += TimeSpan.FromSeconds(1);
+        model.RefreshUpdateIndicator();
+        Assert.True(model.IsUpdateIndicatorVisible);
+        model.ApplyPreview(active with { Update = new UpdateStatus("idle") }, ServiceAvailability.Ready);
+        Assert.False(model.IsUpdateIndicatorVisible);
+        model.ApplyPreview(active, ServiceAvailability.Ready);
+        Assert.False(model.IsUpdateIndicatorVisible);
+        now += TimeSpan.FromSeconds(1);
+        model.RefreshUpdateIndicator();
+        Assert.True(model.IsUpdateIndicatorVisible);
+    });
+
+    [Fact]
     public void 浏览器提醒随快照更新且没有后台连接不能继续() => ui.Invoke(() =>
     {
         using var model = new MainViewModel(() => null, () => null);

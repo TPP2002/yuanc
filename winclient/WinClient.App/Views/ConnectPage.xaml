@@ -9,7 +9,7 @@
    <Grid.ColumnDefinitions><ColumnDefinition Width="56"/><ColumnDefinition Width="*"/><ColumnDefinition Width="144"/></Grid.ColumnDefinitions>
    <c:StatusTile TileSize="56" Spec="{Binding Hero.Tile}" VerticalAlignment="Center"/>
    <StackPanel Grid.Column="1" VerticalAlignment="Center" Margin="16,0"><TextBlock Text="{Binding Hero.Title}" Style="{DynamicResource Yc.Title}" TextWrapping="Wrap"/>
-    <TextBlock Text="{Binding Hero.Subtitle}" FontSize="{DynamicResource Yc.FontSize.Sm}" t:SemanticText.NormalKey="Yc.Text2" t:SemanticText.Tone="{Binding Hero.SubtitleTone}" TextWrapping="Wrap" Margin="0,4,0,0"/>
+    <TextBlock t:MonoText.Text="{Binding Hero.Subtitle}" FontSize="{DynamicResource Yc.FontSize.Sm}" t:SemanticText.NormalKey="Yc.Text2" t:SemanticText.Tone="{Binding Hero.SubtitleTone}" TextWrapping="Wrap" Margin="0,4,0,0"/>
    </StackPanel>
    <Button x:Name="PrimaryButton" Grid.Column="2" Width="144" VerticalAlignment="Center" Padding="4,8" Style="{DynamicResource Yc.Button.Primary}" Content="{Binding ConnectLabel}" Command="{Binding ConnectCommand}" t:ControlMotion.IsBusy="{Binding IsBusy}"/>
   </Grid></Border>
@@ -21,7 +21,7 @@
      <Grid.ColumnDefinitions><ColumnDefinition Width="20"/><ColumnDefinition Width="100"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
      <c:StatusTile Spec="{Binding Tile}" VerticalAlignment="Center"/>
      <TextBlock Grid.Column="1" Text="{Binding Label}" Width="88" Margin="12,0,0,0" FontSize="{DynamicResource Yc.FontSize.Sm}" Foreground="{DynamicResource Yc.Text2}" VerticalAlignment="Center"/>
-     <TextBlock Grid.Column="2" Text="{Binding Text, NotifyOnTargetUpdated=True}" TargetUpdated="RowTextUpdated" t:SemanticText.Tone="{Binding TextTone}" TextWrapping="Wrap" VerticalAlignment="Center"/>
+     <TextBlock Grid.Column="2" t:MonoText.Text="{Binding Text, NotifyOnTargetUpdated=True}" TargetUpdated="RowTextUpdated" t:SemanticText.Tone="{Binding TextTone}" TextWrapping="Wrap" VerticalAlignment="Center"/>
      <TextBlock Grid.Column="3" Text="{Binding Right}" FontSize="{DynamicResource Yc.FontSize.Xs}" FontFamily="{DynamicResource Yc.Font.Mono}" Foreground="{DynamicResource Yc.Text3}" Margin="8,0,0,0" VerticalAlignment="Center"/>
     </Grid></Border>
    </DataTemplate></ItemsControl.ItemTemplate></ItemsControl>
