@@ -54,6 +54,7 @@ public sealed class RenderTests(UiThreadFixture ui, ITestOutputHelper output)
             foreach (var name in new[] { "Base", "Glyphs", "Controls" })
                 resources.MergedDictionaries.Add(new ResourceDictionary { Source = new Uri($"/WinClient.App;component/Themes/{name}.xaml", UriKind.Relative) });
             var bounds = new Dictionary<string, Bounds>();
+            var baselineFailures = new List<string>();
             Bounds? expected = null;
             var count = 0;
             MotionSettings.Override = false;
@@ -82,7 +83,7 @@ public sealed class RenderTests(UiThreadFixture ui, ITestOutputHelper output)
                             Assert.Equal(144, actual.W); Assert.Equal(40, actual.H);
                             bounds[preview.Name] = actual;
                             if (connectionUsable) AssertConnectionState(shell, model, connectionUsable);
-                            WritePng(shell, Path.Combine(directory, "connect-" + preview.Name + suffix + ".png")); count++;
+                            WritePng(shell, Path.Combine(directory, "connect-" + preview.Name + suffix + ".png"), baselineFailures); count++;
                         }
                         finally { Unload(shell); }
                     }
@@ -104,7 +105,7 @@ public sealed class RenderTests(UiThreadFixture ui, ITestOutputHelper output)
                             {
                                 AssertConnectionState(shell, model, connectionUsable);
                                 var stateSuffix = connectionUsable ? "" : "-unavailable";
-                                WritePng(shell, Path.Combine(directory, "page-" + page.ToString().ToLowerInvariant() + stateSuffix + suffix + ".png")); count++;
+                                WritePng(shell, Path.Combine(directory, "page-" + page.ToString().ToLowerInvariant() + stateSuffix + suffix + ".png"), baselineFailures); count++;
                             }
                             finally { Unload(shell); }
                         }
@@ -114,6 +115,7 @@ public sealed class RenderTests(UiThreadFixture ui, ITestOutputHelper output)
                 File.WriteAllText(Path.Combine(directory, "primary-button.json"), JsonSerializer.Serialize(bounds,
                     new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase, WriteIndented = true }));
                 output.WriteLine("已渲染 36 张 PNG；浅深主题十种连接状态下主按钮坐标与尺寸完全相同。");
+                if (baselineFailures.Count > 0) Assert.Fail(string.Join(Environment.NewLine, baselineFailures));
             }
             finally { MotionSettings.Override = null; }
         });
@@ -165,13 +167,45 @@ public sealed class RenderTests(UiThreadFixture ui, ITestOutputHelper output)
         else Assert.True(hints >= 1, "禁用态必须显示未就绪提示");
     }
 
-    private static void WritePng(MainShell shell, string path)
+    private static void WritePng(MainShell shell, string path, List<string> baselineFailures)
     {
         var bitmap = new RenderTargetBitmap(880, 600, 96, 96, PixelFormats.Pbgra32); bitmap.Render(shell);
         var pixels = new int[880 * 600]; bitmap.CopyPixels(pixels, 880 * 4, 0);
         Assert.True(pixels.Any(pixel => pixel != pixels[0]), "截图不得为纯色");
         var encoder = new PngBitmapEncoder(); encoder.Frames.Add(BitmapFrame.Create(bitmap));
-        using var file = File.Create(path); encoder.Save(file);
+        using (var file = File.Create(path)) encoder.Save(file);
+        CompareBaseline(path, bitmap.PixelWidth, bitmap.PixelHeight, pixels, baselineFailures);
+    }
+
+    private static void CompareBaseline(string path, int width, int height, int[] pixels, List<string> failures)
+    {
+        var name = Path.GetFileName(path);
+        var baselineDirectory = ScreenshotBaseline.BaselineDirectory(RepositoryRoot());
+        var baselinePath = Path.Combine(baselineDirectory, name);
+        if (ScreenshotBaseline.UpdateRequested)
+        {
+            if (Environment.GetEnvironmentVariable("CI") == "true") Assert.Fail("检查机上不许更新基准图");
+            Directory.CreateDirectory(baselineDirectory);
+            File.Copy(path, baselinePath, overwrite: true);
+            return;
+        }
+        if (!File.Exists(baselinePath))
+        {
+            failures.Add($"缺少基准图 {name},本机设 YC_UPDATE_UI_BASELINE=1 跑一次 UiTests 生成后连同界面改动一起提交");
+            return;
+        }
+
+        var baseline = ScreenshotBaseline.ReadPng(baselinePath);
+        var diff = new int[pixels.Length];
+        var result = ScreenshotBaseline.Compare(width, height, pixels, baseline.Width, baseline.Height, baseline.Pixels, diff);
+        if (result.Passed) return;
+
+        var diffDirectory = Path.Combine(Path.GetDirectoryName(path)!, "diff");
+        Directory.CreateDirectory(diffDirectory);
+        var bitmap = BitmapSource.Create(width, height, 96, 96, PixelFormats.Pbgra32, null, diff, width * 4);
+        var encoder = new PngBitmapEncoder(); encoder.Frames.Add(BitmapFrame.Create(bitmap));
+        using (var file = File.Create(Path.Combine(diffDirectory, name))) encoder.Save(file);
+        failures.Add(FormattableString.Invariant($"{name} 与基准不同:尺寸一致={(result.SizeMatches ? "真" : "假")},不同像素 {result.DifferentPixels}/{result.TotalPixels}({result.Ratio * 100:F3}%),差异图 build/ui-shots/diff/{name}"));
     }
     private static string RepositoryRoot()
     {
