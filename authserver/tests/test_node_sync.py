@@ -3,9 +3,15 @@ from datetime import datetime
 
 def test_node_auth_is_separate(client, admin, node_key):
     for path, method in (("/node/allowed", client.get), ("/node/heartbeat", client.post)):
-        assert method(path).status_code == 401
-        assert method(path, headers=admin).status_code == 401
-        assert method(path, headers={"X-Node-Key": "wrong"}).status_code == 401
+        response = method(path)
+        assert response.status_code == 404
+        assert response.headers["content-type"].startswith("text/html")
+        response = method(path, headers=admin)
+        assert response.status_code == 404
+        assert response.headers["content-type"].startswith("text/html")
+        response = method(path, headers={"X-Node-Key": "wrong"})
+        assert response.status_code == 404
+        assert response.headers["content-type"].startswith("text/html")
         assert method(path, headers=node_key).status_code == 200
 
 

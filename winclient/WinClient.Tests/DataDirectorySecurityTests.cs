@@ -147,7 +147,7 @@ public sealed class DataDirectorySecurityTests
     }
 
     private static void WriteSettings(string root, string? kernel) => File.WriteAllText(Path.Combine(root, "server.json"),
-        JsonSerializer.Serialize(new { server_url = "https://192.0.2.1", sing_box_path = kernel }));
+        JsonSerializer.Serialize(new { server_url = "https://192.0.2.1", server_spki_sha256 = Convert.ToBase64String(new byte[32]), sing_box_path = kernel }));
 }
 
 public sealed class AdministratorFactAttribute : FactAttribute
