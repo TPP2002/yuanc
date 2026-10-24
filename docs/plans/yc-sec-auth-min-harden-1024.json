@@ -1,0 +1,224 @@
+{
+  "schemaVersion": 1,
+  "taskId": "SEC-AUTH-SAME-IP-EXPOSURE-1022",
+  "slug": "yc-sec-auth-min-harden-1024",
+  "title": "鉴权服务最小加固:关接口文档页、未知路径/错方法/管理与节点密钥错误统一返回通用 404 网页;客户端 server.json 加证书公钥指纹,只认指纹(可用自签证书)",
+  "goal": "以派单时 origin/main 头为基点。负责人 2026-10-24 对看板卡 SEC-AUTH-SAME-IP-EXPOSURE-1022 拍板「最小加固」:分发版鉴权服务(authserver)与出口节点同一个公网 IPv4,客户端用 https://<IP>:<端口> 直连;本单只堵两件事——①外人探测这个端口时一眼看出是 JSON 接口;②别人能冒充鉴权服务(客户端目前靠系统根证书校验,需要给 IP 签发的公共 CA 证书,且任何能拿到该 IP 证书的人都能冒充)。不做「首次登录走隧道」「搬到另一个地址」。\n\n做完后:\n\n【鉴权服务 authserver/authserver/app.py】\n① FastAPI(...) 构造时 docs_url=None、redoc_url=None、openapi_url=None:/docs、/redoc、/openapi.json 都不存在。\n② 新增模块级常量 NOT_FOUND_PAGE(bytes 或 str,一段极简通用 HTML:<!DOCTYPE html><html><head><title>404 Not Found</title></head><body><h1>Not Found</h1></body></html>,不含 fastapi / uvicorn / starlette / json / detail / 中文 等字样)和一个返回它的函数 not_found_response():状态码 404、Content-Type 为 text/html; charset=utf-8、正文就是 NOT_FOUND_PAGE。\n③ 以下几种情况一律返回 not_found_response(),彼此逐字节相同(状态码、Content-Type、正文三样一致):a) 任何未定义的路径(含 GET /、GET /docs、GET /openapi.json、GET /redoc、GET /favicon.ico、GET /admin、POST /随便什么);b) 路径存在但请求方法不对(例如 GET /client/session、GET /client/redeem、GET /admin/invites、POST /admin/accounts、GET /node/heartbeat)——用 starlette.exceptions.HTTPException 的异常处理器把 404 和 405 都换成它,其他状态码的 HTTPException 原样走 FastAPI 默认处理;c) 管理接口(/admin/*)缺 X-Admin-Key 或密钥错误、节点接口(/node/*)缺 X-Node-Key 或密钥错误——原来返回 401 JSON「认证密钥无效或缺失」,改为返回 not_found_response()(做法:verify 失败时抛一个专用异常,由它的处理器返回 not_found_response();不要动 Problem 类本身)。\n④ 客户端接口(/client/redeem、/client/session、/client/logout)对**路径与方法都正确**的请求,状态码与 JSON 语义一律不变(401 令牌无效、404 邀请码不存在、409、410、423、429、422 参数无效等,客户端 AuthApiClient.MapStatus 依赖它们);管理与节点接口密钥正确时行为不变;Cache-Control: no-store 中间件不变。\n⑤ 文档 docs/authserver/接口说明.md:启动命令改为 python -m uvicorn ... --workers 1 --no-server-header(去掉响应头里的 server: uvicorn);新增小节「## 对外表现与证书指纹」写清:接口文档页已关闭;未知路径、错误方法、管理与节点接口密钥不对时都返回同一张通用 404 网页;客户端接口对格式正确的请求仍返回 JSON 状态(已知局限:有人照着接口格式发请求仍能认出这是本服务,首次登录走隧道属于后续方案,未做);HTTPS 证书可以用自签证书,不再需要给 IP 签发的公共证书,客户端靠 server.json 里的 server_spki_sha256 认证书;给出算指纹的命令 openssl x509 -in <证书.pem> -pubkey -noout | openssl pkey -pubin -outform der | openssl dgst -sha256 -binary | openssl base64 -A(结果是 44 个字符、以 = 结尾);换证书但不换私钥时指纹不变,换私钥必须同时给所有客户端发新的 server.json;真机待验证项:用 curl -k 访问 /、/docs、/admin/accounts 得到同一张 404 网页,响应头没有 server: uvicorn。原有内容保留,只改启动命令那一行和新增小节。\n\n【Windows 客户端】\n⑥ winclient/WinClient.Core/Client/ClientSettings.cs:新增属性 [JsonPropertyName(\"server_spki_sha256\")] public string? ServerSpkiSha256 { get; init; }(不要写 required,缺失时由 Load 报中文错误而不是 JsonException)。Load 在现有 server_url 校验之后增加:ServerSpkiSha256 为空、不是合法 base64、或解码后不是 32 字节 → throw new InvalidDataException(\"服务器配置缺少有效的证书指纹 server_spki_sha256(证书公钥的 SHA-256,44 个字符的 base64),请按部署说明补上。\")。其余校验与文案一字不改。\n⑦ 同文件新增:public static string ComputeSpkiSha256(X509Certificate2 certificate) => Base64(SHA256(certificate.PublicKey.ExportSubjectPublicKeyInfo()));internal static bool MatchesPin(X509Certificate2? certificate, string expectedBase64):证书为空返回 false,否则算出 32 字节摘要与 Convert.FromBase64String(expected) 用 CryptographicOperations.FixedTimeEquals 比较;internal static Func<HttpRequestMessage, X509Certificate2?, X509Chain?, SslPolicyErrors, bool> PinValidator(string expectedBase64) 返回 (_, cert, _, _) => MatchesPin(cert, expectedBase64)——**只看指纹,不看证书链与主机名错误**(自签证书、IP 证书都靠指纹认),指纹不对时即使 SslPolicyErrors.None 也拒绝;public HttpClient CreateAuthHttpClient():new HttpClient(new HttpClientHandler { AllowAutoRedirect = false, ServerCertificateCustomValidationCallback = PinValidator(ServerSpkiSha256!) }) { BaseAddress = new Uri(ServerUrl), Timeout = TimeSpan.FromSeconds(15) }。\n⑧ winclient/WinClient.Core/Client/ClientRuntime.cs:现有两处 new HttpClient(new HttpClientHandler { AllowAutoRedirect = false }) { BaseAddress = ..., Timeout = ... } 全部换成 settings.CreateAuthHttpClient(),文件里不再出现 new HttpClientHandler;其余逻辑一字不改。\n⑨ 测试(xunit,新文件 winclient/WinClient.Tests/AuthPinTests.cs,至少 6 个 [Fact]/[Theory]):用 CertificateRequest + ECDsa.Create() 现场生成自签证书(不读写磁盘证书文件、不碰证书存储),覆盖:a) ComputeSpkiSha256 等于手算的 SHA256(ExportSubjectPublicKeyInfo) 的 base64 且长度 44;b) PinValidator 对同一把公钥的证书在 SslPolicyErrors.RemoteCertificateChainErrors | RemoteCertificateNameMismatch 时返回 true;c) 换一把密钥生成的证书在 SslPolicyErrors.None 时返回 false;d) 证书为 null 返回 false;e) ClientSettings.Load:server.json 缺 server_spki_sha256、值为 \"not-base64!\"、值为 31 字节 base64 → 都抛 InvalidDataException 且 Message 含「证书指纹」;f) 合法指纹 → Load 成功、ServerSpkiSha256 原样保留,CreateAuthHttpClient() 返回的 HttpClient BaseAddress 等于 server_url、Timeout 为 15 秒。测试用 TempDirectory(Tests 里已有)写 server.json。\n⑩ 既有测试夹具适配(只补字段,不改断言):DataDirectorySecurityTests.cs 的 WriteSettings、KernelInstallerTests.cs 写 server.json 的三处(第 17、27、132 行附近,含两处手写 JSON 字符串)、PairingTests.cs 第 231 行附近那一处,都加上一个合法的 server_spki_sha256(例如 Convert.ToBase64String(new byte[32]) 即 \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\",可在各文件里写成常量);既有断言(包括「连接内核必须配置为绝对路径。」等原文案)一个不改。\n⑪ 鉴权服务测试:新文件 authserver/tests/test_decoy.py(至少 5 个测试函数,用 conftest 里已有的 client / admin / node_key / enrolled 夹具):a) /docs、/redoc、/openapi.json、/、/favicon.ico、/nope 用 GET,/nope 用 POST,全部 404 且 content-type 以 text/html 开头、正文等于 app 模块的 NOT_FOUND_PAGE、正文里没有 detail 与 fastapi;b) 错误方法(GET /client/session、GET /client/redeem、GET /admin/invites、GET /node/heartbeat、DELETE /client/logout)同样返回那张页面;c) 管理接口缺密钥、错密钥、拿节点密钥,节点接口缺密钥、错密钥、拿管理密钥,全部返回那张页面,且与 GET /nope 的(状态码、content-type、正文)三元组逐一相等;d) 密钥正确时 /admin/accounts 返回 200 JSON、/node/allowed 返回 200;e) 客户端接口语义不变:POST /client/session 假令牌仍 401 且是 JSON、POST /client/redeem 不存在的邀请码仍 404 且是 JSON(有 detail 字段)、POST /client/session 用 enrolled 的刷新令牌仍 200。test_invites.py 的 test_admin_requires_own_key 与 test_node_sync.py 的 test_node_auth_is_separate 里「== 401」改为「== 404」并加断言 content-type 以 text/html 开头(这两处是本单要改的行为,只许改这几行断言,其余测试一行不动)。\n⑫ 文档 docs/winclient/打包与发布说明.md:在讲 server.json 的地方补一句:分发版的 server.json 必须同时写 server_url 与 server_spki_sha256(算法见 docs/authserver/接口说明.md「对外表现与证书指纹」),缺了客户端会提示「缺少有效的证书指纹」;并给一个占位示例 {\"server_url\": \"https://<鉴权服务器IPv4>:<端口>\", \"server_spki_sha256\": \"<44 个字符的证书公钥指纹>\"}。",
+  "background": "项目:外包。中国大陆客户端经加密隧道到澳洲家宽出口节点;分发版多一个邀请码鉴权服务 authserver(FastAPI + SQLite,Python 3.11+,首期与节点同机、同一个公网 IPv4)。Windows 客户端 .NET 9(winclient/WinClient.sln:Core 类库 + WPF App + xunit Tests + UiTests;internal 成员对 Tests 可见)。客户端分发版读 %ProgramData%\\YuanC\\server.json(ClientSettings.Load:server_url 必须是 https + IPv4 数字地址、不含凭据/查询/片段;sing_box_path 可选且必须在安装目录下),ClientRuntime 用它建 HttpClient 交给 AuthApiClient(AuthApiClient 要求 BaseAddress 是 https,依据状态码映射结果:401 令牌无效、403、404 邀请码不存在、409、410、422、423、429)。自用模式(配对文件)不读 server.json,本单不碰。\n\n先读:authserver/authserver/app.py(create_app、verify、admin/node 依赖、Problem 处理器、RequestValidationError 处理器、no_cache 中间件)、authserver/tests/conftest.py(client/admin/node_key/enrolled 等夹具)、authserver/tests/test_invites.py、test_node_sync.py、test_security.py;winclient/WinClient.Core/Client/ClientSettings.cs、ClientRuntime.cs(两处建 HttpClient:构造运行时与 ClearPairingAsync)、winclient/WinClient.Core/Auth/AuthApiClient.cs(只读)、winclient/WinClient.Tests/DataDirectorySecurityTests.cs、KernelInstallerTests.cs、PairingTests.cs(找写 server.json 的地方)、Tests 里 TempDirectory 的定义;docs/authserver/接口说明.md、docs/winclient/打包与发布说明.md。\n\n同仓同时有别的对话在改:winclient/WinClient.App/**、winclient/WinClient.UiTests/**、winclient/WinClient.Core/Firewall/**(WFP 断网保护)——本单一律不碰。\n\n硬规矩:①客户端接口对合法请求的状态码与 JSON 一律不变,不新增依赖;②证书校验只认指纹:指纹对就放行(忽略链与主机名错误),指纹不对一律拒绝;不要写「全部放行」的回调,不要关掉 TLS;③凭据(密钥、令牌、指纹以外的任何秘密)不进日志与报错文案;④所有新增报错与文档中文;⑤工人不许 git 写操作;不许自己跑 dotnet build/test/restore/publish(用派单器自测通道按验收编号申请);Python 测试只写 tmp_path,不往受测目录写文件;⑥工位无外网,缺依赖停下交 blocked,不装依赖;⑦第三方件缓存 winclient/third_party/cache 由派单方放进工位,不要下载;⑧拿不准(例如 starlette 处理器注册写法、HttpClientHandler 回调签名)停下交 blocked + forks,不猜;真机项写进文档,不模拟成通过。跑法:python -m ruff check authserver;python -m pytest -q authserver/tests;dotnet 由派单器跑。",
+  "nonGoals": [
+    "不做首次登录走隧道、不搬鉴权服务地址、不改端口与部署拓扑",
+    "不改客户端接口对合法请求的状态码与 JSON;不改限速、令牌、会话逻辑",
+    "不改配对文件(自用模式)、断网保护、界面;不碰 App、UiTests、Core/Firewall",
+    "不在真机部署或抓包;不生成真实证书文件入库"
+  ],
+  "allowedPaths": [
+    "authserver/authserver/app.py",
+    "authserver/tests/test_decoy.py",
+    "authserver/tests/test_invites.py",
+    "authserver/tests/test_node_sync.py",
+    "docs/authserver/接口说明.md",
+    "winclient/WinClient.Core/Client/ClientSettings.cs",
+    "winclient/WinClient.Core/Client/ClientRuntime.cs",
+    "winclient/WinClient.Tests/AuthPinTests.cs",
+    "winclient/WinClient.Tests/DataDirectorySecurityTests.cs",
+    "winclient/WinClient.Tests/KernelInstallerTests.cs",
+    "winclient/WinClient.Tests/PairingTests.cs",
+    "docs/winclient/打包与发布说明.md"
+  ],
+  "forbiddenPaths": [
+    ".codex/**",
+    ".github/**",
+    ".gitignore",
+    "node/**",
+    "scripts/**",
+    "pyproject.toml",
+    "requirements-dev.txt",
+    "docs/design/**",
+    "docs/plans/**",
+    "docs/acceptance/**",
+    "docs/node/**",
+    "docs/交接/**",
+    "docs/口径速查表.md",
+    "docs/开工须知.md",
+    "authserver/authserver/service.py",
+    "authserver/authserver/config.py",
+    "authserver/authserver/security.py",
+    "authserver/authserver/db.py",
+    "authserver/authserver/models.py",
+    "authserver/authserver/admin_cli.py",
+    "authserver/examples/**",
+    "authserver/pyproject.toml",
+    "authserver/tests/conftest.py",
+    "authserver/tests/test_security.py",
+    "authserver/tests/test_sessions.py",
+    "authserver/tests/test_devices.py",
+    "authserver/tests/test_certificate.py",
+    "winclient/*.sln",
+    "winclient/Directory.Build.props",
+    "winclient/third_party/**",
+    "winclient/WinClient.App/**",
+    "winclient/WinClient.UiTests/**",
+    "winclient/WinClient.Core/Firewall/**",
+    "winclient/WinClient.Core/Auth/**",
+    "winclient/WinClient.Core/Pairing/**",
+    "winclient/WinClient.Core/Client/ClientController.cs",
+    "winclient/WinClient.Core/Client/ISessionSource.cs",
+    "winclient/WinClient.Core/Client/IClientFacade.cs",
+    "winclient/WinClient.Tests/AuthTests.cs",
+    "winclient/WinClient.Tests/ControllerTests.cs",
+    "winclient/WinClient.Tests/IpcTests.cs",
+    "winclient/WinClient.Tests/TestData.cs",
+    "winclient/WinClient.Tests/WinClient.Tests.csproj",
+    "winclient/WinClient.Core/WinClient.Core.csproj"
+  ],
+  "expectArtifacts": [
+    "authserver/authserver/app.py",
+    "authserver/tests/test_decoy.py",
+    "authserver/tests/test_invites.py",
+    "authserver/tests/test_node_sync.py",
+    "docs/authserver/接口说明.md",
+    "winclient/WinClient.Core/Client/ClientSettings.cs",
+    "winclient/WinClient.Core/Client/ClientRuntime.cs",
+    "winclient/WinClient.Tests/AuthPinTests.cs",
+    "winclient/WinClient.Tests/DataDirectorySecurityTests.cs",
+    "winclient/WinClient.Tests/KernelInstallerTests.cs",
+    "winclient/WinClient.Tests/PairingTests.cs",
+    "docs/winclient/打包与发布说明.md"
+  ],
+  "acceptance": [
+    {
+      "id": "BUILD",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "build",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1200
+    },
+    {
+      "id": "TEST",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "test",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--no-build",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1200
+    },
+    {
+      "id": "PYTEST",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+        "authserver/tests"
+      ],
+      "required": true,
+      "timeoutSec": 600
+    },
+    {
+      "id": "RUFF",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "ruff",
+        "check",
+        "authserver"
+      ],
+      "required": true,
+      "timeoutSec": 300
+    },
+    {
+      "id": "SHAPE-SRV",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;s=pathlib.Path('authserver/authserver/app.py').read_text(encoding='utf-8');bad=[k for k,ok in (('docs','docs_url=None' in s and 'redoc_url=None' in s and 'openapi_url=None' in s),('page','NOT_FOUND_PAGE' in s and 'def not_found_response' in s and 'text/html' in s),('starlette','starlette.exceptions' in s and '405' in s),('no401','认证密钥无效或缺失' not in s),('kept','RequestValidationError' in s and 'no-store' in s and 'Problem(429' in s)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "SHAPE-CLIENT",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda f:pathlib.Path('winclient/WinClient.Core/Client/'+f).read_text(encoding='utf-8');s=r('ClientSettings.cs');rt=r('ClientRuntime.cs');bad=[k for k,ok in (('field','server_spki_sha256' in s and 'ServerSpkiSha256' in s and 'required string? ServerSpki' not in s),('pin','ExportSubjectPublicKeyInfo' in s and 'FixedTimeEquals' in s and 'PinValidator' in s and 'ServerCertificateCustomValidationCallback' in s and 'CreateAuthHttpClient' in s),('msg','证书指纹' in s and '连接内核必须配置为绝对路径。' in s),('runtime',rt.count('CreateAuthHttpClient()')==2 and 'new HttpClientHandler' not in rt),('noblind','=> true' not in s)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "TESTS-NEW",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys,re;p=pathlib.Path('winclient/WinClient.Tests/AuthPinTests.cs');d=pathlib.Path('authserver/tests/test_decoy.py');a=p.read_text(encoding='utf-8') if p.exists() else '';b=d.read_text(encoding='utf-8') if d.exists() else '';inv=pathlib.Path('authserver/tests/test_invites.py').read_text(encoding='utf-8');ns=pathlib.Path('authserver/tests/test_node_sync.py').read_text(encoding='utf-8');bad=[k for k,ok in (('pin',a.count('[Fact]')+a.count('[Theory]')>=6 and 'CertificateRequest' in a and 'RemoteCertificateNameMismatch' in a and '证书指纹' in a),('decoy',len(re.findall(r'^def test_',b,re.M))>=5 and 'NOT_FOUND_PAGE' in b and '/openapi.json' in b and '/client/session' in b),('inv','== 401' not in inv.split('def test_admin_requires_own_key')[1].split('def test_')[0] and 'text/html' in inv),('ns','== 401' not in ns.split('def test_node_auth_is_separate')[1].split('def test_')[0] and 'text/html' in ns)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;a=pathlib.Path('docs/authserver/接口说明.md').read_text(encoding='utf-8');p=pathlib.Path('docs/winclient/打包与发布说明.md').read_text(encoding='utf-8');bad=[k for k,ok in (('section','## 对外表现与证书指纹' in a and '--no-server-header' in a and 'openssl dgst -sha256 -binary' in a and 'server_spki_sha256' in a and '真机' in a and '自签' in a),('kept','## 启动与配置' in a and 'AUTHSERVER_CONFIG' in a),('pkg','server_spki_sha256' in p and '证书指纹' in p)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "SCOPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess as sp,sys;g=lambda *a:sp.check_output(['git','-c','core.quotepath=false']+list(a)).decode('utf-8').split(chr(10));mb=g('merge-base','origin/main','HEAD')[0].strip();ch={p.strip() for p in g('diff','--name-only',mb)+g('ls-files','--others','--exclude-standard') if p.strip()};ok=set(['authserver/authserver/app.py', 'authserver/tests/test_decoy.py', 'authserver/tests/test_invites.py', 'authserver/tests/test_node_sync.py', 'docs/authserver/接口说明.md', 'winclient/WinClient.Core/Client/ClientSettings.cs', 'winclient/WinClient.Core/Client/ClientRuntime.cs', 'winclient/WinClient.Tests/AuthPinTests.cs', 'winclient/WinClient.Tests/DataDirectorySecurityTests.cs', 'winclient/WinClient.Tests/KernelInstallerTests.cs', 'winclient/WinClient.Tests/PairingTests.cs', 'docs/winclient/打包与发布说明.md']);bad=sorted(ch-ok);print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "NOBIN",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess,sys;out=subprocess.run(['git','ls-files','winclient','build'],capture_output=True,text=True).stdout.split();bad=[f for f in out if f.endswith(('.exe','.dll','.zip','.pdb'))];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "model": null,
+  "timeoutSec": 7200,
+  "repoRoot": "E:/yuanc",
+  "engine": "codex",
+  "reasoningEffort": "medium",
+  "steps": [
+    "读 BACKGROUND 列出的文件;先写 authserver/tests/test_decoy.py 与 winclient/WinClient.Tests/AuthPinTests.cs、改两处 401 断言,跑 PYTEST 证红。",
+    "改 app.py 与 ClientSettings.cs / ClientRuntime.cs,补三个测试文件的 server.json 夹具;PYTEST / RUFF / BUILD / TEST / SHAPE-SRV / SHAPE-CLIENT / TESTS-NEW 全绿。",
+    "改两份文档;DOCS / SCOPE / NOBIN 绿;交活说明列出真机待验证项。"
+  ]
+}
