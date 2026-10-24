@@ -14,7 +14,7 @@ public sealed class KernelInstallerTests
     public void ServerSettingsRejectNonIpv4Hosts(string url)
     {
         using var directory = new TempDirectory();
-        File.WriteAllText(Path.Combine(directory.Path, "server.json"), JsonSerializer.Serialize(new { server_url = url }));
+        File.WriteAllText(Path.Combine(directory.Path, "server.json"), JsonSerializer.Serialize(new { server_url = url, server_spki_sha256 = Convert.ToBase64String(new byte[32]) }));
         Assert.Contains("IPv4", Assert.Throws<InvalidDataException>(() => ClientSettings.Load(directory.Path)).Message);
     }
 
@@ -24,7 +24,7 @@ public sealed class KernelInstallerTests
     public void ServerSettingsExposeServiceAuthEndpoint(string url, int port)
     {
         using var directory = new TempDirectory();
-        File.WriteAllText(Path.Combine(directory.Path, "server.json"), JsonSerializer.Serialize(new { server_url = url }));
+        File.WriteAllText(Path.Combine(directory.Path, "server.json"), JsonSerializer.Serialize(new { server_url = url, server_spki_sha256 = Convert.ToBase64String(new byte[32]) }));
         var settings = ClientSettings.Load(directory.Path)!;
         Assert.Equal(url, settings.ServerUrl);
         var endpoint = Assert.IsType<WinClient.Core.Firewall.AuthEndpoint>(settings.AuthEndpoint);
@@ -130,12 +130,12 @@ public sealed class KernelInstallerTests
     {
         using var directory = new TempDirectory();
         var configPath = Path.Combine(directory.Path, "server.json");
-        File.WriteAllText(configPath, "{\"server_url\":\"https://192.0.2.1\"}");
+        File.WriteAllText(configPath, "{\"server_url\":\"https://192.0.2.1\",\"server_spki_sha256\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"}");
         Assert.Null(ClientSettings.Load(directory.Path, kernelRoot: directory.Path)!.SingBoxPath);
         var explicitPath = Path.Combine(directory.Path, "custom", "sing-box.exe");
-        File.WriteAllText(configPath, JsonSerializer.Serialize(new { server_url = "https://192.0.2.1", sing_box_path = explicitPath }));
+        File.WriteAllText(configPath, JsonSerializer.Serialize(new { server_url = "https://192.0.2.1", server_spki_sha256 = Convert.ToBase64String(new byte[32]), sing_box_path = explicitPath }));
         Assert.Equal(explicitPath, ClientSettings.Load(directory.Path, kernelRoot: directory.Path)!.SingBoxPath);
-        File.WriteAllText(configPath, "{\"server_url\":\"https://192.0.2.1\",\"sing_box_path\":\"relative.exe\"}");
+        File.WriteAllText(configPath, "{\"server_url\":\"https://192.0.2.1\",\"server_spki_sha256\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\",\"sing_box_path\":\"relative.exe\"}");
         Assert.Throws<InvalidDataException>(() => ClientSettings.Load(directory.Path, kernelRoot: directory.Path));
     }
 

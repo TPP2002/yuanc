@@ -229,7 +229,7 @@ public sealed class PairingTests
         if (!OperatingSystem.IsWindows()) return;
         using var directory = new TempDirectory(); var store = new PairingStore(directory.Path);
         var serverPath = Path.Combine(directory.Path, "server.json");
-        File.WriteAllText(serverPath, JsonSerializer.Serialize(new { server_url = "https://192.0.2.1", sing_box_path = Path.Combine(directory.Path, "fake.exe") }));
+        File.WriteAllText(serverPath, JsonSerializer.Serialize(new { server_url = "https://192.0.2.1", server_spki_sha256 = Convert.ToBase64String(new byte[32]), sing_box_path = Path.Combine(directory.Path, "fake.exe") }));
         using var http = new HttpClient(new AuthTests.Handler(_ => throw new InvalidOperationException())) { BaseAddress = new("https://unit.invalid") };
         var server = new AuthServerSessionSource(new AuthApiClient(http), new WinClient.Core.Storage.InMemoryCredentialStore());
         var fallbackCalls = 0;

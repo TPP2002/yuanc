@@ -63,8 +63,7 @@ public sealed class ClientRuntime : IClientFacade, IDisposable
             var source = SelectSessionSource(pairingStore, () =>
             {
                 if (settings is null) return null;
-                http = new HttpClient(new HttpClientHandler { AllowAutoRedirect = false })
-                { BaseAddress = new Uri(settings.ServerUrl), Timeout = TimeSpan.FromSeconds(15) };
+                http = settings.CreateAuthHttpClient();
                 return new AuthServerSessionSource(new AuthApiClient(http, log), new DpapiCredentialStore(ClientSettings.ProductName, root: storeRoot, scope: scope));
             }, log);
             var program = settings?.SingBoxPath ?? installer.Ensure();
@@ -128,8 +127,7 @@ public sealed class ClientRuntime : IClientFacade, IDisposable
     {
         // Validate the fallback first, leaving the imported pairing intact on failure.
         var settings = ClientSettings.Load(ownerIsTrusted: DataDirectorySecurity.IsTrustedOwner);
-        HttpClient? nextHttp = settings is null ? null : new HttpClient(new HttpClientHandler { AllowAutoRedirect = false })
-        { BaseAddress = new Uri(settings.ServerUrl), Timeout = TimeSpan.FromSeconds(15) };
+        HttpClient? nextHttp = settings is null ? null : settings.CreateAuthHttpClient();
         try { pairingStore.Clear(); }
         catch { nextHttp?.Dispose(); throw; }
         http?.Dispose(); http = nextHttp;

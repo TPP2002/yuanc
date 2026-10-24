@@ -1,5 +1,7 @@
 using System.Net;
+using System.Net.Security;
 using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using WinClient.Core.Firewall;
@@ -10,6 +12,7 @@ public sealed class ClientSettings
 {
     public const string ProductName = "YuanC";
     [JsonPropertyName("server_url")] public required string ServerUrl { get; init; }
+    [JsonPropertyName("server_spki_sha256")] public string? ServerSpkiSha256 { get; init; }
     [JsonPropertyName("sing_box_path")] public string? SingBoxPath { get; init; }
     [JsonIgnore] public AuthEndpoint? AuthEndpoint
     {
@@ -34,6 +37,9 @@ public sealed class ClientSettings
             throw new InvalidDataException("服务器必须配置为不含凭据的 HTTPS 地址。");
         if (uri.HostNameType != UriHostNameType.IPv4)
             throw new InvalidDataException("服务器地址必须是 IPv4 数字地址，不使用域名。");
+        if (string.IsNullOrWhiteSpace(settings.ServerSpkiSha256) ||
+            !Convert.TryFromBase64String(settings.ServerSpkiSha256, new byte[32], out var pinLength) || pinLength != 32)
+            throw new InvalidDataException("服务器配置缺少有效的证书指纹 server_spki_sha256(证书公钥的 SHA-256,44 个字符的 base64),请按部署说明补上。");
         if (settings.SingBoxPath is not null && !Path.IsPathFullyQualified(settings.SingBoxPath))
             throw new InvalidDataException("连接内核必须配置为绝对路径。");
         if (!string.IsNullOrEmpty(settings.SingBoxPath))
@@ -47,6 +53,22 @@ public sealed class ClientSettings
         }
         return settings;
     }
+
+    public static string ComputeSpkiSha256(X509Certificate2 certificate) =>
+        Convert.ToBase64String(SHA256.HashData(certificate.PublicKey.ExportSubjectPublicKeyInfo()));
+
+    internal static bool MatchesPin(X509Certificate2? certificate, string expectedBase64) =>
+        certificate is not null && CryptographicOperations.FixedTimeEquals(
+            SHA256.HashData(certificate.PublicKey.ExportSubjectPublicKeyInfo()), Convert.FromBase64String(expectedBase64));
+
+    internal static Func<HttpRequestMessage, X509Certificate2?, X509Chain?, SslPolicyErrors, bool> PinValidator(string expectedBase64) =>
+        (_, cert, _, _) => MatchesPin(cert, expectedBase64);
+
+    public HttpClient CreateAuthHttpClient() => new(new HttpClientHandler
+    {
+        AllowAutoRedirect = false,
+        ServerCertificateCustomValidationCallback = PinValidator(ServerSpkiSha256!)
+    }) { BaseAddress = new Uri(ServerUrl), Timeout = TimeSpan.FromSeconds(15) };
 
     public static string GetDeviceFingerprint(string? root = null, DataProtectionScope scope = DataProtectionScope.CurrentUser)
     {

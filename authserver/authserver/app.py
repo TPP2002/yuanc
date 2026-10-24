@@ -5,14 +5,29 @@ from collections import deque
 from threading import Lock
 
 from fastapi import Depends, FastAPI, Header, Request
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
+from starlette.exceptions import HTTPException
 
 from .config import load_config
 from .db import Database
 from .security import hash_token, now
 from .service import Problem, Service
+
+NOT_FOUND_PAGE = (
+    "<!DOCTYPE html><html><head><title>404 Not Found</title></head>"
+    "<body><h1>Not Found</h1></body></html>"
+)
+
+
+def not_found_response():
+    return HTMLResponse(NOT_FOUND_PAGE, status_code=404, media_type="text/html")
+
+
+class InvalidAccessKey(Exception):
+    """管理或节点密钥校验失败。"""
 
 
 class Input(BaseModel):
@@ -87,7 +102,8 @@ def create_app(settings=None, db_path=None, clock=now):
     db = Database(db_path or os.environ.get("AUTHSERVER_DB", "authserver.sqlite3"))
     db.initialize()
     service = Service(db, settings, clock)
-    app = FastAPI(title="邀请码鉴权服务", debug=False)
+    app = FastAPI(title="邀请码鉴权服务", debug=False,
+                  docs_url=None, redoc_url=None, openapi_url=None)
     app.state.service = service
     limiter = RateLimiter(settings.limits.redeem_per_ip_per_hour, clock)
     salt = settings.security.token_salt.get_secret_value()
@@ -100,7 +116,7 @@ def create_app(settings=None, db_path=None, clock=now):
         import hmac
 
         if raw is None or not hmac.compare_digest(hash_token(raw, salt), hash_token(expected, salt)):
-            raise Problem(401, "认证密钥无效或缺失")
+            raise InvalidAccessKey()
 
     def admin(key: str | None = Header(default=None, alias="X-Admin-Key")):
         verify(key, settings.security.admin_key.get_secret_value())
@@ -113,6 +129,16 @@ def create_app(settings=None, db_path=None, clock=now):
 
     def session_limit(request: Request):
         limiter.check(ip(request), "session")
+
+    @app.exception_handler(HTTPException)
+    async def routing_error_handler(request, error):
+        if error.status_code in (404, 405):
+            return not_found_response()
+        return await http_exception_handler(request, error)
+
+    @app.exception_handler(InvalidAccessKey)
+    async def invalid_access_key_handler(request, error):
+        return not_found_response()
 
     @app.exception_handler(Problem)
     async def problem_handler(request, error):

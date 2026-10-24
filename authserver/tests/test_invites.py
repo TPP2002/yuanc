@@ -27,9 +27,13 @@ def test_create_and_redeem_days(days, client, admin, device, clock):
 
 @pytest.mark.parametrize("headers", [{}, {"X-Admin-Key": "wrong"}, {"X-Node-Key": "test-node-only"}])
 def test_admin_requires_own_key(client, headers):
-    assert client.post("/admin/invites", headers=headers, json={"days": 1}).status_code == 401
+    response = client.post("/admin/invites", headers=headers, json={"days": 1})
+    assert response.status_code == 404
+    assert response.headers["content-type"].startswith("text/html")
     for path in ("accounts", "devices", "audit"):
-        assert client.get("/admin/" + path, headers=headers).status_code == 401
+        response = client.get("/admin/" + path, headers=headers)
+        assert response.status_code == 404
+        assert response.headers["content-type"].startswith("text/html")
 
 
 @pytest.mark.parametrize("body", [{"days": 0}, {"days": -1}, {"days": True},
