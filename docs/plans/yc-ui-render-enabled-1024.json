@@ -1,0 +1,185 @@
+{
+  "schemaVersion": 1,
+  "taskId": "WINCLIENT-PREVIEW-ENABLED-STATE-SCREENSHOTS-1023",
+  "slug": "yc-ui-render-enabled-1024",
+  "title": "界面渲染测试在检查机上真跑(删掉交互会话门槛),预览可声明「连接可用」,截图分启用态与禁用态两套共 36 张",
+  "goal": "以派单时 origin/main 头为基点。两张看板卡合成一单,都只动界面渲染预览与它的测试:\n\n问题一(WINCLIENT-UITEST-SCREENSHOT-SKIPPED-NONINTERACTIVE-1023):RenderTests.cs 的渲染测试开头判 `System.Environment.UserInteractive` 为假就 WriteLine 一句后 return,算作「通过」。自托管检查机以 NETWORK SERVICE 非交互运行,所以 CI 上 28 张截图与主按钮断言从没真跑过,却显示绿。派单方 2026-10-24 已实测(草稿 PR #61,run 40055849384):去掉这道门槛后在同一台检查机上 WinClient.UiTests 59 项全过、耗时 3 秒,离屏绘制(RenderTargetBitmap)在非交互会话可用。所以修法就是删掉门槛,让渲染测试在任何会话都实际绘制与断言;不许改成 Skip、不许换别的会话判断、不许加环境变量开关。\n\n问题二(WINCLIENT-PREVIEW-ENABLED-STATE-SCREENSHOTS-1023):`MainViewModel.ApplyPreview` 不设 client,`CanUseConnection` 要求 `client is not null`,所以预览里即使 availability=Ready,所有依赖后台连接的按钮也都是禁用态,各页都叠着「后台服务未就绪」提示——这与真实就绪时的界面不符,启用态样式从来截不到。\n\n做完后:\n\n① MainViewModel.cs(只改这两处,其余一个字不动):\n  - 新增私有字段 `private bool previewConnection;`。\n  - `ApplyPreview` 签名改为 `public void ApplyPreview(ControlSnapshot snapshot, ServiceAvailability availability, bool connectionUsable = false)`,方法体第一行起加 `previewConnection = connectionUsable;`,其余照旧。\n  - `CanUseConnection` 改为 `(client is not null || previewConnection) && availability == ServiceAvailability.Ready && !IsBusy`。\n  缺省 false 时行为与现在完全一致(ViewModelTests 现有 5 个用例依赖「预览没有后台连接 → 禁用」,一个都不许改断言)。预览态下命令若被执行,SendAsync 仍因 client 为 null 抛 IOException 并由 RunAsync 既有路径吞掉,不新增任何真实连接路径。\n\n② RenderTests.cs:\n  - 删掉 UserInteractive 判断及那句跳过输出,文件里不再出现 `UserInteractive` 字样。\n  - `Model(...)` 帮助方法加参数 `bool connectionUsable`,透传给 ApplyPreview。\n  - 连接页十种状态:availability 为 Ready 的七种用 connectionUsable=true 渲染(与真实就绪一致);need-install / need-repair / unavailable 三种保持 false。文件名不变。\n  - 其他四页(Routing / Environment / Account / Update)各渲染两张:`page-<名>.png` 用 Ready + connectionUsable=true(启用态);新增 `page-<名>-unavailable.png` 用 `ServiceAvailability.Unavailable` + false(禁用态)。深色同样在扩展名前加 `-dark`。总数 = (10 + 8) × 2 = 36,`Assert.Equal(36, count)`;`bounds` 仍只记十种连接状态,`Assert.Equal(10, bounds.Count)` 不变;测试方法名里的「二十八」改「三十六」。\n  - 每张截图前新增断言:用帮助方法统计「自身及所有祖先 Visibility 都为 Visible」的 TextBlock 中 Text 含「未就绪」的个数(不许用 IsVisible:离屏没有 PresentationSource 时恒为 false)。connectionUsable=true 的每一张必须为 0,且 `model.CanUseConnection` 为 true;`page-*-unavailable` 的每一张必须 ≥ 1,且 `model.CanUseConnection` 为 false。连接页 need-install / need-repair / unavailable 三张不做这条断言。\n  - 主按钮的位置、尺寸、文字、颜色断言与非纯色断言全部保留。\n\n③ ViewModelTests.cs 新增一个 [Fact] `预览声明连接可用时按钮启用且可用性仍受后台状态约束`:同一 model 依次 ApplyPreview(未连接、ProtectionActive=false 的快照, Ready, connectionUsable: true) → CanUseConnection 真、CheckUpdateCommand.CanExecute(null) 真、CanRestoreEnvironment 真、ConnectionDisabledReason 为空串;再 ApplyPreview(同快照, Unavailable, connectionUsable: true) → CanUseConnection 假、ConnectionDisabledReason 含「未就绪」;再 ApplyPreview(同快照, Ready)(不传第三参)→ CanUseConnection 假。现有用例不动。\n\n④ docs/winclient/界面说明.md(只改渲染测试相关的那几段):截图清单改为连接页十张 + 其他四页各「启用态 page-<名>.png / 禁用态 page-<名>-unavailable.png」两张,浅深合计 36 张;写明预览经 ApplyPreview 第三个参数声明「连接可用」,Ready 状态默认按启用态渲染;删掉「若 Environment.UserInteractive 为 false,渲染测试按约定直接返回…」整句,改写为:渲染测试不依赖交互式会话,在自托管检查机(服务账户、非交互)上同样实际绘制并断言,2026-10-24 实测。「固定的八项自检明细样本」那句保留原文。不写施工过程(自测次数、响应文件、git 操作等)。",
+  "background": "项目:外包,Windows 客户端 .NET 9(Core 类库 + WPF App + xunit Tests + WinClient.UiTests 界面测试,sln 四个工程);App 已 `InternalsVisibleTo WinClient.UiTests`。\nMainViewModel(WinClient.App/MainViewModel.cs):字段 `availability`(ServiceAvailability)、`client`(ControlClient?);第 66 行 `public bool CanUseConnection => client is not null && availability == ServiceAvailability.Ready && !IsBusy;`;第 121 行 ConnectionDisabledReason 在不可用时返回「后台服务未就绪,请先在「连接」页处理。」;CanRestoreEnvironment / CanChangeRouting / CheckUpdateCommand / RedeemCommand / ContinueAnywayCommand 都以 CanUseConnection 为前提;ConnectCommand(主按钮)只看 !IsBusy;第 320 行 `public void ApplyPreview(ControlSnapshot snapshot, ServiceAvailability availability)` 设 availability、snapshot、serviceVersion、updateMessage、updateStatus 后 Refresh();Refresh 会 Notify(CanUseConnection) 等;CurrentPage 设为 Environment 时调 LoadSelfCheckAsync,client 为 null 时直接 ApplySelfCheckJson(null) 返回(RenderTests 之后再喂样本,不受影响)。\n界面里显示「未就绪」的地方:EnvironmentPage.xaml 第 15 行「后台服务未就绪,暂时不能改」(CanUseConnection 取反显示)、第 18 行自检明细区只在 CanUseConnection 为真时显示;AccountPage / RoutingPage / UpdatePage 显示 ConnectionDisabledReason(非空才显示)。这些 xaml 本单不改。\nRenderTests.cs(165 行):`[Collection(\"界面线程\")]`,Preview 记录(Name, Snapshot, Availability 缺省 Ready);Cases() 十种连接状态;测试方法 `浅深二十八张截图与主按钮位置固定` 开头第 49~53 行是 UserInteractive 门槛;ui.Invoke 内合并 Base/Glyphs/Controls 资源字典,浅深两主题循环,连接页按 Cases 渲染并断言 PrimaryButton,其他四页用 Disconnected 快照 + Ready 渲染,Environment 页额外 ApplySelfCheckJson(SelfCheckReport());帮助方法 Model / Arrange(880×600 Measure/Arrange,补发 Loaded)/ Unload / Descendants(VisualTreeHelper 递归)/ WritePng(非纯色断言)/ RepositoryRoot;截图写仓库根 build/ui-shots/(gitignore 内,不在施工面)。\nViewModelTests.cs:5 个用例在 `ui.Invoke(() => {...})` 里同步跑,`new MainViewModel(() => null, () => null)`。\nCI(.github/workflows/ci.yml)跑 `dotnet test winclient --nologo`;本单验收跑整个 sln 的 Release 构建与测试。\n本仓红线:只动本项目文件;凭据不入库;Windows 子进程一律隐藏窗口(本单不新增子进程);工人工位里不许装依赖、不许自己跑 dotnet build/test/restore(构建与测试一律经投递箱按验收编号 BUILD / TEST 申请,自己跑会留下带受限令牌的 MSBuild 节点害后续构建);测试只许写 build/ 或临时目录,不许往施工面(allowedPaths)写产物;不许读写 secrets/;不做 git 写操作。遇到契约之外的岔路(比如要动禁区文件)停下交 blocked 写结构化 forks,不自己定。\n看板卡 WINCLIENT-PREVIEW-ENABLED-STATE-SCREENSHOTS-1023(主)与 WINCLIENT-UITEST-SCREENSHOT-SKIPPED-NONINTERACTIVE-1023(合单)。",
+  "nonGoals": [
+    "不改任何 xaml、主题、样式、Presentation 与 Core;不改 CI 工作流与检查机运行方式",
+    "不做像素级金图比对、不把截图入库、不做悬停/按下态截图",
+    "不改 ViewModelTests 既有用例的断言;不在真机实测"
+  ],
+  "allowedPaths": [
+    "winclient/WinClient.App/MainViewModel.cs",
+    "winclient/WinClient.UiTests/RenderTests.cs",
+    "winclient/WinClient.UiTests/ViewModelTests.cs",
+    "docs/winclient/界面说明.md"
+  ],
+  "forbiddenPaths": [
+    ".codex/**",
+    ".github/**",
+    ".gitignore",
+    "authserver/**",
+    "node/**",
+    "scripts/**",
+    "pyproject.toml",
+    "requirements-dev.txt",
+    "docs/acceptance/**",
+    "docs/authserver/**",
+    "docs/design/**",
+    "docs/node/**",
+    "docs/plans/**",
+    "docs/交接/**",
+    "docs/口径速查表.md",
+    "docs/开工须知.md",
+    "docs/winclient/分应用代理说明.md",
+    "docs/winclient/打包与发布说明.md",
+    "docs/winclient/断网保护加固说明.md",
+    "docs/winclient/服务化与自启说明.md",
+    "docs/winclient/架构说明.md",
+    "docs/winclient/环境一致性说明.md",
+    "docs/winclient/自动更新说明.md",
+    "winclient/*.sln",
+    "winclient/Directory.Build.props",
+    "winclient/NuGet.Config",
+    "winclient/third_party/**",
+    "winclient/WinClient.Core/**",
+    "winclient/WinClient.Tests/**",
+    "winclient/WinClient.App/Views/**",
+    "winclient/WinClient.App/Themes/**",
+    "winclient/WinClient.App/Presentation/**",
+    "winclient/WinClient.App/Hosting/**",
+    "winclient/WinClient.App/Controls/**",
+    "winclient/WinClient.App/Assets/**",
+    "winclient/WinClient.App/Properties/**",
+    "winclient/WinClient.App/App.xaml",
+    "winclient/WinClient.App/App.xaml.cs",
+    "winclient/WinClient.App/MainWindow.xaml",
+    "winclient/WinClient.App/MainWindow.xaml.cs",
+    "winclient/WinClient.App/Program.cs",
+    "winclient/WinClient.App/EmbeddedKernelSource.cs",
+    "winclient/WinClient.App/WinClient.App.csproj",
+    "winclient/WinClient.App/app.manifest",
+    "winclient/WinClient.UiTests/StatusPresentationTests.cs",
+    "winclient/WinClient.UiTests/ThemeAndMotionTests.cs",
+    "winclient/WinClient.UiTests/UiThreadFixture.cs",
+    "winclient/WinClient.UiTests/WinClient.UiTests.csproj"
+  ],
+  "expectArtifacts": [
+    "winclient/WinClient.App/MainViewModel.cs",
+    "winclient/WinClient.UiTests/RenderTests.cs",
+    "winclient/WinClient.UiTests/ViewModelTests.cs",
+    "docs/winclient/界面说明.md"
+  ],
+  "acceptance": [
+    {
+      "id": "BUILD",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "build",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1200
+    },
+    {
+      "id": "TEST",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "test",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--no-build",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1200
+    },
+    {
+      "id": "SHAPE-VM",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;s=pathlib.Path('winclient/WinClient.App/MainViewModel.cs').read_text(encoding='utf-8');bad=[k for k,ok in (('sig','public void ApplyPreview(ControlSnapshot snapshot, ServiceAvailability availability, bool connectionUsable = false)' in s),('field','private bool previewConnection;' in s),('set','previewConnection = connectionUsable;' in s),('can','(client is not null || previewConnection) && availability == ServiceAvailability.Ready && !IsBusy' in s)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "SHAPE-RENDER",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;s=pathlib.Path('winclient/WinClient.UiTests/RenderTests.cs').read_text(encoding='utf-8');bad=[k for k,ok in (('nogate','UserInteractive' not in s),('count','Assert.Equal(36, count)' in s and 'Assert.Equal(28, count)' not in s),('bounds','Assert.Equal(10, bounds.Count)' in s),('name','三十六' in s and '二十八' not in s),('unavail','-unavailable' in s and 'ServiceAvailability.Unavailable' in s),('usable','connectionUsable' in s),('hint','未就绪' in s and 'Visibility.Visible' in s and 'IsVisible' not in s),('kept','PrimaryButton' in s and 'Assert.Equal(144, actual.W)' in s and '截图不得为纯色' in s)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "TESTS-VM",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;s=pathlib.Path('winclient/WinClient.UiTests/ViewModelTests.cs').read_text(encoding='utf-8');bad=[k for k,ok in (('fact','预览声明连接可用时按钮启用且可用性仍受后台状态约束' in s),('arg',s.count('connectionUsable: true')>=2),('kept',all(n in s for n in ('浏览器提醒随快照更新且没有后台连接不能继续','强制恢复在连接保护或后台不可用时禁用','预览不建立连接且保留消息和版本','Assert.False(model.CanUseConnection)'))),('facts',s.count('[Fact]')>=6)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;u=pathlib.Path('docs/winclient/界面说明.md').read_text(encoding='utf-8');bad=[k for k,ok in (('n36','36 张' in u and '28 张' not in u),('unavail',all('page-'+n+'-unavailable.png' in u for n in ('routing','environment','account','update'))),('gate','按约定直接返回' not in u and '非交互' in u and '2026-10-24' in u),('arg','ApplyPreview' in u and '连接可用' in u),('kept','固定的八项自检明细样本' in u and 'primary-button.json' in u and '## 真机待验证' in u),('noproc','自测' not in u and '响应文件' not in u)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "SCOPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess as sp,sys;g=lambda *a:sp.check_output(['git','-c','core.quotepath=false']+list(a)).decode('utf-8').split(chr(10));mb=g('merge-base','origin/main','HEAD')[0].strip();ch={p.strip() for p in g('diff','--name-only',mb)+g('ls-files','--others','--exclude-standard') if p.strip()};ok={'winclient/WinClient.App/MainViewModel.cs','winclient/WinClient.UiTests/RenderTests.cs','winclient/WinClient.UiTests/ViewModelTests.cs','docs/winclient/界面说明.md'};bad=sorted(ch-ok);print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "NOBIN",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess,sys;out=subprocess.run(['git','ls-files','winclient','build'],capture_output=True,text=True).stdout.split();bad=[f for f in out if f.endswith(('.exe','.dll','.zip','.pdb','.png'))];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "model": null,
+  "timeoutSec": 7200,
+  "repoRoot": "E:/yuanc",
+  "engine": "codex",
+  "reasoningEffort": "medium",
+  "steps": [
+    "读 MainViewModel.cs(CanUseConnection、ConnectionDisabledReason、ApplyPreview、LoadSelfCheckAsync)、RenderTests.cs、ViewModelTests.cs、Views 下五个页面 xaml(只读,看「未就绪」提示怎么显示)、docs/winclient/界面说明.md 渲染测试那几段。",
+    "先写 ViewModelTests 新用例与 RenderTests 新断言,经投递箱申请 BUILD / TEST 看红;再改 MainViewModel 两处与 RenderTests 渲染矩阵;BUILD / TEST / SHAPE-VM / SHAPE-RENDER / TESTS-VM / SCOPE / NOBIN 全绿。",
+    "改 界面说明.md;DOCS 绿;交活说明里列出真机待验证项(150% 缩放、悬停/按下态仍未覆盖)。"
+  ]
+}
