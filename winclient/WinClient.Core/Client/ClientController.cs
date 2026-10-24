@@ -89,6 +89,7 @@ public sealed class ClientController : IDisposable
     private bool protectionVerified;
     private string? firewallWarning;
     private const string KeepTunnelWarning = "断网保护未能重新套用:系统防火墙已被关闭或被策略覆盖,隧道保持但失去断网兜底;请立即在 Windows 安全中心开启防火墙或联系管理员";
+    private const string WfpKeepTunnelWarning = "断网保护未能重新套用:系统过滤层的过滤器未能建立,隧道保持,但缺少这道断网兜底;请联系管理员";
     private bool disposed;
     private long generation;
     private string message = "";
@@ -562,11 +563,12 @@ public sealed class ClientController : IDisposable
                         protectionVerified = true;
                         firewallWarning = null;
                     }
-                    catch (FirewallIneffectiveException) when (held)
+                    catch (FirewallIneffectiveException ex) when (held)
                     {
-                        firewallWarning = KeepTunnelWarning;
-                        guardStatus = KeepTunnelWarning;
-                        message = KeepTunnelWarning;
+                        var keep = ex is WfpUnavailableException ? WfpKeepTunnelWarning : KeepTunnelWarning;
+                        firewallWarning = keep;
+                        guardStatus = keep;
+                        message = keep;
                     }
                     break;
                 case EffectKind.UpdateKillSwitchNode:
@@ -758,6 +760,7 @@ public sealed class ClientController : IDisposable
                 message = "断网保护已重新生效。";
             }
         }
+        catch (WfpUnavailableException ex) { guardStatus = ex.Message; message = guardStatus; }
         catch (FirewallIneffectiveException)
         {
             guardStatus = "系统防火墙已被关闭或被策略覆盖,断网保护可能失效,请立即在 Windows 安全中心开启防火墙或联系管理员";

@@ -1779,6 +1779,38 @@ public sealed class ControllerTests
     private static HttpClient SessionHttp(Func<SessionResponse> response) => new(new AuthTests.Handler(_ => new(HttpStatusCode.OK)
     { Content = new StringContent(JsonSerializer.Serialize(response(), new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower })) }))
     { BaseAddress = new("https://unit.invalid") };
+    [Fact]
+    public async Task HeldWfpFailureKeepsTunnelAndShowsExactWarning()
+    {
+        var order = new List<string>();
+        var firewall = new Firewall(order) { HasPendingState = true,
+            ApplyError = new WfpUnavailableException(KillSwitchApplier.WfpConnectRefused) };
+        using var controller = new ClientController(new PairingSessionSource(PairingTests.ValidPairing()),
+            firewall, new Tunnel(order), Path.GetFullPath("fake.exe"), TestData.Device);
+        await controller.InitializeAsync(autoConnect: false, keepProtection: true);
+        Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
+        Assert.Equal(new[] { "apply", "start" }, order);
+        Assert.True(controller.Snapshot.ProtectionActive);
+        Assert.Equal("断网保护未能重新套用:系统过滤层的过滤器未能建立,隧道保持,但缺少这道断网兜底;请联系管理员", controller.Snapshot.Message);
+    }
+
+    [Fact]
+    public async Task FirstWfpFailureRefusesTunnelAndRequiresManualRecovery()
+    {
+        var order = new List<string>(); using var http = SessionHttp(() => TestData.Session());
+        var store = new InMemoryCredentialStore(); store.Save("refresh");
+        using var controller = new ClientController(new AuthApiClient(http), store,
+            new Firewall(order) { ApplyError = new WfpUnavailableException(KillSwitchApplier.WfpConnectRefused) },
+            new Tunnel(order), Path.GetFullPath("fake.exe"), TestData.Device);
+        await controller.ConnectAsync();
+        Assert.Equal(ConnectionState.NeedsManual, controller.Snapshot.State);
+        Assert.Equal(KillSwitchApplier.WfpConnectRefused, controller.Snapshot.Message);
+        Assert.True(controller.Snapshot.ProtectionActive);
+        Assert.Contains("apply", order);
+        Assert.DoesNotContain("start", order);
+        Assert.DoesNotContain("remove", order);
+    }
+
     private sealed class Firewall(List<string> order) : IKillSwitch
     {
         public bool BlockPatrol { get; set; }

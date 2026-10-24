@@ -28,12 +28,20 @@ public interface IKillSwitch
         realityPort == 443 ? UpdateNodeAsync(ips, program, hy2Port) : throw new InvalidOperationException("当前断网保护不支持此出口端口。");
 }
 
-public sealed class FirewallIneffectiveException(string message) : InvalidOperationException(message);
+public class FirewallIneffectiveException(string message) : InvalidOperationException(message);
+public sealed class WfpUnavailableException(string message) : FirewallIneffectiveException(message);
 
 public sealed class KillSwitchApplier : IKillSwitch
 {
     public const int VerifyFailedExitCode = 3;
+    public const string WfpConnectRefused = "系统过滤层断网保护未能建立,已拒绝连接。请点击断开后重试,仍失败请联系管理员。";
+    public const string WfpRemoveFailed = "系统过滤层断网保护未能撤销,网络可能仍被阻断;请重试断开或联系管理员。";
+    public const string WfpPatrolFailed = "系统过滤层过滤器缺失且未能重建,断网保护可能失效,请联系管理员";
     private readonly ICommandRunner runner;
+    private readonly IWfpEngine? wfp;
+    private readonly string wfpOffPath;
+    private IReadOnlyList<WfpFilterSpec>? wfpPolicy;
+    private AuthEndpoint? lastAuth;
     private readonly SemaphoreSlim gate = new(1, 1);
     public string StatePath { get; }
     public bool HasPendingState => File.Exists(StatePath);
@@ -52,24 +60,29 @@ public sealed class KillSwitchApplier : IKillSwitch
     }
     public string AuditPath { get; }
     public string? LastRecoveryWarning { get; private set; }
-    public KillSwitchApplier(string runDirectory, ICommandRunner? runner = null)
+    public KillSwitchApplier(string runDirectory, ICommandRunner? runner = null, IWfpEngine? wfp = null)
     {
         this.runner = runner ?? new CommandRunner();
+        this.wfp = wfp;
+        wfpOffPath = Path.Combine(runDirectory, "wfp-off");
         StatePath = Path.Combine(runDirectory, "killswitch-state.json");
         AuditPath = Path.Combine(runDirectory, "firewall-audit.json");
     }
 
     public Task ApplyAsync(IReadOnlyList<IPAddress> ips, string program, int hy2Port, AuthEndpoint? auth = null) =>
-        ExecuteAsync(KillSwitchPlanner.Plan(ips, KillSwitchPlanner.TunAlias, program, hy2Port, KillSwitchMode.Apply, auth: auth));
+        ApplyAsync(ips, program, hy2Port, 443, auth);
     public Task UpdateNodeAsync(IReadOnlyList<IPAddress> ips, string program, int hy2Port) =>
-        ExecuteAsync(KillSwitchPlanner.UpdateNode(ips, program, hy2Port));
+        UpdateNodeAsync(ips, program, hy2Port, 443);
     public Task ApplyAsync(IReadOnlyList<IPAddress> ips, string program, int hy2Port, int realityPort, AuthEndpoint? auth = null) =>
-        ExecuteAsync(KillSwitchPlanner.Plan(ips, KillSwitchPlanner.TunAlias, program, hy2Port, KillSwitchMode.Apply, realityPort, auth));
+        ExecuteAsync(KillSwitchPlanner.Plan(ips, KillSwitchPlanner.TunAlias, program, hy2Port, KillSwitchMode.Apply, realityPort, auth),
+            () => WfpPlanner.PlanGlobal(ips, program, hy2Port, realityPort, auth), rememberAuth: true, auth: auth);
     public Task UpdateNodeAsync(IReadOnlyList<IPAddress> ips, string program, int hy2Port, int realityPort) =>
-        ExecuteAsync(KillSwitchPlanner.UpdateNode(ips, program, hy2Port, realityPort));
-    public Task RemoveAsync() => ExecuteAsync([new RemoveRulesByPrefix(KillSwitchPlanner.Prefix), new RestoreProfileDefault()]);
+        ExecuteAsync(KillSwitchPlanner.UpdateNode(ips, program, hy2Port, realityPort),
+            () => WfpPlanner.PlanGlobal(ips, program, hy2Port, realityPort, lastAuth));
+    public Task RemoveAsync() => ExecuteAsync([new RemoveRulesByPrefix(KillSwitchPlanner.Prefix), new RestoreProfileDefault()], remove: true);
 
-    public Task ApplyAppsAsync(IReadOnlyList<string> programs) => ExecuteAsync(KillSwitchPlanner.PlanApps(programs));
+    public Task ApplyAppsAsync(IReadOnlyList<string> programs) => ExecuteAsync(KillSwitchPlanner.PlanApps(programs),
+        () => WfpPlanner.PlanApps(programs), rememberAuth: true);
     public Task<PatrolReport> PatrolAsync(IReadOnlyList<string> expectedRules) => PatrolAsync(expectedRules, true);
 
     public Task<PatrolReport> PatrolAsync(IReadOnlyList<string> expectedRules, bool enforceDefaultBlock)
@@ -80,6 +93,22 @@ public sealed class KillSwitchApplier : IKillSwitch
         await gate.WaitAsync().ConfigureAwait(false);
         try
         {
+            var wfpFailed = false;
+            var wfpRebuilt = false;
+            if (wfp is not null && !File.Exists(wfpOffPath) && wfpPolicy is not null)
+            {
+                try
+                {
+                    var names = wfp.ListFilterNames();
+                    if (names.Count != wfpPolicy.Count || !names.Order(StringComparer.Ordinal)
+                        .SequenceEqual(wfpPolicy.Select(filter => filter.Name).Order(StringComparer.Ordinal), StringComparer.Ordinal))
+                    {
+                        wfp.Install(wfpPolicy);
+                        wfpRebuilt = true;
+                    }
+                }
+                catch (WfpException) { wfpFailed = true; }
+            }
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
             timeout.CancelAfter(TimeSpan.FromSeconds(180));
             var script = KillSwitchPlanner.ToPowerShellScript([new Patrol(expectedRules.ToArray(), EnforceDefaultBlock: enforceDefaultBlock)], StatePath, AuditPath);
@@ -87,15 +116,18 @@ public sealed class KillSwitchApplier : IKillSwitch
             if (result.ExitCode == VerifyFailedExitCode)
                 throw new FirewallIneffectiveException("系统防火墙已被关闭或被策略覆盖，断网保护无法生效，已拒绝连接。请点击断开，在 Windows 安全中心开启防火墙（或联系管理员解除策略）后重新连接。");
             if (result.ExitCode != 0) throw new InvalidOperationException("断网保护巡检失败,请联系管理员。");
+            PatrolReport report;
             try
             {
                 var line = result.Output.Split('\n').LastOrDefault(value => !string.IsNullOrWhiteSpace(value));
                 using var json = JsonDocument.Parse(line ?? "");
-                return new(ReadNames(json.RootElement, "reenforced"), ReadNames(json.RootElement, "newly_disabled"),
+                report = new(ReadNames(json.RootElement, "reenforced"), ReadNames(json.RootElement, "newly_disabled"),
                     ReadNames(json.RootElement, "missing_rules"));
             }
             catch (Exception ex) when (ex is JsonException or InvalidOperationException or KeyNotFoundException)
             { throw new InvalidOperationException("断网保护巡检失败,请联系管理员。"); }
+            if (wfpFailed) throw new WfpUnavailableException(WfpPatrolFailed);
+            return wfpRebuilt ? report with { MissingRules = [.. report.MissingRules, WfpPlanner.MissingMarker] } : report;
         }
         finally { gate.Release(); }
     }
@@ -109,6 +141,16 @@ public sealed class KillSwitchApplier : IKillSwitch
         await gate.WaitAsync().ConfigureAwait(false);
         try
         {
+            var wfpFailed = !RemoveWfp();
+            var warning = await RecoverFirewallAsync().ConfigureAwait(false);
+            if (wfpFailed) throw new InvalidOperationException(WfpRemoveFailed);
+            return warning;
+        }
+        finally { gate.Release(); }
+    }
+
+    private async Task<string?> RecoverFirewallAsync()
+    {
             if (!File.Exists(StatePath)) return LastRecoveryWarning;
             if (await RunRecoveryStageAsync([new RemoveRulesByPrefix(KillSwitchPlanner.Prefix), new RestoreProfileDefault()], "restore").ConfigureAwait(false) == 0)
             {
@@ -121,8 +163,6 @@ public sealed class KillSwitchApplier : IKillSwitch
                 return LastRecoveryWarning;
             }
             throw new InvalidOperationException("防火墙操作失败，恢复记录已保留，请联系管理员。");
-        }
-        finally { gate.Release(); }
     }
 
     private async Task<int> RunRecoveryStageAsync(IReadOnlyList<FirewallAction> actions, string stage)
@@ -156,11 +196,52 @@ public sealed class KillSwitchApplier : IKillSwitch
         return start;
     }
 
-    private async Task ExecuteAsync(IReadOnlyList<FirewallAction> actions)
+    // 仅在既有 gate 内调用。移除失败不遮蔽先前的防火墙异常。
+    private bool RemoveWfp()
+    {
+        try
+        {
+            wfp?.Remove();
+            wfpPolicy = null;
+            lastAuth = null;
+            return true;
+        }
+        catch (WfpException) { return false; }
+    }
+
+    private bool InstallWfp(Func<IReadOnlyList<WfpFilterSpec>> createPolicy, bool rememberAuth, AuthEndpoint? auth)
+    {
+        if (wfp is null) return true;
+        var policy = createPolicy(); // 参数错误不能被吞掉，也不能执行脚本。
+        if (rememberAuth) lastAuth = auth;
+        if (File.Exists(wfpOffPath))
+        {
+            try { wfp.Remove(); wfpPolicy = null; }
+            catch (WfpException) { /* 显式关闭时清理旧过滤器，但不报告 WFP 安装错误。 */ }
+            return true;
+        }
+        try { wfp.Install(policy); wfpPolicy = policy; return true; }
+        catch (WfpException) { return false; }
+    }
+
+    private async Task ExecuteAsync(IReadOnlyList<FirewallAction> actions,
+        Func<IReadOnlyList<WfpFilterSpec>>? createPolicy = null, bool rememberAuth = false, AuthEndpoint? auth = null, bool remove = false)
     {
         await gate.WaitAsync().ConfigureAwait(false);
         try
         {
+            var installed = createPolicy is null || InstallWfp(createPolicy, rememberAuth, auth);
+            var removed = true;
+            try { await RunActionsAsync(actions).ConfigureAwait(false); }
+            finally { if (remove) removed = RemoveWfp(); }
+            if (!removed) throw new InvalidOperationException(WfpRemoveFailed);
+            if (!installed) throw new WfpUnavailableException(WfpConnectRefused);
+        }
+        finally { gate.Release(); }
+    }
+
+    private async Task RunActionsAsync(IReadOnlyList<FirewallAction> actions)
+    {
             using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(180));
             var result = await runner.RunAsync(CreateStartInfo(KillSwitchPlanner.ToPowerShellScript(actions, StatePath, AuditPath)), timeout.Token).ConfigureAwait(false);
             if (result.ExitCode == VerifyFailedExitCode && actions.Any(action => action is VerifyRules))
@@ -168,7 +249,5 @@ public sealed class KillSwitchApplier : IKillSwitch
             if (result.ExitCode == VerifyFailedExitCode)
                 throw new FirewallIneffectiveException("系统防火墙已被关闭或被策略覆盖，断网保护无法生效，已拒绝连接。请点击断开，在 Windows 安全中心开启防火墙（或联系管理员解除策略）后重新连接。");
             if (result.ExitCode != 0) throw new InvalidOperationException("防火墙操作失败，恢复记录已保留，请联系管理员。");
-        }
-        finally { gate.Release(); }
     }
 }
