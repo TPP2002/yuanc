@@ -46,11 +46,7 @@ public sealed class RenderTests(UiThreadFixture ui, ITestOutputHelper output)
     [Fact]
     public void 浅深二十八张截图与主按钮位置固定()
     {
-        if (!System.Environment.UserInteractive)
-        {
-            output.WriteLine("跳过渲染：Environment.UserInteractive 为 false，当前不是交互式用户会话。");
-            return;
-        }
+        Console.WriteLine("EXP-SESSION0 UserInteractive=" + System.Environment.UserInteractive + " user=" + System.Environment.UserName);
         ui.Invoke(() =>
         {
             var directory = Path.Combine(RepositoryRoot(), "build", "ui-shots");
@@ -108,6 +104,7 @@ public sealed class RenderTests(UiThreadFixture ui, ITestOutputHelper output)
                 Assert.Equal(28, count); Assert.Equal(10, bounds.Count);
                 File.WriteAllText(Path.Combine(directory, "primary-button.json"), JsonSerializer.Serialize(bounds,
                     new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase, WriteIndented = true }));
+                Console.WriteLine("EXP-SESSION0 rendered " + count + " png");
                 output.WriteLine("已渲染 28 张 PNG；浅深主题十种连接状态下主按钮坐标与尺寸完全相同。");
             }
             finally { MotionSettings.Override = null; }
