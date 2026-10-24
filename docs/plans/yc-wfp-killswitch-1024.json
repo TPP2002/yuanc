@@ -261,7 +261,7 @@
       "argv": [
         "python",
         "-c",
-        "import subprocess as sp,sys;g=lambda *a:sp.check_output(['git','-c','core.quotepath=false']+list(a)).decode('utf-8').split(chr(10));mb=g('merge-base','origin/main','HEAD')[0].strip();ch={p.strip() for p in g('diff','--name-only',mb)+g('ls-files','--others','--exclude-standard') if p.strip()};ok=set([\"winclient/WinClient.Core/Firewall/WfpPlanner.cs\", \"winclient/WinClient.Core/Firewall/WfpEngine.cs\", \"winclient/WinClient.Core/Firewall/WfpNative.cs\", \"winclient/WinClient.Core/Firewall/KillSwitchApplier.cs\", \"winclient/WinClient.Core/WinClient.Core.csproj\", \"winclient/WinClient.Core/Client/ClientRuntime.cs\", \"winclient/WinClient.Core/Client/ClientController.cs\", \"winclient/WinClient.App/Hosting/InstallerRunner.cs\", \"winclient/WinClient.Tests/WfpPlannerTests.cs\", \"winclient/WinClient.Tests/WfpApplierTests.cs\", \"winclient/WinClient.Tests/WfpLiveTests.cs\", \"winclient/WinClient.Tests/ControllerTests.cs\", \"docs/winclient/断网保护加固说明.md\", \"docs/winclient/架构说明.md\"]);bad=sorted(ch-ok);print(bad);sys.exit(1 if bad else 0)"
+        "import subprocess as sp,sys;g=lambda *a:sp.check_output(['git','-c','core.quotepath=false']+list(a)).decode('utf-8').split(chr(10));mb=g('merge-base','origin/main','HEAD')[0].strip();ch={p.strip() for p in g('diff','--name-only',mb)+g('ls-files','--others','--exclude-standard') if p.strip()};W='winclient/WinClient.';ok={W+x for x in ('Core/Firewall/WfpPlanner.cs','Core/Firewall/WfpEngine.cs','Core/Firewall/WfpNative.cs','Core/Firewall/KillSwitchApplier.cs','Core/WinClient.Core.csproj','Core/Client/ClientRuntime.cs','Core/Client/ClientController.cs','App/Hosting/InstallerRunner.cs','Tests/WfpPlannerTests.cs','Tests/WfpApplierTests.cs','Tests/WfpLiveTests.cs','Tests/ControllerTests.cs')}|{'docs/winclient/断网保护加固说明.md','docs/winclient/架构说明.md'};bad=sorted(ch-ok);print(bad);sys.exit(1 if bad else 0)"
       ]
     },
     {
@@ -272,7 +272,18 @@
       "argv": [
         "python",
         "-c",
-        "import pathlib,sys;d='winclient/WinClient.Core/Firewall/';r=lambda f:pathlib.Path(d+f).read_text(encoding='utf-8') if pathlib.Path(d+f).exists() else '';p=r('WfpPlanner.cs');n=r('WfpNative.cs');e=r('WfpEngine.cs');allc=p+n+e;bad=[k for k,ok in (('planner','static IReadOnlyList<WfpFilterSpec> PlanGlobal(' in p and 'static IReadOnlyList<WfpFilterSpec> PlanApps(' in p and 'DllImport' not in p and 'File.' not in p),('native','fwpuclnt.dll' in n and all(x in n for x in ('FwpmTransactionBegin0','FwpmTransactionAbort0','FwpmTransactionCommit0','FwpmFilterAdd0','FwpmGetAppIdFromFileName0','FwpmFreeMemory0','FwpmFilterCreateEnumHandle0','FwpmSubLayerAdd0','FwpmProviderAdd0'))),('engine','interface IWfpEngine' in e and 'CreateProduction' in e and '49ba4101-50c7-486e-80d0-979345e10a22' in e and 'ffef6964-a2ff-45c3-a939-f39ac090e98e' in e),('nohard',len(allc)>0 and all(x not in allc for x in ('CLEAR_ACTION_RIGHT','BOOTTIME','FwpmCalloutAdd','ProcessStartInfo','.Start('))),('nodyn','FWPM_SESSION_FLAG_DYNAMIC' not in e)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+        "import pathlib,sys;d='winclient/WinClient.Core/Firewall/';r=lambda f:pathlib.Path(d+f).read_text(encoding='utf-8') if pathlib.Path(d+f).exists() else '';p=r('WfpPlanner.cs');n=r('WfpNative.cs');e=r('WfpEngine.cs');allc=p+n+e;bad=[k for k,ok in (('planner','static IReadOnlyList<WfpFilterSpec> PlanGlobal(' in p and 'static IReadOnlyList<WfpFilterSpec> PlanApps(' in p and 'DllImport' not in p and 'File.' not in p),('native','fwpuclnt.dll' in n and all(x in n for x in ('FwpmTransactionBegin0','FwpmTransactionAbort0','FwpmTransactionCommit0','FwpmFilterAdd0','FwpmGetAppIdFromFileName0','FwpmFreeMemory0','FwpmFilterCreateEnumHandle0','FwpmSubLayerAdd0','FwpmProviderAdd0')))) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ]
+    },
+    {
+      "id": "SHAPE-WFP2",
+      "kind": "command",
+      "required": true,
+      "timeoutSec": 120,
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;d='winclient/WinClient.Core/Firewall/';r=lambda f:pathlib.Path(d+f).read_text(encoding='utf-8') if pathlib.Path(d+f).exists() else '';p=r('WfpPlanner.cs');n=r('WfpNative.cs');e=r('WfpEngine.cs');allc=p+n+e;bad=[k for k,ok in (('engine','interface IWfpEngine' in e and 'CreateProduction' in e and '49ba4101-50c7-486e-80d0-979345e10a22' in e and 'ffef6964-a2ff-45c3-a939-f39ac090e98e' in e),('nohard',len(allc)>0 and all(x not in allc for x in ('CLEAR_ACTION_RIGHT','BOOTTIME','FwpmCalloutAdd','ProcessStartInfo','.Start('))),('nodyn','FWPM_SESSION_FLAG_DYNAMIC' not in e)) if not ok];print(bad);sys.exit(1 if bad else 0)"
       ]
     },
     {
