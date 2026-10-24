@@ -49,3 +49,12 @@ jobs:
       - name: 运行客户端测试
         if: hashFiles('winclient/**/*.sln') != ''
         run: dotnet test winclient --nologo
+      - name: 保存界面截图
+        if: always() && hashFiles('winclient/**/*.sln') != ''
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-shots-${{ github.run_id }}
+          path: build/ui-shots
+          retention-days: 7
+          if-no-files-found: ignore
