@@ -1,0 +1,184 @@
+{
+  "schemaVersion": 1,
+  "taskId": "SEC-WIN-NIC-PUBLIC-ADDR-1025",
+  "slug": "yc-leak-nic-conn-1025",
+  "title": "连接期间收紧网卡公网地址(公网 IPv4 拒连、关公网 IPv6 绑定并可恢复)+ 断网保护套用后重置连接前建立的隧道外 TCP 连接;自检第 11 项",
+  "goal": "以派单时 origin/main 头为基点。看板卡 SEC-WIN-NIC-PUBLIC-ADDR-1025 与 SEC-WIN-STALE-CONN-RESET-1025 合单(taskId 填前者)。这是 VPN 客户端防泄漏的两项标准做法,两种代理范围(全部流量 / 仅指定程序)都要生效:\n\n【一】网卡上的公网地址(SEC-WIN-NIC-PUBLIC-ADDR-1025)。浏览器与桌面应用的实时通信功能(WebRTC)会直接读本机网卡地址作为「本机候选地址」写进信令,这一步不经网络,隧道与断网保护都拦不到。国内家宽普遍给电脑分公网 IPv6,电脑自己拨号时网卡上还有公网 IPv4。做法:连接前有公网 IPv4 就拒连;连接期间关掉带公网 IPv6 的网卡的 IPv6 绑定,断开时恢复。\n\n【二】连接前已建立的旧连接(SEC-WIN-STALE-CONN-RESET-1025)。连接前就开着的软件经物理网卡建好的 TCP 长连接,源地址是物理网卡地址,改路由后仍可能从物理网卡发出。做法:断网保护套用后立即把这些 IPv4 TCP 连接重置,软件会马上重连并被隧道接管。\n\n做完后:\n\n① 新建 winclient/WinClient.Core/Network/PublicAddress.cs,命名空间 WinClient.Core.Network,`public static class PublicAddress { public static bool IsPublic(IPAddress address) }`。IPv4 以下网段一律不算公网,其余算:0.0.0.0/8、10.0.0.0/8、100.64.0.0/10、127.0.0.0/8、169.254.0.0/16、172.16.0.0/12、192.0.0.0/24、192.0.2.0/24、192.168.0.0/16、198.18.0.0/15、198.51.100.0/24、203.0.113.0/24、224.0.0.0/4、240.0.0.0/4。IPv6:IPv4 映射地址(::ffff:a.b.c.d)按其 IPv4 判;否则只有落在 2000::/3 且不在 2001:db8::/32 的算公网(链路本地、fc00::/7 含隧道 fdfe:dcba:9876::/126、组播、回环都不算)。\n\n② AdapterProbe.cs:`AdapterInfo` 加 init 属性 `public IReadOnlyList<AdapterAddress> Ipv6 { get; init; } = [];`(构造参数不变,既有调用不改),`SystemAdapterProbe` 同时填 IPv6 单播地址。EnvironmentSelfCheck 第 9 项(网段冲突)仍只看 Ipv4。\n\n③ 新建 winclient/WinClient.Core/Network/NicGuard.cs(可再拆文件,都放 Network 目录):\n- `public sealed class NicGuardException(string message) : FirewallIneffectiveException(message);`\n- `public sealed record NicPatrolReport(IReadOnlyList<string> NewlyDisabled, IReadOnlyList<string> PublicIpv4Adapters);`\n- `public interface INicGuard { bool HasPendingState { get; } string? PublicIpv4Adapter(); Task ApplyAsync(CancellationToken token); Task<NicPatrolReport> PatrolAsync(CancellationToken token); Task<string?> RestoreAsync(); }`\n- `public sealed class NicGuard : INicGuard`,构造 `(string runDirectory, IAdapterProbe probe, ICommandRunner? runner = null, Func<TimeSpan, CancellationToken, Task>? delay = null)`,记录文件 `<runDirectory>/nic-guard-state.json`,内容 `{\"disabled\":[\"网卡名\",...]}`,原子写(.tmp + 刷盘 + 替换)。\n- 「被管网卡」= 探针快照里名字不是 `YuanC-TUN`(KillSwitchPlanner.TunAlias)的网卡。\n- `PublicIpv4Adapter()`:返回第一个 Ipv4 里有 PublicAddress.IsPublic 地址的被管网卡名,没有返回 null;快照为 null 抛 InvalidOperationException(\"无法读取网卡地址\")。\n- `ApplyAsync`:找出 Ipv6 里有公网地址的被管网卡;没有就直接返回(不写记录、不跑脚本);有就**先**把这些名字与已有记录取并集写进记录,**再**跑 PowerShell:对每个名字 `Disable-NetAdapterBinding -Name '<名>' -ComponentID ms_tcpip6 -Confirm:$false -ErrorAction Stop`;然后每秒重新快照一次、最多 10 次,直到被管网卡都不再有公网 IPv6;脚本退出码非 0 或 10 次后仍有,抛 NicGuardException(\"未能关闭网卡「<名>」的 IPv6,其公网 IPv6 地址可能被网页读到,已拒绝连接。请点击断开后重试,仍失败请联系管理员。\")(<名> 为第一个仍有公网 IPv6 或失败的网卡)。\n- `PatrolAsync`:重新快照;新出现公网 IPv6 的被管网卡照 ApplyAsync 同样先记后关,返回其名字于 NewlyDisabled;Ipv4 有公网地址的被管网卡名放进 PublicIpv4Adapters;关闭失败抛 NicGuardException(\"未能关闭网卡「<名>」的 IPv6,隧道保持,但该网卡的公网 IPv6 地址可能被网页读到;请联系管理员。\")。\n- `RestoreAsync`:没有记录返回 null;有记录就对记录里每个名字 `Enable-NetAdapterBinding -Name '<名>' -ComponentID ms_tcpip6 -Confirm:$false`(网卡已不存在算成功);全部成功删记录返回 null;部分失败把失败的名字写回记录(只留失败的)并返回 \"网卡「<名1>、<名2>」的 IPv6 未能恢复,请重试断开或联系管理员。\";运行器异常同样按全部失败处理、不抛出。\n- PowerShell 用 `-NoProfile -NonInteractive -ExecutionPolicy Bypass`,网卡名单引号包裹并把 ' 双写;ProcessStartInfo 必须 `CreateNoWindow = true`、`UseShellExecute = false`、`WindowStyle = Hidden`。不把任何地址写进脚本、记录、异常或日志。\n\n④ 新建 winclient/WinClient.Core/Network/ConnectionReaper.cs(可拆文件):\n- `public sealed record TcpEntry(int State, IPAddress Local, int LocalPort, IPAddress Remote, int RemotePort, int Pid, string? ProcessPath);`(State 用 MIB_TCP_STATE 数值:1 CLOSED、2 LISTEN、11 TIME_WAIT、12 DELETE_TCB)\n- `public interface ITcpTable { IReadOnlyList<TcpEntry> Snapshot(); bool Reset(TcpEntry entry); }`;`SystemTcpTable` 用 iphlpapi `GetExtendedTcpTable`(AF_INET、TCP_TABLE_OWNER_PID_ALL)取表、`QueryFullProcessImageName`(PROCESS_QUERY_LIMITED_INFORMATION)取进程完整路径(取不到为 null)、`SetTcpEntry` 把 dwState 设为 12 重置;端口按网络字节序转换。\n- `public sealed record ReapPolicy(bool AppsMode, IReadOnlyList<string> Apps, string KernelPath, IReadOnlyList<IPAddress> NodeIps, AuthEndpoint? Auth);` `public sealed record ReapReport(int Reset, int Failed, int Remaining);`\n- `public static class StaleConnectionPlanner { public static IReadOnlyList<TcpEntry> Select(IEnumerable<TcpEntry> entries, ReapPolicy policy) }`,选中条件全部满足才选:State 不是 1/2/11/12;Local 不是 0.0.0.0、不在 127.0.0.0/8、不在 172.19.0.0/30;PublicAddress.IsPublic(Remote);不是「ProcessPath 与 KernelPath 不分大小写相等且 Remote ∈ NodeIps」;不是「Auth 非空且 ProcessPath 与 Auth.Program 不分大小写相等且 Remote == Auth.Address 且 RemotePort == Auth.Port」;AppsMode 时还要求 ProcessPath 非空且不分大小写等于 Apps 之一(取不到路径的不选),全部流量模式下取不到路径的照样选。\n- `public interface IConnectionReaper { ReapReport Reap(ReapPolicy policy); }`;`ConnectionReaper(ITcpTable table)`:快照 → Select → 逐条 Reset(返回 false 或抛 Win32Exception 都计 Failed)→ 再快照 → Select 的条数为 Remaining。不记录任何地址与端口。\n\n⑤ ClientController:两个构造函数末尾各加可选参数 `INicGuard? nicGuard = null, IConnectionReaper? reaper = null`(第一个构造函数透传),为 null 时一切行为与现在逐字节相同。\n- ConnectAsync:在「仅指定程序至少要选一个程序」与「保护记录模式不一致」两项检查之后、浏览器提醒之前,`nicGuard.PublicIpv4Adapter()` 非 null 时 message = \"网卡「<名>」上直接有公网 IPv4 地址(通常是电脑自己拨号上网),部分软件和网页可以直接读到这个地址,已拒绝连接。请改由路由器拨号上网后再连接,或联系管理员。\" 并返回;抛出(读不到网卡)时 message = \"无法读取网卡地址,已拒绝连接;请重试或联系管理员。\" 并返回。两种代理范围都检查,fromUser 真假都检查。\n- EffectKind.ApplyKillSwitch:防火墙套用成功后(同一 try 内)依次 `await nicGuard.ApplyAsync(lifetime.Token)`,再调 reaper(见下)。NicGuardException 走既有 `catch (FirewallIneffectiveException ex) when (held)` 分路,但提示用 NicGuard 的保持文案:\"未能关闭网卡「<名>」的 IPv6,隧道保持,但该网卡的公网 IPv6 地址可能被网页读到;请联系管理员。\"(从异常文案里取网卡名或由异常带出网卡名,二选一,写测试固定);非保持路径照现有逻辑进 FailAsync,最终 message = 异常文案。\n- reaper:`reaper.Reap(new ReapPolicy(activeRouting.Mode == RoutingMode.Apps, activeRouting.Apps, program, NodeIps(session!), sessionSource is AuthServerSessionSource ? authEndpoint : null))`;异常(IsOperational 那几类 + Win32Exception)吞掉;Failed + Remaining > 0 时把 \"有 <n> 条连接前建立的连接未能重置,相关软件可能仍走原网络,请重启这些软件。\" 追加进 message(n = Failed + Remaining 中较大者,不重复计),不影响连接。\n- EffectKind.RemoveKillSwitch:`firewall.RemoveAsync()` 成功之后调 `nicGuard.RestoreAsync()`,返回的警告存字段;DisconnectAsync 组装消息时有警告就追加在既有消息后。恢复失败不抛、不阻止状态迁移。\n- InitializeAsync 非保持分支:`firewall.RecoverAsync()` 之后调 `nicGuard.RestoreAsync()`,警告并入既有 warning 与 message;保持分支不恢复(连接中的保护包括关掉的 IPv6 绑定)。\n- PatrolAsync:防火墙巡检完成后(含规则重建分路)调 `nicGuard.PatrolAsync(lifetime.Token)`;NewlyDisabled 非空时 guardStatus 追加 \",已关闭新出现公网 IPv6 的网卡 <n> 个\";PublicIpv4Adapters 非空时 guardStatus 与 message 都设为 \"网卡「<名>」出现公网 IPv4 地址,部分软件可能读到它;连接与断网保护保持,请改由路由器拨号或联系管理员\";NicGuardException 时 guardStatus 与 message 设为异常文案。任何结果都不断开、不撤保护。\n\n⑥ EnvironmentSelfCheck 加第 11 项,名称「网卡无公网地址」,排在第 10 项之后:Adapters 为 null →「无法核验」;除 YuanC-TUN 外任一网卡 Ipv4 或 Ipv6 有公网地址 →「未通过」,明细「网卡「<名>」有公网 IPv4 地址」/「网卡「<名>」有公网 IPv6 地址」,多个用「;」连接,**明细里不出现任何地址**;否则「通过」。两种代理范围都评估、不受环境总开关影响。汇总文字随之变成 11 项(既有测试里的「10 项通过」「9 项通过,1 项未能检查」等计数按新项数改,只改计数,不改其余断言)。\n\n⑦ ClientRuntime 接线:`new NicGuard(<run 目录>, new SystemAdapterProbe())`、`new ConnectionReaper(new SystemTcpTable())` 传进 ClientController。InstallerRunner 卸载时在 KillSwitchApplier.RemoveAsync 之后同样 `new NicGuard(<run 目录>, new SystemAdapterProbe()).RestoreAsync()`,警告照该处既有方式输出,不影响卸载继续。\n\n⑧ 测试(新文件放 winclient/WinClient.Tests/,方法名必须用下列名字,可再加):\n- PublicAddressTests.cs:`ClassifiesPublicAndReservedAddresses`(Theory,至少含 8.8.8.8 真、100.64.0.1 假、192.168.1.5 假、172.19.0.1 假、198.18.0.1 假、240e::1 真、2001:db8::1 假、fe80::1 假、fdfe:dcba:9876::1 假、::ffff:8.8.8.8 真)。\n- NicGuardTests.cs:`ApplyDisablesOnlyAdaptersWithPublicIpv6`(含名为 YuanC-TUN 且有公网 IPv6 的网卡不被处理)、`ApplyWritesRecordBeforeDisabling`(假运行器执行时记录文件已存在且含该名)、`ApplyThrowsWhenPublicIpv6Remains`、`RestoreEnablesOnlyRecordedAdapters`、`RestoreKeepsRecordOnPartialFailure`、`PatrolDisablesNewlyAppearedAdapters`、`ScriptsRunHidden`(CreateNoWindow 为真、脚本含 ms_tcpip6)。\n- StaleConnectionTests.cs:`SelectSkipsKernelToNodeAndServiceToAuth`、`SelectSkipsLanTunnelLoopbackAndClosedStates`、`AppsModeSelectsOnlyListedPrograms`(大小写不同也命中,路径为 null 不选;全部流量模式路径为 null 仍选)、`ReapReportsResetFailedRemaining`。\n- TcpResetLiveTests.cs:`ResetClosesLoopbackConnection`,用 WfpLiveTests.cs 里的 `[WfpLiveFact]`(YUANC_WFP_LIVE=1 且管理员才跑,默认跳过):本机回环建一对 TCP 连接,用 SystemTcpTable 找到客户端那条并 Reset,断言对端读到连接重置或 0 字节。\n- ControllerTests.cs 新增:`ConnectRefusedWhenAdapterHasPublicIpv4`(两种代理范围)、`NicGuardAppliedAfterFirewallBeforeTunnel`、`HeldProtectionKeepsTunnelWhenNicGuardFails`、`DisconnectRestoresNicAfterFirewall`、`StartupRestoresNicOnlyWithoutKeepProtection`、`PatrolReportsNewPublicIpv4AdapterWithoutDisconnect`、`StaleConnectionsReapedAfterKillSwitch`(含仅指定程序模式 ReapPolicy.AppsMode 为真、Apps 为名单)。\n- EnvironmentSelfCheckTests.cs 新增 `AdapterPublicAddressItemFailsWithoutLeakingAddress`(明细不含该地址字符串)。\n\n⑨ 文档:\n- docs/winclient/断网保护加固说明.md 新增两节「网卡公网地址收紧」「连接前旧连接的重置」:写清做法、记录文件 nic-guard-state.json、恢复时机(主动断开、启动非保持、卸载;保持保护时不恢复)、对全机的影响(连接期间这些网卡没有 IPv6,包括虚拟机网卡与仅指定程序模式下名单外的软件)、UDP 与 IPv6 TCP 连接无法逐条重置(靠关 IPv6 绑定与过滤层兜底)、仅指定程序模式只重置名单程序的连接;各带「真机待验证」清单(至少:公网 IPv6 网卡连接后 ipconfig 无 2/3 开头 IPv6、断开后恢复;服务崩溃重启后仍关着;连接前开着的长连接软件连上后对端看到的是节点出口;电脑直接拨号时拒连)。\n- docs/winclient/环境一致性说明.md 自检节加第 11 项,并把「十项」类计数改成十一项(浏览器「十项策略」那处是策略条数,不改)。\n- docs/winclient/架构说明.md 自检「十项」改「十一项」,并在已知局限或验证边界里加一句网卡公网地址与旧连接的处理指向加固说明。\n- docs/winclient/分应用代理说明.md:两种模式对比表加一行「网卡 IPv6 与旧连接」(全部流量:关带公网 IPv6 网卡的 IPv6 绑定、重置全部隧道外旧 TCP 连接;仅指定程序:同样关 IPv6 绑定(全机生效)、只重置名单程序的旧连接),自检汇总文字改为新项数。\n- docs/winclient/服务化与自启说明.md 如有启动恢复步骤清单,补上网卡记录的恢复一句;没有就不改。",
+  "background": "项目:外包「澳洲出口节点 + Windows 一键客户端」。客户端 .NET 9(winclient/WinClient.sln:Core + App + Tests + UiTests),后台服务以 LocalSystem 运行,连接时先套断网保护(Windows 防火墙规则 + WFP 系统过滤层)再起 sing-box TUN;代理范围两档:全部流量 / 仅指定程序(RoutingPolicy)。\n\n先读:winclient/WinClient.Core/Client/ClientController.cs(全文:ConnectAsync、ExecuteEffectsAsync 的 ApplyKillSwitch / RemoveKillSwitch、InitializeAsync 的保持与非保持分路、PatrolAsync、FailAsync)、Client/ClientRuntime.cs、Firewall/KillSwitchApplier.cs(IKillSwitch、FirewallIneffectiveException、CreateStartInfo 的隐藏窗口写法、原子写状态文件的写法)、Firewall/CommandRunner.cs、Firewall/KillSwitchPlanner.cs(TunAlias、TunAddress、Quote)、Firewall/WfpPlanner.cs、Environment/AdapterProbe.cs、Environment/EnvironmentSelfCheck.cs、State/ConnectionStateMachine.cs(ApplyKillSwitch 在 StartTunnel 之前)、WinClient.App/Hosting/InstallerRunner.cs(卸载恢复段)、WinClient.Tests/ControllerTests.cs(假件写法)、EnvironmentSelfCheckTests.cs、WfpLiveTests.cs(WfpLiveFact)、AdapterProbeTests.cs;docs/winclient/断网保护加固说明.md、环境一致性说明.md「环境自检」节、分应用代理说明.md。\n\n硬规矩:①既有测试断言只在本单明确改变处改(自检计数),其余不删不放宽;新增接口参数一律可选,null 时既有行为逐字节不变;②任何地址、端口不进日志、异常文案、记录文件、自检明细;③Windows 子进程一律 CreateNoWindow + UseShellExecute=false + WindowStyle=Hidden;④工人不许 git 写操作,不许自己跑 dotnet(用派单器自测通道按验收编号申请);⑤工位无外网,缺依赖停下交 blocked;⑥新增文案与注释中文;⑦不得在测试里真正关闭或启用任何网卡绑定、不得真正重置非回环连接;真机行为一律写进文档「真机待验证」,不许写成已通过;⑧拿不准(例如某条既有测试意图与本单冲突、P/Invoke 结构体布局无把握)停下交 blocked + forks,不猜。",
+  "nonGoals": [
+    "不改 sing-box 配置渲染(LocalConfigRenderer / RoutingRenderer)与仅指定程序模式的匹配规则(另一张卡做)",
+    "不改防火墙与 WFP 规则集本身",
+    "不处理 UDP 连接与 IPv6 TCP 连接的逐条重置",
+    "不改界面(WinClient.App 只动 InstallerRunner)、不改 UiTests"
+  ],
+  "allowedPaths": [
+    "winclient/WinClient.Core/Client/ClientController.cs",
+    "winclient/WinClient.Core/Client/ClientRuntime.cs",
+    "winclient/WinClient.Core/Environment/AdapterProbe.cs",
+    "winclient/WinClient.Core/Environment/EnvironmentSelfCheck.cs",
+    "winclient/WinClient.App/Hosting/InstallerRunner.cs",
+    "docs/winclient/断网保护加固说明.md",
+    "docs/winclient/环境一致性说明.md",
+    "docs/winclient/架构说明.md",
+    "docs/winclient/分应用代理说明.md",
+    "docs/winclient/服务化与自启说明.md",
+    "winclient/WinClient.Core/Network/*.cs",
+    "winclient/WinClient.Tests/*.cs"
+  ],
+  "forbiddenPaths": [
+    ".codex/**",
+    ".github/**",
+    ".gitignore",
+    "authserver/**",
+    "node/**",
+    "pyproject.toml",
+    "requirements-dev.txt",
+    "docs/design/**",
+    "docs/plans/**",
+    "docs/acceptance/**",
+    "docs/交接/**",
+    "docs/authserver/**",
+    "docs/node/**",
+    "docs/口径速查表.md",
+    "docs/开工须知.md",
+    "winclient/*.sln",
+    "winclient/Directory.Build.props",
+    "winclient/third_party/**",
+    "winclient/WinClient.UiTests/**",
+    "winclient/WinClient.Tests/WinClient.Tests.csproj",
+    "winclient/WinClient.Core/WinClient.Core.csproj",
+    "winclient/WinClient.App/WinClient.App.csproj",
+    "scripts/**"
+  ],
+  "expectArtifacts": [
+    "winclient/WinClient.Core/Network/PublicAddress.cs",
+    "winclient/WinClient.Core/Network/NicGuard.cs",
+    "winclient/WinClient.Core/Network/ConnectionReaper.cs",
+    "winclient/WinClient.Tests/NicGuardTests.cs",
+    "winclient/WinClient.Tests/StaleConnectionTests.cs",
+    "winclient/WinClient.Tests/PublicAddressTests.cs",
+    "winclient/WinClient.Tests/TcpResetLiveTests.cs"
+  ],
+  "acceptance": [
+    {
+      "id": "BUILD",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "build",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1200
+    },
+    {
+      "id": "TEST",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "test",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--no-build",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1500
+    },
+    {
+      "id": "SHAPE-NET",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import json,pathlib,sys;d=pathlib.Path('winclient/WinClient.Core/Network');t=''.join(p.read_text(encoding='utf-8') for p in d.glob('*.cs')) if d.exists() else '';bad=[k for k,ok in (('pub','100.64' in t and '198.18' in t and '2001:db8' in t and 'IsPublic' in t),('nic','ms_tcpip6' in t and 'Disable-NetAdapterBinding' in t and 'Enable-NetAdapterBinding' in t and 'nic-guard-state.json' in t and 'NicGuardException' in t and 'CreateNoWindow' in t),('reap','GetExtendedTcpTable' in t and 'SetTcpEntry' in t and 'QueryFullProcessImageName' in t and 'StaleConnectionPlanner' in t)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "SHAPE-WIRE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import json,pathlib,sys;r=lambda f:pathlib.Path('winclient/WinClient.'+f).read_text(encoding='utf-8');c=r('Core/Client/ClientController.cs');u=r('Core/Client/ClientRuntime.cs');i=r('App/Hosting/InstallerRunner.cs');e=r('Core/Environment/EnvironmentSelfCheck.cs');a=r('Core/Environment/AdapterProbe.cs');bad=[k for k,ok in (('ctl','INicGuard? nicGuard = null' in c and 'IConnectionReaper? reaper = null' in c and '公网 IPv4 地址(通常是电脑自己拨号上网)' in c),('rt','new NicGuard(' in u and 'new ConnectionReaper(new SystemTcpTable())' in u),('inst','NicGuard' in i),('self','网卡无公网地址' in e),('probe','Ipv6' in a and 'InterNetworkV6' in a)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "TESTS-NEW",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import json,pathlib,sys;r=lambda f:(pathlib.Path('winclient/WinClient.Tests/'+f).read_text(encoding='utf-8') if pathlib.Path('winclient/WinClient.Tests/'+f).exists() else '');n={'PublicAddressTests.cs':['ClassifiesPublicAndReservedAddresses','240e::1','::ffff:8.8.8.8','100.64.0.1'],'NicGuardTests.cs':['ApplyDisablesOnlyAdaptersWithPublicIpv6','ApplyWritesRecordBeforeDisabling','ApplyThrowsWhenPublicIpv6Remains','RestoreEnablesOnlyRecordedAdapters','RestoreKeepsRecordOnPartialFailure','PatrolDisablesNewlyAppearedAdapters','ScriptsRunHidden','YuanC-TUN'],'StaleConnectionTests.cs':['SelectSkipsKernelToNodeAndServiceToAuth','SelectSkipsLanTunnelLoopbackAndClosedStates','AppsModeSelectsOnlyListedPrograms','ReapReportsResetFailedRemaining'],'TcpResetLiveTests.cs':['ResetClosesLoopbackConnection','WfpLiveFact']};bad=[f+':'+w for f,ws in n.items() for w in ws if w not in r(f)];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "TESTS-CTL",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import json,pathlib,sys;c=pathlib.Path('winclient/WinClient.Tests/ControllerTests.cs').read_text(encoding='utf-8');e=pathlib.Path('winclient/WinClient.Tests/EnvironmentSelfCheckTests.cs').read_text(encoding='utf-8');w=['ConnectRefusedWhenAdapterHasPublicIpv4','NicGuardAppliedAfterFirewallBeforeTunnel','HeldProtectionKeepsTunnelWhenNicGuardFails','DisconnectRestoresNicAfterFirewall','StartupRestoresNicOnlyWithoutKeepProtection','PatrolReportsNewPublicIpv4AdapterWithoutDisconnect','StaleConnectionsReapedAfterKillSwitch'];bad=[x for x in w if x not in c]+([] if 'AdapterPublicAddressItemFailsWithoutLeakingAddress' in e and '11 项通过' in e else ['selfcheck']);print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import json,pathlib,sys;r=lambda f:pathlib.Path('docs/winclient/'+f).read_text(encoding='utf-8');k=r('断网保护加固说明.md');v=r('环境一致性说明.md');a=r('架构说明.md');p=r('分应用代理说明.md');bad=[x for x,ok in (('ks','## 网卡公网地址收紧' in k and '## 连接前旧连接的重置' in k and 'nic-guard-state.json' in k and '真机待验证' in k and 'ms_tcpip6' in k),('env','网卡无公网地址' in v and '第 11 项' in v),('arch','十一项' in a and '自检在每次出口核验终局后只读评估十项' not in a),('apps','网卡 IPv6 与旧连接' in p and '9 项通过,1 项未能检查' not in p)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "SCOPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess as sp,sys;g=lambda *a:sp.check_output(['git','-c','core.quotepath=false']+list(a)).decode('utf-8').split(chr(10));mb=g('merge-base','origin/main','HEAD')[0].strip();ch={p.strip() for p in g('diff','--name-only',mb)+g('ls-files','--others','--exclude-standard') if p.strip()};ok=set([\"winclient/WinClient.Core/Client/ClientController.cs\", \"winclient/WinClient.Core/Client/ClientRuntime.cs\", \"winclient/WinClient.Core/Environment/AdapterProbe.cs\", \"winclient/WinClient.Core/Environment/EnvironmentSelfCheck.cs\", \"winclient/WinClient.App/Hosting/InstallerRunner.cs\", \"docs/winclient/断网保护加固说明.md\", \"docs/winclient/环境一致性说明.md\", \"docs/winclient/架构说明.md\", \"docs/winclient/分应用代理说明.md\", \"docs/winclient/服务化与自启说明.md\"]);pre=[\"winclient/WinClient.Core/Network/\", \"winclient/WinClient.Tests/\"];bad=sorted(p for p in ch if p not in ok and not any(p.startswith(x) for x in pre));print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "NOBIN",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess,sys;out=subprocess.run(['git','ls-files','winclient','build','scripts','node'],capture_output=True,text=True).stdout.split();bad=[f for f in out if f.endswith(('.exe','.dll','.zip','.pdb','.tar.gz','.so'))];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "model": null,
+  "timeoutSec": 10800,
+  "repoRoot": "E:/yuanc",
+  "engine": "codex",
+  "reasoningEffort": "high",
+  "steps": [
+    "读 BACKGROUND 列出的文件;先写 PublicAddressTests / NicGuardTests / StaleConnectionTests 与 ControllerTests 新增用例,申请 BUILD 以编译失败证红。",
+    "写 Network 目录下 PublicAddress、NicGuard、ConnectionReaper(含 SystemTcpTable P/Invoke)与 AdapterProbe 的 IPv6,BUILD / TEST / SHAPE-NET / TESTS-NEW 绿。",
+    "接线 ClientController、ClientRuntime、InstallerRunner,加自检第 11 项并改计数,BUILD / TEST / SHAPE-WIRE / TESTS-CTL 绿。",
+    "改文档,DOCS / SCOPE / NOBIN 绿。"
+  ]
+}
