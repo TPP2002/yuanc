@@ -25,6 +25,8 @@ public sealed record SelfCheckInput(ExitProbeResult? Exit, string NodeHost, stri
     bool? Ipv6Reachable, JsonElement SingboxConfig, DateTimeOffset Now)
 {
     public RoutingPolicy Routing { get; init; } = RoutingPolicy.Global;
+    /// <summary>仅指定程序模式下渲染进配置的名单匹配式;为空时回退到各程序的完整路径匹配式。</summary>
+    public IReadOnlyList<string>? AppPatterns { get; init; }
     public AuthEndpoint? Auth { get; init; }
     public string? ServiceProcessPath { get; init; }
     public IReadOnlyList<AdapterInfo>? Adapters { get; init; }
@@ -110,8 +112,18 @@ public static class EnvironmentSelfCheck
             bool HasPrograms(JsonElement rule)
             {
                 var patterns = Property(rule, "process_path_regex");
-                return patterns.ValueKind == JsonValueKind.Array && input.Routing.Apps.All(path =>
-                    patterns.EnumerateArray().Any(pattern => Text(pattern) == RoutingRenderer.PathPattern(path)));
+                var required = input.AppPatterns ?? input.Routing.Apps.Select(RoutingRenderer.PathPattern).ToArray();
+                return patterns.ValueKind == JsonValueKind.Array && required.All(expected =>
+                    patterns.EnumerateArray().Any(pattern => Text(pattern) == expected));
+            }
+            bool HasIdentifiedDirect() => rules.ValueKind == JsonValueKind.Array && rules.EnumerateArray().Any(rule =>
+                Property(rule, "process_path_regex") is { ValueKind: JsonValueKind.Array } list && list.GetArrayLength() == 1
+                && Text(list[0]) == "(?i)^.+$" && Text(Property(rule, "outbound")) == "direct");
+            bool EndsWithBareReject()
+            {
+                if (rules.ValueKind != JsonValueKind.Array || rules.GetArrayLength() == 0) return false;
+                var last = rules[rules.GetArrayLength() - 1];
+                return last.ValueKind == JsonValueKind.Object && last.EnumerateObject().Count() == 1 && Text(Property(last, "action")) == "reject";
             }
             bool HasRule(string target, bool ipv6) => rules.ValueKind == JsonValueKind.Array && rules.EnumerateArray().Any(rule =>
                 HasPrograms(rule) && Text(Property(rule, ipv6 ? "action" : "outbound")) == target && (!ipv6 ||
@@ -120,6 +132,8 @@ public static class EnvironmentSelfCheck
                 ("route.final direct", Text(Property(route, "final")) == "direct"),
                 ("route.rules 指定程序→proxy", HasRule("proxy", false)),
                 ("route.rules 指定程序 IPv6 阻断", HasRule("reject", true)),
+                ("route.rules 认得出的名单外程序→direct", HasIdentifiedDirect()),
+                ("route.rules 认不出归属的连接拒绝", EndsWithBareReject()),
                 ("dns.servers detour", servers.ValueKind == JsonValueKind.Array && servers.EnumerateArray().All(server => Text(Property(server, "detour")) == "proxy")));
             items.Add(scoped with { Detail = "仅指定程序模式:" + scoped.Detail });
             items.Add(new("ipv6_direct", "IPv6 已封堵", "跳过", "仅指定程序模式不检测整机 IPv6;指定程序的 IPv6 已由配置与防火墙阻断"));

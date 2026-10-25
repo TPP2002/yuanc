@@ -89,9 +89,20 @@ public sealed class WfpPlannerTests
             Assert.Equal(new[] { WfpLayer.ConnectV4, WfpLayer.ConnectV4, WfpLayer.ConnectV4, WfpLayer.ConnectV6, WfpLayer.ConnectV6, WfpLayer.ConnectV6 }, rules.Select(f => f.Layer));
             Assert.All(rules.Where(f => f.Action == WfpAction.Block), f => Assert.Equal(new WfpFilterSpec(f.Name, f.Layer, WfpAction.Block, 0, paths[i]), f));
         }
-        Assert.Throws<ArgumentException>(() => WfpPlanner.PlanApps(Enumerable.Repeat(ProgramPath, 33).ToArray()));
+        Assert.Throws<ArgumentException>(() => WfpPlanner.PlanApps(Enumerable.Repeat(ProgramPath, 2081).ToArray()));
         Assert.Throws<ArgumentException>(() => WfpPlanner.PlanApps([]));
         Assert.Throws<ArgumentException>(() => WfpPlanner.PlanApps(["relative.exe"]));
+    }
+
+    [Fact]
+    public void AppsAcceptsLargeFilterProgramList()
+    {
+        var programs = Enumerable.Range(1, 100).Select(i => Path.GetFullPath($"app{i}.exe")).ToArray();
+        Assert.Equal(600, WfpPlanner.PlanApps(programs).Count);
+        Assert.Equal(2080 * 6, WfpPlanner.PlanApps(Enumerable.Repeat(ProgramPath, 2080).ToArray()).Count);
+        var empty = Assert.Throws<ArgumentException>(() => WfpPlanner.PlanApps([]));
+        Assert.Equal("仅指定程序模式必须提供 1 到 2080 个程序的绝对路径。", empty.Message);
+        Assert.Throws<ArgumentException>(() => WfpPlanner.PlanApps(Enumerable.Repeat(ProgramPath, 2081).ToArray()));
     }
 
     [Fact]

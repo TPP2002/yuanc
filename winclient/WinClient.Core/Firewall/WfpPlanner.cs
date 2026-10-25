@@ -71,8 +71,8 @@ public static class WfpPlanner
 
     public static IReadOnlyList<WfpFilterSpec> PlanApps(IReadOnlyList<string> programs)
     {
-        if (programs.Count is < 1 or > 32 || programs.Any(path => string.IsNullOrWhiteSpace(path) || !Path.IsPathFullyQualified(path)))
-            throw new ArgumentException("仅指定程序模式必须提供 1 到 32 个程序的绝对路径。");
+        if (programs.Count is < 1 or > 2080 || programs.Any(path => string.IsNullOrWhiteSpace(path) || !Path.IsPathFullyQualified(path)))
+            throw new ArgumentException("仅指定程序模式必须提供 1 到 2080 个程序的绝对路径。");
         var result = new List<WfpFilterSpec>();
         for (var i = 0; i < programs.Count; i++)
         {

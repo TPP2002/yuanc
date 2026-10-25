@@ -7,18 +7,22 @@ namespace WinClient.Core.Client;
 
 public static class RoutingRenderer
 {
-    public static string PathPattern(string path)
+    public static string PathPattern(string path) => "(?i)^" + Escape(path) + "$";
+
+    /// <summary>按 RE2 元字符转义文本。</summary>
+    public static string Escape(string text)
     {
-        var pattern = new StringBuilder("(?i)^");
-        foreach (var character in path)
+        var escaped = new StringBuilder();
+        foreach (var character in text)
         {
-            if ("\\.+*?()|[]{}^$".Contains(character)) pattern.Append('\\');
-            pattern.Append(character);
+            if ("\\.+*?()|[]{}^$".Contains(character)) escaped.Append('\\');
+            escaped.Append(character);
         }
-        return pattern.Append('$').ToString();
+        return escaped.ToString();
     }
 
-    public static JsonElement Render(JsonElement configuration, RoutingPolicy routing, string serviceProcessPath, AuthEndpoint? auth = null)
+    public static JsonElement Render(JsonElement configuration, RoutingPolicy routing, string serviceProcessPath, AuthEndpoint? auth = null,
+        IReadOnlyList<string>? appPatterns = null)
     {
         if (routing.Mode == RoutingMode.Global && auth is null) return configuration;
         var root = JsonNode.Parse(configuration.GetRawText()) as JsonObject
@@ -32,8 +36,11 @@ public static class RoutingRenderer
         if (root["dns"] is not JsonObject dns) throw new InvalidDataException("服务器配置缺少 DNS 设置。");
         if (dns["servers"] is not JsonArray servers || !servers.OfType<JsonObject>().Any(server => Text(server["detour"]) == "proxy"))
             throw new InvalidDataException("服务器配置缺少经隧道的 DNS,无法启用仅指定程序模式。");
-        var patterns = routing.Apps.Append(serviceProcessPath).Distinct(StringComparer.OrdinalIgnoreCase)
-            .Order(StringComparer.Ordinal).Select(PathPattern).ToArray();
+        var patterns = appPatterns is null
+            ? routing.Apps.Append(serviceProcessPath).Distinct(StringComparer.OrdinalIgnoreCase)
+                .Order(StringComparer.Ordinal).Select(PathPattern).ToArray()
+            : appPatterns.Append(PathPattern(serviceProcessPath)).Distinct(StringComparer.OrdinalIgnoreCase)
+                .Order(StringComparer.Ordinal).ToArray();
         var rules = new JsonArray();
         if (route["rules"] is JsonArray previous)
             foreach (var rule in previous.OfType<JsonObject>().Where(rule => Text(rule["action"]) == "sniff" || Text(rule["protocol"]) == "dns"))
@@ -42,6 +49,9 @@ public static class RoutingRenderer
             rules.Add(AuthDirectRule(serviceProcessPath, auth));
         rules.Add(new JsonObject { ["process_path_regex"] = Strings(patterns), ["ip_version"] = 6, ["action"] = "reject" });
         rules.Add(new JsonObject { ["process_path_regex"] = Strings(patterns), ["outbound"] = "proxy" });
+        // 失败即关:认得出归属的名单外程序直连;认不出归属的连接(无进程信息)落到最后一条,一律拒绝。
+        rules.Add(new JsonObject { ["process_path_regex"] = Strings(["(?i)^.+$"]), ["outbound"] = "direct" });
+        rules.Add(new JsonObject { ["action"] = "reject" });
         route["rules"] = rules;
         route["final"] = "direct";
         }
