@@ -47,7 +47,10 @@ public static class LeakCheckRunner
                 return 2;
             }
             var routing = new RoutingSettingsStore().Read();
-            var options = new LeakCheckOptions(seconds, node, outDir, keep, routing.Mode == RoutingMode.Apps, routing.Apps, LoadAuth());
+            var options = new LeakCheckOptions(seconds, node, outDir, keep, routing.Mode == RoutingMode.Apps, routing.Apps, LoadAuth())
+            {
+                AppPatterns = routing.Mode == RoutingMode.Apps ? ScopePatterns(routing.Apps) : null
+            };
             var started = DateTime.Now;
             Console.WriteLine($"开始泄漏检测,抓包 {seconds} 秒,请在此期间正常使用电脑……");
             using var cancel = new CancellationTokenSource();
@@ -92,6 +95,20 @@ public static class LeakCheckRunner
             }
         }
         return true;
+    }
+
+    // 与客户端连接时同一算法算出每个名单程序的连带范围匹配式;单个解析失败时退回只认该程序本身。
+    private static string[] ScopePatterns(IReadOnlyList<string> apps)
+    {
+        var folders = AppScopeResolver.SystemFolders();
+        var fileSystem = new SystemAppScopeFileSystem();
+        var patterns = new List<string>();
+        foreach (var path in apps)
+        {
+            try { patterns.Add(AppScopeResolver.Resolve(path, folders, fileSystem).Pattern); }
+            catch (Exception) { patterns.Add(RoutingRenderer.PathPattern(path)); }
+        }
+        return [.. patterns];
     }
 
     // 分发版鉴权地址;读不到就不放行任何鉴权地址。
