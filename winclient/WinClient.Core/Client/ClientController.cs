@@ -3,6 +3,7 @@ using System.Net.Sockets;
 using WinClient.Core.Auth;
 using WinClient.Core.Pairing;
 using WinClient.Core.Firewall;
+using WinClient.Core.Network;
 using WinClient.Core.State;
 using WinClient.Core.Storage;
 using WinClient.Core.EnvironmentSupport;
@@ -90,6 +91,10 @@ public sealed class ClientController : IDisposable
     private string? firewallWarning;
     private const string KeepTunnelWarning = "断网保护未能重新套用:系统防火墙已被关闭或被策略覆盖,隧道保持但失去断网兜底;请立即在 Windows 安全中心开启防火墙或联系管理员";
     private const string WfpKeepTunnelWarning = "断网保护未能重新套用:系统过滤层的过滤器未能建立,隧道保持,但缺少这道断网兜底;请联系管理员";
+    private readonly INicGuard? nicGuard;
+    private readonly IConnectionReaper? reaper;
+    private string? reapWarning;
+    private string? nicRestoreWarning;
     private bool disposed;
     private long generation;
     private string message = "";
@@ -112,11 +117,11 @@ public sealed class ClientController : IDisposable
         IEnvironmentEnforcer? environment = null, IEnvironmentSettingsStore? environmentSettings = null,
         IIpv6Probe? ipv6Probe = null, Action<EnvironmentReport>? reportSink = null,
         IRoutingSettingsStore? routingSettings = null, string? serviceProcessPath = null, IAdapterProbe? adapterProbe = null,
-        IBrowserProcessProbe? browserProbe = null)
+        IBrowserProcessProbe? browserProbe = null, INicGuard? nicGuard = null, IConnectionReaper? reaper = null)
         : this(auth is null ? null : new AuthServerSessionSource(auth, credentials), firewall, tunnel, program, device,
             authEndpoint: authEndpoint, exitProbe: exitProbe, environment: environment, environmentSettings: environmentSettings,
             ipv6Probe: ipv6Probe, reportSink: reportSink, routingSettings: routingSettings, serviceProcessPath: serviceProcessPath, adapterProbe: adapterProbe,
-            browserProbe: browserProbe) { }
+            browserProbe: browserProbe, nicGuard: nicGuard, reaper: reaper) { }
 
     public ClientController(ISessionSource? sessionSource, IKillSwitch firewall,
         ITunnelTransport tunnel, string program, DeviceInfo device, Func<TimeSpan, CancellationToken, Task>? delayAsync = null,
@@ -124,8 +129,10 @@ public sealed class ClientController : IDisposable
         IEnvironmentEnforcer? environment = null, IEnvironmentSettingsStore? environmentSettings = null,
         IIpv6Probe? ipv6Probe = null, Action<EnvironmentReport>? reportSink = null,
         IRoutingSettingsStore? routingSettings = null, string? serviceProcessPath = null, IAdapterProbe? adapterProbe = null,
-        IBrowserProcessProbe? browserProbe = null)
+        IBrowserProcessProbe? browserProbe = null, INicGuard? nicGuard = null, IConnectionReaper? reaper = null)
     {
+        this.nicGuard = nicGuard;
+        this.reaper = reaper;
         this.sessionSource = sessionSource;
         this.delayAsync = delayAsync ?? ((delay, token) => Task.Delay(delay, token));
         this.firewall = firewall;
@@ -165,6 +172,11 @@ public sealed class ClientController : IDisposable
             else
             {
                 warning = await firewall.RecoverAsync();
+                if (nicGuard is not null)
+                {
+                    var nicWarning = await nicGuard.RestoreAsync();
+                    if (nicWarning is not null) warning = warning is null ? nicWarning : warning + " " + nicWarning;
+                }
                 if (warning is not null) message = warning + (sessionSource is null ? " 未配置服务器。" : "");
                 else if (sessionSource is null) message = "未配置服务器";
                 if (!await RestoreEnvironmentAsync())
@@ -265,6 +277,17 @@ public sealed class ClientController : IDisposable
             { message = "仅指定程序模式至少要选一个程序,请先添加程序或切回全部流量。"; return; }
             if (firewall.HasPendingState && (firewall.PendingMode ?? "global") != ModeName(activeRouting))
             { message = "上次的断网保护记录与当前代理范围不一致,请先用原来的代理范围连接并正常断开,或重启后台服务后再试。"; return; }
+            if (nicGuard is not null)
+            {
+                string? publicAdapter;
+                try { publicAdapter = nicGuard.PublicIpv4Adapter(); }
+                catch (Exception ex) when (IsOperational(ex)) { message = "无法读取网卡地址,已拒绝连接;请重试或联系管理员。"; return; }
+                if (publicAdapter is not null)
+                {
+                    message = $"网卡「{publicAdapter}」上直接有公网 IPv4 地址(通常是电脑自己拨号上网),部分软件和网页可以直接读到这个地址,已拒绝连接。请改由路由器拨号上网后再连接,或联系管理员。";
+                    return;
+                }
+            }
             if (fromUser && ShouldWarnBrowsers("连接", checkApplied: false)) return;
             lifetime.Cancel();
             lifetime.Dispose();
@@ -287,12 +310,14 @@ public sealed class ClientController : IDisposable
         try
         {
             guardStatus = "";
+            nicRestoreWarning = null;
             // Execution is ordered: a failure to stop the tunnel must not proceed to Remove.
             await ExecuteAsync(machine.Handle(new(ConnectionEventKind.UserDisconnect)));
             session = null;
             var environmentRestored = await RestoreEnvironmentAsync();
             message = environmentRestored ? "已断开，原网络设置已恢复。"
                 : "已断开,原网络设置已恢复;但时区或浏览器设置未能恢复,请联系管理员。";
+            if (nicRestoreWarning is not null) message += " " + nicRestoreWarning;
         }
         catch (Exception ex) when (IsOperational(ex)) { await FailAsync(ex); }
         finally { Publish(); gate.Release(); }
@@ -562,10 +587,14 @@ public sealed class ClientController : IDisposable
                                 sessionSource is AuthServerSessionSource ? authEndpoint : null);
                         protectionVerified = true;
                         firewallWarning = null;
+                        reapWarning = null;
+                        if (nicGuard is not null) await nicGuard.ApplyAsync(lifetime.Token);
+                        ReapStaleConnections();
                     }
                     catch (FirewallIneffectiveException ex) when (held)
                     {
-                        var keep = ex is WfpUnavailableException ? WfpKeepTunnelWarning : KeepTunnelWarning;
+                        var keep = ex is NicGuardException nicFailure ? NicKeepTunnelWarning(nicFailure)
+                            : ex is WfpUnavailableException ? WfpKeepTunnelWarning : KeepTunnelWarning;
                         firewallWarning = keep;
                         guardStatus = keep;
                         message = keep;
@@ -576,7 +605,9 @@ public sealed class ClientController : IDisposable
                         await firewall.UpdateNodeAsync(effect.NewIps!, program, session!.Node.Hy2Port, session.Node.RealityPort);
                     break;
                 case EffectKind.RemoveKillSwitch:
-                    await firewall.RemoveAsync(); protection = false; protectionVerified = false; firewallWarning = null; break;
+                    await firewall.RemoveAsync(); protection = false; protectionVerified = false; firewallWarning = null; reapWarning = null;
+                    if (nicGuard is not null) nicRestoreWarning = await nicGuard.RestoreAsync(); // 恢复失败不抛、不阻止状态迁移。
+                    break;
                 case EffectKind.StopTunnel: tunnel.Stop(); break;
                 case EffectKind.StartTunnel:
                     if (session is null || session.SessionExpiresAt <= DateTimeOffset.UtcNow || session.AccountExpiresAt <= DateTimeOffset.UtcNow)
@@ -586,7 +617,7 @@ public sealed class ClientController : IDisposable
                         await tunnel.StartAsync(RenderedConfiguration(session), lifetime.Token);
                         lifetime.Token.ThrowIfCancellationRequested();
                         await ExecuteAsync(machine.Handle(new(ConnectionEventKind.TunnelUp)));
-                        message = firewallWarning ?? "虚拟网卡已就绪。";
+                        message = (firewallWarning ?? "虚拟网卡已就绪。") + (reapWarning is null ? "" : " " + reapWarning);
                         await ApplyEnvironmentAsync();
                     }
                     catch (FileNotFoundException ex)
@@ -769,9 +800,45 @@ public sealed class ClientController : IDisposable
         catch (Exception ex) when (IsOperational(ex)) { guardStatus = "巡检失败,下一轮重试"; }
         finally
         {
+            await PatrolNicAsync(); // 防火墙巡检(含规则重建分路)之后再巡检网卡。
             Publish();
             if (!disposed && !lifetime.IsCancellationRequested && ShouldPatrol && ReferenceEquals(cycle, patrolCycle)) SchedulePatrol(cycle);
         }
+    }
+
+    /// <summary>网卡巡检:任何结果都不断开、不撤保护,只更新提示。</summary>
+    private async Task PatrolNicAsync()
+    {
+        if (nicGuard is null || lifetime.IsCancellationRequested || disposed) return;
+        try
+        {
+            var nic = await nicGuard.PatrolAsync(lifetime.Token);
+            if (nic.NewlyDisabled.Count > 0) guardStatus += $",已关闭新出现公网 IPv6 的网卡 {nic.NewlyDisabled.Count} 个";
+            if (nic.PublicIpv4Adapters.Count > 0)
+            {
+                guardStatus = $"网卡「{nic.PublicIpv4Adapters[0]}」出现公网 IPv4 地址,部分软件可能读到它;连接与断网保护保持,请改由路由器拨号或联系管理员";
+                message = guardStatus;
+            }
+        }
+        catch (NicGuardException ex) { guardStatus = ex.Message; message = guardStatus; }
+        catch (Exception ex) when (IsOperational(ex)) { }
+    }
+
+    private static string NicKeepTunnelWarning(NicGuardException ex) =>
+        $"未能关闭网卡「{ex.AdapterName ?? "未知"}」的 IPv6,隧道保持,但该网卡的公网 IPv6 地址可能被网页读到;请联系管理员。";
+
+    /// <summary>断网保护套用后重置连接前建立的隧道外 TCP 连接;失败只提示,不影响连接。</summary>
+    private void ReapStaleConnections()
+    {
+        if (reaper is null) return;
+        try
+        {
+            var report = reaper.Reap(new ReapPolicy(activeRouting.Mode == RoutingMode.Apps, activeRouting.Apps, program,
+                NodeIps(session!), sessionSource is AuthServerSessionSource ? authEndpoint : null));
+            if (report.Failed + report.Remaining > 0)
+                reapWarning = $"有 {Math.Max(report.Failed, report.Remaining)} 条连接前建立的连接未能重置,相关软件可能仍走原网络,请重启这些软件。";
+        }
+        catch (Exception ex) when (IsOperational(ex)) { }
     }
 
     private void ScheduleExpiry(SessionResponse value)
