@@ -1,0 +1,164 @@
+{
+  "schemaVersion": 1,
+  "taskId": "WINCLIENT-LEAK-CAPTURE-TOOL-1025",
+  "slug": "yc-leak-capture-1025",
+  "title": "客户端加 --leak-check 真机检测命令:pktmon 只抓网卡、解析 pcapng、连接表采样归属程序,凡发往公网且不是节点/鉴权的包记为可疑,出中文摘要与 JSON 报告",
+  "goal": "以派单时 origin/main 头为基点(已含 yc-leak-nic-conn-1025 的 WinClient.Core/Network:PublicAddress、ITcpTable / SystemTcpTable)。看板卡 WINCLIENT-LEAK-CAPTURE-TOOL-1025。真机验收要证明「连接期间,物理网卡上除了发往澳洲节点(与分发版鉴权服务器)的流量外,没有任何发往公网的包」,目前只能人工抓包。做一个随客户端发布的一键检测命令,用 Windows 自带的 pktmon 抓包、解析、按程序归类,出中文结论与 JSON 报告。\n\n做完后:\n\n① 新建 winclient/WinClient.Core/Diagnostics/(命名空间 WinClient.Core.Diagnostics,可拆多个文件):\n- `PcapNgReader`:`public static IEnumerable<CapturedPacket> Read(Stream stream)`,解析 pcapng 的 SHB(两种字节序)、IDB(记录每个接口的链路类型)、EPB 与 SPB,跳过其他块;链路类型支持 1(以太网,含 0x8100 VLAN 一层)、101 / 228 / 229(裸 IPv4/IPv6);`public sealed record CapturedPacket(int LinkType, IPAddress? Source, IPAddress? Destination, string Protocol, int SourcePort, int DestinationPort)`,Protocol 取 \"TCP\" / \"UDP\" / \"ICMP\" / \"ICMPv6\" / \"OTHER\";解析不了的包 Source/Destination 为 null(计入「未解析」),块长度不合法时停止读取并抛 InvalidDataException(\"抓包文件格式不正确\")。IPv6 跳过常见扩展头(0、43、44、60)找传输层。\n- `LeakClassifier`:`public static LeakVerdict Classify(IEnumerable<CapturedPacket> packets, LeakContext context, Func<CapturedPacket, string?> owner)`。`LeakContext(IReadOnlySet<IPAddress> LocalAddresses, IReadOnlySet<IPAddress> NodeAddresses, IPEndPoint? Auth, bool AppsMode, IReadOnlyList<string> Apps)`。规则:跳过任一端在 172.19.0.0/30 或 fdfe:dcba:9876::/126 的包(隧道网卡内部);对端 = 两端里不属于 LocalAddresses 的那个(都属于或都不属于时两端都当候选);候选对端用 WinClient.Core.Network.PublicAddress.IsPublic 判定,是公网且不在 NodeAddresses、也不等于 Auth(地址 + 端口,TCP)→ 可疑。可疑包按(协议、对端地址、对端端口、归属程序)聚合计数。仅指定程序模式下每条可疑流标 Listed:归属程序路径不分大小写等于名单之一,或位于名单某程序所在目录(含子目录)之下 → true;归属未知 → null。`LeakVerdict(int Total, int Tunnel, int Allowed, int Unparsed, IReadOnlyList<SuspiciousFlow> Suspicious)`,`SuspiciousFlow(string Protocol, string Remote, int RemotePort, string? Process, bool? Listed, int Count)`;Remote 只写对端地址字符串,**任何属于 LocalAddresses 的地址一律不写进结果**。\n- `ConnectionOwnerSampler`:每 500 毫秒用 ITcpTable(已有 SystemTcpTable)与新建的 IUdpTable 采样一次,累积「(TCP:本地端口 + 对端地址 + 对端端口)→ 进程路径」「(UDP:本地端口)→ 进程路径」的映射;`string? Owner(CapturedPacket p)` 先按包的源端口(本机发出)再按目的端口(发往本机)查。\n- `LeakCapture`:编排一次检测:`Task<LeakCheckResult> RunAsync(LeakCheckOptions options, CancellationToken token)`;依次经 ICommandRunner 跑 `pktmon filter remove`、`pktmon start --capture --comp nics --file-name <etl>`、等待 options.Seconds 秒(期间采样)、`pktmon stop`、`pktmon etl2pcap <etl> --out <pcapng>`,再解析与归类;任一 pktmon 步骤退出码非 0 → 返回「无法检测」并带中文原因,并且只要 start 成功过就保证执行一次 stop;默认检测结束后删除 etl 与 pcapng(options.KeepCapture 为真才保留)。所有子进程 CreateNoWindow + UseShellExecute=false + WindowStyle=Hidden。节点地址:options.Node 非空用它;否则取 SystemTcpTable 里进程文件名为 sing-box.exe 的已建立连接的对端 IPv4,取不到 → 无法检测,原因「未找到隧道内核的连接,请先连接,或用 --node 指定节点地址」。LocalAddresses 用 SystemAdapterProbe 取本机全部网卡的 IPv4 与 IPv6。\n- 退出码约定:0 = 未发现可疑流量(仅指定程序模式:没有 Listed 为 true 或 null 的可疑流);1 = 发现可疑流量;2 = 无法检测。\n② 新建 winclient/WinClient.Core/Network/SystemUdpTable.cs:`public sealed record UdpEntry(IPAddress Local, int LocalPort, int Pid, string? ProcessPath); public interface IUdpTable { IReadOnlyList<UdpEntry> Snapshot(); }`,`SystemUdpTable` 用 iphlpapi GetExtendedUdpTable(AF_INET 与 AF_INET6,UDP_TABLE_OWNER_PID)与 QueryFullProcessImageName。不改 Network 目录里已有文件。\n③ 新建 winclient/WinClient.App/Hosting/LeakCheckRunner.cs,Program.cs 加一个分支 `case \"--leak-check\": return LeakCheckRunner.Run(args.Skip(1).ToArray());`(其余分支不动)。参数:`--seconds <10~600,默认 120>`、`--node <IPv4>`(可选)、`--out <目录>`(默认 %ProgramData%\\YuanC\\leakcheck\\<yyyyMMdd-HHmmss>)、`--keep-capture`。代理范围与名单从 RoutingSettingsStore 读;分发版鉴权地址从 ClientSettings.Load 的 AuthEndpoint 取(没有就不放行任何鉴权地址)。先 AttachConsole(-1) 以便在命令行里看到输出;不是管理员时输出「请以管理员身份运行」并返回 2。输出 `<out>/leak-report.json`(snake_case:started_at、seconds、mode、total、tunnel、allowed、unparsed、suspicious[…]、verdict、reason)与终端中文摘要(前 20 条可疑流:协议、对端地址:端口、程序文件名、计数,仅指定程序模式另标「名单程序」/「名单外程序(按设计直连)」/「归属未知」)。报告与摘要都不出现本机任何网卡地址。\n④ 测试(方法名必须用下列名字,可再加;全部用内存里拼出的 pcapng 字节与假运行器,不真正运行 pktmon):\n- PcapNgReaderTests.cs:`ReadsEthernetIpv4TcpAndUdp`、`ReadsVlanTaggedAndRawIpv6`、`HandlesBigEndianSectionHeader`、`SkipsUnknownBlocksAndCountsUnparsed`、`RejectsTruncatedBlock`。\n- LeakCaptureTests.cs:`TunnelAndLanAndNodeTrafficIsAllowed`、`PublicNonNodeTrafficIsSuspicious`(含发往 74.125.250.129:19302 的 UDP)、`AuthAllowedOnlyOnItsPort`、`LocalAddressesNeverAppearInVerdict`、`AppsModeMarksListedAndUnlisted`(同目录子程序算名单内)、`StopsPktmonEvenWhenConversionFails`、`ExitCodeReflectsVerdict`、`ProcessesRunHidden`。\n⑤ 文档:新建 docs/winclient/泄漏检测说明.md:用途、命令写法(以管理员运行 `YuanC 客户端.exe --leak-check --seconds 120` 一类,写实际 exe 名以发布说明为准)、判定规则、退出码、报告字段、隐私说明(不写本机地址、默认删抓包文件)、建议的真机检测步骤(全部流量模式:连上后开桌面应用与浏览器,打开 WebRTC 检测页与 DNS 检测页,检测期间正常使用两分钟;仅指定程序模式:同上并看「名单程序」一栏为零;断开隧道内核后再检测一次应只剩被阻断的尝试、没有成功外发)、局限(pktmon 需 Windows 10 2004 及以上;只能看到物理网卡层;归属靠连接表采样,极短连接可能「归属未知」)。不改其他文档(断网保护加固说明里的指向由派单方收单时补)。",
+  "background": "项目:外包「澳洲出口节点 + Windows 一键客户端」。客户端 .NET 9 WPF(winclient/WinClient.sln:Core + App + Tests + UiTests),App 是 WinExe;隧道网卡地址 172.19.0.1/30 与 fdfe:dcba:9876::1/126,网卡名 YuanC-TUN。\n\n先读:winclient/WinClient.Core/Network/(PublicAddress、ConnectionReaper 里的 ITcpTable / SystemTcpTable 与 P/Invoke 写法)、Environment/AdapterProbe.cs、Firewall/CommandRunner.cs、Firewall/KillSwitchApplier.cs 的 CreateStartInfo(隐藏窗口写法)、Client/RoutingSettings.cs、Client/ClientSettings.cs(AuthEndpoint、DataDirectory)、WinClient.App/Program.cs、Hosting/InstallerRunner.cs(命令行入口的输出与退出码写法);docs/winclient/断网保护加固说明.md 的真机待验证部分。\n\n硬规矩:①不改 Program.cs 既有分支、不改 Network 目录已有文件、不改 Client / Firewall / Environment 目录;②本机网卡地址不进报告、摘要、日志、异常;③所有子进程隐藏窗口;④测试不真正运行 pktmon、不抓真实网卡;⑤工人不许 git 写操作,不许自己跑 dotnet(按验收编号申请);⑥每次 Edit / Write 的新内容控制在 150 行以内,大文件先建能编译的骨架再分段补;⑦新增文案与注释中文;⑧拿不准(例如 pktmon 某参数在 Windows 10 19045 上的写法)停下交 blocked + forks,不猜。",
+  "nonGoals": [
+    "不改连接、断网保护、代理范围的任何行为",
+    "不改界面;不加按钮(只做命令行入口)",
+    "不引入第三方抓包库,不提交任何抓包文件"
+  ],
+  "allowedPaths": [
+    "winclient/WinClient.App/Program.cs",
+    "winclient/WinClient.App/Hosting/LeakCheckRunner.cs",
+    "winclient/WinClient.Core/Network/SystemUdpTable.cs",
+    "winclient/WinClient.Tests/LeakCaptureTests.cs",
+    "winclient/WinClient.Tests/PcapNgReaderTests.cs",
+    "docs/winclient/泄漏检测说明.md",
+    "winclient/WinClient.Core/Diagnostics/*.cs"
+  ],
+  "forbiddenPaths": [
+    ".codex/**",
+    ".github/**",
+    ".gitignore",
+    "authserver/**",
+    "node/**",
+    "scripts/**",
+    "pyproject.toml",
+    "docs/design/**",
+    "docs/plans/**",
+    "docs/acceptance/**",
+    "docs/交接/**",
+    "docs/node/**",
+    "docs/口径速查表.md",
+    "docs/开工须知.md",
+    "docs/winclient/分应用代理说明.md",
+    "docs/winclient/环境一致性说明.md",
+    "docs/winclient/断网保护加固说明.md",
+    "winclient/*.sln",
+    "winclient/Directory.Build.props",
+    "winclient/third_party/**",
+    "winclient/WinClient.UiTests/**",
+    "winclient/WinClient.Core/Client/**",
+    "winclient/WinClient.Core/Firewall/**",
+    "winclient/WinClient.Core/Environment/**",
+    "winclient/WinClient.Core/Network/PublicAddress.cs",
+    "winclient/WinClient.Core/Network/NicGuard*.cs",
+    "winclient/WinClient.Core/Network/ConnectionReaper*.cs",
+    "winclient/WinClient.Tests/ControllerTests.cs",
+    "winclient/WinClient.Tests/RoutingTests.cs",
+    "winclient/WinClient.Tests/AppScopeTests.cs",
+    "winclient/WinClient.Tests/Wfp*.cs",
+    "winclient/WinClient.Tests/WinClient.Tests.csproj",
+    "winclient/WinClient.Core/WinClient.Core.csproj",
+    "winclient/WinClient.App/WinClient.App.csproj"
+  ],
+  "expectArtifacts": [
+    "winclient/WinClient.App/Hosting/LeakCheckRunner.cs",
+    "winclient/WinClient.Core/Network/SystemUdpTable.cs",
+    "winclient/WinClient.Tests/LeakCaptureTests.cs",
+    "winclient/WinClient.Tests/PcapNgReaderTests.cs",
+    "docs/winclient/泄漏检测说明.md"
+  ],
+  "acceptance": [
+    {
+      "id": "BUILD",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "build",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1200
+    },
+    {
+      "id": "TEST",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "test",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--no-build",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1500
+    },
+    {
+      "id": "SHAPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import json,pathlib,sys;d=pathlib.Path('winclient/WinClient.Core/Diagnostics');t=''.join(p.read_text(encoding='utf-8') for p in d.glob('*.cs')) if d.exists() else '';u=pathlib.Path('winclient/WinClient.Core/Network/SystemUdpTable.cs');u=u.read_text(encoding='utf-8') if u.exists() else '';g=pathlib.Path('winclient/WinClient.App/Program.cs').read_text(encoding='utf-8');h=pathlib.Path('winclient/WinClient.App/Hosting/LeakCheckRunner.cs');h=h.read_text(encoding='utf-8') if h.exists() else '';bad=[k for k,ok in (('diag','PcapNgReader' in t and 'LeakClassifier' in t and 'ConnectionOwnerSampler' in t and '--comp' in t and 'etl2pcap' in t and 'CreateNoWindow' in t and 'PublicAddress.IsPublic' in t),('udp','GetExtendedUdpTable' in u),('prog','\"--leak-check\"' in g and 'LeakCheckRunner' in g),('run','AttachConsole' in h and 'leak-report.json' in h and '请以管理员身份运行' in h)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "TESTS-NEW",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import json,pathlib,sys;r=lambda f:(pathlib.Path('winclient/WinClient.Tests/'+f).read_text(encoding='utf-8') if pathlib.Path('winclient/WinClient.Tests/'+f).exists() else '');n={'PcapNgReaderTests.cs':['ReadsEthernetIpv4TcpAndUdp','ReadsVlanTaggedAndRawIpv6','HandlesBigEndianSectionHeader','SkipsUnknownBlocksAndCountsUnparsed','RejectsTruncatedBlock'],'LeakCaptureTests.cs':['TunnelAndLanAndNodeTrafficIsAllowed','PublicNonNodeTrafficIsSuspicious','19302','AuthAllowedOnlyOnItsPort','LocalAddressesNeverAppearInVerdict','AppsModeMarksListedAndUnlisted','StopsPktmonEvenWhenConversionFails','ExitCodeReflectsVerdict','ProcessesRunHidden']};bad=[f+':'+w for f,ws in n.items() for w in ws if w not in r(f)];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import json,pathlib,sys;p=pathlib.Path('docs/winclient/泄漏检测说明.md');t=p.read_text(encoding='utf-8') if p.exists() else '';bad=[x for x,ok in (('doc','--leak-check' in t and 'pktmon' in t and '退出码' in t and 'leak-report.json' in t and '2004' in t and '归属未知' in t),) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "SCOPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess as sp,sys;g=lambda *a:sp.check_output(['git','-c','core.quotepath=false']+list(a)).decode('utf-8').split(chr(10));mb=g('merge-base','origin/main','HEAD')[0].strip();ch={p.strip() for p in g('diff','--name-only',mb)+g('ls-files','--others','--exclude-standard') if p.strip()};ok=set([\"winclient/WinClient.App/Program.cs\", \"winclient/WinClient.App/Hosting/LeakCheckRunner.cs\", \"winclient/WinClient.Core/Network/SystemUdpTable.cs\", \"winclient/WinClient.Tests/LeakCaptureTests.cs\", \"winclient/WinClient.Tests/PcapNgReaderTests.cs\", \"docs/winclient/泄漏检测说明.md\"]);pre=[\"winclient/WinClient.Core/Diagnostics/\"];bad=sorted(p for p in ch if p not in ok and not any(p.startswith(x) for x in pre));print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "NOBIN",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess,sys;out=subprocess.run(['git','ls-files','winclient','build','scripts','node'],capture_output=True,text=True).stdout.split();bad=[f for f in out if f.endswith(('.exe','.dll','.zip','.pdb','.tar.gz','.so','.etl','.pcapng'))];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "model": "claude-sonnet-5-5",
+  "timeoutSec": 10800,
+  "repoRoot": "E:/yuanc",
+  "engine": "claude",
+  "steps": [
+    "读 BACKGROUND 列出的文件;先写 PcapNgReaderTests 与 LeakCaptureTests,申请 BUILD 以编译失败证红。",
+    "写 Diagnostics 目录(读取器、归类器、归属采样、编排)与 SystemUdpTable,BUILD / TEST / TESTS-NEW 绿。",
+    "写 LeakCheckRunner 与 Program.cs 分支,SHAPE 绿。",
+    "写文档,DOCS / SCOPE / NOBIN 绿。"
+  ]
+}

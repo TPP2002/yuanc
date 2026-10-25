@@ -1,0 +1,187 @@
+{
+  "schemaVersion": 1,
+  "taskId": "SEC-WIN-PERAPP-FAILCLOSED-1025",
+  "slug": "yc-perapp-failclosed-1025",
+  "title": "仅指定程序模式失败即关:认不出归属的连接拒绝;名单自动连带同一安装目录的程序文件(版本目录与商店包泛化),过滤层按连带文件加过滤器,巡检补新文件",
+  "goal": "以派单时 origin/main 头为基点(已含 yc-leak-nic-conn-1025 的 Network 目录、NicGuard 与 ConnectionReaper)。看板卡 SEC-WIN-PERAPP-FAILCLOSED-1025。客户 1025 要求「仅指定程序」模式下名单里的程序在任何情况下都只走隧道。现状三个缺口(docs/winclient/分应用代理说明.md「已知局限」第 1、4、5 条):①route.final=direct,sing-box 在 Windows 按源端口反查进程,UDP/QUIC/高并发时认不出进程的流落到 direct,由 sing-box 自己从物理网卡发出,名单程序的防火墙与过滤层阻断拦不到;②名单只认完整 exe 路径,同一软件的其他程序文件(Update.exe、helper、子进程)不继承;③Electron 类软件升级后版本目录(app-1.2.3)变了,路径失配整体直连。\n\n做法是 VPN 分应用的标准「失败即关」:认不出归属的连接一律拒绝;名单每项自动扩成同一软件安装目录下的全部程序文件。名单外但认得出的程序照旧直连(客户明示的选择,不改)。\n\n做完后:\n\n① 新建 winclient/WinClient.Core/Client/AppScope.cs(命名空间 WinClient.Core.Client):\n- `public sealed record AppScope(string Selected, string Pattern, IReadOnlyList<string> Executables, bool Expanded) { public static AppScope Exact(string path) }`;Exact 的 Pattern = RoutingRenderer.PathPattern(path)、Executables = [path]、Expanded = false。\n- `public sealed record AppScopeFolders(string Windows, string ProgramFiles, string ProgramFilesX86, string LocalAppData, string RoamingAppData, string UserProfile, string ProgramData)`;`public interface IAppScopeFileSystem { IReadOnlyList<string> EnumerateExecutables(string root, int maxDepth, int limit); }`(返回完整路径,跳过重解析点,最多 limit 个);`SystemAppScopeFileSystem` 实现;`AppScopeResolver.SystemFolders()` 取系统真实目录。\n- `public static class AppScopeResolver { public const int MaxDepth = 4; public const int MaxExecutables = 64; public static AppScope Resolve(string selected, AppScopeFolders folders, IAppScopeFileSystem fs) }`,规则:\n  a. dir = 所选 exe 所在目录。依次看 dir 自己的名字、父目录名、祖父目录名(到盘符根为止),取第一个命中的:版本段 `^(app-)?\\d+(\\.\\d+){1,3}$`(不分大小写)→ 根 = 该段的父目录,Pattern = `(?i)^` + 转义(根) + `\\\\.+\\.exe$`;商店包段 `^(?<name>[^_\\\\]+)_\\d+(\\.\\d+){1,3}_[^_\\\\]*__(?<pub>[a-z0-9]+)$`(不分大小写)→ 枚举根 = 该包目录,Pattern = `(?i)^` + 转义(包目录的父目录) + `\\\\` + 转义(name) + `_[^\\\\]+__` + 转义(pub) + `\\\\.+\\.exe$`;都没命中 → 根 = dir,Pattern = `(?i)^` + 转义(dir) + `\\\\.+\\.exe$`。\n  b. 过宽不扩:根(去掉末尾反斜杠,不分大小写比较)等于盘符根、Windows、ProgramFiles、ProgramFilesX86、LocalAppData、RoamingAppData、UserProfile、ProgramData、ProgramFiles\\WindowsApps 之一,或位于 Windows 目录之下,或盘符下只有一级(如 C:\\Tools)→ 返回 Exact(selected)。商店包段命中时不受「位于 ProgramFiles\\WindowsApps 下」限制(它本来就在那里),但包目录本身就是枚举根。\n  c. 枚举 fs.EnumerateExecutables(枚举根, MaxDepth, MaxExecutables + 1);超过 MaxExecutables 个或抛异常 → Exact(selected);否则 Executables = selected 与枚举结果按不分大小写去重、按 StringComparer.OrdinalIgnoreCase 排序,Expanded = true。\n  d. 「转义」与 RoutingRenderer.PathPattern 用同一套 RE2 元字符转义(抽成 RoutingRenderer 内部的 public static string Escape(string text),PathPattern 改为调用它,输出逐字节不变)。\n② RoutingRenderer.Render 加末尾可选参数 `IReadOnlyList<string>? appPatterns = null`。全部流量模式输出逐字节不变。仅指定程序模式:名单匹配用 appPatterns(为 null 时用各 app 的 PathPattern,即现状),后台服务路径照旧用 PathPattern 并入;规则顺序改为:原有 sniff / DNS 规则 → 分发版鉴权直连 → 名单 IPv6 reject → 名单 proxy → `{\"process_path_regex\":[\"(?i)^.+$\"],\"outbound\":\"direct\"}`(认得出的名单外程序直连)→ `{\"action\":\"reject\"}`(没有任何其他字段:认不出归属的连接拒绝);route.final 仍为 \"direct\"。\n③ EnvironmentSelfCheck 第 7 项仅指定程序分路:SelfCheckInput 加 init 属性 `IReadOnlyList<string>? AppPatterns`,名单覆盖判定改为比对 AppPatterns(null 时回退 PathPattern);再加两条子项「route.rules 认得出的名单外程序→direct」「route.rules 认不出归属的连接拒绝」(最后一条规则恰为 {\"action\":\"reject\"});明细前缀「仅指定程序模式:」不变。\n④ 过滤层:WfpPlanner.PlanApps 程序数上限从 32 改为 2080(报错文字改成「仅指定程序模式必须提供 1 到 2080 个程序的绝对路径。」)。IKillSwitch 加默认方法 `Task ApplyAppsAsync(IReadOnlyList<string> programs, IReadOnlyList<string> filterPrograms) => ApplyAppsAsync(programs);`,KillSwitchApplier 实现:防火墙规则仍按 programs(用户所选,≤32,规则名与巡检预期不变),过滤层按 filterPrograms。\n⑤ ClientController:构造函数末尾加可选参数 `Func<string, AppScope>? scopeResolver = null`(两个构造函数都加,第一个透传),null 时用 AppScope.Exact(既有测试不受文件系统影响)。ConnectAsync 读出仅指定程序名单后解析一次得 activeScopes(全部流量为空);渲染配置传 activeScopes 的 Pattern;ApplyKillSwitch 调 `ApplyAppsAsync(activeRouting.Apps, <全部 scope 的 Executables 并集,不分大小写去重>)`;ConnectionReaper 的 ReapPolicy.Apps 改为同一个并集;自检输入 AppPatterns 传 activeScopes 的 Pattern。巡检(仅指定程序)在防火墙巡检前重新解析各 scope 的 Executables(Pattern 保持连接时的值,不重启隧道),并集有新增时重新 ApplyAppsAsync,guardStatus 设为「已为新出现的 <n> 个程序文件补上保护」(n 为新增个数),失败照既有巡检失败分路;任何情况不断开、不撤保护。\n⑥ ClientRuntime 接线:scopeResolver = path => AppScopeResolver.Resolve(path, AppScopeResolver.SystemFolders(), new SystemAppScopeFileSystem())。\n⑦ 测试(方法名必须用下列名字,可再加):\n- AppScopeTests.cs(新):`ExpandsVersionedSquirrelLayoutToParent`(…\\Local\\Discord\\app-1.0.9\\Discord.exe 的 Pattern 用 .NET Regex 去掉 (?i) 加 IgnoreCase 后能匹配 …\\Discord\\Update.exe 与 …\\Discord\\app-1.0.10\\Discord.exe,不匹配 …\\Local\\Other\\x.exe)、`ExpandsPlainInstallDirectory`(Chrome Application 目录)、`GeneralizesMsixPackageVersion`(C:\\Program Files\\WindowsApps\\Claude_1.2.3.0_x64__pzs8sxrjxfjjc\\app\\claude.exe 能匹配 Claude_1.3.0.0_x64__pzs8sxrjxfjjc\\app\\claude.exe,不匹配 Other_1.0.0.0_x64__abc\\x.exe)、`DoesNotExpandBroadOrSystemDirectories`(C:\\Windows\\System32\\curl.exe、C:\\Tools\\curl.exe、C:\\Program Files\\app.exe、LocalAppData 根下的 x.exe)、`FallsBackWhenTooManyExecutables`(65 个)、`FallsBackWhenEnumerationFails`、`PatternEscapesMetacharacters`(路径含空格、括号、加号)。全部用假文件系统,不碰真实磁盘。\n- RoutingTests.cs:`AppsRejectsUnidentifiedAndDirectsIdentifiedOthers`(规则顺序与最后两条的精确内容)、`AppsUsesScopePatternsWhenProvided`;既有全部流量测试不改;既有仅指定程序规则顺序测试按新顺序改(只改顺序与新增两条,其余断言不动)。\n- WfpPlannerTests.cs:`AppsAcceptsLargeFilterProgramList`(100 个通过,0 个与 2081 个拒绝)。\n- WfpApplierTests.cs 或 FirewallTests.cs:`ApplyAppsUsesExactProgramsForFirewallAndScopeForFilters`。\n- ControllerTests.cs:`AppsModeRendersScopePatterns`、`AppsModePassesScopeExecutablesToFilters`、`PatrolAddsProtectionForNewExecutables`、`AppsModeReapsScopeExecutables`。\n- EnvironmentSelfCheckTests.cs:`AppsModeNoDirectPathRequiresRejectForUnidentified`。\n⑧ 文档:\n- docs/winclient/分应用代理说明.md:对比表「接管范围」改为「名单程序(含连带范围)走 proxy;认得出的名单外程序走 direct;认不出归属的连接拒绝」;新增一节「## 连带范围」写清①的规则、过宽不扩的目录、64 个上限与回退、巡检补新程序文件、sing-box 用目录正则而过滤层用枚举出的文件;「已知局限」第 1 条改写为「认不出归属的连接一律拒绝」及其代价(名单外软件少量 UDP、ICMP 偶发失败);第 4、5 条改写为:同一安装目录内的程序已连带,跨目录的共享运行库(如 WebView2 的 msedgewebview2.exe)仍须手动加入;版本目录已泛化;「真机待验证清单」加:STUN 探测与 QUIC 在高并发下名单程序全部走隧道或被拒、名单外程序照常;Discord/Claude 类软件升级换版本目录后不用重新添加;巡检补新文件。\n- docs/winclient/断网保护加固说明.md 分应用相关段落写明过滤层按连带范围的全部程序文件加过滤器,防火墙规则仍按所选程序。\n- docs/winclient/环境一致性说明.md 第 7 项仅指定程序模式的子项加上两条新子项。",
+  "background": "项目:外包「澳洲出口节点 + Windows 一键客户端」。客户端 .NET 9(winclient/WinClient.sln)。隧道内核 sing-box 1.13.21(规则写法:阻断用 action=reject;没有任何匹配字段的规则匹配全部连接,现有配置里的 {\"action\":\"sniff\"} 就是这样用的;process_path_regex 在进程信息取不到时不匹配,所以「(?i)^.+$」只匹配认得出归属的连接)。仅指定程序模式的现状与局限见 docs/winclient/分应用代理说明.md。\n\n先读:winclient/WinClient.Core/Client/RoutingRenderer.cs、RoutingSettings.cs、ClientController.cs(ConnectAsync、RenderedConfiguration、ExecuteEffectsAsync 的 ApplyKillSwitch、PatrolAsync、CheckEnvironmentAsync、ConnectionReaper 调用处)、ClientRuntime.cs、Firewall/KillSwitchApplier.cs、Firewall/KillSwitchPlanner.cs(PlanApps)、Firewall/WfpPlanner.cs、Environment/EnvironmentSelfCheck.cs 第 7 项、Network/ConnectionReaper.cs;测试 RoutingTests.cs、WfpPlannerTests.cs、WfpApplierTests.cs、ControllerTests.cs、EnvironmentSelfCheckTests.cs;docs/winclient/分应用代理说明.md 全文。\n\n硬规矩:①全部流量模式的渲染、断网保护、巡检、自检逐字节不变;新参数一律可选,null 时既有行为不变;②既有测试断言只在本单明确改变处改(仅指定程序的规则顺序、上限文字),其余不删不放宽;③不在测试里访问真实文件系统做枚举,不在测试里安装真实过滤器;④Windows 子进程一律隐藏窗口;⑤工人不许 git 写操作,不许自己跑 dotnet(按验收编号申请);⑥每次 Edit / Write 的新内容控制在 150 行以内,大文件先建能编译的骨架再分段补;⑦新增文案与注释中文;⑧任何地址不进日志与自检明细;⑨拿不准(例如 sing-box 规则语义、既有测试意图冲突)停下交 blocked + forks,不猜。",
+  "nonGoals": [
+    "不改全部流量模式的任何行为",
+    "不改界面(WinClient.App)与 UiTests;不改名单上限 32 与 routing.json 格式",
+    "不做按父子进程关系的动态跟踪;跨目录共享运行库仍由用户手动加入",
+    "不改 Network 目录(NicGuard / ConnectionReaper 只改调用参数)"
+  ],
+  "allowedPaths": [
+    "winclient/WinClient.Core/Client/AppScope.cs",
+    "winclient/WinClient.Core/Client/RoutingRenderer.cs",
+    "winclient/WinClient.Core/Client/ClientController.cs",
+    "winclient/WinClient.Core/Client/ClientRuntime.cs",
+    "winclient/WinClient.Core/Firewall/KillSwitchApplier.cs",
+    "winclient/WinClient.Core/Firewall/WfpPlanner.cs",
+    "winclient/WinClient.Core/Environment/EnvironmentSelfCheck.cs",
+    "winclient/WinClient.Tests/AppScopeTests.cs",
+    "winclient/WinClient.Tests/RoutingTests.cs",
+    "winclient/WinClient.Tests/WfpPlannerTests.cs",
+    "winclient/WinClient.Tests/WfpApplierTests.cs",
+    "winclient/WinClient.Tests/ControllerTests.cs",
+    "winclient/WinClient.Tests/EnvironmentSelfCheckTests.cs",
+    "winclient/WinClient.Tests/KillSwitchPatrolTests.cs",
+    "winclient/WinClient.Tests/FirewallTests.cs",
+    "winclient/WinClient.Tests/IpcTests.cs",
+    "docs/winclient/分应用代理说明.md",
+    "docs/winclient/断网保护加固说明.md",
+    "docs/winclient/环境一致性说明.md"
+  ],
+  "forbiddenPaths": [
+    ".codex/**",
+    ".github/**",
+    ".gitignore",
+    "authserver/**",
+    "node/**",
+    "scripts/**",
+    "pyproject.toml",
+    "docs/design/**",
+    "docs/plans/**",
+    "docs/acceptance/**",
+    "docs/交接/**",
+    "docs/node/**",
+    "docs/口径速查表.md",
+    "docs/开工须知.md",
+    "winclient/*.sln",
+    "winclient/Directory.Build.props",
+    "winclient/third_party/**",
+    "winclient/WinClient.UiTests/**",
+    "winclient/WinClient.App/**",
+    "winclient/WinClient.Core/Network/**",
+    "winclient/WinClient.Core/Diagnostics/**",
+    "winclient/WinClient.Tests/Leak*.cs",
+    "winclient/WinClient.Tests/PcapNg*.cs",
+    "winclient/WinClient.Tests/WinClient.Tests.csproj",
+    "winclient/WinClient.Core/WinClient.Core.csproj"
+  ],
+  "expectArtifacts": [
+    "winclient/WinClient.Core/Client/AppScope.cs",
+    "winclient/WinClient.Tests/AppScopeTests.cs"
+  ],
+  "acceptance": [
+    {
+      "id": "BUILD",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "build",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1200
+    },
+    {
+      "id": "TEST",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "test",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--no-build",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1500
+    },
+    {
+      "id": "SHAPE-SCOPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import json,pathlib,sys;p=pathlib.Path('winclient/WinClient.Core/Client/AppScope.cs');t=p.read_text(encoding='utf-8') if p.exists() else '';r=pathlib.Path('winclient/WinClient.Core/Client/RoutingRenderer.cs').read_text(encoding='utf-8');bad=[k for k,ok in (('scope','MaxExecutables = 64' in t and 'MaxDepth = 4' in t and 'WindowsApps' in t and 'app-' in t and 'AppScope Exact(' in t and 'SystemAppScopeFileSystem' in t),('render','(?i)^.+$' in r and 'appPatterns' in r and 'Escape(' in r and '\"reject\"' in r)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "SHAPE-WIRE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import json,pathlib,sys;r=lambda f:pathlib.Path('winclient/WinClient.Core/'+f).read_text(encoding='utf-8');c=r('Client/ClientController.cs');u=r('Client/ClientRuntime.cs');k=r('Firewall/KillSwitchApplier.cs');w=r('Firewall/WfpPlanner.cs');e=r('Environment/EnvironmentSelfCheck.cs');bad=[x for x,ok in (('ctl','Func<string, AppScope>? scopeResolver = null' in c and '补上保护' in c),('rt','AppScopeResolver.Resolve(' in u),('ks','filterPrograms' in k),('wfp','2080' in w and '1 到 32 个' not in w),('self','AppPatterns' in e and '认不出归属的连接拒绝' in e)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "TESTS-SCOPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import json,pathlib,sys;r=lambda f:(pathlib.Path('winclient/WinClient.Tests/'+f).read_text(encoding='utf-8') if pathlib.Path('winclient/WinClient.Tests/'+f).exists() else '');n={'AppScopeTests.cs':['ExpandsVersionedSquirrelLayoutToParent','ExpandsPlainInstallDirectory','GeneralizesMsixPackageVersion','DoesNotExpandBroadOrSystemDirectories','FallsBackWhenTooManyExecutables','FallsBackWhenEnumerationFails','PatternEscapesMetacharacters'],'RoutingTests.cs':['AppsRejectsUnidentifiedAndDirectsIdentifiedOthers','AppsUsesScopePatternsWhenProvided'],'WfpPlannerTests.cs':['AppsAcceptsLargeFilterProgramList']};bad=[f+':'+w for f,ws in n.items() for w in ws if w not in r(f)];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "TESTS-WIRE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import json,pathlib,sys;r=lambda f:(pathlib.Path('winclient/WinClient.Tests/'+f).read_text(encoding='utf-8') if pathlib.Path('winclient/WinClient.Tests/'+f).exists() else '');n={'ControllerTests.cs':['AppsModeRendersScopePatterns','AppsModePassesScopeExecutablesToFilters','PatrolAddsProtectionForNewExecutables','AppsModeReapsScopeExecutables'],'EnvironmentSelfCheckTests.cs':['AppsModeNoDirectPathRequiresRejectForUnidentified']};bad=[f+':'+w for f,ws in n.items() for w in ws if w not in r(f)];bad+=[] if 'ApplyAppsUsesExactProgramsForFirewallAndScopeForFilters' in r('WfpApplierTests.cs')+r('FirewallTests.cs') else ['applier'];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import json,pathlib,sys;r=lambda f:pathlib.Path('docs/winclient/'+f).read_text(encoding='utf-8');p=r('分应用代理说明.md');k=r('断网保护加固说明.md');v=r('环境一致性说明.md');bad=[x for x,ok in (('apps','## 连带范围' in p and '认不出归属的连接' in p and 'msedgewebview2.exe' in p and '64' in p and '升级后完整路径改变，**隧道匹配和防火墙保护会同时失效，须重新添加**' not in p),('ks','连带范围' in k),('env','认不出归属的连接拒绝' in v)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "SCOPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess as sp,sys;g=lambda *a:sp.check_output(['git','-c','core.quotepath=false']+list(a)).decode('utf-8').split(chr(10));mb=g('merge-base','origin/main','HEAD')[0].strip();ch={p.strip() for p in g('diff','--name-only',mb)+g('ls-files','--others','--exclude-standard') if p.strip()};ok=set([\"winclient/WinClient.Core/Firewall/KillSwitchApplier.cs\", \"winclient/WinClient.Core/Firewall/WfpPlanner.cs\", \"winclient/WinClient.Core/Environment/EnvironmentSelfCheck.cs\", \"docs/winclient/分应用代理说明.md\", \"docs/winclient/断网保护加固说明.md\", \"docs/winclient/环境一致性说明.md\"]);pre=[\"winclient/WinClient.Tests/\", \"winclient/WinClient.Core/Client/\"];bad=sorted(p for p in ch if p not in ok and not any(p.startswith(x) for x in pre));print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "NOBIN",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess,sys;out=subprocess.run(['git','ls-files','winclient','build','scripts','node'],capture_output=True,text=True).stdout.split();bad=[f for f in out if f.endswith(('.exe','.dll','.zip','.pdb','.tar.gz','.so'))];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "model": "claude-sonnet-5-5",
+  "timeoutSec": 10800,
+  "repoRoot": "E:/yuanc",
+  "engine": "claude",
+  "steps": [
+    "读 BACKGROUND 列出的文件;先写 AppScopeTests 与 RoutingTests / ControllerTests / WfpPlannerTests / EnvironmentSelfCheckTests 新增用例,申请 BUILD 以编译失败证红。",
+    "写 AppScope.cs 与 RoutingRenderer 改动,BUILD / TEST / SHAPE-SCOPE 绿。",
+    "改 WfpPlanner、KillSwitchApplier、ClientController、ClientRuntime、EnvironmentSelfCheck,BUILD / TEST / SHAPE-WIRE / TESTS-SCOPE / TESTS-WIRE 绿。",
+    "改文档,DOCS / SCOPE / NOBIN 绿。"
+  ]
+}
