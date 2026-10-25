@@ -28,6 +28,8 @@ public static class Program
                 case "--uninstall":
                 case "--repair":
                     return new InstallerRunner().RunAsync(role).GetAwaiter().GetResult();
+                case "--leak-check":
+                    return LeakCheckRunner.Run(args.Skip(1).ToArray());
                 default:
                     Console.Error.WriteLine("无法识别启动参数，请使用客户端快捷方式打开。");
                     return 2;
