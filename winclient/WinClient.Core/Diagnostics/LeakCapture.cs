@@ -10,7 +10,11 @@ namespace WinClient.Core.Diagnostics;
 /// <param name="Seconds">抓包时长(秒)。</param>
 /// <param name="Node">节点 IPv4;为空时从隧道内核的已建立连接里取。</param>
 public sealed record LeakCheckOptions(int Seconds, string? Node, string OutputDirectory, bool KeepCapture,
-    bool AppsMode, IReadOnlyList<string> Apps, AuthEndpoint? Auth);
+    bool AppsMode, IReadOnlyList<string> Apps, AuthEndpoint? Auth)
+{
+    /// <summary>客户端连带范围匹配式(格式同 AppScope.Pattern);仅指定程序模式下由调用方填入。</summary>
+    public IReadOnlyList<string>? AppPatterns { get; init; }
+}
 
 /// <summary>ExitCode:0 未发现可疑流量,1 发现可疑流量,2 无法检测(Verdict 为 null,Reason 给出中文原因)。</summary>
 public sealed record LeakCheckResult(int ExitCode, string? Reason, LeakVerdict? Verdict);
@@ -65,7 +69,10 @@ public sealed class LeakCapture(ICommandRunner runner, ITcpTable tcp, IUdpTable 
         {
             using var stream = File.OpenRead(pcap);
             var auth = options.Auth is { } endpoint ? new IPEndPoint(endpoint.Address, endpoint.Port) : null;
-            var context = new LeakContext(local, nodes, auth, options.AppsMode, options.Apps);
+            var context = new LeakContext(local, nodes, auth, options.AppsMode, options.Apps)
+            {
+                AppPatterns = options.AppPatterns
+            };
             var verdict = LeakClassifier.Classify(PcapNgReader.Read(stream), context, sampler.Owner);
             return new(LeakClassifier.ExitCode(verdict, options.AppsMode), null, verdict);
         }

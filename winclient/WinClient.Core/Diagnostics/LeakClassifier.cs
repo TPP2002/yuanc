@@ -1,12 +1,17 @@
 using System.Net;
 using System.Net.Sockets;
+using System.Text.RegularExpressions;
 using WinClient.Core.Network;
 
 namespace WinClient.Core.Diagnostics;
 
 /// <summary>归类所需的上下文。LocalAddresses 只用于判断对端,绝不写进结果。</summary>
 public sealed record LeakContext(IReadOnlySet<IPAddress> LocalAddresses, IReadOnlySet<IPAddress> NodeAddresses,
-    IPEndPoint? Auth, bool AppsMode, IReadOnlyList<string> Apps);
+    IPEndPoint? Auth, bool AppsMode, IReadOnlyList<string> Apps)
+{
+    /// <summary>客户端连带范围匹配式(格式同 AppScope.Pattern,以 (?i) 开头的 RE2 写法);为 null 时只认所选程序本身与其目录。</summary>
+    public IReadOnlyList<string>? AppPatterns { get; init; }
+}
 
 public sealed record SuspiciousFlow(string Protocol, string Remote, int RemotePort, string? Process, bool? Listed, int Count);
 
@@ -75,7 +80,20 @@ public static class LeakClassifier
             var slash = listed.LastIndexOf('\\');
             if (slash > 0 && path.StartsWith(listed[..(slash + 1)], StringComparison.OrdinalIgnoreCase)) return true;
         }
-        return false;
+        return context.AppPatterns is { } patterns && patterns.Any(pattern => MatchesPattern(pattern, path));
+    }
+
+    // 匹配式编译失败或匹配超时都当作不匹配,不抛出。
+    private static bool MatchesPattern(string pattern, string path)
+    {
+        const string CaseFlag = "(?i)";
+        try
+        {
+            var body = pattern.StartsWith(CaseFlag, StringComparison.Ordinal) ? pattern[CaseFlag.Length..] : pattern;
+            var regex = new Regex(body, RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, TimeSpan.FromMilliseconds(100));
+            return regex.IsMatch(path);
+        }
+        catch (Exception ex) when (ex is ArgumentException or RegexMatchTimeoutException) { return false; }
     }
 
     private static string Normalize(string path) => path.Replace('/', '\\');

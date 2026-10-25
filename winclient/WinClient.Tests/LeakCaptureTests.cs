@@ -103,6 +103,66 @@ public sealed class LeakCaptureTests
         Assert.Null(verdict.Suspicious.Single(flow => flow.Process is null).Listed);
     }
 
+    private const string DiscordExe = @"C:\Users\a\AppData\Local\Discord\app-1.0.9\Discord.exe";
+    private const string DiscordPattern = @"(?i)^C:\\Users\\a\\AppData\\Local\\Discord\\.+\.exe$";
+    private const string DiscordUpdate = @"C:\Users\a\AppData\Local\Discord\Update.exe";
+
+    private static LeakVerdict ClassifyOwners(LeakContext context, Dictionary<int, string?> owners) =>
+        LeakClassifier.Classify(owners.Keys.Select(port => Tcp("192.168.1.5", "8.8.8.8", port, 443)), context,
+            packet => owners[packet.SourcePort]);
+
+    [Fact]
+    public void AppsModeMatchesScopePatterns()
+    {
+        var context = Context(null, true, DiscordExe) with { AppPatterns = [DiscordPattern] };
+        var owners = new Dictionary<int, string?>
+        {
+            [1] = DiscordUpdate, [2] = @"C:\Users\a\AppData\Local\discord\APP-1.0.10\Discord.exe",
+            [3] = @"C:\Other\x.exe", [4] = null
+        };
+        var verdict = ClassifyOwners(context, owners);
+        Assert.Equal(true, verdict.Suspicious.Single(flow => flow.Process == owners[1]).Listed);
+        Assert.Equal(true, verdict.Suspicious.Single(flow => flow.Process == owners[2]).Listed);
+        Assert.Equal(false, verdict.Suspicious.Single(flow => flow.Process == owners[3]).Listed);
+        Assert.Null(verdict.Suspicious.Single(flow => flow.Process is null).Listed);
+    }
+
+    [Fact]
+    public void ScopeSiblingLeakFailsExitCode()
+    {
+        var context = Context(null, true, DiscordExe) with { AppPatterns = [DiscordPattern] };
+        var verdict = ClassifyOwners(context, new Dictionary<int, string?> { [1] = DiscordUpdate });
+        Assert.Equal(1, LeakClassifier.ExitCode(verdict, true));
+    }
+
+    [Fact]
+    public void InvalidPatternIsIgnored()
+    {
+        var context = Context(null, true, DiscordExe) with { AppPatterns = [@"(?i)^C:\\[", DiscordPattern] };
+        var owners = new Dictionary<int, string?> { [1] = DiscordUpdate, [2] = @"C:\Other\x.exe" };
+        var verdict = ClassifyOwners(context, owners);
+        Assert.Equal(true, verdict.Suspicious.Single(flow => flow.Process == owners[1]).Listed);
+        Assert.Equal(false, verdict.Suspicious.Single(flow => flow.Process == owners[2]).Listed);
+    }
+
+    [Fact]
+    public void NullPatternsKeepOldBehavior()
+    {
+        var context = Context(null, true, "C:\\Apps\\Chat\\chat.exe", DiscordExe);
+        Assert.Null(context.AppPatterns);
+        var owners = new Dictionary<int, string?>
+        {
+            [1] = "c:\\apps\\chat\\CHAT.EXE", [2] = "C:\\Apps\\Chat\\helper\\child.exe",
+            [3] = "C:\\Other\\browser.exe", [4] = null, [5] = DiscordUpdate
+        };
+        var verdict = ClassifyOwners(context, owners);
+        Assert.Equal(true, verdict.Suspicious.Single(flow => flow.Process == owners[1]).Listed);
+        Assert.Equal(true, verdict.Suspicious.Single(flow => flow.Process == owners[2]).Listed);
+        Assert.Equal(false, verdict.Suspicious.Single(flow => flow.Process == owners[3]).Listed);
+        Assert.Null(verdict.Suspicious.Single(flow => flow.Process is null).Listed);
+        Assert.Equal(false, verdict.Suspicious.Single(flow => flow.Process == owners[5]).Listed);
+    }
+
     [Fact]
     public async Task StopsPktmonEvenWhenConversionFails()
     {
