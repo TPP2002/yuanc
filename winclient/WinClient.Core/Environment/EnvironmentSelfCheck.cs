@@ -3,6 +3,7 @@ using System.Net.Sockets;
 using System.Text.Json;
 using WinClient.Core.Client;
 using WinClient.Core.Firewall;
+using WinClient.Core.Network;
 
 namespace WinClient.Core.EnvironmentSupport;
 
@@ -60,7 +61,7 @@ public static class EnvironmentSelfCheck
 
     public static EnvironmentReport Evaluate(SelfCheckInput input)
     {
-        var items = new List<CheckItem>(10);
+        var items = new List<CheckItem>(11);
         void Add(string id, string name, bool pass, string detail) => items.Add(new(id, name, pass ? "通过" : "未通过", detail));
         if (input.Exit is null)
             items.Add(new("exit_country", "出口归属澳洲", "无法核验", "未取得出口探测结果"));
@@ -137,7 +138,26 @@ public static class EnvironmentSelfCheck
         }
         items.Add(CheckTunSubnet(input.Adapters));
         items.Add(CheckBrowsersClosed(input));
+        items.Add(CheckAdapterPublicAddress(input.Adapters));
         return new(input.Now, items);
+    }
+
+    /// <summary>除隧道网卡外任一网卡有公网地址即未通过;明细只写网卡名,不写任何地址。</summary>
+    private static CheckItem CheckAdapterPublicAddress(IReadOnlyList<AdapterInfo>? adapters)
+    {
+        const string id = "adapter_public";
+        const string name = "网卡无公网地址";
+        if (adapters is null) return new(id, name, "无法核验", "未取得本机网卡清单");
+        static bool AnyPublic(IReadOnlyList<AdapterAddress> list) =>
+            list.Any(item => IPAddress.TryParse(item.Address, out var ip) && PublicAddress.IsPublic(ip));
+        var findings = new List<string>();
+        foreach (var adapter in adapters.Where(adapter => adapter.Name != KillSwitchPlanner.TunAlias))
+        {
+            if (AnyPublic(adapter.Ipv4)) findings.Add($"网卡「{adapter.Name}」有公网 IPv4 地址");
+            if (AnyPublic(adapter.Ipv6)) findings.Add($"网卡「{adapter.Name}」有公网 IPv6 地址");
+        }
+        return findings.Count == 0 ? new(id, name, "通过", "除隧道网卡外没有网卡带公网地址")
+            : new(id, name, "未通过", string.Join(";", findings));
     }
 
     private static CheckItem CheckBrowsersClosed(SelfCheckInput input)

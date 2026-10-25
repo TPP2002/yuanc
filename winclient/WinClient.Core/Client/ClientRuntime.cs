@@ -3,6 +3,7 @@ using System.Security.Cryptography;
 using System.Text.Json;
 using WinClient.Core.Auth;
 using WinClient.Core.Firewall;
+using WinClient.Core.Network;
 using WinClient.Core.Process;
 using WinClient.Core.Storage;
 using WinClient.Core.Logging;
@@ -75,7 +76,9 @@ public sealed class ClientRuntime : IClientFacade, IDisposable
                 environmentSettings: new EnvironmentSettingsStore(), ipv6Probe: new SocketIpv6Probe(),
                 reportSink: report => WriteSelfCheck(Path.Combine(ClientSettings.DataDirectory, "run", "selfcheck.json"), report),
                 routingSettings: new RoutingSettingsStore(), serviceProcessPath: Environment.ProcessPath, adapterProbe: new SystemAdapterProbe(),
-                browserProbe: new SystemBrowserProcessProbe());
+                browserProbe: new SystemBrowserProcessProbe(),
+                nicGuard: new NicGuard(Path.Combine(ClientSettings.DataDirectory, "run"), new SystemAdapterProbe()),
+                reaper: new ConnectionReaper(new SystemTcpTable()));
             return new(controller, firewall, http, pairingStore, log, storeRoot, scope);
         }
         catch { http?.Dispose(); throw; }

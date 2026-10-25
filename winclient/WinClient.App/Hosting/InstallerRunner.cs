@@ -7,8 +7,10 @@ using System.Security.Cryptography;
 using System.Security.Principal;
 using System.ServiceProcess;
 using Microsoft.Win32;
+using WinClient.Core.EnvironmentSupport;
 using WinClient.Core.Firewall;
 using WinClient.Core.Client;
+using WinClient.Core.Network;
 using WinClient.Core.Hosting;
 using WinClient.Core.Ipc;
 using WinClient.Core.State;
@@ -135,6 +137,16 @@ public sealed class InstallerRunner
             {
                 // 撤防失败时保留服务与自启值：下次开机服务仍能按期望状态接管保护，比留一套没人管的阻止规则安全。
                 throw SafeError("未能撤销断网保护，卸载已停止，请联系管理员。");
+            }
+            // 撤防之后恢复连接期间关掉的网卡 IPv6 绑定;失败只提示,卸载继续。
+            try
+            {
+                var nicWarning = await new NicGuard(Path.Combine(ClientSettings.DataDirectory, "run"), new SystemAdapterProbe()).RestoreAsync();
+                if (nicWarning is not null) Console.Error.WriteLine(nicWarning);
+            }
+            catch (Exception)
+            {
+                Console.Error.WriteLine("网卡的 IPv6 未能恢复,请重试或联系管理员。");
             }
         }
         if (ServiceStatus() is not null) await RunCommandAsync(ServiceInstaller.Delete(), "删除后台服务失败。");
