@@ -1,0 +1,161 @@
+{
+  "schemaVersion": 1,
+  "taskId": "WINCLIENT-LEAKCHECK-SCOPE-MATCH-1025",
+  "slug": "yc-leakcheck-scope-1025",
+  "title": "泄漏检测命令的「名单程序」判定加上客户端连带范围匹配式,堵住连带程序直连被判成名单外的假绿",
+  "goal": "以派单时 origin/main 头为基点(已含 PR #70 泄漏检测命令与 PR #71 仅指定程序连带范围 AppScopeResolver)。看板卡 WINCLIENT-LEAKCHECK-SCOPE-MATCH-1025。\n\n问题:检测工具 LeakClassifier 判「名单程序」只认所选 exe 完整路径或其所在目录(含子目录)前缀;客户端自 PR #71 起按 AppScopeResolver 的连带范围匹配(版本目录取上一级、商店包泛化版本)。例:名单选 `C:\\Users\\a\\AppData\\Local\\Discord\\app-1.0.9\\Discord.exe`,连带范围包括 `…\\Discord\\Update.exe` 与 `…\\Discord\\app-1.0.10\\Discord.exe`;它们若真从物理网卡直连,检测工具现在会标成「名单外程序(按设计直连)」并返回退出码 0(假绿)。\n\n做完后:\n① LeakClassifier.cs:`LeakContext` 保持现有位置参数不变,新增 `public IReadOnlyList<string>? AppPatterns { get; init; }`(连带范围匹配式,格式同 AppScope.Pattern,以 `(?i)` 开头的 RE2 写法)。`Listed` 判定改为三者取或:原有「完整路径不分大小写相等」、原有「位于名单某程序所在目录(含子目录)之下」、新增「匹配 AppPatterns 中任一条」。匹配用 .NET `Regex`:去掉开头的 `(?i)` 后以 `RegexOptions.IgnoreCase | RegexOptions.CultureInvariant` 编译,带 100 毫秒匹配超时;编译失败或超时的那一条当作不匹配,不抛出。路径先把 `/` 换成 `\\` 再匹配。AppPatterns 为 null 时行为与现在完全一致。\n② LeakCapture.cs:`LeakCheckOptions` 保持现有位置参数不变,新增 `public IReadOnlyList<string>? AppPatterns { get; init; }`,Analyze 建 LeakContext 时带上。\n③ LeakCheckRunner.cs:仅指定程序模式下对每个名单程序调 `AppScopeResolver.Resolve(path, AppScopeResolver.SystemFolders(), new SystemAppScopeFileSystem()).Pattern`(与客户端连接时同一算法),结果放进 options 的 AppPatterns;全部流量模式不算。单个程序解析抛异常时用 `RoutingRenderer.PathPattern(path)` 兜底。\n④ 测试(LeakCaptureTests.cs 追加,方法名必须用下列名字,可再加;既有用例不改):\n- `AppsModeMatchesScopePatterns`:名单 `C:\\Users\\a\\AppData\\Local\\Discord\\app-1.0.9\\Discord.exe`,AppPatterns 为 `(?i)^C:\\\\Users\\\\a\\\\AppData\\\\Local\\\\Discord\\\\.+\\.exe$`(即 C# 里 `@\"(?i)^C:\\Users\\a\\AppData\\Local\\Discord\\.+\\.exe$\"`);归属 `…\\Discord\\Update.exe`、`…\\discord\\APP-1.0.10\\Discord.exe` → Listed true;`C:\\Other\\x.exe` → false;归属未知 → null。\n- `ScopeSiblingLeakFailsExitCode`:同上名单与匹配式,只有一条归属 `…\\Discord\\Update.exe` 的可疑流时 `LeakClassifier.ExitCode(verdict, true)` 为 1。\n- `InvalidPatternIsIgnored`:AppPatterns 含一条非法正则(如 `(?i)^C:\\\\[`)加一条合法的,不抛异常,合法那条照常生效。\n- `NullPatternsKeepOldBehavior`:AppPatterns 为 null 时与现有 `AppsModeMarksListedAndUnlisted` 同样输入得到同样结果,且 `…\\Discord\\Update.exe`(所选 exe 在 app-1.0.9 子目录)判 false。\n⑤ 文档 docs/winclient/泄漏检测说明.md「判定规则」里名单那一句改为:三者之一即「名单程序」——完整路径相等、位于所选程序目录之下、或落在客户端的「连带范围」内(与客户端连接时同一算法,见 [分应用代理说明](分应用代理说明.md#连带范围));其余不改。",
+  "background": "项目:外包「澳洲出口节点 + Windows 一键客户端」。客户端 .NET 9 WPF(winclient/WinClient.sln:Core + App + Tests + UiTests)。\n\n先读:winclient/WinClient.Core/Diagnostics/LeakClassifier.cs、LeakCapture.cs、winclient/WinClient.App/Hosting/LeakCheckRunner.cs、winclient/WinClient.Core/Client/AppScope.cs(AppScopeResolver / SystemAppScopeFileSystem / Pattern 写法)、Client/RoutingRenderer.cs(PathPattern / Escape)、winclient/WinClient.Tests/LeakCaptureTests.cs(Context 帮手与 Tcp 帮手)、docs/winclient/泄漏检测说明.md「判定规则」。\n\n硬规矩:①只改允许清单里的五个文件,不改 Client / Firewall / Environment / Network 目录;②LeakContext 与 LeakCheckOptions 的现有位置参数与既有测试不改;③本机网卡地址不进报告、摘要、日志、异常;④工人不许 git 写操作,不许自己跑 dotnet(按验收编号申请);⑤每次 Edit / Write 的新内容控制在 150 行以内;⑥新增文案与注释中文;⑦拿不准停下交 blocked + forks,不猜。",
+  "nonGoals": [
+    "不改客户端连接、路由、断网保护的任何行为",
+    "不改 pcapng 解析、抓包编排与退出码约定以外的逻辑",
+    "不改报告字段"
+  ],
+  "allowedPaths": [
+    "winclient/WinClient.Core/Diagnostics/LeakClassifier.cs",
+    "winclient/WinClient.Core/Diagnostics/LeakCapture.cs",
+    "winclient/WinClient.App/Hosting/LeakCheckRunner.cs",
+    "winclient/WinClient.Tests/LeakCaptureTests.cs",
+    "docs/winclient/泄漏检测说明.md"
+  ],
+  "forbiddenPaths": [
+    ".codex/**",
+    ".github/**",
+    ".gitignore",
+    "authserver/**",
+    "node/**",
+    "scripts/**",
+    "pyproject.toml",
+    "docs/design/**",
+    "docs/plans/**",
+    "docs/acceptance/**",
+    "docs/交接/**",
+    "docs/node/**",
+    "docs/口径速查表.md",
+    "docs/开工须知.md",
+    "docs/winclient/分应用代理说明.md",
+    "docs/winclient/环境一致性说明.md",
+    "docs/winclient/断网保护加固说明.md",
+    "winclient/*.sln",
+    "winclient/Directory.Build.props",
+    "winclient/third_party/**",
+    "winclient/WinClient.UiTests/**",
+    "winclient/WinClient.Core/Client/**",
+    "winclient/WinClient.Core/Firewall/**",
+    "winclient/WinClient.Core/Environment/**",
+    "winclient/WinClient.Core/Network/PublicAddress.cs",
+    "winclient/WinClient.Core/Network/NicGuard*.cs",
+    "winclient/WinClient.Core/Network/ConnectionReaper*.cs",
+    "winclient/WinClient.Tests/ControllerTests.cs",
+    "winclient/WinClient.Tests/RoutingTests.cs",
+    "winclient/WinClient.Tests/Wfp*.cs",
+    "winclient/WinClient.Tests/WinClient.Tests.csproj",
+    "winclient/WinClient.Core/WinClient.Core.csproj",
+    "winclient/WinClient.App/WinClient.App.csproj",
+    "winclient/WinClient.Core/Network/**",
+    "winclient/WinClient.App/Program.cs",
+    "winclient/WinClient.Tests/PcapNgReaderTests.cs",
+    "winclient/WinClient.Tests/AppScopeTests.cs"
+  ],
+  "expectArtifacts": [
+    "winclient/WinClient.Tests/LeakCaptureTests.cs"
+  ],
+  "acceptance": [
+    {
+      "id": "BUILD",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "build",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1200
+    },
+    {
+      "id": "TEST",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "test",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--no-build",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1500
+    },
+    {
+      "id": "NOBIN",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess,sys;out=subprocess.run(['git','ls-files','winclient','build','scripts','node'],capture_output=True,text=True).stdout.split();bad=[f for f in out if f.endswith(('.exe','.dll','.zip','.pdb','.tar.gz','.so','.etl','.pcapng'))];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "SHAPE",
+      "kind": "command",
+      "required": true,
+      "timeoutSec": 120,
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda f:pathlib.Path(f).read_text(encoding='utf-8');c=r('winclient/WinClient.Core/Diagnostics/LeakClassifier.cs');p=r('winclient/WinClient.Core/Diagnostics/LeakCapture.cs');h=r('winclient/WinClient.App/Hosting/LeakCheckRunner.cs');bad=[k for k,ok in (('cls','AppPatterns' in c and 'RegexOptions.IgnoreCase' in c and 'TimeSpan' in c),('opt','AppPatterns' in p),('run','AppScopeResolver.Resolve' in h and 'SystemAppScopeFileSystem' in h)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ]
+    },
+    {
+      "id": "TESTS-NEW",
+      "kind": "command",
+      "required": true,
+      "timeoutSec": 120,
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;t=pathlib.Path('winclient/WinClient.Tests/LeakCaptureTests.cs').read_text(encoding='utf-8');bad=[n for n in ('AppsModeMatchesScopePatterns','ScopeSiblingLeakFailsExitCode','InvalidPatternIsIgnored','NullPatternsKeepOldBehavior','AppsModeMarksListedAndUnlisted') if 'void '+n+'(' not in t and 'Task '+n+'(' not in t];print(bad);sys.exit(1 if bad else 0)"
+      ]
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "required": true,
+      "timeoutSec": 120,
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;t=pathlib.Path('docs/winclient/泄漏检测说明.md').read_text(encoding='utf-8');bad=[k for k,ok in (('scope','连带范围' in t and '分应用代理说明.md#连带范围' in t),) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ]
+    },
+    {
+      "id": "SCOPE",
+      "kind": "command",
+      "required": true,
+      "timeoutSec": 120,
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess as sp,sys;g=lambda *a:sp.check_output(['git','-c','core.quotepath=false']+list(a)).decode('utf-8').split(chr(10));mb=g('merge-base','origin/main','HEAD')[0].strip();ch={p.strip() for p in g('diff','--name-only',mb)+g('ls-files','--others','--exclude-standard') if p.strip()};ok=set(['winclient/WinClient.Core/Diagnostics/LeakClassifier.cs', 'winclient/WinClient.Core/Diagnostics/LeakCapture.cs', 'winclient/WinClient.App/Hosting/LeakCheckRunner.cs', 'winclient/WinClient.Tests/LeakCaptureTests.cs', 'docs/winclient/泄漏检测说明.md']);bad=sorted(p for p in ch if p not in ok);print(bad);sys.exit(1 if bad else 0)"
+      ]
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "model": "claude-sonnet-5-5",
+  "timeoutSec": 5400,
+  "repoRoot": "E:/yuanc",
+  "engine": "claude",
+  "steps": [
+    "读 BACKGROUND 列出的文件;先在 LeakCaptureTests 追加四个新用例,申请 BUILD 以编译失败证红。",
+    "改 LeakClassifier 与 LeakCapture(新增 AppPatterns),BUILD / TEST / TESTS-NEW 绿。",
+    "改 LeakCheckRunner 接上 AppScopeResolver,SHAPE 绿。",
+    "改文档一句,DOCS / SCOPE / NOBIN 绿。"
+  ]
+}
