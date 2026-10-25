@@ -84,6 +84,26 @@ public sealed class WfpApplierTests
     }
 
     [Fact]
+    public async Task ApplyAppsUsesExactProgramsForFirewallAndScopeForFilters()
+    {
+        using var f = new Fixture();
+        var selected = Path.GetFullPath("selected.exe");
+        var extra = Enumerable.Range(1, 40).Select(i => Path.GetFullPath($"extra{i}.exe")).ToArray();
+        await f.Applier.ApplyAppsAsync([selected], [selected, .. extra]);
+        // 过滤层:41 个程序,每个 6 条。
+        Assert.Equal(41 * 6, f.Engine.Policy.Count);
+        Assert.Contains(f.Engine.Policy, p => p.AppPath == extra[^1]);
+        // 防火墙规则:只按所选的一个程序(规则名 YuanC-KS-App-1,没有 -2)。
+        Assert.Contains("YuanC-KS-App-1", f.Runner.Script);
+        Assert.DoesNotContain("YuanC-KS-App-2", f.Runner.Script);
+        Assert.DoesNotContain("extra1.exe", f.Runner.Script);
+        // 只传一个参数时与旧行为一致:过滤层也按所选程序。
+        using var g = new Fixture();
+        await g.Applier.ApplyAppsAsync([selected]);
+        Assert.Equal(6, g.Engine.Policy.Count);
+    }
+
+    [Fact]
     public async Task PatrolComparesNamesAndCountAndAppendsMarkerOnlyAfterRepair()
     {
         using var f = new Fixture();

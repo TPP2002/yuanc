@@ -13,6 +13,7 @@ public sealed record PatrolReport(IReadOnlyList<string> Reenforced, IReadOnlyLis
 public interface IKillSwitch
 {
     Task ApplyAppsAsync(IReadOnlyList<string> programs) => throw new InvalidOperationException("当前断网保护不支持仅指定程序模式。");
+    Task ApplyAppsAsync(IReadOnlyList<string> programs, IReadOnlyList<string> filterPrograms) => ApplyAppsAsync(programs);
     Task<PatrolReport> PatrolAsync(IReadOnlyList<string> expectedRules, bool enforceDefaultBlock) => PatrolAsync(expectedRules);
     Task<PatrolReport> PatrolAsync(IReadOnlyList<string> expectedRules, bool enforceDefaultBlock, CancellationToken token) => PatrolAsync(expectedRules, enforceDefaultBlock);
     string? PendingMode => null;
@@ -81,8 +82,11 @@ public sealed class KillSwitchApplier : IKillSwitch
             () => WfpPlanner.PlanGlobal(ips, program, hy2Port, realityPort, lastAuth));
     public Task RemoveAsync() => ExecuteAsync([new RemoveRulesByPrefix(KillSwitchPlanner.Prefix), new RestoreProfileDefault()], remove: true);
 
-    public Task ApplyAppsAsync(IReadOnlyList<string> programs) => ExecuteAsync(KillSwitchPlanner.PlanApps(programs),
-        () => WfpPlanner.PlanApps(programs), rememberAuth: true);
+    public Task ApplyAppsAsync(IReadOnlyList<string> programs) => ApplyAppsAsync(programs, programs);
+
+    /// <summary>防火墙规则按用户所选程序;过滤层按连带范围内的全部程序文件(filterPrograms)。</summary>
+    public Task ApplyAppsAsync(IReadOnlyList<string> programs, IReadOnlyList<string> filterPrograms) =>
+        ExecuteAsync(KillSwitchPlanner.PlanApps(programs), () => WfpPlanner.PlanApps(filterPrograms), rememberAuth: true);
     public Task<PatrolReport> PatrolAsync(IReadOnlyList<string> expectedRules) => PatrolAsync(expectedRules, true);
 
     public Task<PatrolReport> PatrolAsync(IReadOnlyList<string> expectedRules, bool enforceDefaultBlock)

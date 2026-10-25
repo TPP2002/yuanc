@@ -208,6 +208,37 @@ public sealed class EnvironmentSelfCheckTests
         report = EnvironmentSelfCheck.Evaluate(Good with { Routing = RoutingTests.Apps, SingboxConfig = bad });
         Assert.Equal("未通过", report.Items[6].Result); Assert.Contains("dns.servers", report.Items[6].Detail);
     }
+    [Fact]
+    public void AppsModeNoDirectPathRequiresRejectForUnidentified()
+    {
+        var config = RoutingRenderer.Render(Good.SingboxConfig, RoutingTests.Apps, RoutingTests.Service);
+        var report = EnvironmentSelfCheck.Evaluate(Good with { Routing = RoutingTests.Apps, SingboxConfig = config });
+        Assert.Equal("通过", report.Items[6].Result);
+        Assert.StartsWith("仅指定程序模式:", report.Items[6].Detail);
+        // 去掉末尾的无条件拒绝:认不出归属的连接会落到 route.final=direct,必须未通过。
+        var raw = config.GetRawText();
+        var withoutReject = raw.Replace(",{\"action\":\"reject\"}]", "]");
+        Assert.NotEqual(raw, withoutReject);
+        report = EnvironmentSelfCheck.Evaluate(Good with { Routing = RoutingTests.Apps, SingboxConfig = JsonSerializer.Deserialize<JsonElement>(withoutReject) });
+        Assert.Equal("未通过", report.Items[6].Result);
+        Assert.Contains("认不出归属的连接拒绝", report.Items[6].Detail);
+        // 最后一条带了别的字段就不算无条件拒绝。
+        var scoped = raw.Replace(",{\"action\":\"reject\"}]", ",{\"ip_version\":6,\"action\":\"reject\"}]");
+        report = EnvironmentSelfCheck.Evaluate(Good with { Routing = RoutingTests.Apps, SingboxConfig = JsonSerializer.Deserialize<JsonElement>(scoped) });
+        Assert.Equal("未通过", report.Items[6].Result);
+        // 去掉名单外直连规则。
+        var noDirect = raw.Replace("{\"process_path_regex\":[\"(?i)^.\\u002B$\"],\"outbound\":\"direct\"},", "");
+        Assert.NotEqual(raw, noDirect);
+        report = EnvironmentSelfCheck.Evaluate(Good with { Routing = RoutingTests.Apps, SingboxConfig = JsonSerializer.Deserialize<JsonElement>(noDirect) });
+        Assert.Equal("未通过", report.Items[6].Result);
+        Assert.Contains("认得出的名单外程序→direct", report.Items[6].Detail);
+        // 用连带范围匹配式渲染时,必须按 AppPatterns 比对。
+        const string pattern = @"(?i)^C:\\Apps\\Tool\\.+\.exe$";
+        var scopedConfig = RoutingRenderer.Render(Good.SingboxConfig, RoutingTests.Apps, RoutingTests.Service, null, [pattern]);
+        Assert.Equal("通过", EnvironmentSelfCheck.Evaluate(Good with { Routing = RoutingTests.Apps, SingboxConfig = scopedConfig, AppPatterns = [pattern] }).Items[6].Result);
+        Assert.Equal("未通过", EnvironmentSelfCheck.Evaluate(Good with { Routing = RoutingTests.Apps, SingboxConfig = scopedConfig }).Items[6].Result);
+    }
+
     internal const string GoodConfig = """
         {"inbounds":[{"type":"tun"}],"route":{"final":"proxy","rules":[{"action":"sniff"},{"ip_version":6,"action":"reject"}]},
          "dns":{"servers":[{"type":"https","tag":"dns-remote","server":"1.1.1.1","detour":"proxy"}]},"outbounds":[{"type":"vless","tag":"proxy"}]}

@@ -247,9 +247,11 @@ public sealed class ControllerTests
         Assert.Equal(new[] { "apply-apps", "start" }, order);
         Assert.Equal(new[] { RoutingTests.Chrome }, firewall.AppliedApps);
         var rules = tunnel.Config.GetProperty("route").GetProperty("rules").EnumerateArray().ToArray();
-        Assert.Contains(RoutingRenderer.PathPattern(RoutingTests.Service), rules[^1].GetProperty("process_path_regex").EnumerateArray().Select(x => x.GetString()));
+        Assert.Contains(RoutingRenderer.PathPattern(RoutingTests.Service), rules[^3].GetProperty("process_path_regex").EnumerateArray().Select(x => x.GetString()));
+        Assert.Equal("{\"action\":\"reject\"}", rules[^1].GetRawText());
+        // 名单外认得出的程序直连规则(无地址限制)始终存在;鉴权直连规则(带地址)只在分发版出现。
         Assert.Equal(distribution, rules.Any(r => r.TryGetProperty("outbound", out var outbound)
-            && outbound.GetString() == "direct"));
+            && outbound.GetString() == "direct" && r.TryGetProperty("ip_cidr", out _)));
     }
 
     [Theory]
@@ -307,6 +309,102 @@ public sealed class ControllerTests
         await FireAndPublish(controller, timers, "出口核验", TimeSpan.FromSeconds(3));
         Assert.Equal(0, ipv6.Calls); Assert.Equal("跳过", Assert.Single(reports).Items[7].Result);
         Assert.Equal("已核验(后台服务出口)", controller.Snapshot.ExitStatus);
+    }
+
+    private const string ScopeDir = @"C:\Apps\Tool";
+    private static readonly string ScopeSelected = ScopeDir + @"\app-1.0.0\tool.exe";
+    private static readonly string ScopePattern = @"(?i)^C:\\Apps\\Tool\\.+\.exe$";
+
+    private static Func<string, AppScope> ScopeOf(List<string> files) =>
+        path => new(path, ScopePattern, files.Append(path).Distinct(StringComparer.OrdinalIgnoreCase).Order(StringComparer.OrdinalIgnoreCase).ToArray(), true);
+
+    private static ClientController ScopeController(List<string> order, Timers timers, Firewall firewall, FakeReaper? reaper,
+        List<string> files, List<EnvironmentReport>? reports = null)
+    {
+        var source = new ScriptedSource(); source.Enqueue(Ok(AppsSession()));
+        var controller = new ClientController(source, firewall, new Tunnel(order), Path.GetFullPath("fake.exe"), TestData.Device,
+            timers.Delay, routingSettings: new MemoryRouting { Policy = RoutingPolicy.Create("apps", [ScopeSelected]) },
+            serviceProcessPath: RoutingTests.Service, exitProbe: new DetailedProbe(), reaper: reaper, reportSink: reports is null ? null : reports.Add,
+            scopeResolver: ScopeOf(files)) { DelayWithPurposeAsync = timers.Delay };
+        controller.Changed += _ => Interlocked.Increment(ref timers.Published);
+        return controller;
+    }
+
+    [Fact]
+    public async Task AppsModeRendersScopePatterns()
+    {
+        var order = new List<string>(); var timers = new Timers(); var reports = new List<EnvironmentReport>();
+        var source = new ScriptedSource(); source.Enqueue(Ok(AppsSession()));
+        var tunnel = new Tunnel(order);
+        using var controller = new ClientController(source, new Firewall(order), tunnel, Path.GetFullPath("fake.exe"), TestData.Device,
+            timers.Delay, routingSettings: new MemoryRouting { Policy = RoutingPolicy.Create("apps", [ScopeSelected]) },
+            serviceProcessPath: RoutingTests.Service, exitProbe: new DetailedProbe(), reportSink: reports.Add,
+            scopeResolver: ScopeOf([ScopeDir + @"\Update.exe"])) { DelayWithPurposeAsync = timers.Delay };
+        controller.Changed += _ => Interlocked.Increment(ref timers.Published);
+        await controller.ConnectAsync();
+        var rules = tunnel.Config.GetProperty("route").GetProperty("rules").EnumerateArray().ToArray();
+        var proxy = Assert.Single(rules, r => r.TryGetProperty("outbound", out var o) && o.GetString() == "proxy");
+        var patterns = proxy.GetProperty("process_path_regex").EnumerateArray().Select(x => x.GetString()).ToArray();
+        Assert.Contains(ScopePattern, patterns);
+        Assert.DoesNotContain(RoutingRenderer.PathPattern(ScopeSelected), patterns);
+        Assert.Equal("{\"action\":\"reject\"}", rules[^1].GetRawText());
+        // 自检按连带范围匹配式比对,不会因路径匹配式缺失而未通过。
+        await FireAndPublish(controller, timers, "出口核验", TimeSpan.FromSeconds(3));
+        Assert.Equal("通过", Assert.Single(reports).Items[6].Result);
+    }
+
+    [Fact]
+    public async Task AppsModePassesScopeExecutablesToFilters()
+    {
+        var order = new List<string>(); var firewall = new Firewall(order);
+        var files = new List<string> { ScopeDir + @"\Update.exe", ScopeDir + @"\app-1.0.0\TOOL.exe" };
+        using var controller = ScopeController(order, new Timers(), firewall, null, files);
+        await controller.ConnectAsync();
+        // 防火墙规则仍按所选程序;过滤层按全部程序文件(不分大小写去重)。
+        Assert.Equal(new[] { ScopeSelected }, firewall.AppliedApps);
+        var filters = Assert.Single(firewall.AppliedFilters);
+        Assert.Equal(2, filters.Length);
+        Assert.Contains(ScopeDir + @"\Update.exe", filters);
+        Assert.Contains(filters, f => string.Equals(f, ScopeSelected, StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public async Task AppsModeReapsScopeExecutables()
+    {
+        var order = new List<string>(); var reaper = new FakeReaper(order);
+        var files = new List<string> { ScopeDir + @"\Update.exe" };
+        using var controller = ScopeController(order, new Timers(), new Firewall(order), reaper, files);
+        await controller.ConnectAsync();
+        var policy = Assert.Single(reaper.Policies);
+        Assert.True(policy.AppsMode);
+        Assert.Equal(new[] { ScopeDir + @"\Update.exe", ScopeSelected }.Order(StringComparer.OrdinalIgnoreCase), policy.Apps);
+    }
+
+    [Fact]
+    public async Task PatrolAddsProtectionForNewExecutables()
+    {
+        var order = new List<string>(); var timers = new Timers(); var firewall = new Firewall(order);
+        var files = new List<string> { ScopeDir + @"\Update.exe" };
+        using var controller = ScopeController(order, timers, firewall, null, files);
+        await controller.ConnectAsync();
+        Assert.Single(firewall.AppliedFilters);
+        await FireAndPublish(controller, timers, "巡检", TimeSpan.FromSeconds(60));
+        Assert.Single(firewall.AppliedFilters); // 没有新增:不重复套用。
+        Assert.Equal("正常", controller.Snapshot.GuardStatus);
+        files.AddRange([ScopeDir + @"\app-1.0.1\tool.exe", ScopeDir + @"\helper.exe"]);
+        await FireAndPublish(controller, timers, "巡检", TimeSpan.FromSeconds(60));
+        Assert.Equal(2, firewall.AppliedFilters.Count);
+        Assert.Equal(4, firewall.AppliedFilters[^1].Length);
+        Assert.Equal(new[] { ScopeSelected }, firewall.AppliedApps);
+        Assert.Equal("已为新出现的 2 个程序文件补上保护", controller.Snapshot.GuardStatus);
+        Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
+        Assert.True(controller.Snapshot.ProtectionActive);
+        Assert.DoesNotContain("remove", order);
+        // 文件消失不撤保护;下一轮没有新增,恢复为正常。
+        files.Clear();
+        await FireAndPublish(controller, timers, "巡检", TimeSpan.FromSeconds(60));
+        Assert.Equal(2, firewall.AppliedFilters.Count);
+        Assert.Equal("正常", controller.Snapshot.GuardStatus);
     }
 
     [Fact]
@@ -2031,6 +2129,9 @@ public sealed class ControllerTests
         public string[] AppliedApps { get; private set; } = [];
         public List<bool> EnforceDefaultCalls { get; } = [];
         public Exception? ApplyAppsError { get; set; }
+        public List<string[]> AppliedFilters { get; } = [];
+        public Task ApplyAppsAsync(IReadOnlyList<string> programs, IReadOnlyList<string> filterPrograms)
+        { AppliedFilters.Add(filterPrograms.ToArray()); return ApplyAppsAsync(programs); }
         public Task ApplyAppsAsync(IReadOnlyList<string> programs)
         { AppliedApps = programs.ToArray(); order.Add("apply-apps"); if (ApplyAppsError is not null) throw ApplyAppsError; return Task.CompletedTask; }
         public Task<PatrolReport> PatrolAsync(IReadOnlyList<string> rules, bool enforceDefaultBlock)

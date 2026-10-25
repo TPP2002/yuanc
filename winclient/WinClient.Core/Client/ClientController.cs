@@ -60,6 +60,8 @@ public sealed class ClientController : IDisposable
     private readonly IRoutingSettingsStore? routingSettings;
     private readonly string serviceProcessPath;
     private RoutingPolicy activeRouting = RoutingPolicy.Global;
+    private readonly Func<string, AppScope> scopeResolver;
+    private IReadOnlyList<AppScope> activeScopes = [];
     private string selfCheckStatus = "未检测";
     private bool environmentApplied;
     private string environmentStatus = "未应用";
@@ -117,11 +119,12 @@ public sealed class ClientController : IDisposable
         IEnvironmentEnforcer? environment = null, IEnvironmentSettingsStore? environmentSettings = null,
         IIpv6Probe? ipv6Probe = null, Action<EnvironmentReport>? reportSink = null,
         IRoutingSettingsStore? routingSettings = null, string? serviceProcessPath = null, IAdapterProbe? adapterProbe = null,
-        IBrowserProcessProbe? browserProbe = null, INicGuard? nicGuard = null, IConnectionReaper? reaper = null)
+        IBrowserProcessProbe? browserProbe = null, INicGuard? nicGuard = null, IConnectionReaper? reaper = null,
+        Func<string, AppScope>? scopeResolver = null)
         : this(auth is null ? null : new AuthServerSessionSource(auth, credentials), firewall, tunnel, program, device,
             authEndpoint: authEndpoint, exitProbe: exitProbe, environment: environment, environmentSettings: environmentSettings,
             ipv6Probe: ipv6Probe, reportSink: reportSink, routingSettings: routingSettings, serviceProcessPath: serviceProcessPath, adapterProbe: adapterProbe,
-            browserProbe: browserProbe, nicGuard: nicGuard, reaper: reaper) { }
+            browserProbe: browserProbe, nicGuard: nicGuard, reaper: reaper, scopeResolver: scopeResolver) { }
 
     public ClientController(ISessionSource? sessionSource, IKillSwitch firewall,
         ITunnelTransport tunnel, string program, DeviceInfo device, Func<TimeSpan, CancellationToken, Task>? delayAsync = null,
@@ -129,8 +132,10 @@ public sealed class ClientController : IDisposable
         IEnvironmentEnforcer? environment = null, IEnvironmentSettingsStore? environmentSettings = null,
         IIpv6Probe? ipv6Probe = null, Action<EnvironmentReport>? reportSink = null,
         IRoutingSettingsStore? routingSettings = null, string? serviceProcessPath = null, IAdapterProbe? adapterProbe = null,
-        IBrowserProcessProbe? browserProbe = null, INicGuard? nicGuard = null, IConnectionReaper? reaper = null)
+        IBrowserProcessProbe? browserProbe = null, INicGuard? nicGuard = null, IConnectionReaper? reaper = null,
+        Func<string, AppScope>? scopeResolver = null)
     {
+        this.scopeResolver = scopeResolver ?? AppScope.Exact;
         this.nicGuard = nicGuard;
         this.reaper = reaper;
         this.sessionSource = sessionSource;
@@ -275,6 +280,7 @@ public sealed class ClientController : IDisposable
             activeRouting = routingSettings?.Read() ?? RoutingPolicy.Global;
             if (activeRouting.Mode == RoutingMode.Apps && activeRouting.Apps.Count == 0)
             { message = "仅指定程序模式至少要选一个程序,请先添加程序或切回全部流量。"; return; }
+            activeScopes = activeRouting.Mode == RoutingMode.Apps ? activeRouting.Apps.Select(scopeResolver).ToArray() : [];
             if (firewall.HasPendingState && (firewall.PendingMode ?? "global") != ModeName(activeRouting))
             { message = "上次的断网保护记录与当前代理范围不一致,请先用原来的代理范围连接并正常断开,或重启后台服务后再试。"; return; }
             if (nicGuard is not null)
@@ -554,7 +560,14 @@ public sealed class ClientController : IDisposable
 
     private System.Text.Json.JsonElement RenderedConfiguration(SessionResponse value) =>
         RoutingRenderer.Render(LocalConfigRenderer.Render(value.Node), activeRouting, serviceProcessPath,
-            sessionSource is AuthServerSessionSource ? authEndpoint : null);
+            sessionSource is AuthServerSessionSource ? authEndpoint : null, ScopePatterns());
+
+    private string[]? ScopePatterns() => activeRouting.Mode == RoutingMode.Apps ? activeScopes.Select(scope => scope.Pattern).ToArray() : null;
+
+    /// <summary>全部名单项连带范围内的程序文件并集(不分大小写去重),给过滤层与连接清理使用。</summary>
+    private string[] ScopeExecutables() => activeScopes.SelectMany(scope => scope.Executables).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+
+    private Task ApplyAppsAsync() => firewall.ApplyAppsAsync(activeRouting.Apps, ScopeExecutables());
 
     private static DateTimeOffset Expiry(SessionResponse value) =>
         value.SessionExpiresAt < value.AccountExpiresAt ? value.SessionExpiresAt : value.AccountExpiresAt;
@@ -582,7 +595,7 @@ public sealed class ClientController : IDisposable
                     protection = true; // Even partial Apply must be treated as requiring explicit recovery.
                     try
                     {
-                        if (activeRouting.Mode == RoutingMode.Apps) await firewall.ApplyAppsAsync(activeRouting.Apps);
+                        if (activeRouting.Mode == RoutingMode.Apps) await ApplyAppsAsync();
                         else await firewall.ApplyAsync(NodeIps(session!), program, session!.Node.Hy2Port, session.Node.RealityPort,
                                 sessionSource is AuthServerSessionSource ? authEndpoint : null);
                         protectionVerified = true;
@@ -748,7 +761,7 @@ public sealed class ClientController : IDisposable
         var report = EnvironmentSelfCheck.Evaluate(new(exit, session!.Node.Host, policy.ExpectedCountry,
             policy.Enabled, environmentApplied, policy.Target, inspection, ipv6,
             RenderedConfiguration(session),
-            DateTimeOffset.UtcNow) { Routing = activeRouting,
+            DateTimeOffset.UtcNow) { Routing = activeRouting, AppPatterns = ScopePatterns(),
                 Auth = sessionSource is AuthServerSessionSource ? authEndpoint : null, ServiceProcessPath = serviceProcessPath, Adapters = adapters,
                 BrowsersAtApply = browsersAtApply });
         selfCheckStatus = report.Summary;
@@ -767,6 +780,7 @@ public sealed class ClientController : IDisposable
         if (!ReferenceEquals(cycle, patrolCycle) || !ShouldPatrol) return;
         try
         {
+            var addedNote = await PatrolNewExecutablesAsync();
             var report = activeRouting.Mode == RoutingMode.Apps
                 ? await firewall.PatrolAsync(KillSwitchPlanner.AppRuleNames(activeRouting.Apps.Count), enforceDefaultBlock: false, lifetime.Token)
                 : await firewall.PatrolAsync(KillSwitchPlanner.ExpectedRuleNames(sessionSource is AuthServerSessionSource), enforceDefaultBlock: true, lifetime.Token);
@@ -775,7 +789,7 @@ public sealed class ClientController : IDisposable
             {
                 if (session is not null)
                 {
-                    if (activeRouting.Mode == RoutingMode.Apps) await firewall.ApplyAppsAsync(activeRouting.Apps);
+                    if (activeRouting.Mode == RoutingMode.Apps) await ApplyAppsAsync();
                     else await firewall.ApplyAsync(NodeIps(session), program, session.Node.Hy2Port, session.Node.RealityPort,
                             sessionSource is AuthServerSessionSource ? authEndpoint : null);
                     guardStatus = $"已重建 {report.MissingRules.Count} 条本项目规则";
@@ -783,7 +797,7 @@ public sealed class ClientController : IDisposable
                 else guardStatus = "巡检失败,下一轮重试";
             }
             else if (!report.Clean) guardStatus = $"已重新收紧 {report.Reenforced.Count + report.NewlyDisabled.Count} 条规则";
-            else guardStatus = "正常";
+            else guardStatus = addedNote ?? "正常";
             if (firewallWarning is not null)
             {
                 firewallWarning = null;
@@ -804,6 +818,27 @@ public sealed class ClientController : IDisposable
             Publish();
             if (!disposed && !lifetime.IsCancellationRequested && ShouldPatrol && ReferenceEquals(cycle, patrolCycle)) SchedulePatrol(cycle);
         }
+    }
+
+    /// <summary>
+    /// 仅指定程序模式:重新枚举连带范围内的程序文件,有新增就重新套用过滤层;匹配式保持连接时的值,不重启隧道。
+    /// 只增不减(旧文件仍保留保护);套用成功后才更新记录,失败则下一轮重试。返回提示文字,没有新增返回空。
+    /// </summary>
+    private async Task<string?> PatrolNewExecutablesAsync()
+    {
+        if (activeRouting.Mode != RoutingMode.Apps || activeScopes.Count == 0) return null;
+        var known = ScopeExecutables().ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var fresh = activeScopes.Select(scope => !scope.Expanded ? scope : scope with
+        {
+            Executables = scope.Executables.Concat(scopeResolver(scope.Selected).Executables)
+                .Distinct(StringComparer.OrdinalIgnoreCase).Order(StringComparer.OrdinalIgnoreCase).ToArray()
+        }).ToArray();
+        var union = fresh.SelectMany(scope => scope.Executables).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+        var added = union.Count(path => !known.Contains(path));
+        if (added == 0) return null;
+        await firewall.ApplyAppsAsync(activeRouting.Apps, union);
+        activeScopes = fresh;
+        return $"已为新出现的 {added} 个程序文件补上保护";
     }
 
     /// <summary>网卡巡检:任何结果都不断开、不撤保护,只更新提示。</summary>
@@ -833,7 +868,8 @@ public sealed class ClientController : IDisposable
         if (reaper is null) return;
         try
         {
-            var report = reaper.Reap(new ReapPolicy(activeRouting.Mode == RoutingMode.Apps, activeRouting.Apps, program,
+            var report = reaper.Reap(new ReapPolicy(activeRouting.Mode == RoutingMode.Apps,
+                activeRouting.Mode == RoutingMode.Apps ? ScopeExecutables() : activeRouting.Apps, program,
                 NodeIps(session!), sessionSource is AuthServerSessionSource ? authEndpoint : null));
             if (report.Failed + report.Remaining > 0)
                 reapWarning = $"有 {Math.Max(report.Failed, report.Remaining)} 条连接前建立的连接未能重置,相关软件可能仍走原网络,请重启这些软件。";
