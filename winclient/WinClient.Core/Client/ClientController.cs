@@ -93,6 +93,7 @@ public sealed class ClientController : IDisposable
     private string? firewallWarning;
     private const string KeepTunnelWarning = "断网保护未能重新套用:系统防火墙已被关闭或被策略覆盖,隧道保持但失去断网兜底;请立即在 Windows 安全中心开启防火墙或联系管理员";
     private const string WfpKeepTunnelWarning = "断网保护未能重新套用:系统过滤层的过滤器未能建立,隧道保持,但缺少这道断网兜底;请联系管理员";
+    public const string RouteKeepTunnelWarning = "兜底路由未能建立,隧道保持,但隧道中断时虚拟机与 WSL 的流量可能直连;请联系管理员。";
     private readonly INicGuard? nicGuard;
     private readonly IConnectionReaper? reaper;
     private string? reapWarning;
@@ -607,7 +608,8 @@ public sealed class ClientController : IDisposable
                     catch (FirewallIneffectiveException ex) when (held)
                     {
                         var keep = ex is NicGuardException nicFailure ? NicKeepTunnelWarning(nicFailure)
-                            : ex is WfpUnavailableException ? WfpKeepTunnelWarning : KeepTunnelWarning;
+                            : ex is WfpUnavailableException ? WfpKeepTunnelWarning
+                            : ex is RouteGuardUnavailableException ? RouteKeepTunnelWarning : KeepTunnelWarning;
                         firewallWarning = keep;
                         guardStatus = keep;
                         message = keep;
@@ -805,7 +807,8 @@ public sealed class ClientController : IDisposable
                 message = "断网保护已重新生效。";
             }
         }
-        catch (WfpUnavailableException ex) { guardStatus = ex.Message; message = guardStatus; }
+        catch (FirewallIneffectiveException ex) when (ex is WfpUnavailableException or RouteGuardUnavailableException)
+        { guardStatus = ex.Message; message = guardStatus; }
         catch (FirewallIneffectiveException)
         {
             guardStatus = "系统防火墙已被关闭或被策略覆盖,断网保护可能失效,请立即在 Windows 安全中心开启防火墙或联系管理员";
