@@ -35,18 +35,16 @@ public sealed class RouteGuard : IRouteGuard
     {
         await RunAsync(Setup + $$"""
             try {
-                foreach ($store in @('ActiveStore','PersistentStore')) {
-                    foreach ($p in $prefixes) {
-                        $own = @(Get-NetRoute -PolicyStore $store | Where-Object {
-                            $_.DestinationPrefix -eq $p -and $_.InterfaceIndex -eq $lo -and $_.RouteMetric -eq {{Metric}} })
-                        if ($own.Count -eq 0) {
-                            New-NetRoute -DestinationPrefix $p -InterfaceIndex $lo -NextHop 0.0.0.0 -RouteMetric {{Metric}} -PolicyStore $store | Out-Null
-                        }
-                    }
+                $own = { param($store) @(Get-NetRoute -PolicyStore $store | Where-Object {
+                    $_.DestinationPrefix -eq $p -and $_.InterfaceIndex -eq $lo -and $_.RouteMetric -eq {{Metric}} }) }
+                foreach ($p in $prefixes) {
+                    if ((& $own 'ActiveStore').Count -gt 0 -and (& $own 'PersistentStore').Count -gt 0) { continue }
+                    # New-NetRoute 不接受单写 PersistentStore(真机报参数无效):缺一处就删掉本产品的残留,再不带 -PolicyStore 同时写入两处。
+                    foreach ($store in @('ActiveStore','PersistentStore')) { & $own $store | Remove-NetRoute -Confirm:$false | Out-Null }
+                    New-NetRoute -DestinationPrefix $p -InterfaceIndex $lo -NextHop 0.0.0.0 -RouteMetric {{Metric}} | Out-Null
                 }
                 foreach ($p in $prefixes) {
-                    if (@(Get-NetRoute -PolicyStore ActiveStore | Where-Object {
-                        $_.DestinationPrefix -eq $p -and $_.InterfaceIndex -eq $lo -and $_.RouteMetric -eq {{Metric}} }).Count -eq 0) { exit 1 }
+                    if ((& $own 'ActiveStore').Count -eq 0 -or (& $own 'PersistentStore').Count -eq 0) { exit 1 }
                 }
                 exit 0
             } catch { exit 1 }

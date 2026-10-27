@@ -280,7 +280,7 @@ public sealed class RouteGuardTests
                 if (@(Get-NetRoute -ErrorAction Stop | Where-Object {
                     $prefixes -contains $_.DestinationPrefix -and $_.InterfaceIndex -eq $lo -and
                     ($_.RouteMetric -eq 9472 -or $_.RouteMetric -eq 9473) }).Count) { exit 1 }
-                New-NetRoute -DestinationPrefix $prefixes[0] -InterfaceIndex $lo -NextHop 0.0.0.0 -RouteMetric 9472 -PolicyStore ActiveStore | Out-Null
+                New-NetRoute -DestinationPrefix '203.0.113.0/24' -InterfaceIndex $lo -NextHop 0.0.0.0 -RouteMetric 9472 -PolicyStore ActiveStore | Out-Null
                 exit 0
                 """);
             ownsDecoy = true;
@@ -304,7 +304,7 @@ public sealed class RouteGuardTests
                         $prefixes -contains $_.DestinationPrefix -and $_.InterfaceIndex -eq $lo -and $_.RouteMetric -eq 9473 }).Count) { exit 1 }
                 }
                 if (@(Get-NetRoute -PolicyStore ActiveStore | Where-Object {
-                    $_.DestinationPrefix -eq $prefixes[0] -and $_.InterfaceIndex -eq $lo -and $_.RouteMetric -eq 9472 }).Count -ne 1) { exit 1 }
+                    $_.DestinationPrefix -eq '203.0.113.0/24' -and $_.InterfaceIndex -eq $lo -and $_.RouteMetric -eq 9472 }).Count -ne 1) { exit 1 }
                 exit 0
                 """);
             Assert.False(await guard.IsInstalledAsync(default));
@@ -316,7 +316,7 @@ public sealed class RouteGuardTests
                 try { await guard.RemoveAsync(default); }
                 finally { await Run("""
                 Get-NetRoute -PolicyStore ActiveStore | Where-Object {
-                    $_.DestinationPrefix -eq $prefixes[0] -and $_.InterfaceIndex -eq $lo -and $_.RouteMetric -eq 9472
+                    $_.DestinationPrefix -eq '203.0.113.0/24' -and $_.InterfaceIndex -eq $lo -and $_.RouteMetric -eq 9472
                 } | Remove-NetRoute -Confirm:$false | Out-Null
                 exit 0
                 """); }
