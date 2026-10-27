@@ -46,7 +46,7 @@ public sealed class ClientRuntime : IClientFacade, IDisposable
     public static async Task<ClientRuntime> CreateAsync(IKernelInstaller installer, string? storeRoot = null,
         DataProtectionScope scope = DataProtectionScope.CurrentUser, bool keepProtection = false)
     {
-        var firewall = new KillSwitchApplier(Path.Combine(ClientSettings.DataDirectory, "run"), wfp: WfpEngine.CreateProduction());
+        var firewall = new KillSwitchApplier(Path.Combine(ClientSettings.DataDirectory, "run"), wfp: WfpEngine.CreateProduction(), routes: new RouteGuard());
         if (!keepProtection)
         {
             try { await firewall.RecoverAsync(); } // 恢复路径仍先于读取服务器配置。

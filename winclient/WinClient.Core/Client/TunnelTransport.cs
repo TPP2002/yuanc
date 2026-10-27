@@ -52,6 +52,7 @@ public sealed class TunnelTransport : ITunnelTransport
         tuns[0]["interface_name"] = KillSwitchPlanner.TunAlias;
         tuns[0]["strict_route"] = true;
         tuns[0]["auto_route"] = true;
+        tuns[0]["route_address"] = new JsonArray(RouteGuard.TunRoutes.Select(value => (JsonNode?)JsonValue.Create(value)).ToArray());
         return JsonSerializer.SerializeToElement(node);
     }
     public void Stop() => manager.Stop();

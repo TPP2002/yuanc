@@ -132,7 +132,7 @@ public sealed class InstallerRunner
             // 管道被占满或被冒名时服务不可达：先停服务（避免它再加规则），再由卸载程序自己撤掉断网保护。
             Console.Error.WriteLine("无法联系后台服务，将在停止服务后直接恢复网络。");
             await StopServiceAsync();
-            try { await new KillSwitchApplier(Path.Combine(ClientSettings.DataDirectory, "run"), wfp: WfpEngine.CreateProduction()).RemoveAsync(); }
+            try { await new KillSwitchApplier(Path.Combine(ClientSettings.DataDirectory, "run"), wfp: WfpEngine.CreateProduction(), routes: new RouteGuard()).RemoveAsync(); }
             catch (Exception)
             {
                 // 撤防失败时保留服务与自启值：下次开机服务仍能按期望状态接管保护，比留一套没人管的阻止规则安全。

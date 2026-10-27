@@ -31,6 +31,7 @@ public interface IKillSwitch
 
 public class FirewallIneffectiveException(string message) : InvalidOperationException(message);
 public sealed class WfpUnavailableException(string message) : FirewallIneffectiveException(message);
+public sealed class RouteGuardUnavailableException(string message) : FirewallIneffectiveException(message);
 
 public sealed class KillSwitchApplier : IKillSwitch
 {
@@ -38,9 +39,15 @@ public sealed class KillSwitchApplier : IKillSwitch
     public const string WfpConnectRefused = "系统过滤层断网保护未能建立,已拒绝连接。请点击断开后重试,仍失败请联系管理员。";
     public const string WfpRemoveFailed = "系统过滤层断网保护未能撤销,网络可能仍被阻断;请重试断开或联系管理员。";
     public const string WfpPatrolFailed = "系统过滤层过滤器缺失且未能重建,断网保护可能失效,请联系管理员";
+    public const string RouteConnectRefused = "兜底路由未能建立,隧道中断时虚拟机与 WSL 的流量可能直连,已拒绝连接。请点击断开后重试,仍失败请联系管理员。";
+    public const string RouteRemoveFailed = "兜底路由未能撤销,网络可能仍不通;请重试断开或联系管理员。";
+    public const string RoutePatrolFailed = "兜底路由缺失且未能重建,隧道中断时虚拟机与 WSL 的流量可能直连,请联系管理员";
     private readonly ICommandRunner runner;
     private readonly IWfpEngine? wfp;
     private readonly string wfpOffPath;
+    private readonly IRouteGuard? routes;
+    private readonly string routeOffPath;
+    private bool routesApplied;
     private IReadOnlyList<WfpFilterSpec>? wfpPolicy;
     private AuthEndpoint? lastAuth;
     private readonly SemaphoreSlim gate = new(1, 1);
@@ -61,10 +68,12 @@ public sealed class KillSwitchApplier : IKillSwitch
     }
     public string AuditPath { get; }
     public string? LastRecoveryWarning { get; private set; }
-    public KillSwitchApplier(string runDirectory, ICommandRunner? runner = null, IWfpEngine? wfp = null)
+    public KillSwitchApplier(string runDirectory, ICommandRunner? runner = null, IWfpEngine? wfp = null, IRouteGuard? routes = null)
     {
         this.runner = runner ?? new CommandRunner();
         this.wfp = wfp;
+        this.routes = routes;
+        routeOffPath = Path.Combine(runDirectory, "route-off");
         wfpOffPath = Path.Combine(runDirectory, "wfp-off");
         StatePath = Path.Combine(runDirectory, "killswitch-state.json");
         AuditPath = Path.Combine(runDirectory, "firewall-audit.json");
@@ -76,7 +85,7 @@ public sealed class KillSwitchApplier : IKillSwitch
         UpdateNodeAsync(ips, program, hy2Port, 443);
     public Task ApplyAsync(IReadOnlyList<IPAddress> ips, string program, int hy2Port, int realityPort, AuthEndpoint? auth = null) =>
         ExecuteAsync(KillSwitchPlanner.Plan(ips, KillSwitchPlanner.TunAlias, program, hy2Port, KillSwitchMode.Apply, realityPort, auth),
-            () => WfpPlanner.PlanGlobal(ips, program, hy2Port, realityPort, auth), rememberAuth: true, auth: auth);
+            () => WfpPlanner.PlanGlobal(ips, program, hy2Port, realityPort, auth), rememberAuth: true, auth: auth, installRoutes: true);
     public Task UpdateNodeAsync(IReadOnlyList<IPAddress> ips, string program, int hy2Port, int realityPort) =>
         ExecuteAsync(KillSwitchPlanner.UpdateNode(ips, program, hy2Port, realityPort),
             () => WfpPlanner.PlanGlobal(ips, program, hy2Port, realityPort, lastAuth));
@@ -130,8 +139,25 @@ public sealed class KillSwitchApplier : IKillSwitch
             }
             catch (Exception ex) when (ex is JsonException or InvalidOperationException or KeyNotFoundException)
             { throw new InvalidOperationException("断网保护巡检失败,请联系管理员。"); }
+            var routeFailed = false;
+            var routeRebuilt = false;
+            if (routesApplied && routes is not null && !File.Exists(routeOffPath))
+            {
+                try
+                {
+                    if (!await routes.IsInstalledAsync(token).ConfigureAwait(false))
+                    {
+                        await routes.InstallAsync(token).ConfigureAwait(false);
+                        routeRebuilt = true;
+                    }
+                }
+                catch (RouteGuardException) { routeFailed = true; }
+            }
             if (wfpFailed) throw new WfpUnavailableException(WfpPatrolFailed);
-            return wfpRebuilt ? report with { MissingRules = [.. report.MissingRules, WfpPlanner.MissingMarker] } : report;
+            if (routeFailed) throw new RouteGuardUnavailableException(RoutePatrolFailed);
+            if (wfpRebuilt) report = report with { MissingRules = [.. report.MissingRules, WfpPlanner.MissingMarker] };
+            if (routeRebuilt) report = report with { MissingRules = [.. report.MissingRules, RouteGuard.MissingMarker] };
+            return report;
         }
         finally { gate.Release(); }
     }
@@ -145,9 +171,16 @@ public sealed class KillSwitchApplier : IKillSwitch
         await gate.WaitAsync().ConfigureAwait(false);
         try
         {
-            var wfpFailed = !RemoveWfp();
-            var warning = await RecoverFirewallAsync().ConfigureAwait(false);
-            if (wfpFailed) throw new InvalidOperationException(WfpRemoveFailed);
+            var routesRemoved = true;
+            string? warning;
+            try
+            {
+                var wfpFailed = !RemoveWfp();
+                warning = await RecoverFirewallAsync().ConfigureAwait(false);
+                if (wfpFailed) throw new InvalidOperationException(WfpRemoveFailed);
+            }
+            finally { routesRemoved = await RemoveRoutesAsync().ConfigureAwait(false); }
+            if (!routesRemoved) throw new InvalidOperationException(RouteRemoveFailed);
             return warning;
         }
         finally { gate.Release(); }
@@ -229,19 +262,50 @@ public sealed class KillSwitchApplier : IKillSwitch
     }
 
     private async Task ExecuteAsync(IReadOnlyList<FirewallAction> actions,
-        Func<IReadOnlyList<WfpFilterSpec>>? createPolicy = null, bool rememberAuth = false, AuthEndpoint? auth = null, bool remove = false)
+        Func<IReadOnlyList<WfpFilterSpec>>? createPolicy = null, bool rememberAuth = false, AuthEndpoint? auth = null,
+        bool remove = false, bool installRoutes = false)
     {
         await gate.WaitAsync().ConfigureAwait(false);
         try
         {
             var installed = createPolicy is null || InstallWfp(createPolicy, rememberAuth, auth);
             var removed = true;
+            var routesRemoved = true;
             try { await RunActionsAsync(actions).ConfigureAwait(false); }
-            finally { if (remove) removed = RemoveWfp(); }
+            finally
+            {
+                if (remove)
+                {
+                    try { removed = RemoveWfp(); }
+                    finally { routesRemoved = await RemoveRoutesAsync().ConfigureAwait(false); }
+                }
+            }
             if (!removed) throw new InvalidOperationException(WfpRemoveFailed);
+            if (!routesRemoved) throw new InvalidOperationException(RouteRemoveFailed);
             if (!installed) throw new WfpUnavailableException(WfpConnectRefused);
+            if (installRoutes && routes is not null)
+            {
+                if (File.Exists(routeOffPath)) await RemoveRoutesAsync().ConfigureAwait(false);
+                else
+                {
+                    try { await routes.InstallAsync(CancellationToken.None).ConfigureAwait(false); routesApplied = true; }
+                    catch (RouteGuardException) { throw new RouteGuardUnavailableException(RouteConnectRefused); }
+                }
+            }
         }
         finally { gate.Release(); }
+    }
+
+    // 撤销尽力执行，失败不遮蔽更早的防火墙或过滤层异常。
+    private async Task<bool> RemoveRoutesAsync()
+    {
+        try
+        {
+            if (routes is not null) await routes.RemoveAsync(CancellationToken.None).ConfigureAwait(false);
+            routesApplied = false;
+            return true;
+        }
+        catch (Exception) { return false; }
     }
 
     private async Task RunActionsAsync(IReadOnlyList<FirewallAction> actions)

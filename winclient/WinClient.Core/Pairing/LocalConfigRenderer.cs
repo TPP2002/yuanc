@@ -34,6 +34,7 @@ public static class LocalConfigRenderer
             servers = new[] { new { type = "https", tag = "dns-remote", server = "1.1.1.1", detour = "proxy" } },
             final = "dns-remote", strategy = "ipv4_only"
         },
+        // route_address 由 TunnelTransport.RenderConfiguration 统一注入,本处不写,以保持与节点黄金样本一致。
         inbounds = new[] { new { type = "tun", tag = "tun-in", address = new[] { "172.19.0.1/30", "fdfe:dcba:9876::1/126" },
             auto_route = true, strict_route = true, stack = "system" } },
         outbounds = new object[]

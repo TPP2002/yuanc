@@ -13,6 +13,42 @@ namespace WinClient.Tests;
 
 public sealed class ControllerTests
 {
+    [Fact]
+    public async Task RoutePatrolFailureKeepsTunnelAndShowsOriginalWarning()
+    {
+        var order = new List<string>(); var timers = new Timers();
+        var firewall = new Firewall(order);
+        firewall.PatrolResults.Enqueue(new RouteGuardUnavailableException(KillSwitchApplier.RoutePatrolFailed));
+        using var controller = new ClientController(new PairingSessionSource(PairingTests.ValidPairing()),
+            firewall, new Tunnel(order), Path.Combine(Path.GetTempPath(), "fake.exe"), TestData.Device, timers.Delay)
+            { DelayWithPurposeAsync = timers.Delay };
+        controller.Changed += _ => Interlocked.Increment(ref timers.Published);
+        await controller.ConnectAsync();
+        await FireAndPublish(controller, timers, "巡检", TimeSpan.FromSeconds(60));
+        Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
+        Assert.True(controller.Snapshot.ProtectionActive);
+        Assert.Equal(KillSwitchApplier.RoutePatrolFailed, controller.Snapshot.Message);
+        Assert.Equal(KillSwitchApplier.RoutePatrolFailed, controller.Snapshot.GuardStatus);
+        Assert.DoesNotContain("stop", order);
+        Assert.DoesNotContain("remove", order);
+    }
+
+    [Fact]
+    public async Task HeldProtectionKeepsTunnelWhenRoutesFail()
+    {
+        var order = new List<string>();
+        var firewall = new Firewall(order) { HasPendingState = true,
+            ApplyError = new RouteGuardUnavailableException(KillSwitchApplier.RouteConnectRefused) };
+        using var controller = new ClientController(new PairingSessionSource(PairingTests.ValidPairing()),
+            firewall, new Tunnel(order), Path.Combine(Path.GetTempPath(), "fake.exe"), TestData.Device);
+        await controller.InitializeAsync(autoConnect: false, keepProtection: true);
+        Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
+        Assert.True(controller.Snapshot.ProtectionActive);
+        Assert.Equal(new[] { "apply", "start" }, order);
+        Assert.Equal(ClientController.RouteKeepTunnelWarning, controller.Snapshot.Message);
+        Assert.Equal(ClientController.RouteKeepTunnelWarning, controller.Snapshot.GuardStatus);
+    }
+
     private sealed class ScriptedBrowserProbe(params IReadOnlyList<string>?[] results) : IBrowserProcessProbe
     {
         private int index;

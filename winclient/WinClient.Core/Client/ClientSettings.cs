@@ -5,6 +5,7 @@ using System.Security.Cryptography.X509Certificates;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using WinClient.Core.Firewall;
+using WinClient.Core.Network;
 
 namespace WinClient.Core.Client;
 
@@ -64,10 +65,20 @@ public sealed class ClientSettings
     internal static Func<HttpRequestMessage, X509Certificate2?, X509Chain?, SslPolicyErrors, bool> PinValidator(string expectedBase64) =>
         (_, cert, _, _) => MatchesPin(cert, expectedBase64);
 
-    public HttpClient CreateAuthHttpClient() => new(new HttpClientHandler
+    public HttpClient CreateAuthHttpClient() => new(new SocketsHttpHandler
     {
         AllowAutoRedirect = false,
-        ServerCertificateCustomValidationCallback = PinValidator(ServerSpkiSha256!)
+        ConnectCallback = DefaultRouteBinding.ConnectAsync,
+        SslOptions = new SslClientAuthenticationOptions
+        {
+            RemoteCertificateValidationCallback = (_, certificate, _, _) =>
+            {
+                if (certificate is null) return false;
+                if (certificate is X509Certificate2 certificate2) return MatchesPin(certificate2, ServerSpkiSha256!);
+                using var converted = new X509Certificate2(certificate);
+                return MatchesPin(converted, ServerSpkiSha256!);
+            }
+        }
     }) { BaseAddress = new Uri(ServerUrl), Timeout = TimeSpan.FromSeconds(15) };
 
     public static string GetDeviceFingerprint(string? root = null, DataProtectionScope scope = DataProtectionScope.CurrentUser)

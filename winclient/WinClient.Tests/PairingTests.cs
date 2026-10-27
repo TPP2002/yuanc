@@ -156,7 +156,10 @@ public sealed class PairingTests
         Assert.True(JsonNode.DeepEquals(expected, actual), "本地配置必须与节点黄金文件全部字段和值一致。");
         var rendered = JsonNode.Parse(TunnelTransport.RenderConfiguration(configuration).GetRawText())!;
         Assert.Equal(KillSwitchPlanner.TunAlias, rendered["inbounds"]![0]!["interface_name"]!.GetValue<string>());
+        Assert.Equal(RouteGuard.TunRoutes, rendered["inbounds"]![0]!["route_address"]!.AsArray()
+            .Select(value => value!.GetValue<string>()).ToArray());
         rendered["inbounds"]![0]!.AsObject().Remove("interface_name");
+        rendered["inbounds"]![0]!.AsObject().Remove("route_address");
         Assert.True(JsonNode.DeepEquals(JsonNode.Parse(configuration.GetRawText()), rendered));
     }
 
