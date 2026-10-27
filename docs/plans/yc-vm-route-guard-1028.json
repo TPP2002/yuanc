@@ -1,0 +1,216 @@
+{
+  "schemaVersion": 1,
+  "taskId": "SEC-WIN-VM-NAT-ROUTE-GUARD-1028",
+  "slug": "yc-vm-route-guard-1028",
+  "title": "全部流量模式加回环兜底路由,隧道中断时 WSL2 / Docker / 虚拟机的 NAT 流量也不直连;隧道网卡改四条 /2 路由优先;鉴权直连绑物理网卡",
+  "goal": "以派单时 origin/main 头为基点(已含 PR #65/#67 WFP 第二道闸、PR #69 网卡收紧、PR #71/#72)。看板卡 SEC-WIN-VM-NAT-ROUTE-GUARD-1028。\n\n【问题与实测依据(派单方 2026-10-28 在本机 Win10 19045 管理员实测,不用复核)】\n全部流量模式下,WSL2(NAT 模式)/ Docker Desktop / Hyper-V 虚拟机的流量经系统 NAT 转发出物理网卡。用动态 WFP 会话逐层只挡一个地址:ALE_AUTH_CONNECT_V4、OUTBOUND_TRANSPORT_V4、OUTBOUND_IPPACKET_V4、INBOUND_IPPACKET_V4、INBOUND_TRANSPORT_V4、IPFORWARD_V4(无条件)、四个 VSWITCH 层(无条件)——本机程序被挡,WSL2 全部照通。即现有防火墙规则与 WFP 第二道闸都管不到虚拟机流量。\n另测:sing-box 1.13.21 隧道网卡(auto_route + strict_route,同产品)在时,WSL2 连接出现在内核日志 inbound/tun,即隧道在时它们跟随本机路由进隧道;内核一退出,隧道网卡与路由消失,WSL2 顺物理默认路由直连。\n再测:回环接口(NetworkInterface.LoopbackInterfaceIndex,本机为 1)上加 `New-NetRoute -DestinationPrefix 1.1.1.1/32 -InterfaceIndex 1 -NextHop 0.0.0.0` 后,本机与 WSL2 访问 1.1.1.1 都超时,别的地址不受影响(指向不可达局域网网关的路由则会被 Windows 绕过,不能用)。\n最后测:回环上 0.0.0.0/1 与 128.0.0.0/1(RouteMetric 9000)在场时,sing-box 默认装的是 0.0.0.0/0,被 /1 压住 → 全不通;给 tun 入站加 `route_address` 四条 IPv4 /2 后:隧道在 → 本机与 WSL2 都经隧道;强杀内核 → 都不通;兜底在场时重启内核 → 正常起来并恢复经隧道。内核 direct 出站(auto_detect_interface 绑物理网卡)不受兜底影响。\n\n【做完后】\n① 新建 Core/Firewall/RouteGuard.cs(命名空间 WinClient.Core.Firewall):\n- `public interface IRouteGuard { Task InstallAsync(CancellationToken token); Task RemoveAsync(CancellationToken token); Task<bool> IsInstalledAsync(CancellationToken token); }`,失败抛 `RouteGuardException : InvalidOperationException`(消息中文,不含地址)。\n- `public sealed class RouteGuard : IRouteGuard`,构造 `public RouteGuard(ICommandRunner? runner = null)`,另有 `internal RouteGuard(ICommandRunner? runner, IReadOnlyList<string> prefixes)` 供真机测试换前缀。常量:`public const int Metric = 9473;`、`public static readonly string[] Prefixes = [\"0.0.0.0/1\", \"128.0.0.0/1\"];`、`public const string MissingMarker = \"YuanC-Route\";`、`public static readonly string[] TunRoutes = [\"0.0.0.0/2\", \"64.0.0.0/2\", \"128.0.0.0/2\", \"192.0.0.0/2\", \"::/2\", \"4000::/2\", \"8000::/2\", \"c000::/2\"];`(隧道网卡有 IPv6 地址 fdfe:dcba:9876::1/126,IPv6 也给四条 /2,保持 IPv6 进隧道被拒的现有行为)。\n- 三段 PowerShell 脚本,经 `KillSwitchApplier.CreateStartInfo(script)` 隐藏窗口执行,每段 60 秒超时,脚本里回环序号用 `[System.Net.NetworkInformation.NetworkInterface]::LoopbackInterfaceIndex` 取:\n  · 安装:对每个前缀、对 ActiveStore 与 PersistentStore 各自:若不存在(DestinationPrefix 相等、InterfaceIndex=回环、RouteMetric=9473)就 `New-NetRoute -DestinationPrefix <p> -InterfaceIndex $lo -NextHop 0.0.0.0 -RouteMetric 9473 -PolicyStore <store>`;之后核两个前缀在 ActiveStore 都在,在 → exit 0,否则 exit 1。幂等。\n  · 撤销:两个 store 中只删三者全匹配(前缀在 Prefixes 内、接口=回环、RouteMetric=9473)的路由,其余路由一条不碰;删后两 store 都没有匹配项 → exit 0,否则 exit 1。没有匹配项直接 exit 0。\n  · 在位:ActiveStore 两个前缀都在 → 输出 1,否则 0。\n  非 0 退出码或超时 → 抛 RouteGuardException。不写日志,不输出地址。IPv4 兜底只做两条;不做 IPv6 兜底(理由写进文档:IPv6 已由 WFP v6 阻断与网卡收紧处理,系统 NAT 对虚拟机只做 IPv4)。\n② KillSwitchApplier.cs:\n- 构造器末尾加可选参数 `IRouteGuard? routes = null`(既有调用不改),runDirectory 下新增开关文件 `route-off`(同 `wfp-off` 用法)。\n- 全部流量的两个 ApplyAsync 重载:现有防火墙与 WFP 步骤成功后,若 routes 非空且无 route-off → InstallAsync;失败抛 `public sealed class RouteGuardUnavailableException(string message) : FirewallIneffectiveException(message)`,消息常量 `RouteConnectRefused = \"兜底路由未能建立,隧道中断时虚拟机与 WSL 的流量可能直连,已拒绝连接。请点击断开后重试,仍失败请联系管理员。\"`;成功记内部标记「兜底已套用」。有 route-off 时不装,并尽力撤销已存在的(失败不报)。\n- UpdateNodeAsync、ApplyAppsAsync 不装兜底。\n- RemoveAsync 与 RecoverAsync:无论有无恢复记录、无论防火墙/WFP 步骤是否失败,都调用一次 routes.RemoveAsync(防火墙/WFP 失败时也要先尝试撤销兜底,再抛原来的异常,原异常优先);只有兜底撤销失败时抛 `InvalidOperationException(RouteRemoveFailed)`,`RouteRemoveFailed = \"兜底路由未能撤销,网络可能仍不通;请重试断开或联系管理员。\"`。成功后清标记。\n- PatrolAsync:标记为真且无 route-off 时,在防火墙巡检完成后调 IsInstalledAsync;不在就 InstallAsync,成功把 `RouteGuard.MissingMarker` 追加进 MissingRules,失败抛 RouteGuardUnavailableException(`RoutePatrolFailed = \"兜底路由缺失且未能重建,隧道中断时虚拟机与 WSL 的流量可能直连,请联系管理员\"`)——与 WfpUnavailableException 在巡检里的位置和处理一致。\n③ ClientController.cs:ApplyKillSwitch 的 `catch (FirewallIneffectiveException ex) when (held)` 里,`ex is RouteGuardUnavailableException` 时提示 `RouteKeepTunnelWarning = \"兜底路由未能建立,隧道保持,但隧道中断时虚拟机与 WSL 的流量可能直连;请联系管理员。\"`;其余分支不变。巡检对该异常的处理沿用 WfpUnavailableException 的现有路径(若现有代码按基类统一处理则不改)。\n④ 生产接线:ClientRuntime.cs 与 InstallerRunner.cs 里构造 KillSwitchApplier 处加 `routes: new RouteGuard()`。卸载撤防因此同样删兜底。\n⑤ 内核配置:LocalConfigRenderer.cs 的 tun 入站加 `route_address = RouteGuard.TunRoutes`;TunnelTransport.RenderConfiguration 对服务器给的 tun 入站覆盖写 `route_address`(JsonArray,同八条,忽略服务器原值)。其余字段不变。\n⑥ 鉴权直连绑物理网卡:新建 Core/Network/DefaultRouteBinding.cs(命名空间 WinClient.Core.Network):\n- `public sealed record DefaultRoute(int InterfaceIndex, string Alias, long Metric);`(Metric = 路由跃点 + 接口跃点)\n- `public static int? Pick(IEnumerable<DefaultRoute> routes, int loopbackIndex)`:排除 loopbackIndex 与别名等于 `KillSwitchPlanner.TunAlias`(不分大小写)的,取 Metric 最小,并列取序号最小;没有返回 null。纯函数。\n- `public static IReadOnlyList<DefaultRoute> ReadSystem()`:P/Invoke iphlpapi `GetIpForwardTable2(AF_INET)` 取 0.0.0.0/0 行,接口跃点用 `GetIpInterfaceEntry`,别名用 `ConvertInterfaceIndexToLuid` + `ConvertInterfaceLuidToAlias` 或 `NetworkInterface` 对照;`FreeMibTable` 释放;任何失败返回空表不抛。\n- `public static async ValueTask<Stream> ConnectAsync(SocketsHttpConnectionContext context, CancellationToken token)`:目标是 IPv4 时,新建 TCP 套接字;`Pick(ReadSystem(), NetworkInterface.LoopbackInterfaceIndex)` 非空就设 `SetSocketOption(SocketOptionLevel.IP, (SocketOptionName)31 /* IP_UNICAST_IF */, IPAddress.HostToNetworkOrder(index))`,再连接;为空或目标非 IPv4 就照常连接。返回 `new NetworkStream(socket, ownsSocket: true)`,失败时释放套接字后抛原异常。\n- ClientSettings.CreateAuthHttpClient 改用 `SocketsHttpHandler`:`AllowAutoRedirect = false`、`ConnectCallback = DefaultRouteBinding.ConnectAsync`、`SslOptions.RemoteCertificateValidationCallback` 用现有 `MatchesPin` 校验同一 SPKI(证书非 X509Certificate2 时转换);BaseAddress、Timeout 15 秒不变;`PinValidator`、`MatchesPin` 签名与行为不变(AuthPinTests 不动或只做必要适配)。\n⑦ 测试(新文件 RouteGuardTests.cs、DefaultRouteBindingTests.cs;方法名必须用下列名字,可再加;既有用例断言不改):\nRouteGuardTests:`InstallScriptAddsBothPrefixesToBothStores`(假 runner 截脚本:含两前缀、9473、LoopbackInterfaceIndex、ActiveStore、PersistentStore)、`RemoveScriptOnlyTouchesOwnRoutes`(撤销脚本按前缀+接口+9473 三者过滤)、`NonZeroExitThrowsRouteGuardException`、`GlobalApplyInstallsRoutes`、`ApplyFailsWhenRoutesCannotInstall`(抛 RouteGuardUnavailableException,消息等于 RouteConnectRefused)、`AppsModeDoesNotInstallRoutes`、`RemoveAlwaysRemovesRoutes`、`RemoveStillRemovesRoutesWhenFirewallFails`(防火墙脚本非 0 时兜底仍被撤销,抛防火墙原异常)、`RecoverRemovesRoutesWithoutState`、`RouteOffSkipsInstall`、`PatrolRebuildsMissingRoutes`(MissingRules 含 YuanC-Route)、`PatrolThrowsWhenRebuildFails`、`PatrolSkipsRoutesWhenNotApplied`、`LocalConfigTunUsesQuarterRoutes`、`ServerConfigTunRoutesOverridden`(服务器给 route_address [\"0.0.0.0/0\"] 被覆盖成八条)、`LiveInstallAndRemoveLeaveDecoy`(真机门控:设 YUANC_ROUTE_LIVE=1 且管理员才跑,否则 Skip;用 internal 构造换前缀 203.0.113.0/25、203.0.113.128/25;先在回环加一条同前缀 RouteMetric 9472 的诱饵,装后两 store 都有 9473 的两条,撤后 9473 两 store 全无、诱饵还在,finally 删诱饵与残留)。\nDefaultRouteBindingTests:`PicksLowestMetricPhysicalRoute`、`SkipsLoopbackAndTunnel`、`ReturnsNullWithoutCandidates`、`ReadSystemDoesNotThrow`。\nControllerTests:`HeldProtectionKeepsTunnelWhenRoutesFail`(已持有保护重套时兜底失败 → 隧道保持、提示等于 RouteKeepTunnelWarning)。\n测试只许写临时目录,不得往受测目录写产物。\n⑧ 文档:\n- docs/winclient/断网保护加固说明.md 新增一节「兜底路由(虚拟机与 WSL 的流量)」:实测依据(上面四段的结论,写人话)、做法(回环接口 0.0.0.0/1 与 128.0.0.0/1,跃点 9473,ActiveStore + PersistentStore,只在全部流量模式;隧道网卡改四条 /2 优先)、套用/撤销/巡检/卸载时机、`route-off` 开关、为何不做 IPv6 兜底、鉴权直连绑物理网卡、救急(U 盘客户端管理员运行 `--uninstall`,或手工 `Get-NetRoute -InterfaceIndex <回环> | ? RouteMetric -eq 9473 | Remove-NetRoute`)、真机待验证清单(连接后 `route print` 见两条兜底与四条 /2;WSL2 与 Docker 容器里 curl 出口是澳洲;结束内核进程后 WSL2 与本机都不通直到内核恢复;整机重启后保护保持期间 WSL2 不通;主动断开与卸载后两 store 都无 9473 路由、上网恢复;分发版重启服务后能重新鉴权)。\n- docs/winclient/架构说明.md 第 73 行附近关于 auto_route/strict_route 的一句补:tun 入站另写 `route_address` 四条 IPv4 /2 与四条 IPv6 /2,让位兜底路由,见加固说明对应节。\n- docs/winclient/泄漏检测说明.md 的检测步骤加一条:装了 WSL2 / Docker 的电脑,检测期间在 WSL 与容器里各发几次外网请求,并在一次检测中途结束内核进程,应仍未发现可疑流量。",
+  "background": "项目:外包「澳洲出口节点 + Windows 一键客户端」。客户端 .NET 9 WPF(winclient/WinClient.sln:Core + App + Tests + UiTests)。客户 2026-10-28 反馈:在国内开发时(非仅指定程序模式)电脑发出的一切请求最终都应是澳洲出口,编程软件与工具都一样。\n\n先读:winclient/WinClient.Core/Firewall/KillSwitchApplier.cs(WFP 接入、wfp-off、Patrol 的 MissingMarker 拼接、Remove/Recover 次序)、Firewall/WfpPlanner.cs(MissingMarker 写法)、Network/NicGuard.cs(同类「先记再改、断开恢复、巡检补齐」写法与 CreateStartInfo)、Client/ClientController.cs(ApplyKillSwitch / RemoveKillSwitch 分支与 WfpKeepTunnelWarning)、Client/ClientRuntime.cs、Client/ClientSettings.cs、Client/TunnelTransport.cs、Pairing/LocalConfigRenderer.cs、App/Hosting/InstallerRunner.cs、Tests/WfpApplierTests.cs 与 Tests/WfpLiveTests.cs(假件与门控写法)、Tests/AuthPinTests.cs、docs/winclient/断网保护加固说明.md「系统过滤层第二道闸(WFP)」节。\n\n硬规矩:①只改允许清单里的文件(Tests/Fixtures/ 下可按需改);②既有测试断言不改(只做编译适配);③任何地址、网卡名不进日志、异常与报告;④工人不许 git 写操作,不许自己跑 dotnet(build/test/restore/publish 一律按验收编号申请);⑤每次 Edit / Write 的新内容控制在 150 行以内;⑥新增文案与注释中文;⑦所有子进程隐藏窗口;⑧拿不准停下交 blocked + forks,不猜。",
+  "nonGoals": [
+    "不改仅指定程序模式的路由与保护行为(该模式名单外程序直连是客户明示的选择)",
+    "不改防火墙规则脚本(KillSwitchPlanner)与 WFP 过滤器",
+    "不做 IPv6 兜底路由、不写内核驱动或 callout",
+    "不改自检项数量与界面",
+    "不改出口核验、自动更新的网络路径"
+  ],
+  "allowedPaths": [
+    "winclient/WinClient.Core/Firewall/RouteGuard.cs",
+    "winclient/WinClient.Core/Firewall/KillSwitchApplier.cs",
+    "winclient/WinClient.Core/Network/DefaultRouteBinding.cs",
+    "winclient/WinClient.Core/Client/ClientController.cs",
+    "winclient/WinClient.Core/Client/ClientRuntime.cs",
+    "winclient/WinClient.Core/Client/ClientSettings.cs",
+    "winclient/WinClient.Core/Client/TunnelTransport.cs",
+    "winclient/WinClient.Core/Pairing/LocalConfigRenderer.cs",
+    "winclient/WinClient.App/Hosting/InstallerRunner.cs",
+    "winclient/WinClient.Tests/RouteGuardTests.cs",
+    "winclient/WinClient.Tests/DefaultRouteBindingTests.cs",
+    "winclient/WinClient.Tests/ControllerTests.cs",
+    "winclient/WinClient.Tests/ProcessStorageTests.cs",
+    "winclient/WinClient.Tests/PairingTests.cs",
+    "winclient/WinClient.Tests/RoutingTests.cs",
+    "winclient/WinClient.Tests/AuthPinTests.cs",
+    "docs/winclient/断网保护加固说明.md",
+    "docs/winclient/架构说明.md",
+    "docs/winclient/泄漏检测说明.md"
+  ],
+  "forbiddenPaths": [
+    ".codex/**",
+    ".github/**",
+    ".gitignore",
+    "authserver/**",
+    "node/**",
+    "scripts/**",
+    "pyproject.toml",
+    "docs/design/**",
+    "docs/plans/**",
+    "docs/acceptance/**",
+    "docs/交接/**",
+    "docs/node/**",
+    "docs/口径速查表.md",
+    "docs/开工须知.md",
+    "docs/winclient/分应用代理说明.md",
+    "docs/winclient/环境一致性说明.md",
+    "docs/winclient/服务化与自启说明.md",
+    "winclient/*.sln",
+    "winclient/Directory.Build.props",
+    "winclient/third_party/**",
+    "winclient/WinClient.UiTests/**",
+    "winclient/WinClient.Core/Firewall/KillSwitchPlanner.cs",
+    "winclient/WinClient.Core/Firewall/Wfp*.cs",
+    "winclient/WinClient.Core/Firewall/CommandRunner.cs",
+    "winclient/WinClient.Core/Network/NicGuard.cs",
+    "winclient/WinClient.Core/Network/ConnectionReaper.cs",
+    "winclient/WinClient.Core/Network/PublicAddress.cs",
+    "winclient/WinClient.Core/Environment/**",
+    "winclient/WinClient.Core/Diagnostics/**",
+    "winclient/WinClient.Core/Update/**",
+    "winclient/WinClient.Core/Auth/**",
+    "winclient/WinClient.Core/Client/RoutingRenderer.cs",
+    "winclient/WinClient.Core/Client/AppScope.cs",
+    "winclient/WinClient.Tests/Wfp*.cs",
+    "winclient/WinClient.Tests/KillSwitch*.cs",
+    "winclient/WinClient.Tests/FirewallTests.cs",
+    "winclient/WinClient.Tests/NicGuardTests.cs",
+    "winclient/WinClient.Tests/WinClient.Tests.csproj",
+    "winclient/WinClient.Core/WinClient.Core.csproj",
+    "winclient/WinClient.App/WinClient.App.csproj",
+    "winclient/WinClient.App/Program.cs"
+  ],
+  "expectArtifacts": [
+    "winclient/WinClient.Core/Firewall/RouteGuard.cs",
+    "winclient/WinClient.Core/Network/DefaultRouteBinding.cs",
+    "winclient/WinClient.Tests/RouteGuardTests.cs",
+    "winclient/WinClient.Tests/DefaultRouteBindingTests.cs"
+  ],
+  "acceptance": [
+    {
+      "id": "BUILD",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "build",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1200
+    },
+    {
+      "id": "TEST",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "test",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--no-build",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1500
+    },
+    {
+      "id": "NOBIN",
+      "kind": "command",
+      "required": true,
+      "timeoutSec": 120,
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess,sys;out=subprocess.run(['git','ls-files','winclient','build','scripts','node'],capture_output=True,text=True).stdout.split();bad=[f for f in out if f.endswith(('.exe','.dll','.zip','.pdb','.tar.gz','.so','.etl','.pcapng'))];print(bad);sys.exit(1 if bad else 0)"
+      ]
+    },
+    {
+      "id": "SHAPE-GUARD",
+      "kind": "command",
+      "required": true,
+      "timeoutSec": 120,
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;t=pathlib.Path('winclient/WinClient.Core/Firewall/RouteGuard.cs').read_text(encoding='utf-8');need=['IRouteGuard','RouteGuardException','9473','0.0.0.0/1','128.0.0.0/1','LoopbackInterfaceIndex','ActiveStore','PersistentStore','YuanC-Route','0.0.0.0/2','192.0.0.0/2','c000::/2','CreateStartInfo'];bad=[k for k in need if k not in t];print(bad);sys.exit(1 if bad else 0)"
+      ]
+    },
+    {
+      "id": "SHAPE-WIRE",
+      "kind": "command",
+      "required": true,
+      "timeoutSec": 120,
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;W='winclient/WinClient.';r=lambda f:pathlib.Path(W+f).read_text(encoding='utf-8');a=r('Core/Firewall/KillSwitchApplier.cs');c=r('Core/Client/ClientController.cs');s=r('Core/Client/ClientSettings.cs');chk=[('applier','IRouteGuard' in a and 'route-off' in a and 'RouteGuardUnavailableException' in a and 'RouteRemoveFailed' in a and 'RoutePatrolFailed' in a),('ctl','RouteGuardUnavailableException' in c and 'RouteKeepTunnelWarning' in c),('rt','new RouteGuard(' in r('Core/Client/ClientRuntime.cs')),('inst','new RouteGuard(' in r('App/Hosting/InstallerRunner.cs')),('local','route_address' in r('Core/Pairing/LocalConfigRenderer.cs')),('srv','route_address' in r('Core/Client/TunnelTransport.cs')),('auth','SocketsHttpHandler' in s and 'DefaultRouteBinding.ConnectAsync' in s)];bad=[k for k,ok in chk if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ]
+    },
+    {
+      "id": "SHAPE-BIND",
+      "kind": "command",
+      "required": true,
+      "timeoutSec": 120,
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;t=pathlib.Path('winclient/WinClient.Core/Network/DefaultRouteBinding.cs').read_text(encoding='utf-8');need=['record DefaultRoute','Pick(','ReadSystem(','ConnectAsync(','GetIpForwardTable2','FreeMibTable','HostToNetworkOrder','TunAlias'];bad=[k for k in need if k not in t];print(bad);sys.exit(1 if bad else 0)"
+      ]
+    },
+    {
+      "id": "TESTS-NEW",
+      "kind": "command",
+      "required": true,
+      "timeoutSec": 120,
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;W='winclient/WinClient.Tests/';t=''.join(pathlib.Path(W+f).read_text(encoding='utf-8') for f in ('RouteGuardTests.cs','DefaultRouteBindingTests.cs','ControllerTests.cs'));names='InstallScriptAddsBothPrefixesToBothStores RemoveScriptOnlyTouchesOwnRoutes NonZeroExitThrowsRouteGuardException GlobalApplyInstallsRoutes ApplyFailsWhenRoutesCannotInstall AppsModeDoesNotInstallRoutes RemoveAlwaysRemovesRoutes RemoveStillRemovesRoutesWhenFirewallFails RecoverRemovesRoutesWithoutState RouteOffSkipsInstall PatrolRebuildsMissingRoutes PatrolThrowsWhenRebuildFails PatrolSkipsRoutesWhenNotApplied LocalConfigTunUsesQuarterRoutes ServerConfigTunRoutesOverridden LiveInstallAndRemoveLeaveDecoy PicksLowestMetricPhysicalRoute SkipsLoopbackAndTunnel ReturnsNullWithoutCandidates ReadSystemDoesNotThrow HeldProtectionKeepsTunnelWhenRoutesFail'.split();bad=[n for n in names if ' '+n+'(' not in t];print(bad);sys.exit(1 if bad else 0)"
+      ]
+    },
+    {
+      "id": "TESTS-LIVE-GATE",
+      "kind": "command",
+      "required": true,
+      "timeoutSec": 120,
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;t=pathlib.Path('winclient/WinClient.Tests/RouteGuardTests.cs').read_text(encoding='utf-8');need=['YUANC_ROUTE_LIVE','203.0.113.0/25','203.0.113.128/25','9472'];bad=[k for k in need if k not in t];print(bad);sys.exit(1 if bad else 0)"
+      ]
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "required": true,
+      "timeoutSec": 120,
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda f:pathlib.Path('docs/winclient/'+f).read_text(encoding='utf-8');h=r('断网保护加固说明.md');chk=[('harden','兜底路由' in h and '9473' in h and 'route-off' in h and 'PersistentStore' in h and 'WSL' in h and '真机待验证' in h),('arch','route_address' in r('架构说明.md')),('leak','WSL' in r('泄漏检测说明.md') and 'Docker' in r('泄漏检测说明.md'))];bad=[k for k,ok in chk if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ]
+    },
+    {
+      "id": "SCOPE",
+      "kind": "command",
+      "required": true,
+      "timeoutSec": 120,
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess as sp,sys;g=lambda *a:sp.check_output(['git','-c','core.quotepath=false']+list(a)).decode('utf-8').split(chr(10));mb=g('merge-base','origin/main','HEAD')[0].strip();ch={p.strip() for p in g('diff','--name-only',mb)+g('ls-files','--others','--exclude-standard') if p.strip()};W='winclient/WinClient.';ok={W+x+'.cs' for x in 'Core/Firewall/RouteGuard Core/Firewall/KillSwitchApplier Core/Network/DefaultRouteBinding Core/Client/ClientController Core/Client/ClientRuntime Core/Client/ClientSettings Core/Client/TunnelTransport Core/Pairing/LocalConfigRenderer App/Hosting/InstallerRunner Tests/RouteGuardTests Tests/DefaultRouteBindingTests Tests/ControllerTests Tests/ProcessStorageTests Tests/PairingTests Tests/RoutingTests Tests/AuthPinTests'.split()}|{'docs/winclient/'+x+'.md' for x in '断网保护加固说明 架构说明 泄漏检测说明'.split()};bad=sorted(p for p in ch if p not in ok and not p.startswith(W+'Tests/Fixtures/'));print(bad);sys.exit(1 if bad else 0)"
+      ]
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "timeoutSec": 7200,
+  "repoRoot": "E:/yuanc",
+  "engine": "codex",
+  "steps": [
+    "读 BACKGROUND 列出的文件;先写 RouteGuardTests / DefaultRouteBindingTests 与 ControllerTests 新用例,申请 BUILD 以编译失败证红,之后固定 BUILD→TEST。",
+    "写 RouteGuard.cs 与 DefaultRouteBinding.cs,SHAPE-GUARD / SHAPE-BIND 绿。",
+    "接 KillSwitchApplier、ClientController、ClientRuntime、InstallerRunner、ClientSettings、两处内核配置渲染,SHAPE-WIRE、BUILD、TEST、TESTS-NEW、TESTS-LIVE-GATE 绿。",
+    "改三份文档,DOCS / SCOPE / NOBIN 绿。"
+  ]
+}
