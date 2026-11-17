@@ -9,7 +9,7 @@ import sys
 import zipfile
 from pathlib import PurePosixPath
 
-from . import __version__, device, nft, service, systemd
+from . import __version__, authsync, device, nft, service, systemd
 from .admin import publish as winclient_publish
 from .admin import server as admin_server
 from .config import ConfigError, load
@@ -96,6 +96,12 @@ def parser():
     watcher.add_argument("--config", default=argparse.SUPPRESS, help="配置文件路径")
     actions = watcher.add_subparsers(dest="watchdog_action", required=True, title="看门狗操作")
     for name, description in (("tick", "执行一轮检查与恢复"), ("status", "读取最近检查记录")):
+        action = actions.add_parser(name, help=description, description=description)
+        action.add_argument("--config", default=argparse.SUPPRESS, help="配置文件路径")
+    sync_parser = sub.add_parser("authsync", help="运行或查看名单同步")
+    sync_parser.add_argument("--config", default=argparse.SUPPRESS, help="配置文件路径")
+    actions = sync_parser.add_subparsers(dest="authsync_action", required=True, title="名单同步操作")
+    for name, description in (("tick", "执行一轮名单同步"), ("status", "查看名单同步记录")):
         action = actions.add_parser(name, help=description, description=description)
         action.add_argument("--config", default=argparse.SUPPRESS, help="配置文件路径")
     rescue = sub.add_parser("rescue", help="查看或维护独立救援程序")
@@ -312,6 +318,13 @@ def _install(config, config_path, runner, manifest):
             apply("启用看门狗定时器",
                   lambda: runner.run(["systemctl", "enable", "--now", "exitnode-watchdog.timer"]),
                   {"kind": "systemctl", "unit": "exitnode-watchdog.timer"})
+        if config.authsync.enabled:
+            if not runner.exists(authsync.KEY_PATH):
+                raise ValueError("已启用名单同步,但未找到节点密钥文件,请把鉴权服务器的 node_key 写入 "
+                                 "/var/lib/exitnode/secrets/authserver-node-key")
+            apply("启用名单同步定时器",
+                  lambda: runner.run(["systemctl", "enable", "--now", "exitnode-authsync.timer"]),
+                  {"kind": "systemctl", "unit": "exitnode-authsync.timer"})
 
         def install_rescue():
             current = layout.current_target(config, runner)
@@ -472,6 +485,11 @@ def main(argv=None, runner=None, rescue_runner=None):
                 return watchdog_tick(config, runner)
             print(redact(json.dumps(watchdog_state.read(config, runner), ensure_ascii=False)))
             return 0
+        if args.command == "authsync":
+            if args.authsync_action == "tick":
+                return authsync.tick(config, runner)
+            print(redact(json.dumps(authsync.status(config, runner), ensure_ascii=False)))
+            return 0
         if args.command == "device":
             if args.device_action == "add":
                 device.add(config, runner, name=args.name, platform=args.platform, host=args.host)
@@ -495,6 +513,8 @@ def main(argv=None, runner=None, rescue_runner=None):
                 result["layers"].insert(-1, watchdog_check(config, runner))
                 result["layers"].insert(-1, _rescue_check(runner))
                 result["layers"].insert(-1, service.harden_check(runner))
+                if config.authsync.enabled:
+                    result["layers"].insert(-1, authsync.check(config, runner))
                 result["layers"].append(admin_server.check(config))
             if args.command == "status":
                 result["public_ipv4"] = public_ipv4(runner)

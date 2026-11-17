@@ -4,6 +4,7 @@ import pytest
 from exitnode.systemd import render
 
 UNITS = ("exitnode-admin.service", "exitnode-proxy.service",
+         "exitnode-authsync.service", "exitnode-authsync.timer",
          "exitnode-watchdog.service", "exitnode-watchdog.timer",
          "exitnode-recover.service", "exitnode-nft.service")
 NFT_UNIT = "exitnode-nft.service"
@@ -53,7 +54,7 @@ def test_admin_uses_dynamic_user_without_capabilities_and_only_localhost():
 
 
 @pytest.mark.parametrize("name", ["exitnode-watchdog.service", "exitnode-recover.service",
-                                  "exitnode-rescue.service"])
+                                  "exitnode-rescue.service", "exitnode-authsync.service"])
 def test_root_units_are_sandboxed_but_keep_root(name):
     text = render(name, {})
     assert "ProtectSystem=full\n" in text and "ProtectHome=true\n" in text
@@ -112,6 +113,14 @@ def test_watchdog_service_timer_and_context():
     for unsafe in ('/a\nExecStart=/bin/other', '/a"', '/%n', '/$HOME', '/a\\b'):
         with pytest.raises(ValueError):
             render("exitnode-watchdog.service", {"config_path": unsafe})
+
+
+def test_authsync_service_and_timer():
+    text = render("exitnode-authsync.service", {})
+    assert ' --config "/etc/exitnode/config.toml" authsync tick\n' in text
+    assert "Type=oneshot\n" in text
+    timer = render("exitnode-authsync.timer", {})
+    assert "OnBootSec=60\n" in timer and "OnUnitActiveSec=60\n" in timer
 
 
 def test_recover_unit_runs_once_after_proxy_on_boot():

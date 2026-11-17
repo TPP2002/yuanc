@@ -7,6 +7,7 @@ from pathlib import PurePosixPath
 from .runner import Runner
 
 UNITS = {"exitnode-admin.service", "exitnode-proxy.service",
+         "exitnode-authsync.service", "exitnode-authsync.timer",
          "exitnode-watchdog.service", "exitnode-watchdog.timer",
          "exitnode-rescue.service", "exitnode-rescue.timer",
          "exitnode-recover.service", "exitnode-nft.service"}
