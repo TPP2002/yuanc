@@ -1,0 +1,162 @@
+{
+  "schemaVersion": 1,
+  "taskId": "AUTH-RENEW-EXPIRED-BASE-1117",
+  "slug": "yc-auth-renew-limit-1117",
+  "title": "鉴权服务三处:过期账号续期从当时起算;取会话单独限速;心跳审计只记地址变化、审计接口限条数、清过期会话",
+  "goal": "以派单时 origin/main 头为基点。合单,三张看板卡:AUTH-RENEW-EXPIRED-BASE-1117(主卡)、AUTH-SESSION-RATELIMIT-LOCKOUT-1117、AUTH-HEARTBEAT-AUDIT-GROWTH-1117。\n\n做完后:\n① 续期起算(service.py):redeem 的续期分支(已有账号且 receipt 为空)与 change_account 的 extend,都从「旧到期日」和「当前时间 at」里较晚的一个起算再加天数。没过期的账号结果与现在相同;重试(receipt 不为空)照旧不加天数。\n② 取会话单独限速:config.py 的 Limits 加 session_per_ip_per_hour: int = Field(default=120, ge=1);app.py 的 RateLimiter 改成每类接口各自的上限(redeem 用 redeem_per_ip_per_hour,session 用 session_per_ip_per_hour)。窗口一小时、429 文案、Retry-After、被拒请求不入队,都不变。\n③ 心跳审计:heartbeat 照旧每次更新 node_heartbeat 那一行;审计只在「此前没有心跳行」或「地址与上一次不同」时写一条 node.heartbeat。\n④ 审计接口限条数:Service.audits(limit=2000) 返回 id 最大的 limit 条,按 id 升序;GET /admin/audit 接受查询参数 limit(整数 1~10000,默认 2000),越界返回现有的 422 通用文案。\n⑤ 清过期会话:session() 在同一事务里、插入新会话之前,删掉 expires_at <= at 的全部会话行。\n\n测试(用例名固定,可再加):\ntest_invites.py:\n- 改 test_expired_account_can_redeem_to_extend:期望改为兑码当时的 clock() + 7 天。这是本单改变的口径;该文件其余既有断言不动。\n- 新增 test_long_expired_account_redeem_counts_from_now:days=1 的码建号,clock.advance(days=10),带 refresh_token 兑 days=7 的码,expires_at == clock() + 7 天;再用返回的 refresh_token 调 /client/session 得 200。\n- 新增 test_admin_extend_expired_account_counts_from_now:enrolled(30 天),clock.advance(days=40),管理员 extend 3 天,expires_at == clock() + 3 天。\n- test_renewal_adds_to_existing_expiry、test_admin_extend_disable_enable_and_audit、test_offline_cli 不改,必须仍绿。\ntest_security.py:\n- 改 test_session_ip_limit:10 次假令牌各 401 之后,第 11 次用真令牌得 200。\n- 新增 test_session_limit_is_separate_and_configurable:把 limits.session_per_ip_per_hour 设成 3 另建一个应用(新的 Settings + create_app,库文件放 tmp_path);兑码拿 refresh_token;连取 3 次会话各 200,第 4 次 429、响应头 retry-after 为 3600、detail 含「频繁」;随后调一次 /client/redeem(不存在的码)仍是 404。\n- test_redeem_ip_limit_and_window_reset 不改,必须仍绿。\ntest_node_sync.py:\n- 改 test_heartbeat_persisted_and_audited:同一地址两次心跳后 who='node' 的审计 1 条;再调 app.state.service.heartbeat(ip=\"203.0.113.9\") 后审计 2 条,node_heartbeat 仍只有 1 行且 ip 为 203.0.113.9;再经接口用原地址发一次后审计 3 条。其余断言保留。\ntest_sessions.py:\n- 新增 test_expired_sessions_are_pruned:取一次会话;clock.advance(hours=7);再取一次;sessions 表只剩 1 行。\ntest_audit_limit.py(新文件):\n- test_audit_limit_returns_latest_rows:建 5 个邀请码(5 条审计);GET /admin/audit?limit=2 恰 2 条,是 id 最大的两条且升序;不带参数 5 条;limit=0 与 limit=10001 各 422;不带管理密钥 404。\n\n文档:\n- authserver/examples/config.example.toml 的 [limits]:redeem_per_ip_per_hour 的占位文字改成 \"<每个IP每小时兑换次数上限,默认10>\",其下加一行 session_per_ip_per_hour = \"<每个IP每小时取会话次数上限,默认120>\"。\n- docs/authserver/接口说明.md:配置表 limits 行补 session_per_ip_per_hour(默认 120);限速说明写成兑换与取会话各自计数;续期与管理员延期写明「已过期的从当时起算,未过期的在原到期日上叠加」;/admin/audit 写明 limit 参数(1~10000,默认 2000,返回最近的若干条);心跳写明「节点地址变化时才记审计」。",
+  "background": "项目:外包「澳洲出口节点 + Windows 一键客户端」。authserver 是分发版的邀请码鉴权服务(FastAPI + SQLite,Python 3.11),测试在 authserver/tests,夹具在 conftest.py(clock 可 advance;invite / redeem / enrolled / admin / node_key 夹具)。时间一律是 security.iso 产出的定长 UTC 字符串(微秒六位、+00:00),同格式字符串可以直接比较先后。\n\n先读:authserver/authserver/service.py(全文)、app.py(RateLimiter 与路由)、config.py 的 Limits、authserver/tests/conftest.py、test_invites.py、test_security.py、test_node_sync.py、test_sessions.py、docs/authserver/接口说明.md、authserver/examples/config.example.toml。\n\n为什么改:客户端重连时每轮退避都重新取会话,节点断几分钟就用完共用的 10 次上限,之后一小时全被拒;过期 10 天的账号兑 7 天的码仍是过期;节点每分钟一次心跳,逐条记审计一年约 52 万条。\n\n硬规矩(本仓红线,任何一条做不到就停下交 blocked + forks,不猜):①只改允许清单里的文件;只管本项目自己建的服务、路由、防火墙规则。②凭据不落代码库、不落示例、不落日志:令牌、密钥、邀请码、设备钥匙原文不进日志、异常、测试输出;示例配置只写占位符;不读写 secrets/ 目录。③隧道断了不许静默回落直连;安装更新幂等可回退;做不到的需求如实列冲突,不悄悄降级;真机没测的不写成已通过。④Windows 上拉起的子进程一律隐藏窗口(CREATE_NO_WINDOW)。⑤工人不许 git 写操作,不许自己跑 pytest / ruff / python 脚本(按验收编号走派单器自测通道);不许装依赖,缺依赖交 blocked。⑥测试只许往 tmp_path 写文件,不往仓库目录写产物。⑦既有测试断言只在本单点名的地方改,其余不删、不跳过、不放宽;不用 mock 顶替被测逻辑。⑧新增文案、注释、文档用中文;文档只写现行行为,不写施工过程;每次 Edit / Write 的新内容不超过 150 行。",
+  "nonGoals": [
+    "不改客户端接口的请求与响应字段",
+    "不改数据库表结构(db.py 不在允许清单)",
+    "不改兑换码的限速数值与 429 文案",
+    "不做审计的定期删除"
+  ],
+  "allowedPaths": [
+    "authserver/authserver/service.py",
+    "authserver/authserver/app.py",
+    "authserver/authserver/config.py",
+    "authserver/examples/config.example.toml",
+    "authserver/tests/test_invites.py",
+    "authserver/tests/test_security.py",
+    "authserver/tests/test_node_sync.py",
+    "authserver/tests/test_sessions.py",
+    "authserver/tests/test_audit_limit.py",
+    "docs/authserver/接口说明.md"
+  ],
+  "forbiddenPaths": [
+    ".codex/**",
+    ".github/**",
+    ".gitignore",
+    "pyproject.toml",
+    "winclient/**",
+    "scripts/**",
+    "docs/design/**",
+    "docs/plans/**",
+    "docs/acceptance/**",
+    "docs/交接/**",
+    "docs/winclient/**",
+    "docs/口径速查表.md",
+    "docs/开工须知.md",
+    "docs/授权页.md",
+    "node/**",
+    "docs/node/**",
+    "authserver/authserver/db.py",
+    "authserver/authserver/security.py",
+    "authserver/authserver/models.py",
+    "authserver/authserver/admin_cli.py",
+    "authserver/tests/conftest.py",
+    "authserver/tests/test_decoy.py",
+    "authserver/tests/test_devices.py",
+    "authserver/tests/test_certificate.py"
+  ],
+  "expectArtifacts": [
+    "authserver/tests/test_audit_limit.py"
+  ],
+  "acceptance": [
+    {
+      "id": "T-INVITES",
+      "kind": "test:targeted",
+      "target": "authserver/tests/test_invites.py",
+      "required": true,
+      "failsOnBase": true
+    },
+    {
+      "id": "T-SECURITY",
+      "kind": "test:targeted",
+      "target": "authserver/tests/test_security.py",
+      "required": true,
+      "failsOnBase": true
+    },
+    {
+      "id": "T-NODE",
+      "kind": "test:targeted",
+      "target": "authserver/tests/test_node_sync.py",
+      "required": true,
+      "failsOnBase": true
+    },
+    {
+      "id": "T-SESSIONS",
+      "kind": "test:targeted",
+      "target": "authserver/tests/test_sessions.py",
+      "required": true,
+      "failsOnBase": true
+    },
+    {
+      "id": "T-AUDIT",
+      "kind": "test:targeted",
+      "target": "authserver/tests/test_audit_limit.py",
+      "required": true,
+      "failsOnBase": true
+    },
+    {
+      "id": "PYTEST",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+        "authserver/tests"
+      ],
+      "required": true,
+      "timeoutSec": 900
+    },
+    {
+      "id": "RUFF",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "ruff",
+        "check",
+        "authserver"
+      ],
+      "required": true,
+      "timeoutSec": 300
+    },
+    {
+      "id": "TESTS-NEW",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda f:pathlib.Path('authserver/tests/'+f).read_text(encoding='utf-8');w=(('test_invites.py',('test_expired_account_can_redeem_to_extend','test_long_expired_account_redeem_counts_from_now','test_admin_extend_expired_account_counts_from_now','test_renewal_adds_to_existing_expiry')),('test_security.py',('test_session_ip_limit','test_session_limit_is_separate_and_configurable','test_redeem_ip_limit_and_window_reset')),('test_node_sync.py',('test_heartbeat_persisted_and_audited',)),('test_sessions.py',('test_expired_sessions_are_pruned',)),('test_audit_limit.py',('test_audit_limit_returns_latest_rows',)));bad=[f+':'+n for f,ns in w for n in ns if 'def '+n+'(' not in r(f)];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda f:pathlib.Path(f).read_text(encoding='utf-8');d=r('docs/authserver/接口说明.md');e=r('authserver/examples/config.example.toml');c=r('authserver/authserver/config.py');bad=[k for k,ok in (('doc-limit','session_per_ip_per_hour' in d),('doc-audit','limit' in d and '2000' in d),('doc-renew','从当时起算' in d),('doc-beat','地址变化' in d),('example','session_per_ip_per_hour' in e and '默认120' in e),('config','session_per_ip_per_hour' in c)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "SCOPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess as sp,sys;g=lambda *a:sp.check_output(['git','-c','core.quotepath=false']+list(a)).decode('utf-8').split(chr(10));mb=g('merge-base','origin/main','HEAD')[0].strip();ch={p.strip() for p in g('diff','--name-only',mb)+g('ls-files','--others','--exclude-standard') if p.strip()};ok=set([\"authserver/authserver/service.py\", \"authserver/authserver/app.py\", \"authserver/authserver/config.py\", \"authserver/examples/config.example.toml\", \"authserver/tests/test_invites.py\", \"authserver/tests/test_security.py\", \"authserver/tests/test_node_sync.py\", \"authserver/tests/test_sessions.py\", \"authserver/tests/test_audit_limit.py\", \"docs/authserver/接口说明.md\"]);bad=sorted(p for p in ch if p not in ok);print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "timeoutSec": 5400,
+  "repoRoot": "E:/yuanc",
+  "steps": [
+    "读 BACKGROUND 列出的文件;先改五个测试文件(含新建 test_audit_limit.py),申请 T-INVITES / T-SECURITY / T-NODE / T-SESSIONS / T-AUDIT 证红。",
+    "改 service.py(续期起算、心跳审计、审计条数、清过期会话),T-INVITES / T-NODE / T-SESSIONS 绿。",
+    "改 config.py 与 app.py(会话单独限速、审计 limit 参数),T-SECURITY / T-AUDIT / PYTEST / RUFF 绿。",
+    "改示例配置与接口说明,TESTS-NEW / DOCS / SCOPE 绿。"
+  ]
+}

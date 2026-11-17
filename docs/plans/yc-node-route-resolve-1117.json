@@ -1,0 +1,143 @@
+{
+  "schemaVersion": 1,
+  "taskId": "SEC-NODE-ROUTE-DOMAIN-BYPASS-1117",
+  "slug": "yc-node-route-resolve-1117",
+  "title": "节点路由规则最前加「先解析域名」,堵住用域名绕过私网拦截;补拦运营商内网段 100.64.0.0/10",
+  "goal": "以派单时 origin/main 头为基点。看板卡 SEC-NODE-ROUTE-DOMAIN-BYPASS-1117。\n\n问题:node/exitnode/proxy/server_config.py 的 render_server 生成的路由规则只按数字地址拦私网。sing-box 1.13 里 ip_is_private / ip_cidr 规则对「目的地是域名」的连接不匹配(前面没有 resolve 动作时),连接落到 final=direct 发出。派单方用 1.13.21 实测(mixed 入站 + 同款规则 + 本地监听):目的地 127.0.0.1 被拒;目的地是解析到 127.0.0.1 的域名返回 200。规则最前加一条 {\"action\": \"resolve\"} 后两者都被拒,解析结果里混有公网与私网地址的域名也被拒,198.18.255.1 的管理地址改写照常。另测得 100.64.0.1 不在 ip_is_private 范围内,加不加 resolve 都放行。\n\n做完后:\n① server_config.py:rules 第一条是 {\"action\": \"resolve\"}(只有这一个键)。其后顺序不变:管理地址规则、(有维护设备时)维护规则、{\"ip_is_private\": True, \"action\": \"reject\"},最后一条改为 {\"ip_cidr\": [\"198.18.0.0/15\", \"100.64.0.0/10\"], \"action\": \"reject\"}。渲染输出的其余部分逐字节不变。\n② node/tests/golden/proxy/server.json 同步到新输出,格式保持 json.dumps(..., ensure_ascii=False, indent=2) 加一个换行;test_server_exact_golden_and_revoked_exclusion 仍逐字节比对。\n③ node/tests/test_proxy_server_render.py:既有用例里因本改动而变的精确比对同步改——管理规则从 rules[0] 变成 rules[1];test_private_route_order_without_maintenance 与 test_maintenance_only_allows_active_registered_device_ssh 的整表比对加上第一条和新网段;test_maintenance_users_sorted_and_inbound_names_match_devices 里维护规则下标从 1 变成 2。不删用例,不把精确比对改成包含判断。新增两个用例,名字固定:\n- test_resolve_is_first_rule_before_any_ip_rule:有维护设备、无维护设备两种渲染下,rules[0] == {\"action\": \"resolve\"},且带 ip_cidr 或 ip_is_private 键的规则下标都大于 0。\n- test_carrier_nat_range_rejected:最后一条规则 == {\"ip_cidr\": [\"198.18.0.0/15\", \"100.64.0.0/10\"], \"action\": \"reject\"}。\n④ docs/node/隧道配置说明.md「隧道里能到哪、不能到哪」一节补两件事:目的地是域名时节点先解析,按解析出的地址判定,解析结果里有任何一个落在阻断范围就拒;100.64.0.0/10(运营商级内网段)一律阻断。该节「真机待验证」列表加一条,原文:「从非维护设备访问一个解析到私网地址的域名应失败。」",
+  "background": "项目:外包「澳洲出口节点 + Windows 一键客户端」。节点端 Python 3.11(node/exitnode,测试在 node/tests),隧道内核 sing-box 固定 1.13.21,配置全部用 1.13 写法。\n\n先读:node/exitnode/proxy/server_config.py(全文 60 行)、node/tests/test_proxy_server_render.py、node/tests/golden/proxy/server.json 的 route 段、docs/node/隧道配置说明.md「隧道里能到哪、不能到哪」一节。\n\n验收项 KERNEL-CHECK 会用真内核检查黄金配置;派单方已把 sing-box-1.13.21-windows-amd64.zip 放进工位 winclient/third_party/cache/(不入库,不要动它)。\n\n硬规矩(本仓红线,任何一条做不到就停下交 blocked + forks,不猜):①只改允许清单里的文件;只管本项目自己建的服务、路由、防火墙规则。②凭据不落代码库、不落示例、不落日志:令牌、密钥、邀请码、设备钥匙原文不进日志、异常、测试输出;示例配置只写占位符;不读写 secrets/ 目录。③隧道断了不许静默回落直连;安装更新幂等可回退;做不到的需求如实列冲突,不悄悄降级;真机没测的不写成已通过。④Windows 上拉起的子进程一律隐藏窗口(CREATE_NO_WINDOW)。⑤工人不许 git 写操作,不许自己跑 pytest / ruff / python 脚本(按验收编号走派单器自测通道);不许装依赖,缺依赖交 blocked。⑥测试只许往 tmp_path 写文件,不往仓库目录写产物。⑦既有测试断言只在本单点名的地方改,其余不删、不跳过、不放宽;不用 mock 顶替被测逻辑。⑧新增文案、注释、文档用中文;文档只写现行行为,不写施工过程;每次 Edit / Write 的新内容不超过 150 行。",
+  "nonGoals": [
+    "不改客户端配置渲染(client_config.py、client-windows.json)与 Windows 客户端",
+    "不改 DNS 服务器、入站、出站的任何字段",
+    "不改维护设备放行规则的含义"
+  ],
+  "allowedPaths": [
+    "node/exitnode/proxy/server_config.py",
+    "node/tests/test_proxy_server_render.py",
+    "node/tests/golden/proxy/server.json",
+    "docs/node/隧道配置说明.md"
+  ],
+  "forbiddenPaths": [
+    ".codex/**",
+    ".github/**",
+    ".gitignore",
+    "pyproject.toml",
+    "winclient/**",
+    "scripts/**",
+    "docs/design/**",
+    "docs/plans/**",
+    "docs/acceptance/**",
+    "docs/交接/**",
+    "docs/winclient/**",
+    "docs/口径速查表.md",
+    "docs/开工须知.md",
+    "docs/授权页.md",
+    "authserver/**",
+    "docs/authserver/**",
+    "node/exitnode/proxy/client_config.py",
+    "node/exitnode/proxy/sync.py",
+    "node/tests/golden/proxy/client-windows.json",
+    "node/tests/golden/proxy/inputs.json"
+  ],
+  "expectArtifacts": [
+    "node/tests/golden/proxy/server.json"
+  ],
+  "acceptance": [
+    {
+      "id": "T-RENDER",
+      "kind": "test:targeted",
+      "target": "node/tests/test_proxy_server_render.py",
+      "required": true,
+      "failsOnBase": true
+    },
+    {
+      "id": "PYTEST",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+        "node/tests"
+      ],
+      "required": true,
+      "timeoutSec": 900
+    },
+    {
+      "id": "RUFF",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "ruff",
+        "check",
+        "node"
+      ],
+      "required": true,
+      "timeoutSec": 300
+    },
+    {
+      "id": "KERNEL-CHECK",
+      "kind": "command",
+      "argv": [
+        "python",
+        "scripts/kernel/check_configs.py"
+      ],
+      "required": true,
+      "timeoutSec": 300
+    },
+    {
+      "id": "SHAPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import json,pathlib,sys;r=json.loads(pathlib.Path('node/tests/golden/proxy/server.json').read_text(encoding='utf-8'))['route']['rules'];bad=[k for k,ok in (('first',r[0]=={'action':'resolve'}),('one',sum(1 for x in r if x.get('action')=='resolve')==1),('admin',r[1].get('ip_cidr')==['198.18.255.1/32'] and r[1].get('action')=='route'),('private',{'ip_is_private':True,'action':'reject'} in r),('last',r[-1]=={'ip_cidr':['198.18.0.0/15','100.64.0.0/10'],'action':'reject'})) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "TESTS-NEW",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;t=pathlib.Path('node/tests/test_proxy_server_render.py').read_text(encoding='utf-8');bad=[n for n in ('test_resolve_is_first_rule_before_any_ip_rule','test_carrier_nat_range_rejected','test_server_exact_golden_and_revoked_exclusion','test_private_route_order_without_maintenance','test_maintenance_only_allows_active_registered_device_ssh','test_admin_route_uses_configured_listener') if 'def '+n+'(' not in t];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;d=pathlib.Path('docs/node/隧道配置说明.md').read_text(encoding='utf-8');bad=[k for k,ok in (('cgnat','100.64.0.0/10' in d),('item','从非维护设备访问一个解析到私网地址的域名应失败' in d),('resolve','先解析' in d)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "SCOPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess as sp,sys;g=lambda *a:sp.check_output(['git','-c','core.quotepath=false']+list(a)).decode('utf-8').split(chr(10));mb=g('merge-base','origin/main','HEAD')[0].strip();ch={p.strip() for p in g('diff','--name-only',mb)+g('ls-files','--others','--exclude-standard') if p.strip()};ok=set([\"node/exitnode/proxy/server_config.py\", \"node/tests/test_proxy_server_render.py\", \"node/tests/golden/proxy/server.json\", \"docs/node/隧道配置说明.md\"]);bad=sorted(p for p in ch if p not in ok);print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "timeoutSec": 3600,
+  "repoRoot": "E:/yuanc",
+  "steps": [
+    "读 BACKGROUND 列出的文件;先改 test_proxy_server_render.py(同步既有精确比对、加两个新用例),申请 T-RENDER 证红。",
+    "改 server_config.py 与黄金文件 server.json,T-RENDER / PYTEST / RUFF / SHAPE / TESTS-NEW / KERNEL-CHECK 绿。",
+    "改文档一节,DOCS / SCOPE 绿。"
+  ]
+}
