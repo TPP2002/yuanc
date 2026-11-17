@@ -70,7 +70,7 @@ def test_empty_allowlist_has_no_users(inputs):
 def test_admin_route_uses_configured_listener(inputs):
     ctx, device = inputs
     config = render_server(replace(ctx, admin_bind="127.0.0.2", admin_port=9443), [device])
-    assert config["route"]["rules"][0] == {
+    assert config["route"]["rules"][1] == {
         "ip_cidr": ["198.18.255.1/32"], "action": "route", "outbound": "direct",
         "override_address": "127.0.0.2", "override_port": 9443}
     assert config["route"]["final"] == "direct"
@@ -84,15 +84,39 @@ def test_private_route_order_without_maintenance(inputs):
     config = render_server(ctx, [device])
     assert config["route"] == {
         "rules": [
+            {"action": "resolve"},
             {"ip_cidr": ["198.18.255.1/32"], "action": "route", "outbound": "direct",
              "override_address": ctx.admin_bind, "override_port": ctx.admin_port},
             {"ip_is_private": True, "action": "reject"},
-            {"ip_cidr": ["198.18.0.0/15"], "action": "reject"},
+            {"ip_cidr": ["198.18.0.0/15", "100.64.0.0/10"], "action": "reject"},
         ],
         "final": "direct",
     }
     assert config["outbounds"] == [{"type": "direct", "tag": "direct"}]
     assert all("address" not in server for server in config["dns"]["servers"])
+
+
+def test_resolve_is_first_rule_before_any_ip_rule(inputs):
+    ctx, device = inputs
+    revoked = replace(device, device_id="revoked", uuid="00000000-0000-4000-8000-000000000002",
+                      revoked_at="2026-10-22T01:00:00+00:00")
+    for render_ctx, render_devices in (
+        (ctx, [device]),
+        (replace(ctx, maintenance_device_ids=(device.device_id,)), [device, revoked]),
+    ):
+        rules = render_server(render_ctx, render_devices)["route"]["rules"]
+        assert rules[0] == {"action": "resolve"}
+        ip_rule_indexes = [
+            i for i, rule in enumerate(rules)
+            if "ip_cidr" in rule or "ip_is_private" in rule
+        ]
+        assert ip_rule_indexes and min(ip_rule_indexes) > 0
+
+
+def test_carrier_nat_range_rejected(inputs):
+    ctx, device = inputs
+    rules = render_server(ctx, [device])["route"]["rules"]
+    assert rules[-1] == {"ip_cidr": ["198.18.0.0/15", "100.64.0.0/10"], "action": "reject"}
 
 
 def test_maintenance_only_allows_active_registered_device_ssh(inputs):
@@ -103,12 +127,13 @@ def test_maintenance_only_allows_active_registered_device_ssh(inputs):
     config = render_server(ctx, [revoked, device])
     assert config["route"] == {
         "rules": [
+            {"action": "resolve"},
             {"ip_cidr": ["198.18.255.1/32"], "action": "route", "outbound": "direct",
              "override_address": ctx.admin_bind, "override_port": ctx.admin_port},
             {"auth_user": [device.device_id], "ip_is_private": True,
              "port": [22], "outbound": "direct"},
             {"ip_is_private": True, "action": "reject"},
-            {"ip_cidr": ["198.18.0.0/15"], "action": "reject"},
+            {"ip_cidr": ["198.18.0.0/15", "100.64.0.0/10"], "action": "reject"},
         ],
         "final": "direct",
     }
@@ -120,7 +145,7 @@ def test_maintenance_users_sorted_and_inbound_names_match_devices(inputs):
                     hy2_password="TEST-ONLY-other-password")
     ctx = replace(ctx, maintenance_device_ids=(device.device_id, other.device_id))
     config = render_server(ctx, [device, other])
-    assert config["route"]["rules"][1]["auth_user"] == [other.device_id, device.device_id]
+    assert config["route"]["rules"][2]["auth_user"] == [other.device_id, device.device_id]
     main, backup = config["inbounds"]
     assert main["users"] == [
         {"name": d.device_id, "uuid": d.uuid, "flow": "xtls-rprx-vision"}
