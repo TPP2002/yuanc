@@ -77,8 +77,26 @@ def test_expired_account_can_redeem_to_extend(invite, redeem, clock):
     clock.advance(days=2)
     result = redeem(invite(days=7), token=initial["refresh_token"])
     assert result.status_code == 200
-    assert datetime.fromisoformat(result.json()["expires_at"]) == (
-        datetime.fromisoformat(initial["expires_at"]) + timedelta(days=7))
+    assert datetime.fromisoformat(result.json()["expires_at"]) == clock() + timedelta(days=7)
+
+
+def test_long_expired_account_redeem_counts_from_now(client, invite, redeem, clock):
+    initial = redeem(invite(days=1)).json()
+    clock.advance(days=10)
+    result = redeem(invite(days=7), token=initial["refresh_token"])
+    assert result.status_code == 200
+    assert datetime.fromisoformat(result.json()["expires_at"]) == clock() + timedelta(days=7)
+    session = client.post("/client/session",
+                          json={"refresh_token": result.json()["refresh_token"]})
+    assert session.status_code == 200
+
+
+def test_admin_extend_expired_account_counts_from_now(client, admin, enrolled, clock):
+    clock.advance(days=40)
+    changed = client.post("/admin/accounts/" + enrolled["account_id"] + "/extend",
+                          headers=admin, json={"days": 3})
+    assert changed.status_code == 200
+    assert datetime.fromisoformat(changed.json()["expires_at"]) == clock() + timedelta(days=3)
 
 
 def test_concurrent_last_use_cannot_overspend(invite, redeem, app):
