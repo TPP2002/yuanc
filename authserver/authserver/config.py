@@ -112,6 +112,7 @@ class Limits(Section):
     session_hours: int = Field(default=6, ge=1)
     default_device_limit: int = Field(default=2, ge=1)
     redeem_per_ip_per_hour: int = Field(default=10, ge=1)
+    session_per_ip_per_hour: int = Field(default=120, ge=1)
 
 
 class Settings(Section):

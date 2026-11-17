@@ -3,8 +3,9 @@ import logging
 
 import pytest
 from authserver.app import create_app
-from authserver.config import load_config
+from authserver.config import Settings, load_config
 from authserver.security import hash_token
+from fastapi.testclient import TestClient
 
 
 def test_database_has_no_plaintext_tokens_or_keys(client, enrolled, app, settings):
@@ -73,7 +74,39 @@ def test_redeem_ip_limit_and_window_reset(client, device, clock):
 def test_session_ip_limit(client, enrolled):
     for _ in range(10):
         assert client.post("/client/session", json={"refresh_token": "fake"}).status_code == 401
-    assert client.post("/client/session", json={"refresh_token": enrolled["refresh_token"]}).status_code == 429
+    assert client.post("/client/session",
+                       json={"refresh_token": enrolled["refresh_token"]}).status_code == 200
+
+
+def test_session_limit_is_separate_and_configurable(tmp_path, settings, clock, device):
+    values = {
+        "security": {name: getattr(settings.security, name).get_secret_value()
+                     for name in ("admin_key", "node_key", "token_salt")},
+        "node": {
+            **settings.node.model_dump(exclude={"hy2_certificate", "hy2_obfs_password"}),
+            "hy2_certificate_path": settings.node.hy2_certificate_path,
+            "hy2_obfs_password_path": settings.node.hy2_obfs_password_path,
+        },
+        "limits": {"session_per_ip_per_hour": 3},
+    }
+    custom = Settings.model_validate(values)
+    with TestClient(create_app(custom, tmp_path / "limited.sqlite3", clock)) as limited_client:
+        admin = {"X-Admin-Key": custom.security.admin_key.get_secret_value()}
+        code = limited_client.post("/admin/invites", headers=admin,
+                                   json={"days": 30}).json()["code"]
+        enrolled = limited_client.post(
+            "/client/redeem", json={"code": code, "device": device}).json()
+        for _ in range(3):
+            response = limited_client.post("/client/session",
+                                           json={"refresh_token": enrolled["refresh_token"]})
+            assert response.status_code == 200
+        blocked = limited_client.post("/client/session",
+                                      json={"refresh_token": enrolled["refresh_token"]})
+        assert blocked.status_code == 429
+        assert blocked.headers["retry-after"] == "3600"
+        assert "频繁" in blocked.json()["detail"]
+        assert limited_client.post("/client/redeem",
+                                   json={"code": "missing", "device": device}).status_code == 404
 
 
 def test_logs_and_validation_do_not_echo_tokens(client, enrolled, caplog, device):

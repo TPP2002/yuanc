@@ -54,5 +54,19 @@ def test_heartbeat_persisted_and_audited(client, node_key, app, clock):
         assert heartbeat["ip"] == "testclient"
         assert conn.execute("SELECT COUNT(*) FROM node_heartbeat").fetchone()[0] == 1
         audits = conn.execute("SELECT * FROM audit WHERE who = 'node'").fetchall()
-        assert len(audits) == 2
+        assert len(audits) == 1
         assert all(row["what"] == "node.heartbeat" for row in audits)
+    app.state.service.heartbeat(ip="203.0.113.9")
+    with app.state.service.db.transaction() as conn:
+        heartbeat = conn.execute("SELECT * FROM node_heartbeat").fetchone()
+        assert heartbeat["ip"] == "203.0.113.9"
+        assert conn.execute("SELECT COUNT(*) FROM node_heartbeat").fetchone()[0] == 1
+        audits = conn.execute("SELECT * FROM audit WHERE who = 'node'").fetchall()
+        assert len(audits) == 2
+    assert client.post("/node/heartbeat", headers=node_key).status_code == 200
+    with app.state.service.db.transaction() as conn:
+        heartbeat = conn.execute("SELECT * FROM node_heartbeat").fetchone()
+        assert heartbeat["ip"] == "testclient"
+        assert conn.execute("SELECT COUNT(*) FROM node_heartbeat").fetchone()[0] == 1
+        audits = conn.execute("SELECT * FROM audit WHERE who = 'node'").fetchall()
+        assert len(audits) == 3
