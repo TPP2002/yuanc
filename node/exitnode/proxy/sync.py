@@ -69,6 +69,9 @@ def _plan(devices: list[Device], allowed_list: list[dict]) -> tuple[list[Device]
     return result, diff
 
 
+plan = _plan
+
+
 def sync_allowed(registry: DeviceRegistry, allowed_list: list[dict]) -> Diff:
     original = registry.all()
     devices, diff = _plan(original, allowed_list)

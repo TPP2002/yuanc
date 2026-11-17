@@ -5,6 +5,7 @@ import re
 import tomllib
 from dataclasses import MISSING, asdict, dataclass, field, fields
 from pathlib import PurePosixPath
+from urllib.parse import urlsplit
 
 from .runner import RealRunner, Runner
 
@@ -83,6 +84,13 @@ class Watchdog:
 
 
 @dataclass
+class AuthSync:
+    enabled: bool = False
+    url: str = ""
+    spki_sha256: str = ""
+
+
+@dataclass
 class Config:
     node: Node
     network: Network
@@ -91,6 +99,7 @@ class Config:
     publisher: Publisher
     updater: Updater
     watchdog: Watchdog = field(default_factory=Watchdog)
+    authsync: AuthSync = field(default_factory=AuthSync)
 
     def sanitized(self):
         return asdict(self)
@@ -108,14 +117,15 @@ def load(path: str, runner: Runner | None = None) -> Config:
         # 不转印原文：TOML 错误附近可能包含操作者误填的凭据。
         raise ConfigError(f"配置 {path}：文件无法读取或格式不正确") from exc
     models = {"node": Node, "network": Network, "proxy": Proxy, "admin": Admin,
-              "publisher": Publisher, "updater": Updater, "watchdog": Watchdog}
+              "publisher": Publisher, "updater": Updater, "watchdog": Watchdog,
+              "authsync": AuthSync}
     for name in raw.keys() - models.keys():
         invalid(name, "未知配置项")
     values = {}
     for name, model in models.items():
         if name not in raw:
-            if name == "watchdog":
-                values[name] = Watchdog()
+            if name in {"watchdog", "authsync"}:
+                values[name] = model()
                 continue
             invalid(name, "缺少配置段")
         section = raw[name]
@@ -146,11 +156,34 @@ def load(path: str, runner: Runner | None = None) -> Config:
                 invalid(f"{name}.{key}", "字段类型不正确")
             if (isinstance(value, str) and (not value or any(ord(c) < 32 for c in value))
                     and not (name == "updater" and key == "github_repo" and value == "")
+                    and not (name == "authsync" and key in {"url", "spki_sha256"}
+                             and value == "")
                     # 可选环境字段的空串与格式由下方专用校验处理，保留对应中文错误。
                     and not (name == "node" and key in {"time_zone", "country"})):
                 invalid(f"{name}.{key}", "不能为空或含控制字符")
         values[name] = model(**section)
     config = Config(**values)
+    if config.authsync.enabled:
+        url = config.authsync.url
+        try:
+            parts = urlsplit(url)
+            host, port = parts.hostname, parts.port
+            valid_url = (parts.scheme in {"http", "https"} and host and not parts.username
+                         and not parts.password and not parts.path and not parts.query
+                         and not parts.fragment and not url.endswith(("/", ":"))
+                         and "?" not in url and "#" not in url and "@" not in url
+                         and (port is None or 1 <= port <= 65535)
+                         and re.fullmatch(r"[A-Za-z0-9.-]+", host)
+                         and (parts.scheme != "http" or host == "127.0.0.1"))
+        except ValueError:
+            valid_url = False
+        if not valid_url:
+            invalid("authsync.url", "须为 HTTPS 主机地址或本机 HTTP 地址，不能带路径")
+        pin = config.authsync.spki_sha256
+        if parts.scheme == "https" and not re.fullmatch(r"[A-Za-z0-9+/]{43}=", pin):
+            invalid("authsync.spki_sha256", "HTTPS 须填写有效的公钥指纹")
+        if parts.scheme == "http" and pin:
+            invalid("authsync.spki_sha256", "HTTP 地址不能填写公钥指纹")
     if config.node.time_zone and not re.fullmatch(r"[A-Za-z0-9 ._+/()-]{1,64}", config.node.time_zone):
         invalid("node.time_zone", "须为 IANA 时区名(如 Australia/Sydney)或 Windows 时区标识")
     if config.node.country and not re.fullmatch(r"[A-Z]{2}", config.node.country):

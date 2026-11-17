@@ -2,6 +2,7 @@
 
 import json
 import re
+from contextlib import contextmanager
 from dataclasses import replace
 from typing import NotRequired, TypedDict
 
@@ -146,7 +147,29 @@ def _export(config, runner, ctx, device, clock):
     return path
 
 
+@contextmanager
+def _registry_lock(config, runner):
+    if not config.authsync.enabled:
+        yield
+        return
+    path = config.node.data_dir.rstrip("/") + "/registry.lock"
+    for _ in range(20):
+        if runner.acquire_lock(path):
+            try:
+                yield
+            finally:
+                runner.release_lock(path)
+            return
+        runner.sleep(0.5)
+    raise ValueError("设备登记表正被名单同步占用,请稍后重试")
+
+
 def add(config, runner, *, name, platform="windows", host=None, clock=now):
+    with _registry_lock(config, runner):
+        return _add(config, runner, name=name, platform=platform, host=host, clock=clock)
+
+
+def _add(config, runner, *, name, platform="windows", host=None, clock=now):
     device_id = safe_name(name)
     if platform not in {"windows", "android"}:
         raise ValueError("设备平台只能为 windows 或 android")
@@ -169,6 +192,11 @@ def list_devices(config, runner):
 
 
 def revoke(config, runner, *, name):
+    with _registry_lock(config, runner):
+        _revoke(config, runner, name=name)
+
+
+def _revoke(config, runner, *, name):
     candidate = _CandidateRegistry(registry(config, runner).all())
     device = _find(candidate.all(), name)
     candidate.revoke(device.device_id)

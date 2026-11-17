@@ -441,6 +441,49 @@ def test_watchdog_tick_dispatch(monkeypatch):
     assert calls[0][1] is runner and calls[0][0].watchdog.enabled
 
 
+def test_authsync_subcommands_dispatch(monkeypatch, capsys):
+    from exitnode import authsync
+
+    runner = fake()
+    monkeypatch.setattr(authsync, "tick", lambda config, runner: 7)
+    monkeypatch.setattr(authsync, "status", lambda config, runner: {"version": "v1"})
+    assert main(["authsync", "tick"], runner) == 7
+    assert main(["authsync", "status"], runner) == 0
+    assert json.loads(capsys.readouterr().out) == {"version": "v1"}
+
+
+@pytest.mark.parametrize("enabled,key_present", [(False, False), (True, True), (True, False)])
+def test_init_enables_authsync_timer_only_when_enabled(enabled, key_present, capsys):
+    from exitnode import authsync
+
+    runner = fake(pairing=True)
+    if enabled:
+        runner.files[CONFIG] = runner.files[CONFIG].replace(
+            '[authsync]\nenabled = false\nurl = ""',
+            '[authsync]\nenabled = true\nurl = "http://127.0.0.1"')
+    if key_present:
+        runner.files[authsync.KEY_PATH] = "测试密钥"
+    assert main(["init"], runner) == (1 if enabled and not key_present else 0)
+    command = ("systemctl", "enable", "--now", "exitnode-authsync.timer")
+    assert any(c[0] == "run" and c[1] == command for c in runner.calls) is (enabled and key_present)
+    if enabled and not key_present:
+        assert "未找到节点密钥文件" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_check_includes_authsync_layer_only_when_enabled(enabled, monkeypatch, capsys):
+    runner = fake()
+    if enabled:
+        runner.files[CONFIG] = runner.files[CONFIG].replace(
+            '[authsync]\nenabled = false\nurl = ""',
+            '[authsync]\nenabled = true\nurl = "http://127.0.0.1"')
+    monkeypatch.setattr("exitnode.admin.server.check", lambda config: {
+        "layer": "winclient", "name": "客户端托管服务", "result": "通过", "reason": "测试"})
+    main(["check", "--json"], runner)
+    layers = json.loads(capsys.readouterr().out)["layers"]
+    assert any(layer["layer"] == "authsync" for layer in layers) is enabled
+
+
 @pytest.mark.parametrize("binary", ["/usr/bin/sing-box", "/usr/local/bin/sing-box", None])
 def test_default_binary_first_install_fallback(binary, capsys):
     runner = fake(pairing=True)

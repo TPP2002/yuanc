@@ -54,3 +54,9 @@ weekly_reboot = false
 restart_after_failures = 4
 retry_interval_seconds = 60
 max_backoff_seconds = 300
+
+# 分发版才启用；节点密钥不写在这里。
+[authsync]
+enabled = false
+url = ""
+spki_sha256 = ""

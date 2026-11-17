@@ -1,0 +1,11 @@
+[Unit]
+Description=出口节点每分钟同步放行名单
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=60
+Persistent=false
+Unit=exitnode-authsync.service
+
+[Install]
+WantedBy=timers.target

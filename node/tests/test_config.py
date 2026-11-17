@@ -7,6 +7,35 @@ from exitnode.runner import FakeRunner
 EXAMPLE = Path(__file__).parents[1] / "examples" / "config.example.toml"
 
 
+def test_authsync_defaults_disabled():
+    text = EXAMPLE.read_text(encoding="utf-8")
+    for source in (text, text.split("[authsync]")[0]):
+        value = load("/config", FakeRunner(files={"/config": source})).authsync
+        assert not value.enabled and value.url == value.spki_sha256 == ""
+
+
+@pytest.mark.parametrize("url,pin,extra,valid", [
+    ("", "", "", False),
+    ("http://example.com", "", "", False),
+    ("https://example.com", "", "", False),
+    ("http://127.0.0.1", "A" * 43 + "=", "", False),
+    ("https://example.com/path", "A" * 43 + "=", "", False),
+    ("https://example.com", "bad", "", False),
+    ("http://127.0.0.1", "", "unknown = true\n", False),
+    ("http://127.0.0.1:8000", "", "", True),
+    ("https://example.com:443", "A" * 43 + "=", "", True),
+])
+def test_authsync_validation(url, pin, extra, valid):
+    text = EXAMPLE.read_text(encoding="utf-8").split("[authsync]")[0]
+    text += f'[authsync]\nenabled = true\nurl = "{url}"\nspki_sha256 = "{pin}"\n{extra}'
+    runner = FakeRunner(files={"/config": text})
+    if valid:
+        assert load("/config", runner).authsync.enabled
+    else:
+        with pytest.raises(ConfigError, match="authsync"):
+            load("/config", runner)
+
+
 def environment_config(**values):
     text = EXAMPLE.read_text(encoding="utf-8")
     text = "\n".join(line for line in text.splitlines()
