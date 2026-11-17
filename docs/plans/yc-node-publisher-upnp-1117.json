@@ -1,0 +1,182 @@
+{
+  "schemaVersion": 1,
+  "taskId": "NODE-PUBLISHER-UPNP-MISSING-1117",
+  "slug": "yc-node-publisher-upnp-1117",
+  "title": "节点每十分钟向路由器申请并续期两个端口的映射(UPnP):发布模块、定时单元、安装、状态与检查、卸载清理、文档",
+  "goal": "以派单时 origin/main 头为基点。看板卡 NODE-PUBLISHER-UPNP-MISSING-1117。\n\n问题:设计定的是「节点自己向澳洲家里的路由器申请开端口(UPnP)」,客户不用碰路由器。现在只有配置项 publisher.mode 和 node/exitnode/__init__.py 里一个抛 NotImplementedError 的占位函数,没有任何申请端口映射的代码。小主机接在没做端口转发的家用路由器后面时,外面连不进来。\n\n做法:调用 Debian 12 软件包 miniupnpc(2.2.4)自带的命令行工具 /usr/bin/upnpc,不自己实现协议。它的用法与退出码已对着 2.2.4 源码核实:\n- 申请:upnpc -e <描述> -a @ <内部端口> <外部端口> <tcp|udp> <租期秒数>。选项必须写在 -a 之前;@ 由 upnpc 换成本机局域网地址;租期 0 表示永久。\n- 删除:upnpc -d <外部端口> <tcp|udp>。\n- 退出码:0 成功;2 路由器拒绝了这次映射或删除;1 没找到支持 UPnP 的路由器或参数不对。\n- 成功时标准输出里有一行 ExternalIPAddress = <路由器外网口 IPv4>。\n\n做完后:\n\n一、新模块 node/exitnode/publisher.py,主机操作全部经节点 Runner:\n1. 常量:TOOL = \"/usr/bin/upnpc\";LEASE = 3600;DESCRIPTION = \"exitnode\";状态文件 config.node.data_dir + \"/publisher.json\"。\n2. 要映射的端口固定两条,外部端口与内部端口相同:(config.proxy.reality_port, \"tcp\")、(config.proxy.hy2_port, \"udp\")。\n3. 申请一条:runner.run([TOOL, \"-e\", DESCRIPTION, \"-a\", \"@\", 端口, 端口, 协议, 租期], check=False, timeout=20),端口与租期转成字符串。先用租期 \"3600\";退出码为 2 时再用租期 \"0\" 申请一次(有的路由器只接受永久映射);退出码 0 算成功并记下实际用的租期;退出码 1 不重试。runner.run 抛 RunnerError 按「执行失败」处理。\n4. tick(config, runner) -> int:\n   - config.publisher.mode 不是 \"upnp\":不跑命令、不动状态文件,返回 0。\n   - runner.exists(TOOL) 为假:不跑命令,类别「未安装 miniupnpc」,返回 1。\n   - 依次申请两条。第一条的结果是「没找到路由器」或「执行失败」时不再申请第二条(第二条记同一类别)。\n   - 从成功那次的输出里取 ExternalIPAddress(整行匹配,用 ipaddress.IPv4Address 校验,取不到记 null)。\n   - 两条都成功且外网地址是公网地址(ipaddress 的 is_global 为真)或取不到:返回 0,last_error = null,打印「入口端口:TCP <端口>、UDP <端口> 已向路由器申请映射」。\n   - 两条都成功但外网地址不是公网地址(例如 100.64.x.x、192.168.x.x):类别「路由器外网口不是公网地址」,返回 1。\n   - 其余失败类别固定四种:「未安装 miniupnpc」「没找到支持 UPnP 的路由器」「路由器拒绝了映射」「执行失败」。失败时打印「入口端口:未能自动映射(<类别>);请在路由器上手动把 TCP <端口> 和 UDP <端口> 转发到本机」,返回 1。\n   - 状态文件 JSON,0600,先写 .tmp 再 replace:updated_at、last_ok_at(ISO 时间,由 runner.now() 换算成带时区的 UTC 时间)、consecutive_failures、last_error(类别或 null)、external_ipv4、ports(两项,各含 port、protocol、mapped(布尔)、lease(成功时 3600 或 0,失败时 null))。失败时 last_ok_at 保留上次的值、consecutive_failures 加一;成功时清零。读到损坏的状态文件当作没有。\n   - 输出与状态文件里不出现 upnpc 的原始输出。\n5. remove(config, runner) -> None:mode 为 \"upnp\" 且 TOOL 存在时,对两条各跑一次 [TOOL, \"-d\", 端口, 协议](check=False, timeout=20),任何失败(含 RunnerError)都吞掉不抛;其他情况不跑命令。\n6. status(config, runner) -> 状态文件内容;没有或损坏时返回各字段为空的默认值(ports 为空列表)。\n7. summary(config, runner) -> 一句话:mode 不是 upnp 返回「未启用自动映射」;没有记录返回「尚无映射记录」;last_error 为空返回「已向路由器申请映射」;否则返回「未能自动映射(<类别>),需在路由器上手动转发」。\n8. check(config, runner) -> {\"layer\": \"publisher\", \"name\": \"入口端口映射\", \"result\": …, \"reason\": …}:exitnode-publisher.timer 不是 active → 「失败」「端口映射定时器未运行」;updated_at 距现在超过 1800 秒或没有记录 → 「失败」「半小时内没有端口映射记录」;记录新鲜且 last_error 为空 → 「通过」「两个端口已向路由器申请映射」;记录新鲜但 last_error 非空 → result 写「需手动转发」(不是「失败」:客户手动转发后节点照常可用,不能把整机状态判成异常),reason 写类别加「请在路由器上手动转发」。写法参照 watchdog 的 check。\n\n二、删掉 node/exitnode/__init__.py 里的 publish 占位函数(另外两个占位函数不动)。\n\n三、服务单元与安装(templates、manifest.py、cli.py)。\n1. 新模板 exitnode-publisher.service:照 exitnode-watchdog.service 的写法(同样的加固项、Restart=no、Type=oneshot、Environment=PYTHONPATH=$program_path),Description=出口节点向路由器申请端口映射,After=network-online.target,ExecStart=/usr/bin/python3 -P -m exitnode --config \"$config_path\" publisher tick。新模板 exitnode-publisher.timer:Description=出口节点每十分钟续期端口映射,OnBootSec=45、OnUnitActiveSec=600、Persistent=false、Unit=exitnode-publisher.service、WantedBy=timers.target。两个都加进 manifest.UNITS。\n2. cli.py:新增子命令 exitnode publisher tick(返回 publisher.tick 的返回码)、exitnode publisher status(打印 redact 过的状态 JSON,返回 0)、exitnode publisher remove(调 publisher.remove,打印「已向路由器申请删除端口映射」,返回 0),帮助文字中文。\n3. init:两个单元文件由现有的通用循环写入;在「启用看门狗定时器」那一段之后(若其后已有「启用名单同步定时器」一步,排在它之后)加一步:仅当 config.publisher.mode == \"upnp\" 时 apply(\"启用入口端口映射定时器\", systemctl enable --now exitnode-publisher.timer, {\"kind\": \"systemctl\", \"unit\": \"exitnode-publisher.timer\"});此时若 runner.exists(publisher.TOOL) 为假,在成功项里追加一条「入口端口映射:未找到 upnpc,请执行 apt install miniupnpc,否则需在路由器上手动转发端口」,init 不因此失败。mode 为 \"relay\" 时不启用定时器。\n4. check 命令:仅当 mode == \"upnp\" 时,在现有 insert(-1, …) 那几层之后同样 insert(-1, publisher.check(config, runner))。\n5. status 命令:result[\"publisher\"] = publisher.status(config, runner)(仅 mode == \"upnp\",否则 None);status.py 的 Status 加字段 publisher: dict | None = None,evaluate 原样带出,不参与四档状态的判定;文字输出在「公网 IPv4」一行之后加一行「入口端口:」加 publisher.summary 的那句话(仅 mode == \"upnp\")。\n6. uninstall 命令(只 uninstall,不含 rollback):在撤回安装步骤之前先调 publisher.remove(config, runner)。\n\n四、测试。新文件 node/tests/test_publisher.py(假件用 test_cli 的 fake 与 CONFIG),用例名固定,可再加:\n- test_relay_mode_is_noop\n- test_missing_tool_reports_without_running\n- test_maps_both_ports_with_lease_and_records_external_address:两条 argv 逐项等于上面的写法(含 \"-e\"、\"exitnode\"、\"-a\"、\"@\"、租期 \"3600\"),返回 0,状态里两条 mapped 为真、lease 为 3600、external_ipv4 为假件给的公网地址。\n- test_rejected_lease_retries_permanent:租期 3600 退出码 2、租期 0 退出码 0,记录 lease 为 0,返回 0。\n- test_rejected_both_ways_reports_router_refused\n- test_no_gateway_skips_second_port:第一条退出码 1 时只跑一次 upnpc,类别「没找到支持 UPnP 的路由器」,返回 1。\n- test_runner_error_is_reported_as_failure\n- test_private_wan_address_is_reported:外网地址 100.64.1.2 与 192.168.1.2 各一例,类别「路由器外网口不是公网地址」,返回 1。\n- test_failure_keeps_last_ok_and_counts:先成功一轮再失败两轮,last_ok_at 不变、consecutive_failures 为 2。\n- test_output_and_state_never_contain_raw_tool_output:假件输出里放一段标记文字,打印内容与状态文件里都没有它。\n- test_remove_deletes_both_and_swallows_errors\n- test_check_layer_states:定时器未运行、无记录、记录过期、新鲜成功、新鲜失败(result 为「需手动转发」)。\n- test_summary_sentences\ntest_cli.py 新增:test_publisher_subcommands_dispatch、test_init_enables_publisher_timer_only_for_upnp(含「缺 upnpc 时 init 仍成功并提示」)、test_check_includes_publisher_layer_only_for_upnp、test_status_shows_publisher_line、test_uninstall_removes_mappings_first。\ntest_systemd_render.py:UNITS 元组加两个新单元,补两份黄金文件 node/tests/golden/exitnode-publisher.service 与 .timer;新增 test_publisher_service_and_timer(ExecStart 行、Type=oneshot、OnBootSec=45、OnUnitActiveSec=600)。\n其余既有测试里因「UNITS 多了两个单元、init 多写两个单元文件并多一步启用、status 多一个字段与一行、check 多一层、uninstall 先调删除」而变的精确比对同步改,不改别的断言。既有测试用的假件里没有 /usr/bin/upnpc 时,按「未安装」分支走即可。测试配置里 publisher.mode 是 \"upnp\",所以既有的 check 类测试会多出「入口端口映射」一层:原来期望整体通过的用例,给假件补上 exitnode-publisher.timer 为 active 和一份新鲜且成功的状态记录,让它仍然通过;原来就期望失败的用例不用补。\n\n五、文档。\n- 新建 docs/node/入口发布说明.md,给维护人员看:它做什么(每十分钟向路由器申请把 TCP 主通道端口与 UDP 备用通道端口转到小主机,租期一小时,到期前续期);要装什么(apt install miniupnpc);怎么看结果(exitnode publisher status、exitnode status 里「入口端口」一行、check 里「入口端口映射」一行);五种失败各是什么意思、该怎么办(未安装;路由器没开 UPnP 或不支持 → 在路由器上打开 UPnP 或手动转发两个端口;路由器拒绝 → 端口已被别的设备占用或路由器限制;路由器外网口不是公网地址 → 上面还有一层路由器或运营商共享地址,要找运营商或用中继;执行失败);换路由器后不用重新设置,最长十分钟后自动重新申请;卸载时会先申请删除映射,路由器只接受永久映射而删除失败时要到路由器页面手动删;只支持 UPnP,不支持 NAT-PMP;relay 方式是预留项,不申请映射。已装好的节点升级后要重跑一次 init 才会装上定时器。末尾「真机待验证」列:澳洲现场路由器是否开着 UPnP;映射成功后外网能连进来;租期到期前续期不断线;换路由器后自动恢复;主机上其他防火墙没有拦掉路由器的发现应答。\n- docs/node/配置说明.md:publisher.mode 一行改成现行行为(upnp 时每十分钟申请端口映射,见入口发布说明;relay 为预留项,不申请);publisher.ddns_provider 与 publisher.domain 两行写明「必填文字,当前不使用」。",
+  "background": "项目:外包「澳洲出口节点 + Windows 一键客户端」。节点端 Python 3.11(node/exitnode,测试在 node/tests,无第三方依赖),Debian 12 + systemd。节点装在澳洲客户家里的路由器后面,客户端从国内连进来:主通道 TCP(proxy.reality_port,默认 443),备用通道 UDP(proxy.hy2_port,默认 24443)。\n\n先读(全文):node/exitnode/cli.py、manifest.py(UNITS)、status.py、systemd.py、runner.py 的 Runner 协议与 FakeRunner、watchdog/__init__.py 的 check 与 watchdog/state.py 的保存写法、templates/exitnode-watchdog.service 与 .timer;若仓库里已有 node/exitnode/authsync.py 与它的两个单元模板、node/tests/test_authsync.py,它们是同一种「定时单元 + 状态文件 + 检查层」的现成写法,照着来;node/tests/test_cli.py 的 fake 与 CONFIG、test_systemd_render.py、docs/node/配置说明.md、docs/node/看门狗说明.md(文档体例)。\n\n已定的取舍(不要改):只用 upnpc,不自己实现协议,不做 NAT-PMP,不做动态域名;外部端口与内部端口相同;租期一小时、十分钟续期一次;申请不到映射时检查层写「需手动转发」而不是「失败」;不新增配置项,不改 config.py 与示例配置;不改防火墙规则(本项目的规则表入站是放行策略)。\n\n硬规矩(本仓红线,任何一条做不到就停下交 blocked + forks,不猜):①只改允许清单里的文件;只管本项目自己建的服务、路由、防火墙规则,不碰别的单元和规则表,不改 nft 规则。②凭据不落代码库、不落示例、不落日志;upnpc 的原始输出与报错原文不进 print、日志、异常文本、状态文件,只记固定的中文类别。③申请不到映射不影响隧道服务:不重启、不重载、不改任何别的服务与配置。④安装幂等可回退:新增的安装步骤走 manifest.apply 并带撤回信息;重复跑 init 不重复执行。⑤主机副作用只经 Runner(runner.run / read_file / write_file …),业务代码不直接 open、subprocess、socket;测试只用内存假件(test_cli.fake),不联网、不往仓库目录写文件。⑥工人不许 git 写操作,不许自己跑 pytest / ruff / python(按验收编号走派单器自测通道);不许装依赖,缺依赖交 blocked。⑦既有测试断言只在本单点名的地方改(因新增两个单元、status 多一个字段与一行输出而变的精确比对),其余不删、不跳过、不放宽。⑧新增文案、注释、文档用中文大白话;文档只写现行行为,真机没测的列进「真机待验证」,不写成已通过;每次 Edit / Write 的新内容不超过 150 行。",
+  "nonGoals": [
+    "不改鉴权服务器(authserver/)与 Windows 客户端",
+    "不做 NAT-PMP、动态域名、中继方式",
+    "不做节点公网地址上报(另立卡)",
+    "不改看门狗、升级、救援、名单同步的行为",
+    "不新增配置项"
+  ],
+  "allowedPaths": [
+    "node/exitnode/publisher.py",
+    "node/exitnode/__init__.py",
+    "node/exitnode/cli.py",
+    "node/exitnode/manifest.py",
+    "node/exitnode/status.py",
+    "node/exitnode/templates/exitnode-publisher.service",
+    "node/exitnode/templates/exitnode-publisher.timer",
+    "node/tests/**",
+    "docs/node/入口发布说明.md",
+    "docs/node/配置说明.md"
+  ],
+  "forbiddenPaths": [
+    ".codex/**",
+    ".github/**",
+    ".gitignore",
+    "pyproject.toml",
+    "winclient/**",
+    "scripts/**",
+    "authserver/**",
+    "docs/design/**",
+    "docs/plans/**",
+    "docs/acceptance/**",
+    "docs/交接/**",
+    "docs/winclient/**",
+    "docs/authserver/**",
+    "docs/口径速查表.md",
+    "docs/开工须知.md",
+    "docs/授权页.md",
+    "docs/node/隧道配置说明.md",
+    "docs/node/名单同步说明.md",
+    "node/exitnode/proxy/**",
+    "node/exitnode/updater/**",
+    "node/exitnode/rescue/**",
+    "node/exitnode/watchdog/**",
+    "node/exitnode/admin/**",
+    "node/exitnode/service.py",
+    "node/exitnode/nft.py",
+    "node/exitnode/runner.py",
+    "node/exitnode/config.py",
+    "node/exitnode/device.py",
+    "node/exitnode/authsync.py",
+    "node/examples/**"
+  ],
+  "expectArtifacts": [
+    "node/exitnode/publisher.py",
+    "node/tests/test_publisher.py",
+    "node/exitnode/templates/exitnode-publisher.service",
+    "node/exitnode/templates/exitnode-publisher.timer",
+    "docs/node/入口发布说明.md"
+  ],
+  "acceptance": [
+    {
+      "id": "T-PUBLISHER",
+      "kind": "test:targeted",
+      "target": "node/tests/test_publisher.py",
+      "required": true,
+      "failsOnBase": true
+    },
+    {
+      "id": "T-SYSTEMD",
+      "kind": "test:targeted",
+      "target": "node/tests/test_systemd_render.py",
+      "required": true,
+      "failsOnBase": true
+    },
+    {
+      "id": "T-CLI",
+      "kind": "test:targeted",
+      "target": "node/tests/test_cli.py",
+      "required": true,
+      "failsOnBase": true
+    },
+    {
+      "id": "PYTEST",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+        "node/tests"
+      ],
+      "required": true,
+      "timeoutSec": 900
+    },
+    {
+      "id": "RUFF",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "ruff",
+        "check",
+        "node"
+      ],
+      "required": true,
+      "timeoutSec": 300
+    },
+    {
+      "id": "SHAPE",
+      "kind": "command",
+      "required": true,
+      "timeoutSec": 120,
+      "argv": [
+        "python",
+        "-c",
+        "import sys,pathlib;sys.path.insert(0,'node');import exitnode;from exitnode.manifest import UNITS;from exitnode.systemd import render;from exitnode import publisher;from exitnode.status import Status;s=render('exitnode-publisher.service',{});t=render('exitnode-publisher.timer',{});a=pathlib.Path('node/exitnode/publisher.py').read_text(encoding='utf-8');bad=[k for k,ok in (('units',{'exitnode-publisher.service','exitnode-publisher.timer'}<=UNITS),('exec','publisher tick' in s and 'Type=oneshot' in s and 'NoNewPrivileges=true' in s),('timer','OnUnitActiveSec=600' in t and 'OnBootSec=45' in t),('api',all(hasattr(publisher,n) for n in ('tick','remove','status','summary','check'))),('const',publisher.TOOL=='/usr/bin/upnpc' and publisher.LEASE==3600),('stub',not hasattr(exitnode,'publish')),('field','publisher' in Status.__dataclass_fields__),('raw',not any(x in a for x in ('import subprocess','import socket','open(','urllib')))) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ]
+    },
+    {
+      "id": "TESTS-NEW",
+      "kind": "command",
+      "required": true,
+      "timeoutSec": 120,
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda f:pathlib.Path('node/tests/'+f).read_text(encoding='utf-8');w=(('test_publisher.py',('test_relay_mode_is_noop','test_missing_tool_reports_without_running','test_maps_both_ports_with_lease_and_records_external_address','test_rejected_lease_retries_permanent','test_rejected_both_ways_reports_router_refused','test_no_gateway_skips_second_port','test_runner_error_is_reported_as_failure','test_private_wan_address_is_reported','test_failure_keeps_last_ok_and_counts','test_output_and_state_never_contain_raw_tool_output','test_remove_deletes_both_and_swallows_errors','test_check_layer_states','test_summary_sentences')),);bad=[f+':'+n for f,ns in w for n in ns if 'def '+n+'(' not in r(f)];print(bad);sys.exit(1 if bad else 0)"
+      ]
+    },
+    {
+      "id": "TESTS-OTHER",
+      "kind": "command",
+      "required": true,
+      "timeoutSec": 120,
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda f:pathlib.Path('node/tests/'+f).read_text(encoding='utf-8');w=(('test_cli.py',('test_publisher_subcommands_dispatch','test_init_enables_publisher_timer_only_for_upnp','test_check_includes_publisher_layer_only_for_upnp','test_status_shows_publisher_line','test_uninstall_removes_mappings_first')),('test_systemd_render.py',('test_publisher_service_and_timer',)));bad=[f+':'+n for f,ns in w for n in ns if 'def '+n+'(' not in r(f)];print(bad);sys.exit(1 if bad else 0)"
+      ]
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "required": true,
+      "timeoutSec": 120,
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda f:pathlib.Path('docs/node/'+f).read_text(encoding='utf-8');d=r('入口发布说明.md');c=r('配置说明.md');bad=[k for k,ok in (('pkg','apt install miniupnpc' in d),('status','publisher status' in d),('manual','手动转发' in d),('wan','不是公网地址' in d),('swap','换路由器' in d),('natpmp','NAT-PMP' in d),('init','init' in d),('real','真机待验证' in d),('cfg','入口发布说明' in c and '仅保存设置' not in c)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ]
+    },
+    {
+      "id": "SCOPE",
+      "kind": "command",
+      "required": true,
+      "timeoutSec": 120,
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess as sp,sys;g=lambda *a:sp.check_output(['git','-c','core.quotepath=false']+list(a)).decode('utf-8').split(chr(10));mb=g('merge-base','origin/main','HEAD')[0].strip();ch={p.strip() for p in g('diff','--name-only',mb)+g('ls-files','--others','--exclude-standard') if p.strip()};ok=set([\"node/exitnode/publisher.py\", \"node/exitnode/__init__.py\", \"node/exitnode/cli.py\", \"node/exitnode/manifest.py\", \"node/exitnode/status.py\", \"node/exitnode/templates/exitnode-publisher.service\", \"node/exitnode/templates/exitnode-publisher.timer\", \"docs/node/入口发布说明.md\", \"docs/node/配置说明.md\"]);pre=[\"node/tests/\"];bad=sorted(p for p in ch if p not in ok and not any(p.startswith(x) for x in pre));print(bad);sys.exit(1 if bad else 0)"
+      ]
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "workbuddyTier": "hard",
+  "timeoutSec": 10800,
+  "repoRoot": "E:/yuanc",
+  "steps": [
+    "读 BACKGROUND 列出的文件。先写 test_publisher.py(申请 T-PUBLISHER 证红),再写 publisher.py,T-PUBLISHER 绿。",
+    "两个单元模板、黄金文件、manifest.UNITS、test_systemd_render.py,T-SYSTEMD 绿。",
+    "cli.py(子命令、init 启用步骤、check 层、status 字段与一行输出、uninstall 先删映射)、status.py、删 __init__.py 的占位函数,补 test_cli.py 新用例并同步既有精确比对,T-CLI / PYTEST / RUFF / SHAPE / TESTS-NEW / TESTS-OTHER 绿。",
+    "写两份文档,DOCS / SCOPE 绿。"
+  ]
+}
