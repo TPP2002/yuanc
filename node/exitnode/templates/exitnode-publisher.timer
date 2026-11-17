@@ -1,0 +1,11 @@
+[Unit]
+Description=出口节点每十分钟续期端口映射
+
+[Timer]
+OnBootSec=45
+OnUnitActiveSec=600
+Persistent=false
+Unit=exitnode-publisher.service
+
+[Install]
+WantedBy=timers.target

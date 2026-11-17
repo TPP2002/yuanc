@@ -4,6 +4,7 @@ import pytest
 from exitnode.systemd import render
 
 UNITS = ("exitnode-admin.service", "exitnode-proxy.service",
+         "exitnode-publisher.service", "exitnode-publisher.timer",
          "exitnode-authsync.service", "exitnode-authsync.timer",
          "exitnode-watchdog.service", "exitnode-watchdog.timer",
          "exitnode-recover.service", "exitnode-nft.service")
@@ -121,6 +122,14 @@ def test_authsync_service_and_timer():
     assert "Type=oneshot\n" in text
     timer = render("exitnode-authsync.timer", {})
     assert "OnBootSec=60\n" in timer and "OnUnitActiveSec=60\n" in timer
+
+
+def test_publisher_service_and_timer():
+    text = render("exitnode-publisher.service", {})
+    assert ' --config "/etc/exitnode/config.toml" publisher tick\n' in text
+    assert "Type=oneshot\n" in text
+    timer = render("exitnode-publisher.timer", {})
+    assert "OnBootSec=45\n" in timer and "OnUnitActiveSec=600\n" in timer
 
 
 def test_recover_unit_runs_once_after_proxy_on_boot():

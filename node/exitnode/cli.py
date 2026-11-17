@@ -9,7 +9,7 @@ import sys
 import zipfile
 from pathlib import PurePosixPath
 
-from . import __version__, authsync, device, nft, service, systemd
+from . import __version__, authsync, device, nft, publisher, service, systemd
 from .admin import publish as winclient_publish
 from .admin import server as admin_server
 from .config import ConfigError, load
@@ -102,6 +102,13 @@ def parser():
     sync_parser.add_argument("--config", default=argparse.SUPPRESS, help="配置文件路径")
     actions = sync_parser.add_subparsers(dest="authsync_action", required=True, title="名单同步操作")
     for name, description in (("tick", "执行一轮名单同步"), ("status", "查看名单同步记录")):
+        action = actions.add_parser(name, help=description, description=description)
+        action.add_argument("--config", default=argparse.SUPPRESS, help="配置文件路径")
+    publish_parser = sub.add_parser("publisher", help="管理入口端口映射")
+    publish_parser.add_argument("--config", default=argparse.SUPPRESS, help="配置文件路径")
+    actions = publish_parser.add_subparsers(dest="publisher_action", required=True, title="入口映射操作")
+    for name, description in (("tick", "申请端口映射"), ("status", "查看映射记录"),
+                              ("remove", "删除端口映射")):
         action = actions.add_parser(name, help=description, description=description)
         action.add_argument("--config", default=argparse.SUPPRESS, help="配置文件路径")
     rescue = sub.add_parser("rescue", help="查看或维护独立救援程序")
@@ -325,6 +332,12 @@ def _install(config, config_path, runner, manifest):
             apply("启用名单同步定时器",
                   lambda: runner.run(["systemctl", "enable", "--now", "exitnode-authsync.timer"]),
                   {"kind": "systemctl", "unit": "exitnode-authsync.timer"})
+        if config.publisher.mode == "upnp":
+            apply("启用入口端口映射定时器",
+                  lambda: runner.run(["systemctl", "enable", "--now", "exitnode-publisher.timer"]),
+                  {"kind": "systemctl", "unit": "exitnode-publisher.timer"})
+            if not runner.exists(publisher.TOOL):
+                successful.append("入口端口映射:未找到 upnpc,请执行 apt install miniupnpc,否则需在路由器上手动转发端口")
 
         def install_rescue():
             current = layout.current_target(config, runner)
@@ -490,6 +503,15 @@ def main(argv=None, runner=None, rescue_runner=None):
                 return authsync.tick(config, runner)
             print(redact(json.dumps(authsync.status(config, runner), ensure_ascii=False)))
             return 0
+        if args.command == "publisher":
+            if args.publisher_action == "tick":
+                return publisher.tick(config, runner)
+            if args.publisher_action == "remove":
+                publisher.remove(config, runner)
+                print("已向路由器申请删除端口映射")
+            else:
+                print(redact(json.dumps(publisher.status(config, runner), ensure_ascii=False)))
+            return 0
         if args.command == "device":
             if args.device_action == "add":
                 device.add(config, runner, name=args.name, platform=args.platform, host=args.host)
@@ -515,9 +537,12 @@ def main(argv=None, runner=None, rescue_runner=None):
                 result["layers"].insert(-1, service.harden_check(runner))
                 if config.authsync.enabled:
                     result["layers"].insert(-1, authsync.check(config, runner))
+                if config.publisher.mode == "upnp":
+                    result["layers"].insert(-1, publisher.check(config, runner))
                 result["layers"].append(admin_server.check(config))
             if args.command == "status":
                 result["public_ipv4"] = public_ipv4(runner)
+                result["publisher"] = publisher.status(config, runner) if config.publisher.mode == "upnp" else None
                 try:
                     result["watchdog"] = watchdog_summary(config, runner)
                 except ValueError:
@@ -539,6 +564,8 @@ def main(argv=None, runner=None, rescue_runner=None):
                               State.REAUTH: "需重新授权", State.MANUAL: "需人工处理"}
                     print(labels[status.state] + "：" + status.reason)
                     print("公网 IPv4：" + (status.public_ipv4 or "未取得"))
+                    if config.publisher.mode == "upnp":
+                        print("入口端口：" + publisher.summary(config, runner))
             else:
                 _diagnose(runner, config, result, args.output)
                 return 0
@@ -547,6 +574,8 @@ def main(argv=None, runner=None, rescue_runner=None):
         manifest = Manifest(manifest_path, runner)
         if args.command == "init":
             return _install(config, args.config, runner, manifest)
+        if args.command == "uninstall":
+            publisher.remove(config, runner)
         summary = manifest.rollback(getattr(args, "to_step", None))
         if args.command == "uninstall" and not summary["failed"]:
             if args.purge:
