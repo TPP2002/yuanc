@@ -1,0 +1,200 @@
+{
+  "schemaVersion": 1,
+  "taskId": "NODE-AUTH-SYNC-NOT-WIRED-1117",
+  "slug": "yc-node-authsync-1117",
+  "title": "节点每分钟向鉴权服务器取放行名单并应用、发心跳:分发版接通(配置段、同步模块、定时单元、安装与检查、文档)",
+  "goal": "以派单时 origin/main 头为基点。看板卡 NODE-AUTH-SYNC-NOT-WIRED-1117。\n\n问题:分发版(邀请码模式)的设计是「节点只放行鉴权服务器名单上的设备,吊销和到期 60 秒内生效」。node/exitnode/proxy/sync.py 里按名单增删设备的函数写好了也有测试,但没有任何程序调用;节点不请求 GET /node/allowed,不发 POST /node/heartbeat。结果是邀请码兑出来的设备节点不认,吊销和到期不生效。自用版(exitnode device add 发的设备,account_id 固定为 \"local\")不受影响,本单也不许影响它。\n\n做完后:\n\n一、配置(config.py)。新增可选配置段 [authsync],数据类 AuthSync:enabled: bool = False、url: str = \"\"、spki_sha256: str = \"\"。整段缺省等于未启用(像 watchdog 段一样可省略),既有配置文件照常加载。url 与 spki_sha256 允许空串(不走「不能为空」那条通用校验)。enabled 为 true 时才校验:url 必须是 https://主机[:端口] 或 http://127.0.0.1[:端口](不带路径、不带结尾斜杠、不带账号密码);明文 http 只许 127.0.0.1(鉴权服务器与节点同机部署);https 时 spki_sha256 必填,格式是 43 个 base64 字符加一个等号(与客户端 server.json 的 server_spki_sha256 同一个值);http 时 spki_sha256 必须为空。报错沿用 invalid(键, 中文原因) 的写法。Config 加字段 authsync。node/examples/config.example.toml 末尾加 [authsync] 段:enabled = false、url = \"\"、spki_sha256 = \"\",带一行中文注释说明「分发版才启用;节点密钥不写在这里」。\n\n二、名单比对(proxy/sync.py)。把 _plan 公开为 plan(保留 _plan 这个名字作别名,既有调用与测试不动)。\n\n三、新模块 node/exitnode/authsync.py,主机操作全部经节点 Runner:\n1. 常量:节点密钥文件 service.SECRETS + \"/authserver-node-key\";状态文件 config.node.data_dir + \"/authsync.json\";登记表锁 config.node.data_dir + \"/registry.lock\"。\n2. 取名单:runner.run([\"curl\", \"--silent\", \"--show-error\", \"--fail\", \"--connect-timeout\", \"5\", \"--max-time\", \"15\", \"--max-filesize\", \"4194304\", \"--proto\", \"=https\" 或 \"=http\", \"-H\", \"@-\", …, url + \"/node/allowed\"], check=False, input=\"X-Node-Key: \" + 密钥 + \"\\n\")。https 时另加 \"--insecure\", \"--pinnedpubkey\", \"sha256//\" + spki_sha256(只认公钥指纹,与客户端一致)。不加 --location。密钥只走标准输入,不进 argv。密钥文件不存在、为空、含控制字符或超过 512 字符:不发任何网络请求,按失败处理。\n3. 名单必须是 {\"version\": 非空字符串, \"allowed\": 列表},列表不超过 5000 条;任何一条的 account_id 等于 \"local\" 则整份拒收。不合法一律按失败处理。\n4. 合并:登记表里 account_id == \"local\" 的设备原样保留(在不在名单上都不动,已吊销的也不恢复);其余设备与名单用 sync.plan 比对(名单外的记吊销时间,名单内已吊销的恢复,新设备追加)。合并结果里原有设备顺序不变,新设备追加在末尾;合并后再过一遍 validate_devices。\n5. tick(config, runner) -> int:\n   - 未启用:不读密钥、不跑命令,返回 0。\n   - runner.lock_busy(数据目录 + \"/updater.lock\") 为真(正在升级)或 runner.acquire_lock(登记表锁) 拿不到:本轮跳过,返回 0,状态文件不动。拿到的锁在 finally 里 release_lock。\n   - 取名单失败或名单不合法:登记表、线上配置、last-good 逐字节不变,不校验不重载;状态文件 consecutive_failures 加一、last_error 写固定的中文类别(「取名单失败」「名单格式不对」「节点密钥文件缺失或无效」「发布失败」四选一,不带命令输出);返回 1。\n   - 合并结果与登记表相同:不调 sing-box check、不重载。\n   - 有变化:调 service.publish(config, runner, devices=合并结果)(它负责内核校验、写线上配置与登记表、重载、更新 last-good);它抛 ValueError 时按「发布失败」处理,返回 1。\n   - 取名单成功后(不论有无变化)发一次心跳:同样的 curl 参数加 \"-X\", \"POST\",地址 url + \"/node/heartbeat\"。心跳失败不算本轮失败,只在状态文件记 heartbeat_ok = false。\n   - 成功:状态文件写 version、last_ok_at、consecutive_failures = 0、last_error = null、heartbeat_ok;打印一行「名单同步:新增 N,移除 M,保持 K」。输出与状态文件里不出现 uuid、密码、密钥。返回 0。\n   - 状态文件 JSON,0600,字段:version、last_ok_at、updated_at(ISO 时间,用 runner.now() 换算)、consecutive_failures、last_error、heartbeat_ok。读到损坏的状态文件当作没有。\n6. check(config, runner) -> 检查层字典 {\"layer\": \"authsync\", \"name\": \"名单同步\", \"result\": \"通过\" 或 \"失败\", \"reason\": …}:exitnode-authsync.timer 处于 active 且 last_ok_at 距现在不超过 600 秒才通过;写法参照 watchdog 的 check。\n7. status(config, runner) -> 状态文件内容(没有则各字段为空的默认值)。\n\n四、设备命令加锁(device.py)。只在 config.authsync.enabled 为 true 时,add 与 revoke 在读登记表之前拿登记表锁:拿不到就 runner.sleep(0.5) 后重试,最多 20 次,仍拿不到抛 ValueError(\"设备登记表正被名单同步占用,请稍后重试\");finally 里释放。未启用时行为与调用序列与现在完全一致。\n\n五、服务单元与安装(templates、manifest.py、cli.py)。\n1. 新模板 exitnode-authsync.service:照 exitnode-watchdog.service 的写法(同样的加固项与 Restart=no、Type=oneshot、Environment=PYTHONPATH=$program_path),Description=出口节点放行名单同步,ExecStart=/usr/bin/python3 -P -m exitnode --config \"$config_path\" authsync tick。新模板 exitnode-authsync.timer:Description=出口节点每分钟同步放行名单,OnBootSec=60、OnUnitActiveSec=60、Persistent=false、Unit=exitnode-authsync.service、WantedBy=timers.target。两个都加进 manifest.UNITS。\n2. cli.py:新增子命令 exitnode authsync tick(返回 authsync.tick 的返回码)与 exitnode authsync status(打印 redact 过的状态 JSON,返回 0),帮助文字中文。init 里两个单元文件由现有的通用循环写入;在「启用看门狗定时器」之后加一步:仅当 config.authsync.enabled 时,先确认节点密钥文件存在(不存在抛 ValueError(\"已启用名单同步,但未找到节点密钥文件,请把鉴权服务器的 node_key 写入 /var/lib/exitnode/secrets/authserver-node-key\")),再 apply(\"启用名单同步定时器\", systemctl enable --now exitnode-authsync.timer, {\"kind\": \"systemctl\", \"unit\": \"exitnode-authsync.timer\"})。check 命令:仅当启用时,在现有 insert(-1, …) 那几层之后同样 insert(-1, authsync.check(config, runner))。未启用时 check / status 的输出与现在逐字节相同。\n\n六、测试。新文件 node/tests/test_authsync.py(假件用 test_cli 的 fake 与 CONFIG,做法参照 test_device.py 的 installed 夹具),用例名固定,可再加:\n- test_disabled_tick_is_noop\n- test_tick_adds_and_revokes_remote_devices_and_keeps_local:登记表有一台 local 设备、一台名单外的远端设备;名单给一台新设备。tick 后 local 设备逐字段不变且未吊销,旧远端设备有吊销时间,新设备在册;调用序列里有内核校验与对 exitnode-proxy.service 的 reload;last-good 等于线上配置;输出含「新增 1,移除 1」且不含任何 uuid 与密码。\n- test_list_with_local_account_is_rejected\n- test_fetch_failure_changes_nothing_and_counts_failures:curl 退出码 7 两轮,登记表与线上配置逐字节不变、没有校验与重载、consecutive_failures 为 2、返回 1。\n- test_invalid_payload_changes_nothing:参数化——不是 JSON、缺 allowed、allowed 不是列表、uuid 重复、条目缺字段、version 为空、5001 条。\n- test_unchanged_list_does_not_check_or_reload\n- test_node_key_goes_through_stdin_only:每条 curl 的 argv 里没有密钥,input 是 \"X-Node-Key: <密钥>\\n\";密钥不出现在输出与状态文件里。\n- test_https_pins_public_key_and_never_follows_redirects:argv 含 \"--pinnedpubkey\"、\"sha256//<指纹>\"、\"--proto\"、\"=https\",不含 \"--location\" 与 \"-L\"。\n- test_http_loopback_has_no_pin\n- test_missing_node_key_fails_before_network\n- test_busy_registry_lock_or_upgrade_lock_skips\n- test_heartbeat_after_fetch_and_its_failure_is_not_fatal\n- test_publish_failure_keeps_registry_and_reports:内核校验返回非零时登记表不变、返回 1、last_error 为「发布失败」。\n- test_check_layer_fresh_stale_and_timer\n- test_device_add_waits_for_registry_lock_when_enabled:启用且锁被占时重试 20 次后报中文错误、登记表不变;未启用时不碰锁。\ntest_config.py 新增:test_authsync_defaults_disabled(不写该段、示例配置都能加载且未启用)、test_authsync_validation(参数化:启用但 url 为空、http 非回环、https 缺指纹、http 带指纹、url 带路径、指纹格式不对、未知键;以及两种合法写法)。\ntest_cli.py 新增:test_authsync_subcommands_dispatch、test_init_enables_authsync_timer_only_when_enabled(含「启用但缺密钥文件时 init 失败且不启用定时器」)、test_check_includes_authsync_layer_only_when_enabled。\ntest_systemd_render.py:UNITS 元组加两个新单元,补两份黄金文件 node/tests/golden/exitnode-authsync.service 与 .timer;新增 test_authsync_service_and_timer(ExecStart 行、Type=oneshot、OnBootSec=60、OnUnitActiveSec=60);沙箱类参数化用例把新服务单元加进去。\n其余既有测试里因「UNITS 多了两个单元、init 多写两个单元文件」而变的精确比对同步改,不改别的断言。\n\n七、文档。\n- 新建 docs/node/名单同步说明.md,给维护人员看:什么时候要开(分发版才开,自用版不用);怎么开(配置三项各填什么、节点密钥文件放哪、权限 0600、重跑一次 init);每分钟做什么;几种情况的表现——新兑码的设备最长约一分钟后才连得上;名单有变化时隧道服务重载一次,在线设备会断开并自动重连;鉴权服务器连不上时保持现有名单不动,吊销要等恢复后才生效;自用设备不受名单影响;怎么看状态(exitnode authsync status、check 里的「名单同步」一行)。已装好的节点升级后,要在配置里加 [authsync] 并重跑一次 init 才会装上定时器。末尾「真机待验证」列:Debian 12 的 curl 在 --insecure 下仍按 --pinnedpubkey 拒绝指纹不符的服务器;定时器每 60 秒触发;重载后在线设备自动重连;同机 http://127.0.0.1 部署。\n- docs/node/配置说明.md「每一项怎么填」表里补 authsync.enabled、authsync.url、authsync.spki_sha256 三行,并指到名单同步说明。",
+  "background": "项目:外包「澳洲出口节点 + Windows 一键客户端」。节点端 Python 3.11(node/exitnode,测试在 node/tests,无第三方依赖),Debian 12 + systemd,隧道内核 sing-box 1.13.21。鉴权服务器(authserver,FastAPI)的节点接口:GET /node/allowed 返回 {\"version\": 摘要, \"allowed\": [{\"uuid\", \"hy2_password\", \"account_id\", \"device_id\"}, …]};POST /node/heartbeat 无请求体;两者都要请求头 X-Node-Key,密钥不对返回 404 网页。鉴权服务器本身只提供 HTTP,对外 HTTPS 可用自签证书,客户端与节点都只认证书公钥指纹。\n\n先读(全文):node/exitnode/proxy/sync.py、proxy/registry.py、service.py(publish 与 _publish_checked)、device.py、config.py、cli.py、manifest.py(UNITS)、systemd.py、runner.py 的 Runner 协议、updater/upgrade.py 第 18~45 行(curl 经标准输入传请求头的现成写法)与第 440~455 行(锁的用法)、watchdog/__init__.py 的 check、templates/exitnode-watchdog.service 与 .timer、node/tests/test_cli.py 的 fake 与 CONFIG、test_device.py 的 installed 夹具、test_systemd_render.py、test_config.py、docs/node/配置说明.md、docs/node/看门狗说明.md(文档体例)。\n\n已定的取舍(不要改):名单同步默认关闭;自用设备(account_id 为 local)永远不受名单影响;鉴权服务器不通时保持现有名单;同步复用 service.publish,不复用 sync.apply_sync(它的重载单元名与权限口径和节点服务不一致);节点密钥只放 secrets 目录的独立文件,不进配置文件。\n\n同仓另有两张单在改 node/exitnode/proxy/server_config.py、node/tests/test_proxy_server_render.py、node/tests/golden/proxy/、docs/node/隧道配置说明.md 与 authserver/,本单一律不碰。\n\n硬规矩(本仓红线,任何一条做不到就停下交 blocked + forks,不猜):①只改允许清单里的文件;只管本项目自己建的服务、路由、防火墙规则,不碰别的单元和规则表。②凭据不落代码库、不落示例、不落日志:节点密钥、设备 uuid、备用通道密码、curl 的输出与报错原文,一律不进 print、日志、异常文本、状态文件、测试输出;示例配置不写任何密钥;不读写仓库里的 secrets/ 目录。③失败时保持现状:取不到名单、名单不合法、校验不过,登记表与线上配置逐字节不变,不清空名单,不重载。④安装幂等可回退:新增的安装步骤走 manifest.apply 并带撤回信息;重复跑 init 不重复执行。⑤主机副作用只经 Runner(runner.run / read_file / write_file …),业务代码不直接 open、subprocess、socket;测试只用内存假件(test_cli.fake),不联网、不往仓库目录写文件。⑥工人不许 git 写操作,不许自己跑 pytest / ruff / python(按验收编号走派单器自测通道);不许装依赖,缺依赖交 blocked。⑦既有测试断言只在本单点名的地方改(因新增两个单元、新增配置段而变的精确比对),其余不删、不跳过、不放宽。⑧新增文案、注释、文档用中文大白话;文档只写现行行为,真机没测的列进「真机待验证」,不写成已通过;每次 Edit / Write 的新内容不超过 150 行。",
+  "nonGoals": [
+    "不改鉴权服务器(authserver/)与 Windows 客户端",
+    "不做节点公网地址上报与鉴权服务器下发地址的联动(另立卡)",
+    "不改看门狗、升级、救援的行为",
+    "不改 sync.apply_sync 与 sync_allowed 的既有行为"
+  ],
+  "allowedPaths": [
+    "node/exitnode/authsync.py",
+    "node/exitnode/config.py",
+    "node/exitnode/cli.py",
+    "node/exitnode/device.py",
+    "node/exitnode/manifest.py",
+    "node/exitnode/proxy/sync.py",
+    "node/exitnode/templates/exitnode-authsync.service",
+    "node/exitnode/templates/exitnode-authsync.timer",
+    "node/examples/config.example.toml",
+    "node/tests/**",
+    "docs/node/名单同步说明.md",
+    "docs/node/配置说明.md"
+  ],
+  "forbiddenPaths": [
+    ".codex/**",
+    ".github/**",
+    ".gitignore",
+    "pyproject.toml",
+    "winclient/**",
+    "scripts/**",
+    "authserver/**",
+    "docs/design/**",
+    "docs/plans/**",
+    "docs/acceptance/**",
+    "docs/交接/**",
+    "docs/winclient/**",
+    "docs/authserver/**",
+    "docs/口径速查表.md",
+    "docs/开工须知.md",
+    "docs/授权页.md",
+    "docs/node/隧道配置说明.md",
+    "node/exitnode/proxy/server_config.py",
+    "node/exitnode/proxy/client_config.py",
+    "node/exitnode/updater/**",
+    "node/exitnode/rescue/**",
+    "node/exitnode/watchdog/**",
+    "node/exitnode/admin/**",
+    "node/exitnode/service.py",
+    "node/exitnode/nft.py",
+    "node/exitnode/runner.py",
+    "node/tests/test_proxy_server_render.py",
+    "node/tests/golden/proxy/*"
+  ],
+  "expectArtifacts": [
+    "node/exitnode/authsync.py",
+    "node/tests/test_authsync.py",
+    "node/exitnode/templates/exitnode-authsync.service",
+    "node/exitnode/templates/exitnode-authsync.timer",
+    "docs/node/名单同步说明.md"
+  ],
+  "acceptance": [
+    {
+      "id": "T-AUTHSYNC",
+      "kind": "test:targeted",
+      "target": "node/tests/test_authsync.py",
+      "required": true,
+      "failsOnBase": true
+    },
+    {
+      "id": "T-CONFIG",
+      "kind": "test:targeted",
+      "target": "node/tests/test_config.py",
+      "required": true,
+      "failsOnBase": true
+    },
+    {
+      "id": "T-SYSTEMD",
+      "kind": "test:targeted",
+      "target": "node/tests/test_systemd_render.py",
+      "required": true,
+      "failsOnBase": true
+    },
+    {
+      "id": "T-CLI",
+      "kind": "test:targeted",
+      "target": "node/tests/test_cli.py",
+      "required": true,
+      "failsOnBase": true
+    },
+    {
+      "id": "PYTEST",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+        "node/tests"
+      ],
+      "required": true,
+      "timeoutSec": 900
+    },
+    {
+      "id": "RUFF",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "ruff",
+        "check",
+        "node"
+      ],
+      "required": true,
+      "timeoutSec": 300
+    },
+    {
+      "id": "SHAPE",
+      "kind": "command",
+      "required": true,
+      "timeoutSec": 120,
+      "argv": [
+        "python",
+        "-c",
+        "import sys,pathlib;sys.path.insert(0,'node');from exitnode.manifest import UNITS;from exitnode.systemd import render;from exitnode import authsync;from exitnode.proxy import sync;s=render('exitnode-authsync.service',{});t=render('exitnode-authsync.timer',{});e=pathlib.Path('node/examples/config.example.toml').read_text(encoding='utf-8');a=pathlib.Path('node/exitnode/authsync.py').read_text(encoding='utf-8');bad=[k for k,ok in (('units',{'exitnode-authsync.service','exitnode-authsync.timer'}<=UNITS),('exec','authsync tick' in s and 'Type=oneshot' in s and 'NoNewPrivileges=true' in s),('timer','OnUnitActiveSec=60' in t and 'OnBootSec=60' in t),('example','[authsync]' in e and 'enabled = false' in e),('api',all(hasattr(authsync,n) for n in ('tick','check','status')) and hasattr(sync,'plan')),('pin','--pinnedpubkey' in a and '@-' in a and '--location' not in a)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ]
+    },
+    {
+      "id": "SHAPE-RUNNER",
+      "kind": "command",
+      "required": true,
+      "timeoutSec": 120,
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;a=pathlib.Path('node/exitnode/authsync.py').read_text(encoding='utf-8');bad=[k for k in ('import subprocess','import socket','open(','urllib','http.client') if k in a];print(bad);sys.exit(1 if bad else 0)"
+      ]
+    },
+    {
+      "id": "TESTS-NEW",
+      "kind": "command",
+      "required": true,
+      "timeoutSec": 120,
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda f:pathlib.Path('node/tests/'+f).read_text(encoding='utf-8');w=(('test_authsync.py',('test_disabled_tick_is_noop','test_tick_adds_and_revokes_remote_devices_and_keeps_local','test_list_with_local_account_is_rejected','test_fetch_failure_changes_nothing_and_counts_failures','test_invalid_payload_changes_nothing','test_unchanged_list_does_not_check_or_reload','test_node_key_goes_through_stdin_only','test_https_pins_public_key_and_never_follows_redirects','test_http_loopback_has_no_pin','test_missing_node_key_fails_before_network','test_busy_registry_lock_or_upgrade_lock_skips','test_heartbeat_after_fetch_and_its_failure_is_not_fatal','test_publish_failure_keeps_registry_and_reports','test_check_layer_fresh_stale_and_timer','test_device_add_waits_for_registry_lock_when_enabled')),);bad=[f+':'+n for f,ns in w for n in ns if 'def '+n+'(' not in r(f)];print(bad);sys.exit(1 if bad else 0)"
+      ]
+    },
+    {
+      "id": "TESTS-OTHER",
+      "kind": "command",
+      "required": true,
+      "timeoutSec": 120,
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda f:pathlib.Path('node/tests/'+f).read_text(encoding='utf-8');w=(('test_config.py',('test_authsync_defaults_disabled','test_authsync_validation')),('test_cli.py',('test_authsync_subcommands_dispatch','test_init_enables_authsync_timer_only_when_enabled','test_check_includes_authsync_layer_only_when_enabled')),('test_systemd_render.py',('test_authsync_service_and_timer',)));bad=[f+':'+n for f,ns in w for n in ns if 'def '+n+'(' not in r(f)];print(bad);sys.exit(1 if bad else 0)"
+      ]
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "required": true,
+      "timeoutSec": 120,
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;r=lambda f:pathlib.Path('docs/node/'+f).read_text(encoding='utf-8');d=r('名单同步说明.md');c=r('配置说明.md');bad=[k for k,ok in (('key','authserver-node-key' in d and '0600' in d),('init','init' in d),('static','保持现有名单' in d),('reload','重连' in d),('local','自用' in d),('real','真机待验证' in d and 'pinnedpubkey' in d),('status','authsync status' in d),('cfg',all(x in c for x in ('authsync.enabled','authsync.url','authsync.spki_sha256')))) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ]
+    },
+    {
+      "id": "SCOPE",
+      "kind": "command",
+      "required": true,
+      "timeoutSec": 120,
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess as sp,sys;g=lambda *a:sp.check_output(['git','-c','core.quotepath=false']+list(a)).decode('utf-8').split(chr(10));mb=g('merge-base','origin/main','HEAD')[0].strip();ch={p.strip() for p in g('diff','--name-only',mb)+g('ls-files','--others','--exclude-standard') if p.strip()};ok=set([\"node/exitnode/authsync.py\", \"node/exitnode/config.py\", \"node/exitnode/cli.py\", \"node/exitnode/device.py\", \"node/exitnode/manifest.py\", \"node/exitnode/proxy/sync.py\", \"node/exitnode/templates/exitnode-authsync.service\", \"node/exitnode/templates/exitnode-authsync.timer\", \"node/examples/config.example.toml\", \"docs/node/名单同步说明.md\", \"docs/node/配置说明.md\"]);pre=[\"node/tests/\"];no=('node/tests/test_proxy_server_render.py','node/tests/golden/proxy/');bad=sorted(p for p in ch if p.startswith(no) or (p not in ok and not any(p.startswith(x) for x in pre)));print(bad);sys.exit(1 if bad else 0)"
+      ]
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "workbuddyTier": "hard",
+  "timeoutSec": 10800,
+  "repoRoot": "E:/yuanc",
+  "steps": [
+    "读 BACKGROUND 列出的文件。先写 test_config.py 的两个新用例与 config.py 的 [authsync] 段、示例配置,T-CONFIG 绿。",
+    "sync.py 公开 plan;写 test_authsync.py(先申请 T-AUTHSYNC 证红),再写 authsync.py,T-AUTHSYNC 绿。",
+    "两个单元模板、黄金文件、manifest.UNITS、test_systemd_render.py,T-SYSTEMD 绿。",
+    "cli.py(子命令、init 启用步骤、check 层)与 device.py(启用时加锁),补 test_cli.py 新用例并同步既有精确比对,T-CLI / PYTEST / RUFF / SHAPE / TESTS-NEW 绿。",
+    "写两份文档,DOCS / SCOPE 绿。"
+  ]
+}
