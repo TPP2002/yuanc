@@ -155,7 +155,16 @@ def test_missing_node_key_fails_before_network(installed):
     assert authsync.status(config, runner)["last_error"] == "节点密钥文件缺失或无效"
 
 
-@pytest.mark.parametrize("key", ["", "x\ny", "x\x7fy", "x" * 513])
+@pytest.mark.parametrize("ending", ["\n", "\r\n"])
+def test_trailing_newline_in_key_file_is_ignored(installed, ending):
+    config, runner = installed
+    runner.files[KEY_PATH] = KEY + ending
+    reply(runner, [])
+    assert authsync.tick(config, runner) == 0
+    assert all(c[3] == "X-Node-Key: " + KEY + "\n" for c in commands(runner) if c[1][0] == "curl")
+
+
+@pytest.mark.parametrize("key", ["", "\n", "x\ny", "x\x7fy", "x" * 513])
 def test_invalid_node_key_fails_before_network(installed, key):
     config, runner = installed
     runner.files[KEY_PATH] = key

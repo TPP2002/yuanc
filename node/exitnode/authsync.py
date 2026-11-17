@@ -74,7 +74,8 @@ def tick(config, runner):
         return 0
     try:
         try:
-            key = runner.read_file(KEY_PATH)
+            # 文件末尾的换行是写文件时带上的，不属于密钥。
+            key = runner.read_file(KEY_PATH).rstrip("\r\n")
             if not key or len(key) > 512 or any(unicodedata.category(c) == "Cc" for c in key):
                 raise ValueError
         except (OSError, ValueError, UnicodeError):
