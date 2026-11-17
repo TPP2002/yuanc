@@ -89,6 +89,14 @@ def test_six_hour_session_boundary(client, enrolled, clock, app):
     assert issue(client, enrolled).status_code == 200
 
 
+def test_expired_sessions_are_pruned(client, enrolled, clock, app):
+    assert issue(client, enrolled).status_code == 200
+    clock.advance(hours=7)
+    assert issue(client, enrolled).status_code == 200
+    with app.state.service.db.transaction() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 1
+
+
 @pytest.mark.parametrize("token_field", ["session_token", "refresh_token"])
 def test_logout_invalidates_credentials(client, enrolled, app, node_key, token_field):
     session = issue(client, enrolled).json()

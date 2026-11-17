@@ -27,6 +27,11 @@ def add_days(value, days):
         raise Problem(422, "期限超出支持的日期范围") from None
 
 
+def extend_from(value, at, days):
+    """从旧到期日与当前时间中较晚的一个起算,叠加天数。"""
+    return add_days(value if value > at else at, days)
+
+
 class Service:
     def __init__(self, db, settings, clock=now):
         self.db = db
@@ -75,9 +80,10 @@ class Service:
         with self.db.transaction() as conn:
             return self._devices(conn)
 
-    def audits(self):
+    def audits(self, limit=2000):
         with self.db.transaction() as conn:
-            return [dict(row) for row in conn.execute("SELECT * FROM audit ORDER BY id")]
+            rows = conn.execute("SELECT * FROM audit ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+            return [dict(row) for row in reversed(rows)]
 
     def change_account(self, account_id, action, ip="local", days=None):
         at = self.time()
@@ -89,7 +95,7 @@ class Service:
                 if days is None or days < 1:
                     raise Problem(422, "天数必须为正整数")
                 conn.execute("UPDATE accounts SET expires_at = ? WHERE id = ?",
-                             (add_days(account["expires_at"], days), account_id))
+                             (extend_from(account["expires_at"], at, days), account_id))
             elif action in ("disable", "enable"):
                 conn.execute("UPDATE accounts SET status = ? WHERE id = ?",
                              ("disabled" if action == "disable" else "active", account_id))
@@ -173,7 +179,7 @@ class Service:
                     account = conn.execute("SELECT * FROM accounts WHERE id = ?",
                                            (account_id,)).fetchone()
                 else:
-                    expires = add_days(account["expires_at"], invite["days"])
+                    expires = extend_from(account["expires_at"], at, invite["days"])
                     conn.execute("UPDATE accounts SET expires_at = ? WHERE id = ?",
                                  (expires, account["id"]))
                 conn.execute("UPDATE invites SET used = used + 1 WHERE code = ?", (code,))
@@ -210,6 +216,7 @@ class Service:
         with self.db.transaction(write=True) as conn:
             device = self._by_refresh(conn, refresh_token)
             account = self._check(conn, device, at)
+            conn.execute("DELETE FROM sessions WHERE expires_at <= ?", (at,))
             raw = new_token()
             expires = iso(datetime.fromisoformat(at) + timedelta(
                 hours=self.settings.limits.session_hours))
@@ -268,7 +275,9 @@ class Service:
     def heartbeat(self, ip="local"):
         at = self.time()
         with self.db.transaction(write=True) as conn:
+            previous = conn.execute("SELECT ip FROM node_heartbeat WHERE id = 1").fetchone()
             conn.execute("""INSERT INTO node_heartbeat VALUES (1, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET at = excluded.at, ip = excluded.ip""", (at, ip))
-            audit(conn, "node", "node.heartbeat", at, ip)
+            if previous is None or previous["ip"] != ip:
+                audit(conn, "node", "node.heartbeat", at, ip)
         return {"at": at}

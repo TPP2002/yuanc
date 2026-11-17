@@ -4,7 +4,7 @@ import os
 from collections import deque
 from threading import Lock
 
-from fastapi import Depends, FastAPI, Header, Request
+from fastapi import Depends, FastAPI, Header, Query, Request
 from fastapi.exception_handlers import http_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -72,8 +72,8 @@ class LogoutInput(Input):
 
 
 class RateLimiter:
-    def __init__(self, limit, clock):
-        self.limit = limit
+    def __init__(self, limits, clock):
+        self.limits = limits
         self.clock = clock
         self.buckets = {}
         self.lock = Lock()
@@ -88,7 +88,7 @@ class RateLimiter:
                 if not queue:
                     del self.buckets[key]
             queue = self.buckets.setdefault((ip, kind), deque())
-            if len(queue) >= self.limit:
+            if len(queue) >= self.limits[kind]:
                 raise Problem(429, "请求过于频繁，请一小时后重试")
             queue.append(stamp)
 
@@ -105,7 +105,10 @@ def create_app(settings=None, db_path=None, clock=now):
     app = FastAPI(title="邀请码鉴权服务", debug=False,
                   docs_url=None, redoc_url=None, openapi_url=None)
     app.state.service = service
-    limiter = RateLimiter(settings.limits.redeem_per_ip_per_hour, clock)
+    limiter = RateLimiter({
+        "redeem": settings.limits.redeem_per_ip_per_hour,
+        "session": settings.limits.session_per_ip_per_hour,
+    }, clock)
     salt = settings.security.token_salt.get_secret_value()
 
     def ip(request):
@@ -189,8 +192,8 @@ def create_app(settings=None, db_path=None, clock=now):
         return service.revoke(device_id, ip(request))
 
     @app.get("/admin/audit", dependencies=[Depends(admin)])
-    def audits():
-        return service.audits()
+    def audits(limit: int = Query(default=2000, ge=1, le=10000)):
+        return service.audits(limit)
 
     @app.post("/client/redeem", dependencies=[Depends(redeem_limit)])
     def redeem(body: RedeemInput, request: Request):

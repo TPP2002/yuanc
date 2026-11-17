@@ -24,4 +24,5 @@ hy2_obfs_password_path = "<节点 /var/lib/exitnode/secrets/hy2.obfs 的本地�
 [limits]
 session_hours = "<会话小时数，默认6>"
 default_device_limit = "<设备上限，默认2>"
-redeem_per_ip_per_hour = "<每个IP每类接口每小时上限，默认10>"
+redeem_per_ip_per_hour = "<每个IP每小时兑换次数上限,默认10>"
+session_per_ip_per_hour = "<每个IP每小时取会话次数上限,默认120>"
