@@ -26,6 +26,7 @@ class Status:
     reason: str = ""
     public_ipv4: str | None = None
     watchdog: dict | None = None
+    publisher: dict | None = None
 
     def to_json(self):
         return redact(json.dumps(asdict(self), ensure_ascii=False))
@@ -53,4 +54,4 @@ def evaluate(check_result):
     if address and ipaddress.IPv4Address(address) in ipaddress.IPv4Network("100.64.0.0/10"):
         reason += "；疑似运营商内网地址(CGNAT),外网无法直连"
     return Status(state, __version__, check_result["network"], reason=reason,
-                  public_ipv4=address, watchdog=watchdog)
+                  public_ipv4=address, watchdog=watchdog, publisher=check_result.get("publisher"))

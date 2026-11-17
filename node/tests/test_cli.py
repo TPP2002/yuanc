@@ -18,6 +18,66 @@ def test_upgrade_parser_accepts_downgrade_and_switch():
     assert args.allow_downgrade is True
     assert args.switch == "0.1.0"
 
+
+def test_publisher_subcommands_dispatch(capsys):
+    from exitnode import publisher
+
+    runner = fake()
+    runner.files[publisher.TOOL] = "工具"
+    runner.responses[(publisher.TOOL,)] = CompletedResult(out="ExternalIPAddress = 8.8.8.8")
+    assert main(["publisher", "tick"], runner) == 0
+    capsys.readouterr()
+    assert main(["publisher", "status"], runner) == 0
+    assert json.loads(capsys.readouterr().out)["external_ipv4"] == "8.8.8.8"
+    assert main(["publisher", "remove"], runner) == 0
+    assert "已向路由器申请删除端口映射" in capsys.readouterr().out
+
+
+def test_init_enables_publisher_timer_only_for_upnp(capsys):
+    runner = fake(pairing=True)
+    assert main(["init"], runner) == 0
+    assert "未找到 upnpc" in capsys.readouterr().out
+    assert any(c[0] == "run" and c[1] == ("systemctl", "enable", "--now",
+                                          "exitnode-publisher.timer") for c in runner.calls)
+    runner = fake(pairing=True)
+    runner.files[CONFIG] = TEXT.replace('mode = "upnp"', 'mode = "relay"')
+    assert main(["init"], runner) == 0
+    assert not any(c[0] == "run" and c[1] == ("systemctl", "enable", "--now",
+                                              "exitnode-publisher.timer") for c in runner.calls)
+
+
+def test_check_includes_publisher_layer_only_for_upnp(capsys):
+    runner = fake()
+    main(["check", "--json"], runner)
+    assert any(x["layer"] == "publisher" for x in json.loads(capsys.readouterr().out)["layers"])
+    runner.files[CONFIG] = TEXT.replace('mode = "upnp"', 'mode = "relay"')
+    main(["check", "--json"], runner)
+    assert not any(x["layer"] == "publisher" for x in json.loads(capsys.readouterr().out)["layers"])
+
+
+def test_status_shows_publisher_line(capsys):
+    runner = fake()
+    assert main(["status"], runner) == 0
+    assert "入口端口：尚无映射记录" in capsys.readouterr().out
+    runner.files[CONFIG] = TEXT.replace('mode = "upnp"', 'mode = "relay"')
+    assert main(["status"], runner) == 0
+    assert "入口端口：" not in capsys.readouterr().out
+
+
+def test_uninstall_removes_mappings_first():
+    from exitnode import publisher
+
+    runner = fake(pairing=True)
+    assert main(["init"], runner) == 0
+    runner.files[publisher.TOOL] = "工具"
+    runner.responses[(publisher.TOOL,)] = CompletedResult()
+    boundary = len(runner.calls)
+    assert main(["uninstall"], runner) == 0
+    runs = [c[1] for c in runner.calls[boundary:] if c[0] == "run"]
+    assert runs[0][:2] == (publisher.TOOL, "-d")
+    assert runs[1][:2] == (publisher.TOOL, "-d")
+    assert runs[2][0] == "systemctl"
+
 CONFIG = "/etc/exitnode/config.toml"
 TEXT = (Path(__file__).parents[1] / "examples" / "config.example.toml").read_text(encoding="utf-8")
 
@@ -72,7 +132,7 @@ def test_status_json_fields_and_four_states(capsys):
     assert main(["status", "--json"], runner) == 0
     result = json.loads(capsys.readouterr().out)
     assert set(result) == {"state", "version", "network", "path", "last_ok_at", "reason",
-                           "public_ipv4", "watchdog"}
+                           "public_ipv4", "watchdog", "publisher"}
     assert result["watchdog"] is None
     assert result["public_ipv4"] is None
     assert result["state"] == "normal"
@@ -100,14 +160,20 @@ def test_check_unintegrated_layers_are_not_passed(capsys, monkeypatch):
                                                 "updated_at": rescue_state.iso(runner.now())})
     runner.responses[("systemctl", "is-active", "exitnode-rescue.timer")] = CompletedResult(out="active")
     harden(runner)
+    from exitnode import publisher
+    runner.files[publisher.TOOL] = "工具"
+    runner.responses[(publisher.TOOL,)] = CompletedResult(out="ExternalIPAddress = 8.8.8.8")
+    publisher.tick(config, runner)
+    capsys.readouterr()
+    runner.responses[("systemctl", "is-active", "exitnode-publisher.timer")] = CompletedResult(out="active")
     assert main(["check", "--json"], runner) == 0
     layers = json.loads(capsys.readouterr().out)["layers"]
     assert [layer["result"] for layer in layers] == [
-        "通过", "通过", "未接入", "未接入", "未接入", "通过", "通过", "通过", "通过", "通过"]
-    assert layers[-5]["name"] == "看门狗"
-    assert layers[-4]["name"] == "救援单元"
-    assert layers[-3]["name"] == "服务加固"
-    assert layers[-3]["layer"] == "hardening"
+        "通过", "通过", "未接入", "未接入", "未接入", "通过", "通过", "通过", "通过", "通过", "通过"]
+    assert layers[-6]["name"] == "看门狗"
+    assert layers[-5]["name"] == "救援单元"
+    assert layers[-4]["name"] == "服务加固"
+    assert layers[-4]["layer"] == "hardening"
     assert layers[-2]["name"] == "隧道服务"
     assert layers[-1]["name"] == "客户端托管服务"
 
