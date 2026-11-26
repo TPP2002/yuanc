@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 
 import pytest
 from authserver.admin_cli import main
+from authserver.service import Service
 
 
 @pytest.mark.parametrize("days", [1, 7, 30, 43])
@@ -127,7 +128,9 @@ def test_admin_extend_disable_enable_and_audit(client, admin, enrolled, app):
     assert client.get("/admin/audit", headers=admin).json() == entries
 
 
-def test_offline_cli(tmp_path, app, enrolled, capsys, settings):
+def test_offline_cli(tmp_path, app, enrolled, capsys, settings, clock, monkeypatch):
+    # 离线命令行默认取真实时间;夹具里的账号按假时钟建,两边要用同一个时钟,否则过了到期日延期起点就变了。
+    monkeypatch.setattr("authserver.admin_cli.Service", lambda db, conf: Service(db, conf, clock))
     config = tmp_path / "config.toml"
     config.write_text('''[security]
 admin_key = "test-admin-only"
