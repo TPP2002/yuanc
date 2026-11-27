@@ -91,6 +91,14 @@ class AuthSync:
 
 
 @dataclass
+class Console:
+    """管理网页：独立进程、无特权账户运行，只读检查记录。"""
+    enabled: bool = False
+    port: int = 8444
+    lan: bool = True
+
+
+@dataclass
 class Config:
     node: Node
     network: Network
@@ -100,6 +108,7 @@ class Config:
     updater: Updater
     watchdog: Watchdog = field(default_factory=Watchdog)
     authsync: AuthSync = field(default_factory=AuthSync)
+    console: Console = field(default_factory=Console)
 
     def sanitized(self):
         return asdict(self)
@@ -118,13 +127,13 @@ def load(path: str, runner: Runner | None = None) -> Config:
         raise ConfigError(f"配置 {path}：文件无法读取或格式不正确") from exc
     models = {"node": Node, "network": Network, "proxy": Proxy, "admin": Admin,
               "publisher": Publisher, "updater": Updater, "watchdog": Watchdog,
-              "authsync": AuthSync}
+              "authsync": AuthSync, "console": Console}
     for name in raw.keys() - models.keys():
         invalid(name, "未知配置项")
     values = {}
     for name, model in models.items():
         if name not in raw:
-            if name in {"watchdog", "authsync"}:
+            if name in {"watchdog", "authsync", "console"}:
                 values[name] = model()
                 continue
             invalid(name, "缺少配置段")
@@ -231,6 +240,12 @@ def load(path: str, runner: Runner | None = None) -> Config:
                       ("admin.port", config.admin.port)):
         if not 1 <= port <= 65535:
             invalid(key, "端口须在 1 至 65535 之间")
+    if not 1024 <= config.console.port <= 65535:
+        invalid("console.port", "须在 1024 至 65535 之间(管理网页以无特权账户运行)")
+    # 管理网页没开时不占端口，不拿它去挡已有节点的端口配置。
+    if config.console.enabled and config.console.port in {
+            config.admin.port, config.proxy.reality_port, config.proxy.hy2_port}:
+        invalid("console.port", "不能与 admin.port、proxy.reality_port、proxy.hy2_port 相同")
     try:
         ipaddress.ip_address(config.admin.bind)
     except ValueError:

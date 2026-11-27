@@ -163,6 +163,10 @@ def create_app(settings=None, db_path=None, clock=now):
     def invite(body: InviteInput, request: Request):
         return service.create_invite(body.days, body.max_uses, body.note, ip(request))
 
+    @app.get("/admin/invites", dependencies=[Depends(admin)])
+    def invites():
+        return service.invites()
+
     @app.get("/admin/accounts", dependencies=[Depends(admin)])
     def accounts():
         return service.accounts()

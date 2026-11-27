@@ -62,3 +62,19 @@ def test_client_semantics_unchanged(client, enrolled, device):
     valid = client.post("/client/session", json={"refresh_token": enrolled["refresh_token"]})
     assert valid.status_code == 200
     assert valid.headers["content-type"].startswith("application/json")
+
+
+def test_console_paths_are_not_found_on_authserver(client):
+    for path in ("/console.js", "/console.css", "/api/session", "/api/status", "/api/directory"):
+        assert_not_found(client.get(path))
+    for path in ("/api/login", "/api/invites", "/api/logout"):
+        assert_not_found(client.post(path, json={}))
+
+
+def test_admin_invites_list_requires_key(client, admin):
+    assert_not_found(client.get("/admin/invites"))
+    assert_not_found(client.get("/admin/invites", headers={"X-Admin-Key": "wrong"}))
+    response = client.get("/admin/invites", headers=admin)
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/json")
+    assert isinstance(response.json(), list)
