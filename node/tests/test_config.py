@@ -276,3 +276,23 @@ def test_maintenance_device_list_rejects_wrong_types(value):
         "[proxy]", f"[proxy]\nmaintenance_device_ids = {value}")
     with pytest.raises(ConfigError, match="proxy.maintenance_device_ids.*类型"):
         load("/config", FakeRunner(files={"/config": text}))
+
+
+def test_console_section_defaults_and_validation():
+    text = EXAMPLE.read_text(encoding="utf-8")
+    console = load("/config", FakeRunner(files={"/config": text})).console
+    assert (console.enabled, console.port, console.lan) == (False, 8444, True)
+
+    for port in (80, 70000):
+        changed = text + f"\n[console]\nport = {port}\n"
+        with pytest.raises(ConfigError, match="console.port.*1024 至 65535"):
+            load("/config", FakeRunner(files={"/config": changed}))
+
+    # 与 admin.port 相同也算冲突（示例里 admin.port 是 8443）。
+    same = text + "\n[console]\nport = 8443\n"
+    with pytest.raises(ConfigError, match="console.port.*不能与"):
+        load("/config", FakeRunner(files={"/config": same}))
+
+    enabled = text + "\n[console]\nenabled = true\nlan = false\nport = 9444\n"
+    value = load("/config", FakeRunner(files={"/config": enabled})).console
+    assert value.enabled is True and value.lan is False and value.port == 9444

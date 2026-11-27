@@ -67,6 +67,15 @@ class Service:
                 return result
             return [dict(row) for row in conn.execute("SELECT * FROM accounts ORDER BY id")]
 
+    def invites(self):
+        """管理网页用的邀请码列表：只给六个字段，新的在前。"""
+        with self.db.transaction() as conn:
+            rows = conn.execute(
+                """SELECT code, days, max_uses, used, note, created_at
+                   FROM invites ORDER BY created_at DESC, code ASC"""
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     @staticmethod
     def _devices(conn, account_id=None):
         sql = """SELECT id, account_id, platform, name, last_seen, revoked_at FROM devices"""

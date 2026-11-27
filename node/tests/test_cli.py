@@ -787,3 +787,64 @@ def test_admin_entrypoints_are_equivalent(argv, monkeypatch):
     monkeypatch.setattr("exitnode.admin.server.serve", calls.append)
     assert main(argv, fake()) == 0
     assert len(calls) == 1 and calls[0].admin.bind == "127.0.0.1"
+
+
+def test_console_subcommands_dispatch(monkeypatch, capsys):
+    from exitnode.console import auth
+
+    runner = fake()
+    assert main(["console", "serve"], runner) == 2
+    assert "管理网页未启用" in capsys.readouterr().err
+    assert not any(call[0] == "run" for call in runner.calls)
+
+    runner = fake()
+    assert main(["console", "snapshot"], runner) == 0
+    assert "/var/lib/exitnode/console/status.json" in runner.files
+    assert capsys.readouterr().out == ""
+
+    runner = fake()
+    assert main(["console", "password"], runner) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert len(lines) == 2
+    assert lines[0].startswith("管理网页新密码:")
+    password = lines[0].split(":", 1)[1]
+    assert lines[1] == "只显示这一次;旧密码已失效,已登录的网页要重新登录。"
+    stored = runner.files["/var/lib/exitnode/secrets/console-password"].strip()
+    assert stored.startswith("scrypt$16384$8$1$")
+    assert auth.verify_password(password, stored)
+    assert ("run", ("systemctl", "try-restart", "exitnode-console.service"), False,
+            None) in runner.calls
+    assert password not in json.dumps(runner.files)
+
+    runner = fake()
+    monkeypatch.setattr("sys.stdin", io.StringIO("test-admin-only\n"))
+    assert main(["console", "admin-key"], runner) == 0
+    saved = runner.files["/var/lib/exitnode/secrets/authserver-admin-key"].strip()
+    assert saved == "test-admin-only"
+    output = capsys.readouterr().out
+    assert "鉴权服务管理密钥已保存。" in output
+    assert "test-admin-only" not in output
+
+    runner = fake()
+    monkeypatch.setattr("sys.stdin", io.StringIO("\n"))
+    assert main(["console", "admin-key"], runner) == 1
+    assert "管理密钥无效" in capsys.readouterr().err
+    assert "/var/lib/exitnode/secrets/authserver-admin-key" not in runner.files
+
+
+def test_check_includes_console_layer_only_when_enabled(monkeypatch, capsys):
+    monkeypatch.setattr("exitnode.admin.server.check", lambda config: {
+        "layer": "winclient", "name": "客户端托管服务", "result": "通过", "reason": "测试"})
+    monkeypatch.setattr("exitnode.console.server.check", lambda config: {
+        "layer": "console", "name": "管理网页", "result": "通过", "reason": "测试"})
+    runner = fake()
+    main(["check", "--json"], runner)
+    layers = json.loads(capsys.readouterr().out)["layers"]
+    assert not any(layer["layer"] == "console" for layer in layers)
+
+    runner = fake()
+    runner.files[CONFIG] = runner.files[CONFIG] + "\n[console]\nenabled = true\n"
+    main(["check", "--json"], runner)
+    layers = json.loads(capsys.readouterr().out)["layers"]
+    assert layers[-1]["layer"] == "console"
+    assert layers[-1]["name"] == "管理网页"
