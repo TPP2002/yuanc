@@ -13,6 +13,7 @@ public sealed class LeakCaptureTests
     private static readonly IPAddress Local = IPAddress.Parse("192.168.1.5");
     private static readonly IPAddress NodeIp = IPAddress.Parse("13.237.1.2");
     private const string Google = "74.125.250.129";
+    private const string DnsHint = "其中发往局域网 53 端口的是域名查询:路由器会把它转给所在地运营商的解析器。";
 
     private static CapturedPacket Tcp(string src, string dst, int sp, int dp) =>
         new(1, IPAddress.Parse(src), IPAddress.Parse(dst), "TCP", sp, dp);
@@ -68,6 +69,70 @@ public sealed class LeakCaptureTests
         Assert.Equal(1, verdict.Allowed);
         Assert.Equal(2, verdict.Suspicious.Count);
         Assert.DoesNotContain(verdict.Suspicious, flow => flow.Protocol == "TCP" && flow.RemotePort == 8443);
+    }
+
+    [Fact]
+    public void LanDnsQueryIsSuspiciousInGlobalMode()
+    {
+        var verdict = LeakClassifier.Classify(
+        [
+            Udp("192.168.1.5", "192.168.1.1", 50000, 53), Udp("192.168.1.5", "192.168.1.1", 50000, 53),
+            Tcp("192.168.1.5", "192.168.1.1", 50001, 53),
+            Udp("fe80::5", "fe80::1", 50002, 53),
+            Udp("192.168.1.1", "192.168.1.5", 53, 50000),
+            Udp("192.168.1.5", "192.168.1.1", 50003, 5353),
+            Tcp("192.168.1.5", "192.168.1.1", 50004, 445)
+        ], Context(), _ => null);
+        Assert.Equal(3, verdict.Suspicious.Count);
+        Assert.Equal(new SuspiciousFlow("UDP", "192.168.1.1", 53, null, null, 2), verdict.Suspicious[0]);
+        Assert.Equal(new SuspiciousFlow("TCP", "192.168.1.1", 53, null, null, 1), verdict.Suspicious[1]);
+        Assert.Equal(new SuspiciousFlow("UDP", "fe80::1", 53, null, null, 1), verdict.Suspicious[2]);
+        Assert.Equal(3, verdict.Allowed);
+        Assert.Equal(1, LeakClassifier.ExitCode(verdict, false));
+
+        var withNode = new LeakContext(new HashSet<IPAddress> { Local, IPAddress.Parse("2409:8a00::5") },
+            new HashSet<IPAddress> { NodeIp, IPAddress.Parse("192.168.1.52") }, null, false, []);
+        var toNode = LeakClassifier.Classify([Udp("192.168.1.5", "192.168.1.52", 50005, 53)], withNode, _ => null);
+        Assert.Empty(toNode.Suspicious);
+    }
+
+    [Fact]
+    public void LanDnsQueryIsNotFlaggedInAppsMode()
+    {
+        var verdict = LeakClassifier.Classify(
+        [
+            Udp("192.168.1.5", "192.168.1.1", 50000, 53), Udp("192.168.1.5", "192.168.1.1", 50000, 53),
+            Tcp("192.168.1.5", "192.168.1.1", 50001, 53),
+            Udp("fe80::5", "fe80::1", 50002, 53),
+            Udp("192.168.1.1", "192.168.1.5", 53, 50000),
+            Udp("192.168.1.5", "192.168.1.1", 50003, 5353),
+            Tcp("192.168.1.5", "192.168.1.1", 50004, 445)
+        ], Context(null, true, "C:\\Apps\\chat.exe"), _ => null);
+        Assert.Empty(verdict.Suspicious);
+    }
+
+    [Fact]
+    public void SummaryExplainsLanDnsFlow()
+    {
+        using var dir = new TempDirectory();
+        var lanVerdict = new LeakVerdict(1, 0, 0, 0, [new SuspiciousFlow("UDP", "192.168.1.1", 53, null, null, 1)]);
+        var lanResult = new LeakCheckResult(1, null, lanVerdict);
+        var global = Options(dir.Path);
+        var writer = new StringWriter();
+        LeakReportFormatter.WriteSummary(writer, global, lanResult, dir.Path);
+        var text = writer.ToString();
+        Assert.Contains(DnsHint, text);
+        Assert.True(text.IndexOf(DnsHint, StringComparison.Ordinal) < text.IndexOf("结论:", StringComparison.Ordinal));
+
+        var publicVerdict = new LeakVerdict(1, 0, 0, 0, [new SuspiciousFlow("UDP", Google, 19302, null, null, 1)]);
+        var publicWriter = new StringWriter();
+        LeakReportFormatter.WriteSummary(publicWriter, global, new LeakCheckResult(1, null, publicVerdict), dir.Path);
+        Assert.DoesNotContain(DnsHint, publicWriter.ToString());
+
+        var apps = global with { AppsMode = true, Apps = ["C:\\Apps\\chat.exe"] };
+        var appsWriter = new StringWriter();
+        LeakReportFormatter.WriteSummary(appsWriter, apps, lanResult, dir.Path);
+        Assert.DoesNotContain(DnsHint, appsWriter.ToString());
     }
 
     [Fact]

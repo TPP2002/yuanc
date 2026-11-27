@@ -17,6 +17,9 @@ public static class WfpPlanner
     public const string MissingMarker = "YuanC-WFP";
     public const byte PermitWeight = 10;
     public const byte BlockWeight = 0;
+    public const byte ExactPermitWeight = 12;
+    public const byte DnsBlockWeight = 11;
+    public const int DnsPort = 53;
     public const string TunAddressV6 = "fdfe:dcba:9876::1";
     public static readonly string[] LanV4 = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "224.0.0.0/4", "255.255.255.255/32"];
     public static readonly string[] LanV6 = ["fe80::/10", "ff00::/8"];
@@ -46,9 +49,9 @@ public static class WfpPlanner
         }
         var result = new List<WfpFilterSpec>();
         foreach (var layer in Layers)
-            result.Add(new(Prefix + "Loopback-" + layer, layer, WfpAction.Permit, PermitWeight, Loopback: true));
+            result.Add(new(Prefix + "Loopback-" + layer, layer, WfpAction.Permit, ExactPermitWeight, Loopback: true));
         foreach (var layer in Layers)
-            result.Add(new(Prefix + "Tun-" + layer, layer, WfpAction.Permit, PermitWeight,
+            result.Add(new(Prefix + "Tun-" + layer, layer, WfpAction.Permit, ExactPermitWeight,
                 LocalAddress: IsV4(layer) ? KillSwitchPlanner.TunAddress : TunAddressV6));
         foreach (var layer in Layers)
             result.Add(new(Prefix + "Lan-" + layer, layer, WfpAction.Permit, PermitWeight,
@@ -57,15 +60,18 @@ public static class WfpPlanner
             result.Add(new(Prefix + "Dhcp-" + layer, layer, WfpAction.Permit, PermitWeight,
                 Protocol: "UDP", LocalPort: 68, RemotePort: 67));
         var addresses = ips.Select(ip => ip.ToString()).Distinct().Order().Select(ip => ip + "/32").ToArray();
-        result.Add(new(Prefix + "Node-Tcp", WfpLayer.ConnectV4, WfpAction.Permit, PermitWeight,
+        result.Add(new(Prefix + "Node-Tcp", WfpLayer.ConnectV4, WfpAction.Permit, ExactPermitWeight,
             program, addresses, Protocol: "TCP", RemotePort: realityPort));
-        result.Add(new(Prefix + "Node-Udp", WfpLayer.ConnectV4, WfpAction.Permit, PermitWeight,
+        result.Add(new(Prefix + "Node-Udp", WfpLayer.ConnectV4, WfpAction.Permit, ExactPermitWeight,
             program, addresses.ToArray(), Protocol: "UDP", RemotePort: hy2Port));
         if (auth is not null)
-            result.Add(new(Prefix + "Auth", WfpLayer.ConnectV4, WfpAction.Permit, PermitWeight,
+            result.Add(new(Prefix + "Auth", WfpLayer.ConnectV4, WfpAction.Permit, ExactPermitWeight,
                 auth.Program, [auth.Address + "/32"], Protocol: "TCP", RemotePort: auth.Port));
         foreach (var layer in Layers)
             result.Add(new(Prefix + "Block-" + layer, layer, WfpAction.Block, BlockWeight));
+        // 域名查询端口阻断排在局域网放行之上、精确放行之下,内核不在时也不把查询交给路由器。
+        foreach (var layer in new[] { WfpLayer.ConnectV4, WfpLayer.ConnectV6 })
+            result.Add(new(Prefix + "Dns53-" + layer, layer, WfpAction.Block, DnsBlockWeight, RemotePort: DnsPort));
         return result.AsReadOnly();
     }
 

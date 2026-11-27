@@ -152,6 +152,18 @@ public sealed class WfpApplierTests
     }
 
     [Fact]
+    public async Task GlobalPolicyKeepsDnsBlockAcrossNodeUpdateAndAppsDropIt()
+    {
+        using var f = new Fixture();
+        await f.Applier.ApplyAsync(Ips, ProgramPath, 443);
+        Assert.Equal(2, f.Engine.Policy.Count(p => p.Name.Contains("Dns53")));
+        await f.Applier.UpdateNodeAsync([IPAddress.Parse("192.0.2.2")], ProgramPath, 444, 8444);
+        Assert.Equal(2, f.Engine.Policy.Count(p => p.Name.Contains("Dns53")));
+        await f.Applier.ApplyAppsAsync([ProgramPath]);
+        Assert.DoesNotContain(f.Engine.Policy, p => p.Name.Contains("Dns53"));
+    }
+
+    [Fact]
     public async Task InvalidPolicyDoesNotTouchEitherEngine()
     {
         using var f = new Fixture();

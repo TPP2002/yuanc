@@ -11,14 +11,15 @@ public sealed class WfpPlannerTests
         WfpPlanner.PlanGlobal([IPAddress.Parse("192.0.2.8")], ProgramPath, 24443, 443, auth);
 
     [Fact]
-    public void GlobalHasExactlyTwentyInContractOrder()
+    public void GlobalHasExactlyTwentyTwoInContractOrder()
     {
         var names = new[] {
             "Loopback-ConnectV4", "Loopback-ConnectV6", "Loopback-AcceptV4", "Loopback-AcceptV6",
             "Tun-ConnectV4", "Tun-ConnectV6", "Tun-AcceptV4", "Tun-AcceptV6",
             "Lan-ConnectV4", "Lan-ConnectV6", "Lan-AcceptV4", "Lan-AcceptV6",
             "Dhcp-ConnectV4", "Dhcp-AcceptV4", "Node-Tcp", "Node-Udp",
-            "Block-ConnectV4", "Block-ConnectV6", "Block-AcceptV4", "Block-AcceptV6" };
+            "Block-ConnectV4", "Block-ConnectV6", "Block-AcceptV4", "Block-AcceptV6",
+            "Dns53-ConnectV4", "Dns53-ConnectV6" };
         Assert.Equal(names.Select(n => "YuanC-WFP-" + n), Plan().Select(f => f.Name));
     }
 
@@ -27,9 +28,9 @@ public sealed class WfpPlannerTests
     {
         var auth = new AuthEndpoint(IPAddress.Parse("192.0.2.9"), 8443, Path.GetFullPath("service.exe"));
         var plan = Plan(auth);
-        Assert.Equal(21, plan.Count);
+        Assert.Equal(23, plan.Count);
         Assert.Equal("YuanC-WFP-Node-Udp", plan[15].Name);
-        Assert.Equal(new WfpFilterSpec("YuanC-WFP-Auth", WfpLayer.ConnectV4, WfpAction.Permit, 10,
+        Assert.Equal(new WfpFilterSpec("YuanC-WFP-Auth", WfpLayer.ConnectV4, WfpAction.Permit, 12,
             auth.Program, plan[16].RemoteAddresses, Protocol: "TCP", RemotePort: 8443), plan[16]);
         Assert.Equal(new[] { "192.0.2.9/32" }, plan[16].RemoteAddresses);
         Assert.Equal("YuanC-WFP-Block-ConnectV4", plan[17].Name);
@@ -52,16 +53,43 @@ public sealed class WfpPlannerTests
     public void BlocksAreUnconditionalAndPermitsHaveHigherWeight()
     {
         var plan = Plan();
-        Assert.Equal(4, plan.Count(f => f.Action == WfpAction.Block));
-        foreach (var rule in plan)
-        {
-            if (rule.Action == WfpAction.Block)
-                Assert.Equal(new WfpFilterSpec(rule.Name, rule.Layer, WfpAction.Block, 0), rule);
-            else Assert.Equal((byte)10, rule.Weight);
-        }
+        Assert.Equal(6, plan.Count(f => f.Action == WfpAction.Block));
+        foreach (var rule in plan.Where(f => f.Name.StartsWith("YuanC-WFP-Block-", StringComparison.Ordinal)))
+            Assert.Equal(new WfpFilterSpec(rule.Name, rule.Layer, WfpAction.Block, 0), rule);
+        foreach (var rule in plan.Where(f => f.Action == WfpAction.Permit))
+            Assert.Equal(rule.Name.Contains("Lan-") || rule.Name.Contains("Dhcp-") ? (byte)10 : (byte)12, rule.Weight);
         Assert.All(plan.Take(4), f => Assert.True(f.Loopback));
         Assert.Equal(new[] { "172.19.0.1", "fdfe:dcba:9876::1", "172.19.0.1", "fdfe:dcba:9876::1" }, plan.Skip(4).Take(4).Select(f => f.LocalAddress));
         Assert.All(plan.Skip(12).Take(2), f => { Assert.Equal("UDP", f.Protocol); Assert.Equal(68, f.LocalPort); Assert.Equal(67, f.RemotePort); });
+    }
+
+    [Fact]
+    public void DnsPortBlockSitsBetweenLanAndExactPermits()
+    {
+        var auth = new AuthEndpoint(IPAddress.Parse("192.0.2.9"), 8443, Path.GetFullPath("service.exe"));
+        foreach (var plan in new[] { Plan(), Plan(auth) })
+        {
+            Assert.Equal(new WfpFilterSpec("YuanC-WFP-Dns53-ConnectV4", WfpLayer.ConnectV4, WfpAction.Block, 11,
+                RemotePort: 53), plan[^2]);
+            Assert.Equal(new WfpFilterSpec("YuanC-WFP-Dns53-ConnectV6", WfpLayer.ConnectV6, WfpAction.Block, 11,
+                RemotePort: 53), plan[^1]);
+            Assert.Equal(2, plan.Count(f => f.Name.Contains("Dns53")));
+            Assert.True(WfpPlanner.ExactPermitWeight > WfpPlanner.DnsBlockWeight);
+            Assert.True(WfpPlanner.DnsBlockWeight > WfpPlanner.PermitWeight);
+            Assert.True(WfpPlanner.PermitWeight > WfpPlanner.BlockWeight);
+            Assert.All(plan.Where(f => f.Name.Contains("Lan-") || f.Name.Contains("Dhcp-")),
+                f => Assert.True(f.Weight < WfpPlanner.DnsBlockWeight));
+            Assert.All(plan.Where(f => f.Action == WfpAction.Permit && !f.Name.Contains("Lan-") && !f.Name.Contains("Dhcp-")),
+                f => Assert.True(f.Weight > WfpPlanner.DnsBlockWeight));
+        }
+    }
+
+    [Fact]
+    public void AppsPlanHasNoDnsBlock()
+    {
+        var plan = WfpPlanner.PlanApps([ProgramPath, Path.GetFullPath("browser.exe")]);
+        Assert.DoesNotContain(plan, f => f.Name.Contains("Dns53"));
+        Assert.All(plan, f => Assert.Contains(f.Weight, new byte[] { 0, 10 }));
     }
 
     [Fact]
