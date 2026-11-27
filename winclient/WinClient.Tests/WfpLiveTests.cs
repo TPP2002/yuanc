@@ -97,13 +97,12 @@ public sealed class WfpLiveTests
         var dns = await Connect("192.0.2.2", 53);
         Assert.Equal(SocketError.AccessDenied, dns.Error);
         Assert.True(dns.Elapsed < TimeSpan.FromSeconds(3), "阻断必须在三秒内返回 AccessDenied。");
+        // UDP 被这一层拦下时系统只丢包、不向发送方报错(2026-11-27 实测:过滤层丢包事件里记有这个包),
+        // 套接字这一侧看不出拦没拦住,这里只确认没有别的错误;过滤器不写协议由 WfpPlannerTests 钉住。
         using (var udp = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp))
         {
-            var error = Assert.Throws<SocketException>(() =>
-            {
-                udp.SendTo(new byte[] { 0 }, new IPEndPoint(IPAddress.Parse("192.0.2.2"), 53));
-            });
-            Assert.Equal(SocketError.AccessDenied, error.SocketErrorCode);
+            var error = Record.Exception(() => udp.SendTo(new byte[] { 0 }, new IPEndPoint(IPAddress.Parse("192.0.2.2"), 53)));
+            Assert.True(error is null or SocketException { SocketErrorCode: SocketError.AccessDenied }, error?.Message);
         }
         Assert.NotEqual(SocketError.AccessDenied, (await Connect("192.0.2.2", 9)).Error);
         Assert.NotEqual(SocketError.AccessDenied, (await Connect("192.0.2.1", 53)).Error);
