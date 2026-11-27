@@ -589,6 +589,32 @@ public sealed class IpcTests
         await serving.WaitAsync(stop.Token);
     }
 
+    [Theory]
+    [InlineData(ConnectionState.Disconnected, false, false)]
+    [InlineData(ConnectionState.NeedsManual, false, false)]
+    [InlineData(ConnectionState.NeedsLogin, false, false)]
+    [InlineData(ConnectionState.NeedsManual, true, true)]
+    [InlineData(ConnectionState.Reconnecting, false, true)]
+    [InlineData(ConnectionState.Connected, true, true)]
+    public async Task ConnectWritesDesiredFromResultingSnapshot(ConnectionState state, bool protection, bool expected)
+    {
+        using var temp = new TempDirectory();
+        using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        var facade = new FakeFacade { SnapshotAfterConnect = new(state, "", "", protection) };
+        var desired = new DesiredStateStore(temp.Path);
+        var server = new ControlServer(facade, desired);
+        var (peer, host) = DuplexStream.Pair();
+        var serving = server.ServeAsync(host, stop.Token);
+        using (var client = new ControlClient(peer))
+        {
+            var response = await client.SendAsync("connect", cancellationToken: stop.Token);
+            Assert.True(response.Ok);
+            if (expected) Assert.True(desired.Read());
+            else Assert.False(desired.Read());
+        }
+        await serving.WaitAsync(stop.Token);
+    }
+
     private sealed class FakeUpdates : IUpdateCoordinator
     {
         public UpdateStatus Status => new UpdateStatus();
@@ -622,13 +648,15 @@ public sealed class IpcTests
         public Action<ClientSnapshot>? CaptureChanged() => Changed;
         // 为空时行为与原来一致；测试 status 不排队时用它把 connect 卡住。
         public TaskCompletionSource? ConnectGate { get; init; }
+        // 为空时行为与原来一致；给了就把它当作 connect 之后的快照。
+        public ClientSnapshot? SnapshotAfterConnect { get; init; }
         public TaskCompletionSource ConnectEntered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public async Task ConnectAsync()
         {
             Actions.Add("connect");
             ConnectEntered.TrySetResult();
             if (ConnectGate is { } gate) await gate.Task;
-            Snapshot = new(ConnectionState.Connected, "已连接", "", true); Changed?.Invoke(Snapshot);
+            Snapshot = SnapshotAfterConnect ?? new(ConnectionState.Connected, "已连接", "", true); Changed?.Invoke(Snapshot);
         }
         public Task DisconnectAsync() { Actions.Add("disconnect"); Snapshot = new(ConnectionState.Disconnected, "未连接", "", false); Changed?.Invoke(Snapshot); return Task.CompletedTask; }
         public Task RedeemAsync(string code) { Actions.Add("redeem:" + code); return Task.CompletedTask; }

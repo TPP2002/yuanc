@@ -1443,11 +1443,11 @@ public sealed class ControllerTests
         }
         var order = new List<string>();
         using var controller = new ClientController(new PairingSessionSource(PairingTests.ValidPairing()),
-            new PairingTests.FakeFirewall(order), new PairingTests.FakeTunnel(order, fail: true), Path.GetFullPath("fake.exe"), TestData.Device, timers.Delay)
+            new Firewall(order) { HasPendingState = true }, new PairingTests.FakeTunnel(order, fail: true), Path.GetFullPath("fake.exe"), TestData.Device, timers.Delay)
             { DelayWithPurposeAsync = Delay };
         var manual = new TaskCompletionSource<ClientSnapshot>(TaskCreationOptions.RunContinuationsAsynchronously);
         controller.Changed += snapshot => { if (snapshot.State == ConnectionState.NeedsManual && snapshot.Message.Contains("出口地址可能已变")) manual.TrySetResult(snapshot); };
-        await controller.ConnectAsync();
+        await controller.InitializeAsync(autoConnect: false, keepProtection: true);
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
         foreach (var seconds in new[] { 2, 4, 8, 16, 32, 60, 60, 60, 60, 60, 60 })
         {
@@ -1499,18 +1499,20 @@ public sealed class ControllerTests
         Assert.DoesNotContain("start", order); Assert.DoesNotContain("apply", order); Assert.DoesNotContain("remove", order);
     }
     [Fact]
-    public async Task ApplyFailureDoesNotStartOrSilentlyRemoveProtection()
+    public async Task ApplyFailureOnFirstConnectRestoresNetworkWithoutStartingTunnel()
     {
         var order = new List<string>(); using var http = SessionHttp(() => TestData.Session());
         var store = new InMemoryCredentialStore(); store.Save("refresh");
         using var controller = new ClientController(new AuthApiClient(http), store, new Firewall(order) { FailApply = true }, new Tunnel(order), Path.GetFullPath("fake.exe"), TestData.Device);
         await controller.ConnectAsync();
-        Assert.Equal(ConnectionState.NeedsManual, controller.Snapshot.State);
-        Assert.True(controller.Snapshot.ProtectionActive);
-        Assert.DoesNotContain("start", order); Assert.DoesNotContain("remove", order);
+        Assert.Equal(ConnectionState.Disconnected, controller.Snapshot.State);
+        Assert.False(controller.Snapshot.ProtectionActive);
+        Assert.StartsWith("连接失败，已恢复原来的网络，当前没有走澳洲出口。", controller.Snapshot.Message);
+        Assert.DoesNotContain("start", order);
+        Assert.Contains("remove", order);
     }
     [Fact]
-    public async Task IneffectiveFirewallKeepsProtectionAndShowsSpecificReasonWithoutStartingTunnel()
+    public async Task IneffectiveFirewallOnFirstConnectRestoresNetworkAndNamesReason()
     {
         var order = new List<string>(); using var http = SessionHttp(() => TestData.Session());
         var store = new InMemoryCredentialStore(); store.Save("refresh");
@@ -1519,12 +1521,12 @@ public sealed class ControllerTests
             new Firewall(order) { ApplyError = new FirewallIneffectiveException(explanation) },
             new Tunnel(order), Path.GetFullPath("fake.exe"), TestData.Device);
         await controller.ConnectAsync();
-        Assert.Equal(ConnectionState.NeedsManual, controller.Snapshot.State);
-        Assert.True(controller.Snapshot.ProtectionActive);
-        Assert.Equal(explanation, controller.Snapshot.Message);
+        Assert.Equal(ConnectionState.Disconnected, controller.Snapshot.State);
+        Assert.False(controller.Snapshot.ProtectionActive);
+        Assert.Equal("连接失败，已恢复原来的网络，当前没有走澳洲出口。原因：系统防火墙没有开启，或被策略覆盖。", controller.Snapshot.Message);
         Assert.Contains("apply", order);
         Assert.DoesNotContain("start", order);
-        Assert.DoesNotContain("remove", order);
+        Assert.Contains("remove", order);
     }
     [Fact]
     public async Task HeldProtectionStartupKeepsTunnelAndWarnsWhenFirewallIsIneffective()
@@ -1594,7 +1596,7 @@ public sealed class ControllerTests
     }
 
     [Fact]
-    public async Task IneffectiveFirewallRejectsFirstConnectionAndRepeatedConnectionWithoutVerifiedProtection()
+    public async Task IneffectiveFirewallOnRepeatedFirstConnectRestoresEachTime()
     {
         var order = new List<string>();
         const string explanation = "系统防火墙被策略覆盖，请断开后联系管理员。";
@@ -1605,13 +1607,13 @@ public sealed class ControllerTests
         for (var attempt = 0; attempt < 2; attempt++)
         {
             await controller.ConnectAsync();
-            Assert.Equal(ConnectionState.NeedsManual, controller.Snapshot.State);
-            Assert.True(controller.Snapshot.ProtectionActive);
-            Assert.Equal(explanation, controller.Snapshot.Message);
+            Assert.Equal(ConnectionState.Disconnected, controller.Snapshot.State);
+            Assert.False(controller.Snapshot.ProtectionActive);
+            Assert.Equal("连接失败，已恢复原来的网络，当前没有走澳洲出口。原因：系统防火墙没有开启，或被策略覆盖。", controller.Snapshot.Message);
             Assert.DoesNotContain("start", order);
-            Assert.DoesNotContain("remove", order);
         }
         Assert.Equal(2, order.Count(item => item == "apply"));
+        Assert.Equal(2, order.Count(item => item == "remove"));
     }
 
     [Fact]
@@ -1956,7 +1958,7 @@ public sealed class ControllerTests
     }
 
     [Fact]
-    public async Task FirstWfpFailureRefusesTunnelAndRequiresManualRecovery()
+    public async Task FirstWfpFailureRestoresNetworkAndNamesReason()
     {
         var order = new List<string>(); using var http = SessionHttp(() => TestData.Session());
         var store = new InMemoryCredentialStore(); store.Save("refresh");
@@ -1964,12 +1966,12 @@ public sealed class ControllerTests
             new Firewall(order) { ApplyError = new WfpUnavailableException(KillSwitchApplier.WfpConnectRefused) },
             new Tunnel(order), Path.GetFullPath("fake.exe"), TestData.Device);
         await controller.ConnectAsync();
-        Assert.Equal(ConnectionState.NeedsManual, controller.Snapshot.State);
-        Assert.Equal(KillSwitchApplier.WfpConnectRefused, controller.Snapshot.Message);
-        Assert.True(controller.Snapshot.ProtectionActive);
+        Assert.Equal(ConnectionState.Disconnected, controller.Snapshot.State);
+        Assert.False(controller.Snapshot.ProtectionActive);
+        Assert.Equal("连接失败，已恢复原来的网络，当前没有走澳洲出口。原因：系统过滤层的保护没能建立。", controller.Snapshot.Message);
         Assert.Contains("apply", order);
         Assert.DoesNotContain("start", order);
-        Assert.DoesNotContain("remove", order);
+        Assert.Contains("remove", order);
     }
 
     private sealed class FakeNic(List<string> order) : INicGuard
@@ -2065,17 +2067,18 @@ public sealed class ControllerTests
     }
 
     [Fact]
-    public async Task NicGuardFailureRefusesTunnelWhenNotHeld()
+    public async Task NicGuardFailureOnFirstConnectRestoresNetworkAndNic()
     {
         var order = new List<string>();
         var nic = new FakeNic(order) { ApplyError = new NicGuardException("拒绝文案") { AdapterName = "以太网" } };
         using var controller = NicController(order, nic, new FakeReaper(order));
         await controller.ConnectAsync();
-        Assert.Equal(ConnectionState.NeedsManual, controller.Snapshot.State);
-        Assert.Equal("拒绝文案", controller.Snapshot.Message);
-        Assert.True(controller.Snapshot.ProtectionActive);
+        Assert.Equal(ConnectionState.Disconnected, controller.Snapshot.State);
+        Assert.False(controller.Snapshot.ProtectionActive);
+        Assert.Equal("连接失败，已恢复原来的网络，当前没有走澳洲出口。原因：没能关闭网卡「以太网」的 IPv6。", controller.Snapshot.Message);
         Assert.DoesNotContain("start", order);
         Assert.DoesNotContain("reap", order);
+        Assert.True(order.IndexOf("nic-restore") > order.IndexOf("remove"));
     }
 
     [Fact]

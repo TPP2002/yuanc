@@ -146,6 +146,31 @@ public class StatusPresentationTests
     }
 
     [Fact]
+    public void TestBuildGuardRowAndTrayTextAreMarked()
+    {
+        foreach (var active in new[] { true, false })
+        {
+            var hero = StatusPresentation.Build(Snapshot() with { ProtectionActive = active }, ServiceAvailability.Ready, false, testBuild: true);
+            var row = hero.Rows[1];
+            Assert.Equal("断网保护", row.Label);
+            Assert.Equal("测试包已关闭,断线时会直连", row.Text);
+            Assert.Equal(Tone.Warn, row.Tile.Tone);
+            Assert.Equal(Glyph.Ask, row.Tile.Glyph);
+            Assert.StartsWith("澳洲出口客户端(测试包) · ", hero.TrayText);
+        }
+        var normal = StatusPresentation.Build(Snapshot(), ServiceAvailability.Ready, false, testBuild: false);
+        var implicitBuild = StatusPresentation.Build(Snapshot(), ServiceAvailability.Ready, false);
+        Assert.Equal(implicitBuild.Title, normal.Title);
+        Assert.Equal(implicitBuild.Subtitle, normal.Subtitle);
+        Assert.Equal(implicitBuild.Tile, normal.Tile);
+        Assert.Equal(implicitBuild.Tray, normal.Tray);
+        Assert.Equal(implicitBuild.TrayText, normal.TrayText);
+        Assert.Equal(implicitBuild.PrimaryLabel, normal.PrimaryLabel);
+        Assert.Equal(implicitBuild.Rows.Select(r => (r.Label, r.Tile, r.Text, r.TextTone, r.Right)),
+            normal.Rows.Select(r => (r.Label, r.Tile, r.Text, r.TextTone, r.Right)));
+    }
+
+    [Fact]
     public void 可安装新版本时主按钮是安装这个版本()
     {
         var hero = StatusPresentation.Build(Snapshot(), ServiceAvailability.NeedUpgrade, false);

@@ -44,7 +44,7 @@ public sealed class ClientRuntime : IClientFacade, IDisposable
     { Controller = controller; this.firewall = firewall; this.http = http; this.pairingStore = pairingStore; this.log = log; this.storeRoot = storeRoot; this.scope = scope; }
 
     public static async Task<ClientRuntime> CreateAsync(IKernelInstaller installer, string? storeRoot = null,
-        DataProtectionScope scope = DataProtectionScope.CurrentUser, bool keepProtection = false)
+        DataProtectionScope scope = DataProtectionScope.CurrentUser, bool keepProtection = false, bool testBuild = false)
     {
         var firewall = new KillSwitchApplier(Path.Combine(ClientSettings.DataDirectory, "run"), wfp: WfpEngine.CreateProduction(), routes: new RouteGuard());
         if (!keepProtection)
@@ -57,6 +57,8 @@ public sealed class ClientRuntime : IClientFacade, IDisposable
         }
         var pairingStore = new PairingStore(root: storeRoot, scope: scope);
         var log = new RedactingLog(new RollingFileLog(Path.Combine(ClientSettings.DataDirectory, "run", "sing-box.log")));
+        // 连接记录单写一份,只放本单定义的三类行;节点地址、出口地址与令牌不进这份记录。
+        var connectLog = new RedactingLog(new RollingFileLog(Path.Combine(ClientSettings.DataDirectory, "run", "connect.log")));
         var settings = ClientSettings.Load(ownerIsTrusted: DataDirectorySecurity.IsTrustedOwner);
         HttpClient? http = null;
         try
@@ -69,7 +71,8 @@ public sealed class ClientRuntime : IClientFacade, IDisposable
             }, log);
             var program = settings?.SingBoxPath ?? installer.Ensure();
             var transport = new TunnelTransport(new SingBoxProcessManager(program, ClientSettings.ProductName, logger: log));
-            var controller = new ClientController(source, firewall,
+            var nic = new NicGuard(Path.Combine(ClientSettings.DataDirectory, "run"), new SystemAdapterProbe());
+            var controller = new ClientController(source, GuardFor(firewall, testBuild),
                 transport, program, new DeviceInfo { Platform = "windows", Name = Environment.MachineName, Fingerprint = ClientSettings.GetDeviceFingerprint(storeRoot, scope) },
                 authEndpoint: settings?.AuthEndpoint, exitProbe: new HttpExitProbe(),
                 environment: new EnvironmentApplier(Path.Combine(ClientSettings.DataDirectory, "run")),
@@ -77,14 +80,18 @@ public sealed class ClientRuntime : IClientFacade, IDisposable
                 reportSink: report => WriteSelfCheck(Path.Combine(ClientSettings.DataDirectory, "run", "selfcheck.json"), report),
                 routingSettings: new RoutingSettingsStore(), serviceProcessPath: Environment.ProcessPath, adapterProbe: new SystemAdapterProbe(),
                 browserProbe: new SystemBrowserProcessProbe(),
-                nicGuard: new NicGuard(Path.Combine(ClientSettings.DataDirectory, "run"), new SystemAdapterProbe()),
-                reaper: new ConnectionReaper(new SystemTcpTable()),
+                nicGuard: testBuild ? new DisabledNicGuard(nic) : nic,
+                reaper: testBuild ? null : new ConnectionReaper(new SystemTcpTable()),
                 proxyProbe: new RegistryProxySettingsProbe(),
-                scopeResolver: path => AppScopeResolver.Resolve(path, AppScopeResolver.SystemFolders(), new SystemAppScopeFileSystem()));
+                scopeResolver: path => AppScopeResolver.Resolve(path, AppScopeResolver.SystemFolders(), new SystemAppScopeFileSystem()))
+                { Journal = connectLog.Write, TestBuild = testBuild };
             return new(controller, firewall, http, pairingStore, log, storeRoot, scope);
         }
         catch { http?.Dispose(); throw; }
     }
+
+    /// <summary>测试包交给控制器的断网保护换成不执行的外壳;正式包原样返回同一个对象。</summary>
+    internal static IKillSwitch GuardFor(IKillSwitch real, bool testBuild) => testBuild ? new DisabledKillSwitch(real) : real;
 
     internal static void WriteSelfCheck(string path, EnvironmentReport report)
     {

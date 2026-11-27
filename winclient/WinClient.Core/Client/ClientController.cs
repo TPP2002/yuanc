@@ -47,6 +47,12 @@ public sealed class ClientController : IDisposable
     internal static readonly string PairingUnverifiableHint = $"出口已连续 {UnverifiableHintRounds} 轮无法核验,出口地址可能已变;若持续如此,请在小主机上重新导出配对文件再导入。连接与断网保护保持,未自动断开。";
     internal static readonly string AuthUnverifiableHint = $"出口已连续 {UnverifiableHintRounds} 轮无法核验,请检查网络或联系管理员;连接与断网保护保持,未自动断开。";
     internal static readonly TimeSpan ExitRecheckInterval = TimeSpan.FromMinutes(5);
+    internal static readonly TimeSpan TestBuildRecheckInterval = TimeSpan.FromMinutes(1);
+    internal const int FirstConnectRetries = 3;
+    // 首次连接失败自动恢复的两句提示与测试包自动断开的提示(原文固定,改动须同步文档与测试)。
+    private const string AbandonRestored = "连接失败，已恢复原来的网络，当前没有走澳洲出口。";
+    private const string AbandonNotRestored = "连接失败，原来的网络没能恢复：请点「断开」再试一次，还不行就重启电脑。";
+    private const string TestBuildDisconnected = "测试包：出口核验不了，已自动断开并恢复原来的网络。";
     internal static readonly TimeSpan PatrolInterval = TimeSpan.FromSeconds(60);
     // 测试可同时记录所有用途；未注入时仍使用原有 delayAsync，不改变调度行为。
     internal Func<TimeSpan, CancellationToken, string, Task>? DelayWithPurposeAsync { get; set; }
@@ -102,6 +108,13 @@ public sealed class ClientController : IDisposable
     private bool disposed;
     private long generation;
     private string message = "";
+    // 首次尝试:从没套过保护也没有恢复记录的那次连接;到第一次 Connected 或断开、换来源时结束。
+    private bool firstAttempt;
+    private int firstBackoffs;
+    public bool TestBuild { get; init; }
+    public Action<string>? Journal { get; init; }
+    /// <summary>首次尝试被放弃并恢复原网络后触发;订阅者抛的异常由控制器接住。</summary>
+    public event Action? AttemptAbandoned;
     public ClientSnapshot Snapshot
     {
         get
@@ -298,12 +311,15 @@ public sealed class ClientController : IDisposable
                 }
             }
             if (fromUser && ShouldWarnBrowsers("连接", checkApplied: false)) return;
+            firstAttempt = !protection && !firewall.HasPendingState;
+            firstBackoffs = 0;
             lifetime.Cancel();
             lifetime.Dispose();
             lifetime = new();
             Interlocked.Increment(ref generation);
             await ExecuteAsync(machine.Handle(new(ConnectionEventKind.UserConnect)));
             await FetchSessionAsync();
+            await MaybeAbandonAfterLoginFailureAsync();
         }
         catch (OperationCanceledException) when (lifetime.IsCancellationRequested) { }
         catch (Exception ex) when (IsOperational(ex)) { await FailAsync(ex); }
@@ -318,6 +334,7 @@ public sealed class ClientController : IDisposable
         await gate.WaitAsync();
         try
         {
+            EndFirstAttempt();
             guardStatus = "";
             nicRestoreWarning = null;
             // Execution is ordered: a failure to stop the tunnel must not proceed to Remove.
@@ -578,7 +595,12 @@ public sealed class ClientController : IDisposable
     private async Task ExecuteAsync(Transition transition)
     {
         try { await ExecuteEffectsAsync(transition); }
-        finally { UpdateMonitoring(); }
+        finally
+        {
+            UpdateMonitoring();
+            // 状态第一次到 Connected 即视为首次尝试结束,之后的掉线重连按既有规则处理。
+            if (machine.State == ConnectionState.Connected) EndFirstAttempt();
+        }
     }
 
     private async Task ExecuteEffectsAsync(Transition transition)
@@ -639,14 +661,23 @@ public sealed class ClientController : IDisposable
                     }
                     catch (FileNotFoundException ex)
                     {
+                        // 首次尝试由放弃并恢复统一给提示;只有已持有保护的路径保留这句原文。
+                        var wasFirstAttempt = firstAttempt;
                         await FailAsync(ex);
-                        message = "未找到连接内核，请联系管理员配置 sing-box.exe 路径。";
+                        if (!wasFirstAttempt) message = "未找到连接内核，请联系管理员配置 sing-box.exe 路径。";
                     }
                     catch (InvalidDataException) { throw; }
                     catch (Exception ex) when (ex is IOException or TimeoutException)
                     { await ExecuteAsync(machine.Handle(new(ConnectionEventKind.TunnelDown))); }
                     break;
                 case EffectKind.ScheduleBackoff:
+                    if (firstAttempt && firstBackoffs >= FirstConnectRetries)
+                    {
+                        // 首次尝试前三次退避(2、4、8 秒)照常;第 4 次要安排时放弃并恢复原网络。
+                        await AbandonAsync(null, phrase: "连续 4 次没连上", reason: "原因：连续 4 次都没连上澳洲出口。");
+                        break;
+                    }
+                    if (firstAttempt) firstBackoffs++;
                     Schedule(effect.Delay!.Value, async () =>
                     {
                         var next = machine.Handle(new(ConnectionEventKind.BackoffElapsed));
@@ -658,6 +689,9 @@ public sealed class ClientController : IDisposable
             }
         }
     }
+
+    /// <summary>测试包出口复核间隔为 1 分钟,正式包仍是 5 分钟。</summary>
+    private TimeSpan RecheckInterval => TestBuild ? TestBuildRecheckInterval : ExitRecheckInterval;
 
     /// <summary>在迁移处理完成后统一更新监测；所有回调沿用串行锁、代数与生命周期。</summary>
     private void UpdateMonitoring()
@@ -700,7 +734,7 @@ public sealed class ClientController : IDisposable
         if (!ReferenceEquals(cycle, exitCycle) || session is null) return;
         if (machine.State != ConnectionState.Connected)
         {
-            if (activeRouting.Mode == RoutingMode.Apps) ScheduleExitCheck(ExitRecheckInterval, cycle, 1);
+            if (activeRouting.Mode == RoutingMode.Apps) ScheduleExitCheck(RecheckInterval, cycle, 1);
             return;
         }
         exitStatus = "核验中";
@@ -732,6 +766,12 @@ public sealed class ClientController : IDisposable
             exitStatus = "无法核验";
             exitIp = "";
             unverifiableRounds++;
+            if (TestBuild && machine.State == ConnectionState.Connected)
+            {
+                // 测试包的第二道保险:一轮核验以「无法核验」收场就自动断开并恢复原网络,不再排下一次。
+                await AbandonAsync(null, phrase: "测试包出口核验不了", reason: "原因：出口核验不了。", fixedMessage: TestBuildDisconnected);
+                return;
+            }
             if (unverifiableRounds >= UnverifiableHintRounds && machine.State == ConnectionState.Connected &&
                 message != PairingUnverifiableHint && message != AuthUnverifiableHint)
             {
@@ -740,7 +780,7 @@ public sealed class ClientController : IDisposable
             }
         }
         await CheckEnvironmentAsync(exit);
-        if (!lifetime.IsCancellationRequested && !disposed) ScheduleExitCheck(ExitRecheckInterval, cycle, 1);
+        if (!lifetime.IsCancellationRequested && !disposed) ScheduleExitCheck(RecheckInterval, cycle, 1);
     }
 
     private async Task CheckEnvironmentAsync(ExitProbeResult? exit)
@@ -913,6 +953,7 @@ public sealed class ClientController : IDisposable
             try
             {
                 if (!disposed && expected == Interlocked.Read(ref generation)) await action();
+                if (!disposed) await MaybeAbandonAfterLoginFailureAsync();
             }
             catch (OperationCanceledException) when (token.IsCancellationRequested) { }
             catch (Exception ex) when (IsOperational(ex)) { await FailAsync(ex); }
@@ -932,6 +973,7 @@ public sealed class ClientController : IDisposable
         {
             if (protection || machine.State is ConnectionState.Connected or ConnectionState.Connecting or ConnectionState.Reconnecting)
                 throw new InvalidOperationException("请先点击断开，再更换配对文件。");
+            EndFirstAttempt();
             var next = change();
             lifetime.Cancel();
             Interlocked.Increment(ref generation);
@@ -944,6 +986,13 @@ public sealed class ClientController : IDisposable
 
     private async Task FailAsync(Exception? cause = null)
     {
+        WriteJournal(cause is null ? "连接失败：原因未知" : "连接失败：" + ConnectJournal.Describe(cause));
+        if (firstAttempt)
+        {
+            // 从没连上的那次尝试失败:放弃并恢复原网络,不停在「需人工处理」。
+            await AbandonAsync(cause);
+            return;
+        }
         lifetime.Cancel();
         message = "操作失败，请联系管理员；断网保护没有自动撤销。";
         var transition = machine.Handle(new(ConnectionEventKind.OperationFailed));
@@ -951,6 +1000,135 @@ public sealed class ClientController : IDisposable
         catch (Exception ex) when (IsOperational(ex)) { message = "连接内核未能停止，请联系管理员；断网保护保留。"; }
         if (cause is FirewallIneffectiveException) message = cause.Message;
     }
+
+    private enum UndoState { NotNeeded, Removed, Failed }
+
+    private static string UndoText(UndoState state) => state switch
+    {
+        UndoState.Removed => "成功",
+        UndoState.Failed => "失败",
+        _ => "不需要"
+    };
+
+    private static string ReasonSentence(Exception? cause) => cause switch
+    {
+        WfpUnavailableException => "原因：系统过滤层的保护没能建立。",
+        RouteGuardUnavailableException => "原因：兜底路由没能建立。",
+        NicGuardException nic => $"原因：没能关闭网卡「{nic.AdapterName ?? "未知"}」的 IPv6。",
+        FirewallIneffectiveException => "原因：系统防火墙没有开启，或被策略覆盖。",
+        FileNotFoundException => "原因：未找到连接内核。",
+        TimeoutException or OperationCanceledException => "原因：有一步操作超过时限没有完成。",
+        _ => "原因已写入诊断记录，请导出诊断发给管理员。"
+    };
+
+    private static string ReasonPhrase(Exception? cause) => cause switch
+    {
+        WfpUnavailableException => "过滤层没建成",
+        RouteGuardUnavailableException => "兜底路由没建成",
+        NicGuardException => "网卡 IPv6 没关成",
+        FirewallIneffectiveException => "系统防火墙没生效",
+        FileNotFoundException => "未找到连接内核",
+        TimeoutException or OperationCanceledException => "操作超时",
+        _ => "其他"
+    };
+
+    /// <summary>放弃并恢复:停隧道、撤销已套上的断网保护、恢复网卡与环境,状态回未连接;最后发一次快照。</summary>
+    private async Task AbandonAsync(Exception? cause, string? phrase = null, string? reason = null, string? fixedMessage = null)
+    {
+        lifetime.Cancel();
+        Interlocked.Increment(ref generation);
+        var stopped = true;
+        try { await ExecuteAsync(machine.Handle(new(ConnectionEventKind.AttemptAbandoned))); }
+        catch (Exception ex) when (IsOperational(ex)) { stopped = false; }
+        var undo = UndoState.NotNeeded;
+        string? nicWarning = null;
+        var environmentRestored = false;
+        if (stopped)
+        {
+            (undo, nicWarning) = await RemoveProtectionAsync();
+            if (undo != UndoState.Failed)
+            {
+                environmentRestored = await RestoreEnvironmentAsync();
+                session = null;
+                guardStatus = "";
+            }
+        }
+        if (!stopped || undo == UndoState.Failed)
+        {
+            // 内核停不下来或保护撤不掉:停在需人工处理,不再做环境恢复,保护保持。
+            try { await ExecuteAsync(machine.Handle(new(ConnectionEventKind.OperationFailed))); }
+            catch (Exception ex) when (IsOperational(ex)) { }
+            message = !stopped
+                ? "连接内核未能停止，请联系管理员；断网保护保留。"
+                : AbandonNotRestored + (reason ?? ReasonSentence(cause));
+            if (!stopped) undo = UndoState.NotNeeded;
+        }
+        else
+        {
+            message = (fixedMessage ?? AbandonRestored + (reason ?? ReasonSentence(cause)))
+                + (nicWarning is null ? "" : " " + nicWarning)
+                + (environmentRestored ? "" : " 时区或浏览器设置未能恢复，请联系管理员。");
+        }
+        EndFirstAttempt();
+        RaiseAttemptAbandoned();
+        WriteJournal("放弃并恢复：" + (phrase ?? ReasonPhrase(cause)) + "，撤销=" + UndoText(undo));
+        Publish();
+    }
+
+    /// <summary>撤销本进程套上的断网保护并恢复网卡;没套过就不碰系统防火墙。</summary>
+    private async Task<(UndoState State, string? Warning)> RemoveProtectionAsync()
+    {
+        if (!protection) return (UndoState.NotNeeded, null);
+        try { await firewall.RemoveAsync(); }
+        catch (Exception ex) when (IsOperational(ex)) { return (UndoState.Failed, null); }
+        protection = false;
+        protectionVerified = false;
+        firewallWarning = null;
+        reapWarning = null;
+        string? warning = null;
+        if (nicGuard is not null)
+        {
+            try { warning = await nicGuard.RestoreAsync(); }
+            catch (Exception ex) when (IsOperational(ex)) { }
+        }
+        return (UndoState.Removed, warning);
+    }
+
+    /// <summary>首次尝试期间落到需重新登录或需人工处理且已套上保护:只撤保护、恢复环境,状态与提示不动。</summary>
+    private async Task MaybeAbandonAfterLoginFailureAsync()
+    {
+        if (!firstAttempt || !protection || machine.State is not (ConnectionState.NeedsLogin or ConnectionState.NeedsManual)) return;
+        var (undo, warning) = await RemoveProtectionAsync();
+        if (undo != UndoState.Failed)
+        {
+            message += " 已恢复原来的网络。";
+            if (warning is not null) message += " " + warning;
+            if (!await RestoreEnvironmentAsync()) message += " 时区或浏览器设置未能恢复，请联系管理员。";
+        }
+        EndFirstAttempt();
+        RaiseAttemptAbandoned();
+        WriteJournal("放弃并恢复：登录状态失效，撤销=" + UndoText(undo));
+        Publish();
+    }
+
+    private void EndFirstAttempt()
+    {
+        firstAttempt = false;
+        firstBackoffs = 0;
+    }
+
+    private void RaiseAttemptAbandoned()
+    {
+        try { AttemptAbandoned?.Invoke(); }
+        catch (Exception) { } // 订阅者抛错不能改变已经完成的恢复结果。
+    }
+
+    private void WriteJournal(string line)
+    {
+        try { Journal?.Invoke(line); }
+        catch (Exception) { } // 记录写不进不影响连接与恢复。
+    }
+
     private static IPAddress[] NodeIps(SessionResponse value)
     {
         if (!IPAddress.TryParse(value.Node.Host, out var ip) || ip.AddressFamily != AddressFamily.InterNetwork)

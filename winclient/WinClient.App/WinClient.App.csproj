@@ -36,4 +36,7 @@
     <EmbeddedResource Include="../third_party/bin/wintun.dll" LogicalName="YuanC.Kernel.wintun.dll" />
     <EmbeddedResource Include="../third_party/bin/kernel-manifest.json" LogicalName="YuanC.Kernel.manifest.json" />
   </ItemGroup>
+  <ItemGroup Condition="'$(YuanCTestBuild)' == 'true'">
+    <AssemblyMetadata Include="YuanC.TestBuild" Value="true" />
+  </ItemGroup>
 </Project>

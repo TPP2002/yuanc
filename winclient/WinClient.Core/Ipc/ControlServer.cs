@@ -3,6 +3,7 @@ using System.Text;
 using System.Text.Json;
 using System.Threading.Channels;
 using WinClient.Core.Client;
+using WinClient.Core.State;
 using WinClient.Core.Update;
 
 namespace WinClient.Core.Ipc;
@@ -11,6 +12,9 @@ public sealed class ControlServer(IClientFacade facade, DesiredStateStore desire
     TimeSpan? idleTimeout = null)
 {
     public static readonly TimeSpan DefaultIdleTimeout = TimeSpan.FromSeconds(30);
+    /// <summary>开机要不要接着连:真有断网保护,或此刻正在连接/已连接/重连中才算要连;首次失败恢复后写不连。</summary>
+    public static bool ShouldStayConnected(ClientSnapshot snapshot) =>
+        snapshot.ProtectionActive || snapshot.State is ConnectionState.Connecting or ConnectionState.Connected or ConnectionState.Reconnecting;
     /// <summary>不可信调用者发会改变连接状态的指令时返回的错误文案。</summary>
     public const string UntrustedCallerError = "只有本产品的界面程序可以执行此操作";
     // 会改变连接状态的指令，以及 check_update（会触发对外网络检查）、read_audit（含本机其他程序的规则名与完整路径）、read_selfcheck（含产品核验到的真实出口地址），只允许程序位于安装目录之下的调用者执行；status 与 subscribe 对任何本机程序开放。
@@ -119,7 +123,7 @@ public sealed class ControlServer(IClientFacade facade, DesiredStateStore desire
             {
                 case "connect":
                     await facade.ConnectAsync().ConfigureAwait(false);
-                    desired.Write(true);
+                    desired.Write(ShouldStayConnected(facade.Snapshot));
                     break;
                 case "disconnect":
                     await facade.DisconnectAsync().ConfigureAwait(false);
