@@ -630,7 +630,7 @@
       invNewMeta.textContent = meta;
       invNewCopy.textContent = '复制';
       invNote.value = '';
-      loadDirectory();
+      loadDirectory(true);
     }, function (error) {
       if (error.code !== 'login_required') invMsg.textContent = error.message;
     }).then(function () {
@@ -712,13 +712,13 @@
   }
 
   /* 目录:邀请码、账号、设备一起取 */
-  function loadDirectory() {
+  function loadDirectory(keepOrder) {
     request('GET', '/api/directory').then(function (data) {
       invitesCache = data.invites || [];
       accountsCache = data.accounts || [];
       devicesCache = data.devices || [];
       renderInvites();
-      renderAccounts();
+      renderAccounts(keepOrder);
       clearPageMsg();
     }, function (error) {
       if (error.code === 'login_required') return;
@@ -726,6 +726,8 @@
     });
   }
 
+  /* 上次摆好的账号顺序,操作后照它摆,刚点的那块不跳走 */
+  var accountOrder = [];
   var GROUP_ORDER = {'使用中': 0, '已过期': 1, '已停用': 2};
 
   function groupOf(account, now) {
@@ -733,7 +735,7 @@
     return dateValue(account.expires_at) > now ? '使用中' : '已过期';
   }
 
-  function renderAccounts() {
+  function renderAccounts(keepOrder) {
     closeExtend();
     closeConfirm();
     clear(accountsEl);
@@ -750,10 +752,25 @@
       if (byExpiry !== 0) return byExpiry;
       return dateValue(right.account.created_at) - dateValue(left.account.created_at);
     });
+    /* 操作后照上次的顺序摆;这次新出现的账号排最后,彼此保持正常排序 */
+    if (keepOrder) {
+      entries.sort(function (left, right) {
+        return orderIndex(left.account.id) - orderIndex(right.account.id);
+      });
+    }
+    accountOrder = [];
+    for (var k = 0; k < entries.length; k++) {
+      accountOrder.push(entries[k].account.id);
+    }
     for (var j = 0; j < entries.length; j++) {
       accountsEl.appendChild(accountCard(entries[j].account, entries[j].group, now));
     }
     accountsEmpty.hidden = entries.length > 0;
+  }
+
+  function orderIndex(id) {
+    var index = accountOrder.indexOf(id);
+    return index === -1 ? accountOrder.length : index;
   }
 
   function findInvite(code) {
@@ -892,7 +909,7 @@
   function accountAction(account, action, button, label, msg) {
     var path = '/api/accounts/' + encodeURIComponent(account.id) + action;
     request('POST', path, {}).then(function () {
-      loadDirectory();
+      loadDirectory(true);
     }, function (error) {
       if (error.code !== 'login_required') setBlockError(msg, error.message);
     }).then(function () {
@@ -959,7 +976,7 @@
       var path = '/api/devices/' + encodeURIComponent(device.id) + '/revoke';
       request('POST', path, {}).then(function () {
         openConfirm = null;
-        loadDirectory();
+        loadDirectory(true);
       }, function (error) {
         if (error.code !== 'login_required') setBlockError(msg, error.message);
       }).then(function () {
@@ -1042,7 +1059,7 @@
       setBusy(submitBtn, true, '正在延期');
       var path = '/api/accounts/' + encodeURIComponent(account.id) + '/extend';
       request('POST', path, {days: days}).then(function () {
-        loadDirectory();
+        loadDirectory(true);
       }, function (error) {
         if (error.code !== 'login_required') setBlockError(msg, error.message);
       }).then(function () {
