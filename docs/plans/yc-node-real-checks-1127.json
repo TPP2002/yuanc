@@ -1,0 +1,180 @@
+{
+  "schemaVersion": 1,
+  "taskId": "NODE-REALMACHINE-INSTALL-1127",
+  "slug": "yc-node-real-checks-1127",
+  "title": "节点检查接上真结果:入口监听、两条通道自测、经隧道出口;装完当场启动规则单元与托管服务;诊断包带上系统日志",
+  "goal": "以派单时 origin/main 头为基点。看板卡 NODE-REALMACHINE-INSTALL-1127。\n\n问题(2026-11-27 在客户软路由 Debian 12.15 真机上实测发现,三处都要修):\n1. `exitnode check` 的「入口可达」「代理进程」「真实出口」三层一直是占位「未接入」,`exitnode status` 永远说「尚不能确认可上网」,维护人员看不出节点到底能不能上网。真机上已验证可行的自测法:root 跑 `<内核> tools fetch -c <只含 main、backup 两个出站的配置> -o main|backup https://1.1.1.1/cdn-cgi/trace`,出站地址填 127.0.0.1,凭据取第一台未吊销的设备,两条通道分别 0.31 秒、0.11 秒拿到 ip= 与 loc=AU 两行。\n2. `init` 装完立刻 `check`,「服务加固」「客户端托管服务」两层失败,重启后才通过。原因:init 对 exitnode-nft.service 和 exitnode-admin.service 只做了 `systemctl enable`,没有当场启动。规则文件 /var/lib/exitnode/exitnode.nft 由 nft.apply 写成「先声明表、再删表、再建表」,重复加载不会累加规则,可以当场启动。\n3. `exitnode diagnose` 的「最近日志.txt」在真机上只有「暂无日志」:程序不写 <data_dir>/logs/exitnode.log,各服务的输出都在 systemd 日志里。\n\n要做的(逐条照做,文字一字不差):\n\n一、新模块 node/exitnode/selftest.py(模块文档字符串一行中文)\n1. 常量:TRACE_URL = \"https://1.1.1.1/cdn-cgi/trace\";PROBE_NAME = \"selftest-probe.json\";FETCH_TIMEOUT = 15;CHANNELS = (\"main\", \"backup\")。\n2. `run(config, runner) -> dict`,按顺序:\n   a. secrets = config.node.secrets_dir.rstrip(\"/\")。`runner.exists(secrets + \"/reality.json\")` 为假 → 返回 {\"skipped\": \"节点尚未完成安装，无法自测隧道\"}。\n   b. 设备取 `device.registry(config, runner).all()` 里第一台 revoked_at 为 None 的;一台都没有 → 返回 {\"skipped\": \"没有未吊销的设备，无法自测隧道\"}。\n   c. ctx = `device._context(config, runner, \"127.0.0.1\")`;cfg = `proxy.client_config.render_client_windows(ctx, 那台设备)`;从 cfg[\"outbounds\"] 按 main、backup 顺序取 tag 为 main 与 backup 的两个出站,原样不改;自测配置 = {\"log\": {\"disabled\": True}, \"outbounds\": [main 出站, backup 出站]},不加别的键。b、c 两步(含读登记表)抛 ValueError / OSError / RuntimeError / KeyError / TypeError 时返回 {\"error\": \"无法生成自测配置，请检查节点凭据\"},不得带出异常原文。\n   d. path = secrets + \"/\" + PROBE_NAME;`runner.write_file(path, json.dumps(自测配置, ensure_ascii=False), 0o600)`。\n   e. 对 CHANNELS 里每个 tag 调一次 `runner.run([config.proxy.binary, \"tools\", \"fetch\", \"-c\", path, \"-o\", tag, TRACE_URL], check=False, timeout=FETCH_TIMEOUT)`;抛 OSError / RuntimeError 时这一条按不通算。\n   f. 判通:退出值为 0,且输出里以 \"ip=\" 开头的行恰好一行,去掉 \"ip=\" 与首尾空白后是规范写法的 IPv4(ipaddress.IPv4Address 能解析且 str 回来与原文相同)→ {\"ok\": True, \"ip\": 该地址, \"loc\": 地区};地区取第一行以 \"loc=\" 开头的行去掉前缀与空白,须完全匹配两位大写字母,否则为 None。不满足 → {\"ok\": False, \"ip\": None, \"loc\": None}。\n   g. d、e 两步放进 try/finally:finally 里 `runner.exists(path)` 为真就先 `runner.write_file(path, \"\", 0o600)` 再 `runner.remove(path)`;清理时抛 OSError / RuntimeError 一律忽略。\n   h. 正常返回 {\"main\": {...}, \"backup\": {...}}。全程不 print、不写日志;返回值里除上面几个键外不放任何东西(不放命令输出、不放凭据)。\n3. 只经 runner 碰主机,不 import subprocess。\n\n二、node/exitnode/netinfo.py\n1. 把 node/exitnode/watchdog/probes.py 里 `_listen(runner, argv, port)` 的函数体原样搬到 netinfo.py,名为 `listen_state(runner, argv, port)`(返回 \"通过\" / \"失败\" / \"未知\",行为一字不变)。probes.py 改为 `from ..netinfo import listen_state` 并保留 `_listen = listen_state` 这一行,probes.probe 里照旧调 `_listen`;probes.py 其余一字不改。\n2. `check(runner, config)` 返回结构不变:{\"network\": …, \"layers\": [六层]},层的顺序与 layer、name 两个键不变:network「网卡与默认路由」、upstream「上游连通」、entry「入口可达」、proxy「代理进程」、egress「真实出口」、最后照旧 `service.check(runner, config)`。只把中间三层的占位换成下面的真结果。\n3. entry 层:r = config.proxy.reality_port,h = config.proxy.hy2_port;两态 = [listen_state(runner, [\"ss\", \"-ltnH\"], r), listen_state(runner, [\"ss\", \"-lunH\"], h)]。\n   - 都为「通过」→ result「通过」,reason f\"主入口 TCP {r} 与备用入口 UDP {h} 都在监听\"\n   - 有「失败」→ result「失败」,reason \"本机入口没有全部打开：\" + \"、\".join(失败的那几项) + \" 没有监听\";两项的称呼分别是 f\"主入口 TCP {r}\"、f\"备用入口 UDP {h}\",例:\"本机入口没有全部打开：备用入口 UDP 24443 没有监听\"\n   - 其余(有「未知」无「失败」)→ result「未知」,reason \"无法读取监听信息，暂不据此判断入口\"\n4. proxy 与 egress 两层:\n   - network 或 upstream 层的 result 不是「通过」→ 两层都是 result「跳过」,reason \"网络或上游不通，暂不自测隧道\";此时不调 selftest.run。\n   - 否则在 check 函数体内 `from . import selftest`(延迟导入,避免与 device.py 循环导入),probe = selftest.run(config, runner):\n     · probe 有 \"skipped\" → 两层都是「跳过」,reason 用 probe[\"skipped\"] 原文。\n     · probe 有 \"error\" → proxy「失败」,reason 用 probe[\"error\"] 原文;egress「跳过」,reason \"隧道自测没有完成，无法确认出口\"。\n     · 否则 m = probe[\"main\"][\"ok\"],b = probe[\"backup\"][\"ok\"];proxy 层多一个键 \"channels\": {\"main\": m, \"backup\": b}:\n       m 与 b 都真 →「通过」\"主通道与备用通道自测都能连通\";只有 m →「通过」f\"主通道能连通；备用通道自测不通，请检查 UDP {h}\";只有 b →「通过」f\"备用通道能连通；主通道自测不通，请检查 TCP {r}\";都假 →「失败」\"主通道与备用通道自测都不通\"。\n       egress:都假 →「失败」\"两条通道都不通，无法经隧道上网\";否则取 m 真时的 main、否则 backup 的 ip 与 loc,egress 层多一个键 \"ipv4\": ip;loc 为 None →「未知」f\"经隧道出口 {ip}，取不到地区\";config.node.country 非空且 loc 不等于它 →「失败」f\"经隧道出口 {ip} 的地区是 {loc}，配置的国家是 {country}\";其余 →「通过」f\"经隧道出口 {ip}，地区 {loc}\"。\n\n三、node/exitnode/status.py 的 evaluate(签名不变,其余分支、CGNAT 后缀、看门狗覆盖一字不改)\n1. path:proxy 层有 \"channels\" 且 main 为真 → \"main\";否则 backup 为真 → \"backup\";否则 \"unknown\"。各分支都这样算。\n2. 正常(State.NORMAL)分支的 reason 换成:egress 层 result 为「通过」时,两条通道都真 →「检查通过，经隧道可以上网」;只有 main →「检查通过，经主通道可以上网；备用通道自测不通」;只有 backup →「检查通过，经备用通道可以上网；主通道自测不通」。egress 层不是「通过」(或没有 egress 层)→ \"检查通过，但尚不能确认可上网：\" + (egress 层的 reason;没有 egress 层时用 \"缺少隧道自测结果\")。\n3. 「未知」「跳过」照旧不算失败,不改状态判定。\n\n四、node/exitnode/cli.py 的 _install(只动这两处,别处一字不改)\n1. 「启用管理面」一步的命令改为 [\"systemctl\", \"enable\", \"--now\", \"exitnode-admin.service\"]。\n2. 「启用防火墙规则单元」一步的命令改为 [\"systemctl\", \"enable\", \"--now\", \"exitnode-nft.service\"];上面那行注释改为「规则文件先删表再建表，重复加载不累加规则；当场启动，装完「服务加固」检查即可通过。」两步的 undo 记录不变。\n\n五、node/exitnode/cli.py 的 _diagnose(只动这个函数并新增一个模块级常量)\n1. 模块级常量 JOURNAL_UNITS = (\"exitnode-proxy.service\", \"exitnode-admin.service\", \"exitnode-nft.service\", \"exitnode-watchdog.service\", \"exitnode-rescue.service\", \"exitnode-recover.service\", \"exitnode-authsync.service\", \"exitnode-publisher.service\")。\n2. 程序日志照旧:<data_dir>/logs/exitnode.log 存在取最后 100 行,否则「暂无日志」。\n3. 系统日志:argv = [\"journalctl\", \"--no-pager\", \"-o\", \"short-iso\", \"-n\", \"300\"],再按 JOURNAL_UNITS 顺序给每个单元追加 \"-u\", 单元名;`runner.run(argv, check=False, timeout=20)`。抛 OSError / RuntimeError 或退出值非 0 → 文字「无法读取系统日志」;退出值 0 且输出去空白后为空 →「暂无系统日志」;否则用去掉首尾空白的输出。\n4. 「最近日志.txt」内容 = \"【程序日志】\\n\" + 程序日志 + \"\\n\\n【系统日志】\\n\" + 系统日志,照旧整体过 redact。诊断.json、文件名、提示语不变。\n\n六、测试\n1. 新文件 node/tests/test_selftest.py,至少这些用例(名字一字不差):test_skips_when_not_installed、test_skips_when_no_active_device、test_probe_config_uses_first_active_device_and_loopback(断言:自测配置只有 log 与 outbounds 两个键,outbounds 依次是 main、backup,两者 server 都是 127.0.0.1,main 的 uuid 是第一台未吊销设备的;写入权限 0o600、路径在凭据目录下)、test_fetch_argv_and_timeout(包一层 runner.run 记录 timeout,断言两次调用的 argv 与 timeout=15)、test_probe_file_cleared_and_removed_even_on_error(runner.run 抛 RuntimeError 时文件也被清空并删除)、test_parses_ip_and_loc_and_rejects_bad_output(退出值非 0、没有 ip 行、两行 ip、非规范 IPv4、loc 不是两位大写都要覆盖)、test_result_has_no_secrets(返回值转 JSON 后不含设备 uuid、hy2 密码、混淆密码)。假主机参照 node/tests/test_cli.py 的 fake(pairing=True) 在本文件里自己写一份,跑一次 main([\"init\"]) 得到凭据与设备。\n2. 新文件 node/tests/test_netinfo_layers.py,至少:test_entry_layer_pass_fail_unknown、test_self_test_skipped_when_upstream_fails(断言没有调用 tools fetch)、test_proxy_and_egress_layers_from_channels(两通、只主、只备、都不通四种)、test_egress_country_mismatch_and_missing、test_layer_order_and_keys_unchanged、test_status_reason_and_path、test_watchdog_listen_uses_shared_helper(断言 probes._listen is netinfo.listen_state)。可以用 monkeypatch 替换 selftest.run 构造各种结果。\n3. node/tests/test_cli.py:\n   - 第 142 行的断言改为 assert \"尚不能确认可上网\" in result[\"reason\"](fake() 没有凭据,自测为「跳过」)。\n   - 第 172 行期望列表改为 [\"通过\", \"通过\", \"未知\", \"跳过\", \"跳过\", \"通过\", \"通过\", \"通过\", \"通过\", \"通过\", \"通过\"](假主机没配 ss,入口为「未知」;没有凭据,自测「跳过」),该用例其余断言不动。\n   - 第 311~315 行:改为断言 (\"systemctl\", \"enable\", \"--now\", \"exitnode-nft.service\") 在 sent 里、且排在 (\"nft\", \"-f\", \"/var/lib/exitnode/exitnode.nft\") 之后;删掉「不带 --now」那条断言(它钉的正是本单要改的旧行为)。\n   - 新增 test_init_starts_admin_and_rules_now:init 后两条 enable --now 都发过、不再有不带 --now 的 enable 这两个单元;manifest 里两步的 undo 仍是 {\"kind\": \"systemctl\", \"unit\": …};rollback 对两个单元都发 (\"systemctl\", \"disable\", \"--now\", 单元)。\n   - 新增 test_diagnose_includes_journal_and_redacts:给 (\"journalctl\",) 配一段含测试 uuid(如 12345678-1234-1234-1234-123456789abc)与 password=abcdefgh 的输出,断言 argv 前缀与每个 \"-u 单元\" 都在、最近日志.txt 含「【程序日志】」「【系统日志】」与那段日志的其他文字、不含完整 uuid 与 abcdefgh。\n   - 新增 test_diagnose_journal_failure_is_reported:退出值 1 与未配置(模拟 127)都写「无法读取系统日志」,退出值 0 空输出写「暂无系统日志」。\n   - 其他既有用例因自测多出的命令变红的,只许在用例里补假应答(例如给 (内核路径, \"tools\", \"fetch\") 配 CompletedResult(out=\"ip=203.0.113.9\\nloc=AU\\n\"),给 (\"ss\",) 配监听行),不许改断言;补了哪些在交活说明里逐条列出。\n",
+  "background": "先读(全文):node/exitnode/netinfo.py、status.py、cli.py(重点 _install 的「启用管理面」「安装网络规则」「启用防火墙规则单元」三步、_diagnose、check/status/diagnose 分支)、device.py(registry、_context)、proxy/client_config.py、proxy/context.py(ipv4_host 接受 127.0.0.1)、proxy/registry.py(Device、revoked_at)、service.py、log.py(redact)、runner.py(Runner.run 的 timeout 参数、FakeRunner 的前缀匹配与未配置返回 127)、nft.py(apply 写的规则文件先删表再建表)、manifest.py(systemctl 类 undo 发 disable --now)、watchdog/probes.py;node/tests/test_cli.py(fake、harden 两个辅助函数与第 130~180、280~325 行)、node/tests/test_watchdog.py(监听相关用例)。\n\n并行情况:另一张单 yc-node-console-core-1127 正在把 cli.py 里 check、status 两个分支的组装抽到 report.py,并在 test_cli.py 加用例。本单在 cli.py 只许动 _install 的两步、_diagnose 与新常量,check/status/diagnose 分支一行不碰,免得撞车;netinfo.py、status.py、selftest.py、watchdog/probes.py 只有本单在改。\n\n已定的取舍(不要改):自测走节点自己的两个入口(127.0.0.1),用第一台未吊销设备的凭据,出站写法照 render_client_windows 原样,保证与客户端同款;自测配置临时落在凭据目录、0600、用完清空再删;取地区只认 1.1.1.1 的 trace;一条通道通就算「代理进程」通过,原因里点名不通的那条;网络或上游不通时不自测,免得白等 30 秒;层的 layer 与 name 不改(管理网页和文档按它们显示)。\n\n硬规矩(本仓红线,任何一条做不到就停下交 blocked + forks,不猜):①只改允许清单里的文件;不碰 systemd 模板、manifest.py、nft.py、proxy/、service.py、示例配置、report.py、console/。②凭据不落代码库、不落示例、不落日志;测试里的 uuid、密码用明显的测试值。③主机副作用只经 Runner;selftest.py 不 import subprocess。④测试只用内存假件与 tmp_path,不联外网,不往仓库目录写文件。⑤只用 Python 3.11 能跑的写法。⑥工人不许 git 写操作,不许自己跑 pytest / ruff / python(按验收编号走派单器自测通道,命令单独一条执行,不写 cd &&、管道、2>&1);不许装依赖,缺依赖交 blocked。⑦既有测试断言不删、不跳过、不放宽;只有【要做的】六、3 点名的三处可以改。⑧新增文案、注释用中文大白话;本单所有给人看的文字照【要做的】原文,没写到又必须有文字的地方停下交 forks 问。⑨每次 Edit / Write 的新内容不超过 150 行。",
+  "nonGoals": [
+    "不改 check/status/diagnose 三个分支的组装(另一张单在抽到 report.py)",
+    "不改示例配置、systemd 模板、隧道路由规则",
+    "不改看门狗的检查与恢复逻辑(只把监听判断函数搬到 netinfo.py 共用)",
+    "不写 docs/ 下任何文档(真机验收记录与说明由契约方写)",
+    "不改 Windows 客户端与鉴权服务"
+  ],
+  "expectArtifacts": [
+    "node/exitnode/selftest.py",
+    "node/tests/test_selftest.py",
+    "node/tests/test_netinfo_layers.py"
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "workbuddyTier": "hard",
+  "timeoutSec": 14400,
+  "repoRoot": "E:/yuanc",
+  "steps": [
+    "读 BACKGROUND 列出的文件。",
+    "写 node/tests/test_selftest.py(先申请 T-SELFTEST 证红),再写 node/exitnode/selftest.py,T-SELFTEST 绿。",
+    "写 node/tests/test_netinfo_layers.py(先申请 T-LAYERS 证红),再改 netinfo.py、watchdog/probes.py、status.py,T-LAYERS 与 T-WATCHDOG 绿。",
+    "改 test_cli.py 的三处既有断言并加三个新用例(先申请 T-CLI 证红),再改 cli.py 的 _install 两步与 _diagnose,T-CLI 绿。",
+    "最后 PYTEST、RUFF、SHAPE、TESTS-NAMES、NO-SUBPROCESS、SCOPE 全绿。"
+  ],
+  "allowedPaths": [
+    "node/exitnode/selftest.py",
+    "node/exitnode/netinfo.py",
+    "node/exitnode/status.py",
+    "node/exitnode/cli.py",
+    "node/exitnode/watchdog/probes.py",
+    "node/tests/test_selftest.py",
+    "node/tests/test_netinfo_layers.py",
+    "node/tests/test_cli.py"
+  ],
+  "forbiddenPaths": [
+    ".codex/**",
+    ".github/**",
+    ".gitignore",
+    "pyproject.toml",
+    "requirements-dev.txt",
+    "winclient/**",
+    "scripts/**",
+    "authserver/**",
+    "node/examples/**",
+    "node/tests/golden/**",
+    "node/exitnode/templates/**",
+    "node/exitnode/manifest.py",
+    "node/exitnode/nft.py",
+    "node/exitnode/proxy/**",
+    "node/exitnode/service.py",
+    "node/exitnode/device.py",
+    "node/exitnode/report.py",
+    "node/exitnode/console/**",
+    "node/exitnode/admin/**",
+    "node/exitnode/updater/**",
+    "node/exitnode/rescue/**",
+    "node/exitnode/runner.py",
+    "node/exitnode/config.py",
+    "node/tests/test_watchdog.py",
+    "docs/**"
+  ],
+  "acceptance": [
+    {
+      "id": "T-SELFTEST",
+      "kind": "test:targeted",
+      "target": "node/tests/test_selftest.py",
+      "required": true,
+      "failsOnBase": true
+    },
+    {
+      "id": "T-LAYERS",
+      "kind": "test:targeted",
+      "target": "node/tests/test_netinfo_layers.py",
+      "required": true,
+      "failsOnBase": true
+    },
+    {
+      "id": "T-CLI",
+      "kind": "test:targeted",
+      "target": "node/tests/test_cli.py",
+      "required": true,
+      "failsOnBase": true
+    },
+    {
+      "id": "T-WATCHDOG",
+      "kind": "test:targeted",
+      "target": "node/tests/test_watchdog.py",
+      "required": true
+    },
+    {
+      "id": "PYTEST",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "pytest",
+        "-q"
+      ],
+      "required": true,
+      "timeoutSec": 1500
+    },
+    {
+      "id": "RUFF",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "ruff",
+        "check",
+        "node",
+        "authserver"
+      ],
+      "required": true,
+      "timeoutSec": 300
+    },
+    {
+      "id": "SHAPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import sys;sys.path[:0]=['node'];from exitnode import selftest,netinfo;from exitnode.watchdog import probes;bad=[k for k,ok in (('url',selftest.TRACE_URL=='https://1.1.1.1/cdn-cgi/trace'),('name',selftest.PROBE_NAME=='selftest-probe.json'),('timeout',selftest.FETCH_TIMEOUT==15),('channels',selftest.CHANNELS==('main','backup')),('run',callable(getattr(selftest,'run',None))),('listen',probes._listen is netinfo.listen_state)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "TEXTS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;n=pathlib.Path('node/exitnode/netinfo.py').read_text(encoding='utf-8');s=pathlib.Path('node/exitnode/status.py').read_text(encoding='utf-8');c=pathlib.Path('node/exitnode/cli.py').read_text(encoding='utf-8');want=((n,'网络或上游不通，暂不自测隧道'),(n,'主通道与备用通道自测都能连通'),(n,'两条通道都不通，无法经隧道上网'),(n,'无法读取监听信息，暂不据此判断入口'),(s,'检查通过，经隧道可以上网'),(s,'检查通过，但尚不能确认可上网：'),(c,'【系统日志】'),(c,'无法读取系统日志'),(c,'暂无系统日志'),(c,'\"enable\", \"--now\", \"exitnode-admin.service\"'),(c,'\"enable\", \"--now\", \"exitnode-nft.service\"'));bad=[w for t,w in want if w not in t]+(['未接入'] if '未接入' in n+s else []);print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "TESTS-NAMES",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;w=(('node/tests/test_selftest.py',('test_skips_when_not_installed','test_skips_when_no_active_device','test_probe_config_uses_first_active_device_and_loopback','test_fetch_argv_and_timeout','test_probe_file_cleared_and_removed_even_on_error','test_parses_ip_and_loc_and_rejects_bad_output','test_result_has_no_secrets')),('node/tests/test_netinfo_layers.py',('test_entry_layer_pass_fail_unknown','test_self_test_skipped_when_upstream_fails','test_proxy_and_egress_layers_from_channels','test_egress_country_mismatch_and_missing','test_layer_order_and_keys_unchanged','test_status_reason_and_path','test_watchdog_listen_uses_shared_helper')),('node/tests/test_cli.py',('test_init_starts_admin_and_rules_now','test_diagnose_includes_journal_and_redacts','test_diagnose_journal_failure_is_reported')));bad=[f+':'+n for f,ns in w for n in ns if 'def '+n+'(' not in pathlib.Path(f).read_text(encoding='utf-8')];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "NO-SUBPROCESS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;t=pathlib.Path('node/exitnode/selftest.py').read_text(encoding='utf-8');bad=[k for k in ('import subprocess','os.system','print(') if k in t];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "SCOPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess as sp,sys;g=lambda *a:sp.check_output(['git','-c','core.quotepath=false']+list(a)).decode('utf-8').split(chr(10));mb=g('merge-base','origin/main','HEAD')[0].strip();ch={p.strip() for p in g('diff','--name-only',mb)+g('ls-files','--others','--exclude-standard') if p.strip()};ok=set('node/exitnode/selftest.py node/exitnode/netinfo.py node/exitnode/status.py node/exitnode/cli.py node/exitnode/watchdog/probes.py node/tests/test_selftest.py node/tests/test_netinfo_layers.py node/tests/test_cli.py'.split());bad=sorted(p for p in ch if p not in ok);print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    }
+  ]
+}
