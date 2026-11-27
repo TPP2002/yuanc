@@ -1,0 +1,154 @@
+{
+  "schemaVersion": 1,
+  "taskId": "WINCLIENT-KERNEL-ORPHAN-1127",
+  "slug": "yc-kernel-orphan-1128",
+  "title": "连接内核跟着后台服务走:作业对象绑定、启动与每次起内核前清残留、就绪认本次进程",
+  "workbuddyTier": "hard",
+  "goal": "以派单时 origin/main 头为基点。看板卡 WINCLIENT-KERNEL-ORPHAN-1127(同一现象的 WINCLIENT-KERNEL-ORPHAN-ON-SERVICE-EXIT-1128 一并做)。\n\n【问题】连接内核 sing-box 由后台服务用 SingBoxLauncher 直接起成子进程,没有任何东西把它绑在后台服务上。后台服务崩溃或被强行结束后,内核和虚拟网卡继续接管全机流量,界面却显示未连接;服务被系统自动拉起后又起一个新内核,两个抢同一块虚拟网卡,状态在「已连接」「重连中」之间来回跳,最后停在「需人工处理」,只能重启电脑。全仓没有清理残留内核的代码(已核实);TunnelTransport 的就绪判断只看有没有名为 YuanC-TUN 的网卡在线,旧内核留下的网卡也会被当成本次启动成功。\n\n【做完后】三层:①内核放进「关闭即结束」的作业对象,后台服务进程一没,内核跟着被系统结束;②每次起内核前、以及后台服务启动时,先结束本产品残留的内核进程;③就绪判断认本次启动的进程。下面的提示语、记录文字照原文一字不差(全角标点照抄)。\n\n① 新文件 winclient/WinClient.Core/Process/KernelJob.cs:`public sealed class KernelJob : IDisposable`\n - `public static KernelJob Create()`:`CreateJobObjectW` 第一个参数(安全属性)传 `IntPtr.Zero`、名字传 null。必须如此:句柄一旦可继承,内核经重定向输出继承句柄后会自己攥着作业,服务死了作业也不关。再用 `SetInformationJobObject` 设 JobObjectExtendedLimitInformation(信息类 9),LimitFlags 只设 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE(0x2000)。任一步失败抛 `Win32Exception`,已建的句柄先释放。\n - 句柄用 SafeHandle 子类保存,释放时 CloseHandle。\n - `public void Assign(System.Diagnostics.Process process)`:AssignProcessToJobObject,失败抛 Win32Exception。\n - `public bool Contains(System.Diagnostics.Process process)`:IsProcessInJob。\n - `Dispose()` 可重复调用。P/Invoke 照仓里 WfpNative.cs 的写法用 `[DllImport(\"kernel32.dll\", SetLastError = true)]`。\n\n② winclient/WinClient.Core/Process/ISingBoxLauncher.cs(两个接口签名一个字不改)\n - SingBoxLauncher 加 `internal static KernelJob? SharedJob`:整个进程共用一个作业,第一次 Start 时建(线程安全),之后一直留着,本类不释放它(进程退出时系统关句柄,内核随之结束)。建失败时 SharedJob 保持 null,下次 Start 再试。\n - `process.Start()` 成功后、`BeginOutputReadLine()` 之前,把子进程 Assign 进 SharedJob。作业没建成或 Assign 抛异常:调一次 `onLog(\"连接内核未能绑定到后台服务，后台服务意外退出时它可能残留。\")`,照常返回子进程,不抛、不结束它(第②层清理兜底)。\n - 私有嵌套类 Child 改成 `internal sealed class Child`,加 `internal System.Diagnostics.Process Process`(只读,测试用来查是否在作业里)。Stop、Dispose 行为不变。\n\n③ 新文件 winclient/WinClient.Core/Process/StrayKernelSweeper.cs:\n - `public sealed record KernelProcessInfo(int Id, string? ImagePath);`\n - `public interface IKernelProcessTable { IReadOnlyList<KernelProcessInfo> FindByName(string processName); bool Kill(int id, TimeSpan wait); }`:Kill 结束整棵进程树,wait 内退出返回 true,进程本来就不存在也返回 true。\n - `public sealed class SystemKernelProcessTable : IKernelProcessTable`:FindByName 用 `Process.GetProcessesByName`;映像路径用 OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,0x1000)+ QueryFullProcessImageNameW 取,取不到(拒绝访问、已退出)就记 null;Kill 用 `Kill(entireProcessTree: true)` + `WaitForExit`;所有 Process 对象用完释放。\n - `public sealed class StrayKernelSweeper(IKernelProcessTable? table = null)`(缺省用 SystemKernelProcessTable),`public const string NotStoppedMessage = \"上次残留的连接内核没能结束，请重启电脑后再连接。\";`,结束等待用 `TimeSpan.FromSeconds(5)`。\n - `public int Sweep(string executablePath, string? ownedDirectory, Action<string>? log = null)`:按 `Path.GetFileNameWithoutExtension(executablePath)` 找进程;跳过 `Environment.ProcessId`、跳过 ImagePath 为空的;算「本产品的内核」的只有两种:(a) 映像全路径与 executablePath 全路径相同;(b) ownedDirectory 不为 null,映像全路径以「ownedDirectory 全路径 + 目录分隔符」开头,且文件名是 \"sing-box.exe\"。比较一律 `StringComparison.OrdinalIgnoreCase`;路径格式异常的当不匹配。匹配的逐个 Kill;返回成功结束的个数;个数大于 0 时调 `log?.Invoke($\"已结束上次残留的连接内核 {count} 个。\")`;有任何一个 Kill 返回 false,全部处理完、记录写完后抛 `IOException(NotStoppedMessage)`。别的路径下同名的程序一个都不许动。\n\n④ winclient/WinClient.Core/Process/SingBoxProcessManager.cs\n - 构造函数末尾加可选参数 `StrayKernelSweeper? sweeper = null`(缺省 new 一个)。\n - `public string OwnedKernelDirectory`:`Path.Combine(root, productName, \"bin\")`,root 与现有 runPath 用的是同一个(与 KernelInstaller 的安装目录一致,各版本内核都装在它下面)。\n - Start:现有的三项检查与 `StopCore()` 之后、`RegisterSecrets` / `WriteConfigAtomically` / `launcher.Start` 之前,调 `sweeper.Sweep(executablePath, OwnedKernelDirectory, log.Write)`;它抛的 IOException 原样往外抛,不起新内核。\n - 新增 `public int StopAndSweep()`:锁内做 dispose 检查、`StopCore()`,再返回同一个 Sweep 调用的结果。\n\n⑤ winclient/WinClient.Core/Client/TunnelTransport.cs\n - 构造函数加第三个可选参数 `Func<TimeSpan, CancellationToken, Task>? delay = null`(缺省 Task.Delay);常量 `internal const int StaleAdapterPolls = 20;`、`internal const int ReadyPolls = 40;`、`internal const int SettlePolls = 8;`,每次间隔 `TimeSpan.FromMilliseconds(250)`。\n - StartAsync 改成:1. exited 置假;2. `manager.StopAndSweep()`;3. 此时 ready() 为真算「旧网卡还在」:最多等 StaleAdapterPolls 次(每次先等 250 毫秒再看),网卡一下线就不算旧网卡、停止等待;等满还在线就带着「旧网卡还在」往下走,不抛;4. `manager.Start(RenderConfiguration(configuration))`;5. 最多看 ReadyPolls 次,每次先查取消、再查 exited(真就抛原来的 IOException「连接内核在启动期间退出。」)、再看 ready():没有旧网卡时 ready() 为真立即返回(与现在一样);有旧网卡时要连续 SettlePolls 次 ready() 为真且内核没退出才返回,中途 ready() 为假计数清零;每次没返回就等 250 毫秒;6. 看满仍没就绪抛原来的 TimeoutException「连接内核尚未建立虚拟网卡。」。StopAndSweep 抛的 IOException 原样往外抛(控制器按隧道断开处理)。\n - Stop、Dispose、RenderConfiguration 不变。\n\n⑥ winclient/WinClient.Core/Client/ClientRuntime.cs 的 CreateAsync:最前面(建 KillSwitchApplier、`firewall.RecoverAsync()`、`installer.Ensure()` 之前)先建 sing-box.log 那个 RedactingLog(把现有那行挪上来,后面照旧用它),再清一次残留:内核目录 = `Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), ClientSettings.ProductName, \"bin\")`,调 `new StrayKernelSweeper().Sweep(Path.Combine(目录, \"sing-box.exe\"), 目录, log.Write)`。抛 IOException、InvalidOperationException、Win32Exception、UnauthorizedAccessException 都接住不往外抛(服务不能因此起不来;连接时 Start 还会再清一次并报错),其余异常照旧。保持保护与不保持两条路都要清。\n\n⑦ 测试:新文件 winclient/WinClient.Tests/KernelLifetimeTests.cs,十个用例,名字照抄:\n - JobKillsChildWhenHandleCloses:先 Create 作业,再起 `Path.Combine(Environment.SystemDirectory, \"PING.EXE\")` 参数 `-n 60 127.0.0.1`(CreateNoWindow = true、UseShellExecute = false、RedirectStandardOutput = true,重定向是为了让子进程继承句柄,验证作业句柄不可继承),Assign 后 Contains 为真,Dispose 作业后 5 秒内子进程退出。\n - LauncherPutsKernelInSharedJob:用 SingBoxLauncher.Start 起同样的 PING,返回值转成 SingBoxLauncher.Child,断言 SharedJob 不为 null 且 Contains(child.Process);finally 里 Stop、Dispose 子进程。\n - SweeperKillsSamePathCopyOnly:把 PING.EXE 用 File.Copy 复制到临时目录下的 a\\sing-box.exe 与 b\\sing-box.exe,各起一个(参数同上,隐藏窗口),300 毫秒后两个都还活着;`new StrayKernelSweeper().Sweep(a 的路径, null)` 返回 1,a 退出,b 还活着。\n - SweeperMatchesOwnedBinDirectoryOnly、SweeperSkipsSelfAndUnreadablePaths、SweeperThrowsWhenStrayWillNotExit:用假的 IKernelProcessTable,分别验:bin 目录下任意版本子目录里的 sing-box.exe 被结束,bin 目录外同名的、bin 下别的文件名的、目录名只是前缀相同的(如 bin2)不动;自身进程号与 ImagePath 为 null 的不动;Kill 返回 false 时抛 IOException 且消息等于 NotStoppedMessage,其余匹配的照样被结束、记录照写。\n - ManagerSweepsBeforeEveryLaunch:假 IKernelProcessTable + 现有那种假 launcher,连续两次 Start,每次 launcher 被调之前都已查过一次进程表;Sweep 抛 IOException 时 launcher 没被调用、异常原样抛出;StopAndSweep 返回结束的个数。\n - TransportWaitsForStaleAdapterBeforeLaunch、TransportRequiresSettledChildWhenAdapterStayed、TransportFailsWhenKernelExitsDuringSettle:用脚本化的 readyProbe 与不真等待的 delay,验:旧网卡在线时先等它下线再起内核(用 launcher 被调时 probe 已被看过几次来断言);旧网卡等满 20 次仍在,则起内核后要连续 8 次在线才返回、少一次都不返回;稳定期内内核退出抛 IOException。\n - 起真进程的用例都在 finally 里把自己起的进程 `Kill(entireProcessTree: true)` 并释放,临时目录用仓里现成的 TempDirectory。测试只许结束自己起的进程。\n - ProcessStorageTests.cs 只许做接口适配(若需要),既有三个用例的名字与断言不改。\n\n⑧ 文档 docs/winclient/服务化与自启说明.md:在「## 卸载」之前加一节「## 内核跟着后台服务走」,写清:作业对象(关闭即结束)做什么、为什么句柄不能可继承;启动时与每次起内核前清残留,只认本产品内核(同一路径,或 ProgramData 下 YuanC\\bin 里各版本的 sing-box.exe);记录原文「已结束上次残留的连接内核 N 个。」「连接内核未能绑定到后台服务，后台服务意外退出时它可能残留。」与报错原文「上次残留的连接内核没能结束，请重启电脑后再连接。」;旧网卡最多等 5 秒、等不到就要新内核稳定 2 秒才算连上;起进程与绑作业之间那一瞬服务死掉的极小窗口由下次启动清理兜底;真机未测。「## 真机待验证清单」里加一条:连着时在任务管理器里结束后台服务进程,内核进程随之消失;服务自动重启后回到已连接,任务管理器里始终只有一个内核进程。",
+  "background": "项目:外包「澳洲出口节点 + Windows 一键客户端」。客户端 .NET 9(winclient/WinClient.sln:Core + App + Tests + UiTests)。后台服务 ControlService(LocalSystem)建 ClientRuntime;ClientController 经 ITunnelTransport(真实现 TunnelTransport)起停内核;TunnelTransport 用 SingBoxProcessManager,后者用 ISingBoxLauncher(真实现 SingBoxLauncher)起 sing-box.exe。内核由 KernelInstaller 装到 %ProgramData%\\YuanC\\bin\\<版本>\\sing-box.exe,开发配置 SingBoxPath 可改成别处。\n\n先读(都读全文):winclient/WinClient.Core/Process/ISingBoxLauncher.cs、SingBoxProcessManager.cs、winclient/WinClient.Core/Client/TunnelTransport.cs、ClientRuntime.cs、winclient/WinClient.Core/Kernel/KernelInstaller.cs、winclient/WinClient.Core/Firewall/WfpNative.cs 的 P/Invoke 写法、winclient/WinClient.App/Hosting/ControlService.cs 的 OnStart、winclient/WinClient.Tests/ProcessStorageTests.cs(假 launcher)与 FirewallTests.cs 末尾的 TempDirectory、docs/winclient/服务化与自启说明.md、检查脚本 docs/plans/checks/yc_kernel_orphan_1128.py(它就是 SHAPE、TESTS-NEW、DOCS、SCOPE 四项验收,照它的字样写)。\n\n与本单同时在施工的另一张单(yc-connect-journal-steps-1128)改 ClientController.cs、ConnectJournal.cs 与连接记录测试,本单一个都不许碰,也不许依赖它新增的任何成员。\n\n硬规矩:①只改允许清单里的文件;②既有测试的名字、数据行、断言不改,只加;③不许 git 写操作,不许自己跑 dotnet(build / test / restore 一律按验收编号申请),命令单独一条执行(不用 cd &&、管道、2>&1);④每次 Edit / Write 的新内容控制在 150 行以内;⑤goal 里的提示语、记录文字照原文一字不差(含全角标点),新增注释用中文;⑥起的子进程一律隐藏窗口(CreateNoWindow = true、UseShellExecute = false);⑦测试不许碰防火墙、过滤层、路由、网卡,不许起真隧道,不许结束不是自己起的进程,不许按 ProgramData 真实目录清理;⑧不许读写 secrets/,工位里不许装依赖(缺依赖停下交 blocked);⑨测试只许写临时目录,不许往仓库里写产物;⑩遇到契约没写到、要自己拍板的地方(例如复制的 PING.EXE 起不来、作业在测试机上嵌套失败),停下交 blocked 并写清楚岔路,不许自行换做法或放宽断言。",
+  "nonGoals": [
+    "不改 ClientController、ConnectJournal 与它们的测试(另一张单正在改)",
+    "不改断网保护(Firewall 目录)、网卡看护、状态机、管道协议、界面",
+    "不改内核打开虚拟网卡的总等待时长 10 秒(另有卡 WINCLIENT-TUN-OPEN-SLOW-TIMEOUT-1028)",
+    "不做真机实测,不打发布包,不改版本号"
+  ],
+  "allowedPaths": [
+    "winclient/WinClient.Core/Process/KernelJob.cs",
+    "winclient/WinClient.Core/Process/StrayKernelSweeper.cs",
+    "winclient/WinClient.Core/Process/ISingBoxLauncher.cs",
+    "winclient/WinClient.Core/Process/SingBoxProcessManager.cs",
+    "winclient/WinClient.Core/Client/TunnelTransport.cs",
+    "winclient/WinClient.Core/Client/ClientRuntime.cs",
+    "winclient/WinClient.Tests/KernelLifetimeTests.cs",
+    "winclient/WinClient.Tests/ProcessStorageTests.cs",
+    "docs/winclient/服务化与自启说明.md"
+  ],
+  "forbiddenPaths": [
+    ".codex/**",
+    ".github/**",
+    ".gitignore",
+    "pyproject.toml",
+    "authserver/**",
+    "node/**",
+    "scripts/**",
+    "docs/plans/**",
+    "docs/design/**",
+    "docs/node/**",
+    "docs/口径速查表.md",
+    "winclient/*.sln",
+    "winclient/Directory.Build.props",
+    "winclient/third_party/**",
+    "winclient/WinClient.App/**",
+    "winclient/WinClient.UiTests/**",
+    "winclient/WinClient.Core/Client/ClientController.cs",
+    "winclient/WinClient.Core/Client/ConnectJournal.cs",
+    "winclient/WinClient.Core/Firewall/**",
+    "winclient/WinClient.Core/Network/**",
+    "winclient/WinClient.Core/State/**",
+    "winclient/WinClient.Core/Update/**",
+    "winclient/WinClient.Core/Ipc/**",
+    "winclient/WinClient.Core/Diagnostics/**",
+    "winclient/WinClient.Core/Kernel/**",
+    "winclient/WinClient.Core/WinClient.Core.csproj",
+    "winclient/WinClient.Tests/WinClient.Tests.csproj",
+    "winclient/WinClient.Tests/ControllerTests.cs",
+    "winclient/WinClient.Tests/ConnectJournalFlowTests.cs",
+    "winclient/WinClient.Tests/ConnectJournalTests.cs",
+    "winclient/WinClient.Tests/FirewallTests.cs"
+  ],
+  "expectArtifacts": [
+    "winclient/WinClient.Core/Process/KernelJob.cs",
+    "winclient/WinClient.Core/Process/StrayKernelSweeper.cs",
+    "winclient/WinClient.Tests/KernelLifetimeTests.cs"
+  ],
+  "acceptance": [
+    {
+      "id": "BUILD",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "build",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1200
+    },
+    {
+      "id": "TEST",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "test",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--no-build",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1500
+    },
+    {
+      "id": "SHAPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_kernel_orphan_1128.py",
+        "shape"
+      ],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "TESTS-NEW",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_kernel_orphan_1128.py",
+        "tests"
+      ],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_kernel_orphan_1128.py",
+        "docs"
+      ],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "SCOPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_kernel_orphan_1128.py",
+        "scope"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "timeoutSec": 10800,
+  "repoRoot": "E:/yuanc",
+  "steps": [
+    "读 background 列出的文件与检查脚本。",
+    "先写测试 KernelLifetimeTests.cs;申请 BUILD 以编译失败证红,之后固定 BUILD→TEST。",
+    "按 goal ①~⑥ 改代码:先 KernelJob 与 StrayKernelSweeper,再 launcher 与 manager,再 TunnelTransport,最后 ClientRuntime。",
+    "按 goal ⑧ 改文档;BUILD、TEST、SHAPE、TESTS-NEW、DOCS、SCOPE 全绿后交活。",
+    "交活说明逐条对照 goal ①~⑧ 写做到了没有,并单列哪些只有真机能验。"
+  ]
+}
