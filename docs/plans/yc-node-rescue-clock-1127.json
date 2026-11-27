@@ -1,0 +1,102 @@
+{
+  "schemaVersion": 1,
+  "taskId": "NODE-REALMACHINE-INSTALL-1127",
+  "slug": "yc-node-rescue-clock-1127",
+  "title": "救援单元时间回拨后不再计数:拨回正确时间时把停在未来的计数时刻一并剔除",
+  "goal": "以派单时 origin/main 头为基点。看板卡 NODE-REALMACHINE-INSTALL-1127。\n\n问题(2026-11-27 在客户软路由 Debian 12.15 真机上实测发现):系统时间拨快一天、救援定时器跑过几轮、再拨回正确时间后,救援状态 /var/lib/exitnode/rescue/state.json 里的 `counted_at`(上一次计数的时刻)停在明天。`state.count()` 用 `now - counted_at >= 300` 判断是否进入新一轮,拨回后这个差是负一天,于是接下来约 24 小时里 P1~P5 的失败计数一直不涨,救援对程序损坏、配置坏、代理服务失败都不再动作。`actions.tick()` 已经会剔除晚于 now+300 秒的 `reinstall_times` 与 `restart_times` 并记一行 `clock_adjusted`,唯独漏了 `counted_at`。\n\n要的改法(只改 actions.tick,一处):在剔除未来 reinstall_times/restart_times 的同一段里,`value[\"counted_at\"]` 不为 None 且大于 `cutoff`(即 `runner.now() + CLOCK_SKEW_TOLERANCE_SEC`)时,把它置为 None,并把这一项计入 `dropped`,使本轮照常记一行 `clock_adjusted`(同一轮多项一起被剔除时仍只记一行)。失败计数 counts 不清零。差值在 300 秒以内的 counted_at 保持原样,行为与现在相同。state.py 的 count() 不改。\n\n在 node/tests/test_rescue.py 末尾加两个用例(名字必须一字不差):\n\n1. `test_future_counted_at_is_dropped_and_rounds_resume`:`runner = ready()`;`damage(runner, \"P1\")`;`value = s.fresh()`;`value[\"counted_at\"] = runner.clock + 86400`;`s.save(runner, value)`。断言 `actions.tick(runner) == 1`;`s.read(runner)[\"counts\"][\"P1\"] == 1`;`s.read(runner)[\"counted_at\"] == runner.clock`;`history_actions(runner) == [\"clock_adjusted\"]`。然后 `runner.clock += 300`,断言 `actions.tick(runner) == 0` 且 `runner.links[p.CURRENT] == p.RELEASES + \"/0.1.0\"`(第二轮照常重装出厂版)。\n2. `test_counted_at_small_skew_is_kept`:`runner = ready()`;`value = s.fresh()`;`value[\"counted_at\"] = runner.clock + 200`;`s.save(runner, value)`;`actions.tick(runner)`。断言 `s.read(runner)[\"counted_at\"] == runner.clock + 200`,且历史文件不存在或其中没有 `clock_adjusted`(写成 `s.HISTORY not in runner.files or \"clock_adjusted\" not in history_actions(runner)`)。\n\n第 1 个用例在改动前必然失败(counts 停在 0、tick 返回 1 但第二轮不重装),由 T-RESCUE 的 failsOnBase 证红。",
+  "background": "先读(全文):node/exitnode/rescue/actions.py(tick 函数开头剔除未来时间的那段、CLOCK_SKEW_TOLERANCE_SEC)、node/exitnode/rescue/state.py(fresh、read、count、history)、node/tests/test_rescue.py(ready、damage、history_actions 三个辅助函数,以及 test_future_reinstall_time_is_dropped_and_not_counted、test_future_restart_time_is_dropped 两个现有用例,新用例照它们的写法)。\n\n说明文档 docs/node/救援单元说明.md 由契约方另行修改,本单不碰。",
+  "nonGoals": [
+    "不改 state.py 的 count() 与状态文件格式",
+    "不改看门狗",
+    "不改频率额度数值与 300 秒容差",
+    "不写 docs/ 下任何文档"
+  ],
+  "expectArtifacts": [],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "timeoutSec": 5400,
+  "repoRoot": "E:/yuanc",
+  "steps": [
+    "读 BACKGROUND 列出的文件。",
+    "在 test_rescue.py 末尾加两个用例(先申请 T-RESCUE 证红)。",
+    "改 actions.tick 一处,T-RESCUE 绿。",
+    "PYTEST、RUFF、TESTS-NAMES、SCOPE 全绿。"
+  ],
+  "allowedPaths": [
+    "node/exitnode/rescue/actions.py",
+    "node/tests/test_rescue.py"
+  ],
+  "forbiddenPaths": [
+    ".codex/**",
+    ".github/**",
+    ".gitignore",
+    "pyproject.toml",
+    "requirements-dev.txt",
+    "winclient/**",
+    "scripts/**",
+    "authserver/**",
+    "docs/**",
+    "node/examples/**",
+    "node/exitnode/templates/**",
+    "node/exitnode/rescue/state.py",
+    "node/exitnode/watchdog/**"
+  ],
+  "acceptance": [
+    {
+      "id": "T-RESCUE",
+      "kind": "test:targeted",
+      "target": "node/tests/test_rescue.py",
+      "required": true,
+      "failsOnBase": true
+    },
+    {
+      "id": "PYTEST",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "pytest",
+        "-q"
+      ],
+      "required": true,
+      "timeoutSec": 1500
+    },
+    {
+      "id": "RUFF",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "ruff",
+        "check",
+        "node",
+        "authserver"
+      ],
+      "required": true,
+      "timeoutSec": 300
+    },
+    {
+      "id": "TESTS-NAMES",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;t=pathlib.Path('node/tests/test_rescue.py').read_text(encoding='utf-8');bad=[n for n in ('test_future_counted_at_is_dropped_and_rounds_resume','test_counted_at_small_skew_is_kept') if 'def '+n+'(' not in t];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "SCOPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess as sp,sys;g=lambda *a:sp.check_output(['git','-c','core.quotepath=false']+list(a)).decode('utf-8').split(chr(10));mb=g('merge-base','origin/main','HEAD')[0].strip();ch={p.strip() for p in g('diff','--name-only',mb)+g('ls-files','--others','--exclude-standard') if p.strip()};ok=set('node/exitnode/rescue/actions.py node/tests/test_rescue.py'.split());bad=sorted(p for p in ch if p not in ok);print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    }
+  ]
+}
