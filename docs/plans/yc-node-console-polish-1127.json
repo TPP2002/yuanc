@@ -1,0 +1,127 @@
+{
+  "schemaVersion": 1,
+  "taskId": "NODE-WEB-CONSOLE-1127",
+  "slug": "yc-node-console-polish-1127",
+  "title": "节点管理网页小修:账号操作后不重排、手机上邀请码不截断不挤成三行",
+  "goal": "以派单时 origin/main 头为基点。看板卡 NODE-WEB-CONSOLE-1127。\n\n背景:节点管理网页的页面(node/exitnode/console/static/ 三件文件)已合并进主干。契约方在本机起服务、用浏览器走了一遍,有三处要改:①账号页点了延期、停用、恢复或确认吊销以后,页面重新取目录、整页按「使用中 / 已过期 / 已停用、到期早的在前」重排,刚操作的那块账号会跳到别处,原位置换成另一个账号,管理员看不到结果,接着点还可能点到别人。②手机宽度(≤640px)下,没有备注的账号标题就是邀请码,被截成省略号,认不出是哪个账号。③手机宽度下,邀请码列表里的码被挤成三行(在横杠处折开)。本单只改页面脚本、样式、设计样张里的样式段和页面测试四个文件。\n\n一、console.js:操作后按上一次的顺序摆\n1. 在 `var GROUP_ORDER = ...` 那行之前加一行:`var accountOrder = [];`(行尾可跟一句中文注释:上次摆好的账号顺序,操作后照它摆,刚点的那块不跳走)。\n2. `function loadDirectory() {` 改成 `function loadDirectory(keepOrder) {`,其中的 `renderAccounts();` 改成 `renderAccounts(keepOrder);`,其余不变。\n3. `function renderAccounts() {` 改成 `function renderAccounts(keepOrder) {`。在现有 `entries.sort(...)` 之后、往 accountsEl 里追加卡片的循环之前,加:keepOrder 为真时再按 orderIndex(entries[i].account.id) 从小到大排一次(Array.prototype.sort 是稳定排序,上次没出现过的账号都拿同一个序号,彼此之间保持正常排序的先后,排在最后);然后不管 keepOrder 真假,都把 accountOrder 重设为这次 entries 里账号 id 的先后顺序。\n4. 新增 `function orderIndex(id) {`:返回 id 在 accountOrder 里的下标;不在里面时返回 accountOrder.length。\n5. 四处「操作成功后刷新」改成 `loadDirectory(true);`:生成邀请码成功后、accountAction 成功后(停用与恢复)、确认吊销成功后、延期成功后。切换页签时那一处保持 `loadDirectory();`(进账号页时照正常规则重排)。改完全文件 `loadDirectory(true);` 恰好 4 处,`loadDirectory();` 恰好 1 处。\n6. 不加「已延期」「已停用」之类的成功提示:那块账号原地刷新出新日期、新徽标,就是结果。\n\n二、console.css 与设计样张 docs/design/2026-11-27-节点管理网页/样张.html 里「/* ==== 搬进 console.css:开始」到「/* ==== 搬进 console.css:结束 ==== */」那一段,两处做完全相同的改动(既有用例 test_css_is_the_design_sample_block 要求两边逐字一致):\n1. 紧接在 `.acct-title { min-width: 0; overflow: hidden; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }` 那行之后加一行(顶格):\n    .acct-title.mono { white-space: normal; overflow-wrap: anywhere; }\n2. `@media (max-width: 640px) {` 段里的 `  .inv .code { flex: 1; width: auto; }` 整行换成(两个空格缩进):\n    .inv .code { flex: 1 1 100%; width: auto; white-space: nowrap; }\n(上面两行前的四个空格是排版缩进;第 2 条在文件里是两个空格缩进,与该段其他行一致。)\n样张.html 除这段样式外一个字不改。\n\n三、测试 node/tests/test_console_page.py(用例名固定,可再加;只读仓库文件,不起服务、不写文件):\n- test_account_order_kept_after_actions:console.js 里有 `var accountOrder = [];`、`function loadDirectory(keepOrder) {`、`renderAccounts(keepOrder);`、`function renderAccounts(keepOrder) {`、`function orderIndex(id) {`;`loadDirectory(true);` 恰好 4 处,`loadDirectory();` 恰好 1 处。\n- test_codes_never_truncated_on_phone:console.css 里有 `.acct-title.mono { white-space: normal; overflow-wrap: anywhere; }`;`@media (max-width: 640px) {` 段里有 `.inv .code { flex: 1 1 100%; width: auto; white-space: nowrap; }`,没有 `.inv .code { flex: 1; width: auto; }`。\n既有用例一个不改。\n",
+  "background": "项目:外包「澳洲出口节点 + Windows 一键客户端」。节点管理网页是一页纯前端(ES5 写法:var、function,不用箭头函数、?.、??),样式与结构照设计样张原样搬。\n\n先读(全文):node/exitnode/console/static/console.js、console.css;node/tests/test_console_page.py;docs/design/2026-11-27-节点管理网页/样张.html 里「搬进 console.css」那一段;检查脚本 docs/plans/checks/yc_node_console_polish_1127.py(SHAPE、TESTS-NEW、SCOPE 三项验收)。\n\n已定的取舍(不要改):账号进页时的排序规则不变;操作后只是不重排;不加成功提示;样式只改契约给的两行,样张与 console.css 保持逐字一致。\n\n硬规矩(做不到就停下交 blocked + forks,不猜):①只改允许清单里的四个文件。②既有测试断言不删、不跳过、不放宽。③工人不许 git 写操作,不许自己跑 pytest / ruff / python(按验收编号走派单器自测通道,命令单独一条执行,不写 cd &&、管道、2>&1);不许装依赖。④新增注释用中文大白话;每次 Edit / Write 的新内容不超过 150 行。",
+  "nonGoals": [
+    "不改 index.html、服务端 Python 代码与接口",
+    "不改进账号页时的排序规则",
+    "不改邀请码列表与账号页的其他样式",
+    "不写 docs/node/ 下任何文档"
+  ],
+  "allowedPaths": [
+    "docs/design/2026-11-27-节点管理网页/样张.html",
+    "node/exitnode/console/static/console.css",
+    "node/exitnode/console/static/console.js",
+    "node/tests/test_console_page.py"
+  ],
+  "forbiddenPaths": [
+    ".codex/**",
+    ".github/**",
+    ".gitignore",
+    "pyproject.toml",
+    "requirements-dev.txt",
+    "winclient/**",
+    "scripts/**",
+    "authserver/**",
+    "docs/node/**",
+    "docs/plans/**",
+    "docs/acceptance/**",
+    "node/exitnode/*.py",
+    "node/exitnode/console/*.py",
+    "node/exitnode/console/static/index.html",
+    "node/exitnode/templates/**",
+    "node/examples/**",
+    "node/tests/golden/**"
+  ],
+  "expectArtifacts": [
+    "docs/design/2026-11-27-节点管理网页/样张.html",
+    "node/exitnode/console/static/console.css",
+    "node/exitnode/console/static/console.js",
+    "node/tests/test_console_page.py"
+  ],
+  "acceptance": [
+    {
+      "id": "T-PAGE",
+      "kind": "test:targeted",
+      "target": "node/tests/test_console_page.py",
+      "required": true,
+      "failsOnBase": true
+    },
+    {
+      "id": "PYTEST",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+        "node/tests",
+        "authserver/tests"
+      ],
+      "required": true,
+      "timeoutSec": 1500
+    },
+    {
+      "id": "RUFF",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "ruff",
+        "check",
+        "node",
+        "authserver"
+      ],
+      "required": true,
+      "timeoutSec": 300
+    },
+    {
+      "id": "SHAPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_node_console_polish_1127.py",
+        "shape"
+      ],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "TESTS-NEW",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_node_console_polish_1127.py",
+        "tests"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "SCOPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_node_console_polish_1127.py",
+        "scope"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "timeoutSec": 5400,
+  "repoRoot": "E:/yuanc",
+  "steps": [
+    "读 BACKGROUND 列出的文件与检查脚本。",
+    "console.js 的 accountOrder、loadDirectory(keepOrder)、renderAccounts(keepOrder)、orderIndex 与四处 loadDirectory(true)。",
+    "console.css 与样张样式段的两行改动,两边逐字一致。",
+    "test_console_page 两个新用例;T-PAGE、PYTEST、RUFF、SHAPE、TESTS-NEW、SCOPE 全绿后交活。"
+  ]
+}
