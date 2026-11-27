@@ -11,7 +11,9 @@ UNITS = {"exitnode-admin.service", "exitnode-proxy.service",
          "exitnode-authsync.service", "exitnode-authsync.timer",
          "exitnode-watchdog.service", "exitnode-watchdog.timer",
          "exitnode-rescue.service", "exitnode-rescue.timer",
-         "exitnode-recover.service", "exitnode-nft.service"}
+         "exitnode-recover.service", "exitnode-nft.service",
+         "exitnode-console.service", "exitnode-console-status.service",
+         "exitnode-console-status.timer"}
 SERVICE_ACCOUNT = "exitnode"
 
 

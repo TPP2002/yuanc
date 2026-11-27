@@ -279,9 +279,13 @@ def test_maintenance_device_list_rejects_wrong_types(value):
 
 
 def test_console_section_defaults_and_validation():
-    text = EXAMPLE.read_text(encoding="utf-8")
+    # 示例配置末尾带管理网页段，先切掉，下面按需再拼，免得段落重复。
+    example = EXAMPLE.read_text(encoding="utf-8")
+    text = example.split("\n[console]\n")[0]
     console = load("/config", FakeRunner(files={"/config": text})).console
     assert (console.enabled, console.port, console.lan) == (False, 8444, True)
+    # 整份示例给出的是开启状态。
+    assert load("/config", FakeRunner(files={"/config": example})).console.enabled is True
 
     for port in (80, 70000):
         changed = text + f"\n[console]\nport = {port}\n"

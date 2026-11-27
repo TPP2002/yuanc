@@ -1,5 +1,6 @@
 """有锁的更新事务；所有主机操作、时间和等待均经 Runner。"""
 
+import contextlib
 import json
 import re
 from datetime import UTC, datetime
@@ -96,12 +97,18 @@ def _restart(runner):
     # 即使一个单元重启失败，也要尝试另一个；外层负责回退。
     failed = False
     for argv in (["systemctl", "restart", "exitnode-proxy.service"],
-                 ["systemctl", "restart", "exitnode-admin.service"],
-                 ["systemctl", "daemon-reload"]):
+                 ["systemctl", "restart", "exitnode-admin.service"]):
         try:
             failed = runner.run(argv, check=False).code != 0 or failed
         except Exception:
             failed = True
+    # 管理网页起不来只在检查里显示失败，不触发升级回退，所以结果一律忽略。
+    with contextlib.suppress(Exception):
+        runner.run(["systemctl", "try-restart", "exitnode-console.service"], check=False)
+    try:
+        failed = runner.run(["systemctl", "daemon-reload"], check=False).code != 0 or failed
+    except Exception:
+        failed = True
     if failed:
         raise UpdateError("本项目服务重启失败")
 

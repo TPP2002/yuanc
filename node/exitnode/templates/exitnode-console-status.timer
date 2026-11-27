@@ -1,0 +1,12 @@
+[Unit]
+Description=出口节点每分钟写管理网页检查记录
+
+[Timer]
+OnBootSec=30
+OnUnitActiveSec=60
+AccuracySec=5s
+Persistent=false
+Unit=exitnode-console-status.service
+
+[Install]
+WantedBy=timers.target
