@@ -75,8 +75,8 @@ def shape():
         ("BlockWeight", "byte", "0"),
         ("DnsPort", "int", "53"),
     ]:
-        if not re.search(r"public\s+const\s+%s\s+%s\s*=\s*%s\s*;" % (kind, name, value), planner):
-            bad.append("WfpPlanner 缺常量 %s = %s" % (name, value))
+        if not re.search(rf"public\s+const\s+{kind}\s+{name}\s*=\s*{value}\s*;", planner):
+            bad.append(f"WfpPlanner 缺常量 {name} = {value}")
     if '"Dns53-"' not in planner:
         bad.append("WfpPlanner 缺 Dns53- 过滤器名")
     head, sep, apps = planner.partition("PlanApps(")
@@ -99,7 +99,7 @@ def tests():
         body = text(TESTS / name)
         for method in methods:
             if " " + method + "(" not in body:
-                bad.append("%s 缺用例 %s" % (name, method))
+                bad.append(f"{name} 缺用例 {method}")
     if " GlobalHasExactlyTwentyInContractOrder(" in text(TESTS / "WfpPlannerTests.cs"):
         bad.append("旧用例名 GlobalHasExactlyTwentyInContractOrder 应已改名")
     live = text(TESTS / "WfpLiveTests.cs")
@@ -120,7 +120,7 @@ def docs():
     bad = []
     harden = text(HARDEN)
     if SECTION not in harden:
-        bad.append("加固说明缺小节「%s」" % SECTION)
+        bad.append(f"加固说明缺小节「{SECTION}」")
     for word in ("YuanC-WFP-Dns53-ConnectV4", "YuanC-WFP-Dns53-ConnectV6", "22 条", "23 条"):
         if word not in harden:
             bad.append("加固说明缺 " + word)
@@ -134,7 +134,7 @@ def docs():
     for body, name in ((harden.partition(SECTION)[2].partition("\n## ")[0], "加固说明新小节"), (leak, "泄漏检测说明")):
         for word in ("申请记录", "git 写操作", "工人"):
             if word in body:
-                bad.append("%s 混进了施工过程用语:%s" % (name, word))
+                bad.append(f"{name} 混进了施工过程用语:{word}")
     fail(bad)
 
 

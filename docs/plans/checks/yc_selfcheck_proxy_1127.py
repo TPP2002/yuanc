@@ -100,7 +100,7 @@ def tests():
             bad.append("缺测试文件 " + name)
             continue
         body = text(path)
-        bad += ["%s 缺用例 %s" % (name, method) for method in methods if " " + method + "(" not in body]
+        bad += [f"{name} 缺用例 {method}" for method in methods if " " + method + "(" not in body]
     selfcheck_tests = text(TESTS / "EnvironmentSelfCheckTests.cs")
     if selfcheck_tests.count("12 项通过") < 5:
         bad.append("EnvironmentSelfCheckTests 里「12 项通过」应不少于 5 处")
@@ -121,7 +121,7 @@ def docs():
     for body, name in ((env, "环境一致性说明"), (arch, "架构说明")):
         for word in ("申请记录", "git 写操作", "工人"):
             if word in body:
-                bad.append("%s 混进了施工过程用语:%s" % (name, word))
+                bad.append(f"{name} 混进了施工过程用语:{word}")
     fail(bad)
 
 
