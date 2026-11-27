@@ -1,0 +1,158 @@
+{
+  "schemaVersion": 1,
+  "taskId": "WINCLIENT-CONNECT-JOURNAL-STEPS-1128",
+  "slug": "yc-connect-journal-steps-1128",
+  "title": "连接过程逐步写进连接记录(请求、取会话、每个动作起止与用时、状态迁移、出口核验、断开、启动、巡检);首次尝试期间任何异常都自动恢复",
+  "workbuddyTier": "hard",
+  "goal": "目标:连接记录(后台服务数据目录 run/connect.log,经 ClientController.Journal 写)现在只有「连接失败：…」「放弃并恢复：…」两种行,看不出一次连接卡在哪一步、每步用了多久。本单把连接过程逐步写进连接记录,并把「首次尝试失败自动恢复」补到任何异常类型都接得住。除第⑨条外,不改任何状态迁移、提示语和对外行为。\n\n① ConnectJournal(winclient/WinClient.Core/Client/ConnectJournal.cs)加三个公开静态方法,Describe 的行为不变:\n- public static string Clean(string? message):把现有私有 Clean 改成公开,入参可空(空当作空串),加工规则不变(换行换成「 | 」、IPv4 换成「[地址]」、用户目录名换成「[用户]」、去首尾空白、超过 300 字截断加「…」)。\n- public static string StateName(ConnectionState state):Disconnected→未连接,Connecting→连接中,Connected→已连接,Reconnecting→重连中,NeedsLogin→需重新登录,NeedsManual→需人工处理。\n- public static string EffectName(ConnectionEffect effect):ApplyKillSwitch→套用断网保护,UpdateKillSwitchNode→更新节点规则,RemoveKillSwitch→撤销断网保护,StopTunnel→停止隧道,StartTunnel→启动隧道,ShowMessage→显示提示,ScheduleBackoff→「安排退避 <秒> 秒」(秒数取 effect.Delay 的整秒,Delay 为空写 0)。\n\n② 下面所有行都经 ClientController 现有的 WriteJournal 写(它已经吞掉记录口抛的异常),一次调用写一行,文字照原文(全角冒号、全角逗号、等号两边不留空格)。「<状态名>」用 ConnectJournal.StateName(machine.State)。「保护」看字段 protection,真写「有」,假写「无」。「恢复记录」读 firewall.HasPendingState,真写「有」,假写「无」,读的时候抛任何异常写「读不到」(写记录不许让连接流程多出新的失败)。\n\n③ ConnectAsync:\n- 拿到串行锁后的第一件事,写「连接请求：来源=<用户|自动>，状态=<状态名>，保护=<有|无>，恢复记录=<有|无|读不到>」(fromUser 为真写「用户」)。\n- 每个提前返回各写一行「连接未开始：<短语>」,短语按现有检查的先后依次是:未配置服务器 / 已在连接或已连接 / 指定程序名单为空 / 恢复记录与代理范围不一致 / 读不到网卡地址 / 网卡上有公网 IPv4 / 浏览器正在运行，等用户再点一次。\n- 通过全部检查、算出 firstAttempt 之后,写「开始连接：模式=<sessionSource.Mode>，代理范围=<全部流量|仅指定程序 N 个>，首次尝试=<是|否>」(N 是名单个数)。\n- finally 里、Publish 之前,写「连接请求结束：状态=<状态名>，保护=<有|无>」(提前返回的也写)。\n\n④ 取会话与续期:FetchSessionAsync 拿到应答后写「取会话：<AuthResult 枚举名>」(如 Ok、Network);应答是 Ok 但会话或账号已到期,再写一行「取会话：会话或账号已到期」。RenewAsync 拿到应答后写「续期：<AuthResult 枚举名>」。\n\n⑤ 状态与动作(ExecuteAsync / ExecuteEffectsAsync):\n- 控制器加一个字段记住上一次写进记录的状态(初值 Disconnected)。ExecuteEffectsAsync 开头和 ExecuteAsync 的 finally 里各核一次:machine.State 与记住的不同,就写「状态：<旧状态名>→<新状态名>」并更新。\n- 每个动作(ShowMessage 除外)开始前写「动作开始：<EffectName>」,做完写「动作结束：<EffectName>，用时 <毫秒> 毫秒」;动作抛出异常时写「动作出错：<EffectName>，用时 <毫秒> 毫秒，<ConnectJournal.Describe(异常)>」,然后原样再抛(throw;)。毫秒取整数。计时用 System.Diagnostics.Stopwatch,类型名写全。\n- StartTunnel 里原有的三个接异常分支(FileNotFoundException、InvalidDataException、IOException 或 TimeoutException),各在原有处理之前写一行「启动隧道没成功：<ConnectJournal.Describe(异常)>」。ApplyKillSwitch 里「已持有保护时保持隧道」的分支,在原有处理之前写「套用断网保护没成功，隧道保持：<ConnectJournal.Describe(异常)>」。这些分支原有的处理一行不改。\n- OnTunnelDown 排的那个回调里,处理 TunnelDown 之前写「隧道掉线」(写在回调里,也就是串行锁内,不写在事件线程上)。\n\n⑥ 出口核验(CheckExitAsync):拿到地址写「出口核验：已核验」或「出口核验：不一致」;这一次没有结果且还要重试,写「出口核验：第 <attempt> 次没有回应」;一轮以「无法核验」收场,写「出口核验：无法核验，已连续 <unverifiableRounds> 轮」(写在测试包自动断开那一段之前)。任何一行都不写地址。\n\n⑦ 断开与启动:\n- DisconnectAsync:被浏览器提醒拦下时写「断开未开始：浏览器正在运行，等用户再点一次」;拿到锁后写「断开请求：状态=<状态名>，保护=<有|无>」;正常走完(没有进 catch)写「断开完成：环境恢复=<成功|失败>」。\n- InitializeAsync:拿到锁后写「启动：保持保护=<是|否>，自动连接=<是|否>，恢复记录=<有|无|读不到>，模式=<sessionSource.Mode,没有来源写「未配置」>」;走接回保护的分支,写「启动：接回断网保护，随后自动连接」;走启动恢复的分支,在恢复与环境恢复都做完后写「启动：已做启动恢复，提醒=<有|无>」(warning 非空写「有」)。\n\n⑧ 巡检(PatrolAsync 的 finally 里,PatrolNicAsync 之后):控制器加一个字段记住上一次写进记录的巡检文字(初值空串)。本轮 guardStatus 既不是「正常」、也不以「已为新出现的」开头时,若与记住的不同,写「巡检：<ConnectJournal.Clean(guardStatus)>」并记住;本轮 guardStatus 是「正常」而记住的非空时,写「巡检：恢复正常」并清空。同一种异常状态连续多轮只写一次。\n\n⑨ 首次尝试期间任何异常都自动恢复(本单唯一的行为改动):\n- ConnectAsync 与 RunScheduledAsync 里,在现有的 catch (Exception ex) when (IsOperational(ex)) 后面各加一条 catch (Exception ex) when (firstAttempt) { await FailAsync(ex); },全文件恰好这两处。不是首次尝试时,名单以外的异常照旧往外抛,不许接。IsOperational 的名单不许改。\n- AbandonAsync 里停隧道那一步、转 OperationFailed 那一步,RemoveProtectionAsync 里撤保护与恢复网卡两步,改成接住任何异常,并按原来「失败」的分支处理。AbandonAsync 与 MaybeAbandonAfterLoginFailureAsync 里调 RestoreEnvironmentAsync 的地方包一层,抛任何异常都当作环境没恢复。接住时各写一行:「停止隧道没成功：<Describe>」「撤销断网保护没成功：<Describe>」「恢复网卡没成功：<Describe>」「恢复环境没成功：<Describe>」(Describe 指 ConnectJournal.Describe(异常);转 OperationFailed 那一步接住时不用写)。\n- 提示语、状态、AttemptAbandoned 事件、「连接失败：…」「放弃并恢复：…」两种行都不变。\n\n⑩ 记录里不许出现:节点地址、出口地址、令牌、配对内容、邀请码、程序名单里的路径。sessionSource.Mode 只有「自用模式」「邀请码模式」两种,可以写。\n\n⑪ 文档:\n- 新建 docs/winclient/连接记录说明.md:写清文件位置(后台服务数据目录下 run/connect.log,轮转规则照 RollingFileLog 的实际实现写)、上面每一种行的原文格式和什么时候写(第③~⑨条的每一种行都要列到)、记录里不会出现哪些内容、怎么拿到(界面「导出诊断」)、哪些只有真机能验(单列「真机待验证（本单未执行）」一段)。\n- docs/winclient/断网保护加固说明.md「首次连接失败自动恢复」一节只改两处:三个触发点的第 1 条整句换成「首次尝试期间任何一步抛出异常（不限类型）或走到失败处理（套用断网保护失败或超时、内核起不来等）。」;在「记录里不出现节点地址、出口地址、令牌或配对内容。」后面接一句「连接过程其余各步的记录格式见[连接记录说明](连接记录说明.md)。」。这份文档别处不动。\n\n⑫ 测试:新建 winclient/WinClient.Tests/ConnectJournalFlowTests.cs。替身写法照 ConnectAbandonTests.cs(需要的替身类抄进新文件,巡检用例另写一个 PatrolAsync 可控的防火墙替身),既有测试文件一个都不许改。Journal 用一个线程安全的队列收行。用例名照下面写,每条后面是要断言的内容:\n1. StateAndEffectNamesAreFixed:六个状态名、七个动作名逐个相等;ScheduleBackoff 带 8 秒时是「安排退避 8 秒」。\n2. CleanScrubsLikeDescribe:Clean(null) 是空串;Clean(\"a\\r\\nb 203.0.113.9 C:\\\\Users\\\\alice\\\\x\") 等于「a | b [地址] C:\\Users\\[用户]\\x」;400 个字的入参截成前 300 字加「…」。\n3. SuccessfulConnectWritesRequestSessionActionsAndStates:自用模式首次连接成功。记录里按先后出现:「连接请求：来源=用户，状态=未连接，保护=无，恢复记录=无」「开始连接：模式=自用模式，代理范围=全部流量，首次尝试=是」「状态：未连接→连接中」「取会话：Ok」「动作开始：套用断网保护」、以「动作结束：套用断网保护，用时 」开头的一行、「动作开始：启动隧道」「状态：连接中→已连接」、以「动作结束：启动隧道，用时 」开头的一行、「连接请求结束：状态=已连接，保护=有」;断言这十行的先后次序。\n4. RejectedConnectWritesReason:三种情形各建一个控制器。没有会话来源 →「连接未开始：未配置服务器」;连上以后再点连接 →「连接未开始：已在连接或已连接」;防火墙替身 HasPendingState 为真、PendingMode 为 \"apps\" →「连接未开始：恢复记录与代理范围不一致」。三种都还要有以「连接请求：来源=」开头和以「连接请求结束：状态=」开头的行。\n5. TunnelStartFailureWritesReasonAndBackoff:隧道替身启动抛 IOException(\"测试断线\")。记录含「启动隧道没成功：IOException：测试断线」「动作开始：安排退避 2 秒」「状态：连接中→重连中」。\n6. SessionResultNameIsWritten:会话来源先给 AuthResult.Network → 记录含「取会话：Network」;另建一个给 Ok 的 → 含「取会话：Ok」。\n7. ExitCheckWritesRoundsWithoutAddress:出口探测替身返回节点地址,放行 3 秒那次核验后记录含「出口核验：已核验」。另建一个探测永远没结果的(不是测试包),依次放行 3 秒和四次 5 秒后,记录含「出口核验：第 1 次没有回应」到「出口核验：第 4 次没有回应」四行和「出口核验：无法核验，已连续 1 轮」。两份记录全文都不含 TestData.Node().Host。\n8. DisconnectWritesRequestAndResult:连上后断开。记录含「断开请求：状态=已连接，保护=有」「动作开始：停止隧道」「动作开始：撤销断网保护」「状态：已连接→未连接」「断开完成：环境恢复=成功」。\n9. InitializeWritesStartupBranch:InitializeAsync(autoConnect: false, keepProtection: false) → 记录含「启动：保持保护=否，自动连接=否，恢复记录=无，模式=自用模式」「启动：已做启动恢复，提醒=无」。另建一个防火墙替身 HasPendingState 为真、InitializeAsync(autoConnect: false, keepProtection: true) → 记录含「启动：接回断网保护，随后自动连接」。\n10. PatrolWritesOnlyChangesFromNormal:连上后放行三轮「巡检」定时(60 秒)。第一轮防火墙替身的 PatrolAsync 抛 FirewallIneffectiveException → 记录里以「巡检：系统防火墙已被关闭或被策略覆盖」开头的行恰好一行;第二轮仍抛 → 这种行仍恰好一行;第三轮返回 PatrolReport.Empty → 记录含「巡检：恢复正常」。\n11. UnexpectedExceptionOnFirstConnectStillRestoresNetwork:防火墙替身套用时抛 NotSupportedException(\"意外\")。状态未连接,保护为假,提示等于「连接失败，已恢复原来的网络，当前没有走澳洲出口。原因已写入诊断记录，请导出诊断发给管理员。」,调用次序里有 remove;记录里有一行以「动作出错：套用断网保护，用时 」开头且含「NotSupportedException：意外」,有一行以「连接失败：NotSupportedException：意外」开头。\n12. UnexpectedExceptionWithHeldProtectionStillPropagates:防火墙替身 HasPendingState 为真,套用时抛 NotSupportedException;await Assert.ThrowsAsync<NotSupportedException>(() => controller.InitializeAsync(autoConnect: false, keepProtection: true));保护仍为真,调用次序里没有 remove。\n13. UnexpectedRemoveFailureDuringAbandonNeedsManualAndKeepsProtection:套用抛 WfpUnavailableException,撤销抛 NotSupportedException(\"撤销意外\")。状态需人工处理,保护为真,提示等于「连接失败，原来的网络没能恢复：请点「断开」再试一次，还不行就重启电脑。原因：系统过滤层的保护没能建立。」,AttemptAbandoned 恰好触发一次,记录里有一行以「撤销断网保护没成功：NotSupportedException：撤销意外」开头。\n14. UnexpectedExceptionInBackoffCallbackOnFirstAttemptRestores:隧道替身第一次启动抛 IOException;等 2 秒的退避排上后,把启动改成抛 NotSupportedException 再放行这次退避。最终状态未连接,保护为假,调用次序里有 remove,提示以「连接失败，已恢复原来的网络，当前没有走澳洲出口。」开头。\n15. JournalSubscriberFailureDoesNotBreakConnect:Journal 每次都抛 InvalidOperationException,连接照样到已连接。\n\n交活说明逐条对照第①~⑫条写做到了没有,并单列哪些只有真机能验。",
+  "background": "项目:外包「澳洲出口节点 + Windows 一键客户端」。客户端 .NET 9(winclient/WinClient.sln:Core + App + Tests + UiTests)。后台服务里的 ClientController 串行处理连接、断开、重连、巡检和出口核验;它有一个可选的记录口 Journal(Action<string>),后台服务把它接到 run/connect.log(RedactingLog 套 RollingFileLog)。2026-11-27 晚国内测试电脑第一次点连接就断网失联,事后连接记录里没有任何一步的痕迹,排查只能靠猜;负责人要求「确保日志搜集的信息足够全面细致」。上一张单(yc-connect-abandon-testbuild-1127,已合并)加了首次连接失败自动恢复和「连接失败：」「放弃并恢复：」两种行,本单接着把其余各步补齐。\n\n先读(都读全文):winclient/WinClient.Core/Client/ClientController.cs、winclient/WinClient.Core/Client/ConnectJournal.cs、winclient/WinClient.Core/State/ConnectionStateMachine.cs、winclient/WinClient.Core/Client/ISessionSource.cs、winclient/WinClient.Core/Firewall/KillSwitchApplier.cs 开头的 PatrolReport 与 IKillSwitch、winclient/WinClient.Core/Client/ExitProbe.cs 的 IExitProbe、winclient/WinClient.Core/Logging/RollingFileLog.cs、winclient/WinClient.Tests/ConnectAbandonTests.cs(替身与定时器的写法照它)、winclient/WinClient.Tests/ConnectJournalTests.cs、docs/winclient/断网保护加固说明.md 的「首次连接失败自动恢复」一节、检查脚本 docs/plans/checks/yc_connect_journal_steps_1128.py(它就是 SHAPE、TESTS-NEW、DOCS、SCOPE 四项验收,照它的字样写)。\n\n与本单同时在施工的另一张单(yc-diag-export-always-writes-1127)改 WinClient.Core/Diagnostics/ 下的新文件、ControlProtocol.cs、WinClient.App 的 MainViewModel.cs、MainWindow.xaml.cs、UpdatePage.xaml、Presentation/DiagnosticsExport.cs,以及 docs/winclient/环境一致性说明.md、界面说明.md,本单一个都不许碰。把记录口接到别处、后台服务端读诊断的指令,由后一张单做,本单不做。\n\n注意名字:Core 里有命名空间 WinClient.Core.Process,另一张单还会加 WinClient.Core.Diagnostics,所以计时类一律写全名 System.Diagnostics.Stopwatch,不要加 using System.Diagnostics。\n\n硬规矩:①只改允许清单里的五个文件;②既有测试文件一个都不许改,既有用例不删不改,只加新文件;既有用例若因为本单变红,停下交 blocked 并在 forks 里写出用例名和断言,不许改它;③不许 git 写操作,不许自己跑 dotnet(build / test / restore 一律按验收编号申请),命令单独一条执行(不用 cd &&、管道、2>&1);④每次 Edit / Write 的新内容控制在 150 行以内;⑤goal 里的方法名、记录行的文字照原文一字不差(含全角标点),新增注释用中文;⑥本单不新增任何子进程;⑦测试不许起真进程、不许读写真的数据目录、不许查或改真防火墙;⑧不许读写 secrets/,工位里不许装依赖(缺依赖停下交 blocked);⑨除 goal 第⑨条写明的两处 catch 和几处「接住任何异常」外,不许改任何状态迁移、提示语、定时间隔;⑩拿不准停下交 blocked 并写 forks,不猜。\n\n项目红线:只管本项目自己建的服务、路由、防火墙规则;凭据不落库不落日志(记录里不写节点地址、出口地址、令牌、配对内容、邀请码);隧道断了不许悄悄退回直连(已经连上以后的掉线重连、保护保持,行为一律不变);安装更新幂等可回退;真机没测的不标通过;Windows 子进程一律隐藏窗口。",
+  "nonGoals": [
+    "不改状态机、提示语、定时间隔;除 goal 第⑨条外不改任何对外行为",
+    "不把记录口接到别处,不做后台服务端读诊断的指令,不改 ClientRuntime、ControlServer、ControlService",
+    "不改既有测试文件",
+    "不做真机实测,不打包"
+  ],
+  "allowedPaths": [
+    "winclient/WinClient.Core/Client/ClientController.cs",
+    "winclient/WinClient.Core/Client/ConnectJournal.cs",
+    "winclient/WinClient.Tests/ConnectJournalFlowTests.cs",
+    "docs/winclient/连接记录说明.md",
+    "docs/winclient/断网保护加固说明.md"
+  ],
+  "forbiddenPaths": [
+    ".codex/**",
+    ".github/**",
+    ".gitignore",
+    "pyproject.toml",
+    "authserver/**",
+    "node/**",
+    "scripts/**",
+    "docs/plans/**",
+    "docs/design/**",
+    "docs/node/**",
+    "winclient/*.sln",
+    "winclient/Directory.Build.props",
+    "winclient/third_party/**",
+    "winclient/WinClient.App/**",
+    "winclient/WinClient.UiTests/**",
+    "winclient/WinClient.Core/Diagnostics/**",
+    "winclient/WinClient.Core/Firewall/**",
+    "winclient/WinClient.Core/Network/**",
+    "winclient/WinClient.Core/State/**",
+    "winclient/WinClient.Core/Update/**",
+    "winclient/WinClient.Core/Logging/**",
+    "winclient/WinClient.Core/Ipc/**",
+    "winclient/WinClient.Core/Process/**",
+    "winclient/WinClient.Core/WinClient.Core.csproj",
+    "winclient/WinClient.Core/Client/ClientRuntime.cs",
+    "winclient/WinClient.Core/Client/BuildInfo.cs",
+    "winclient/WinClient.Core/Client/ISessionSource.cs",
+    "winclient/WinClient.Tests/WinClient.Tests.csproj",
+    "winclient/WinClient.Tests/ControllerTests.cs",
+    "winclient/WinClient.Tests/ConnectAbandonTests.cs",
+    "winclient/WinClient.Tests/ConnectJournalTests.cs",
+    "winclient/WinClient.Tests/IpcTests.cs",
+    "winclient/WinClient.Tests/StateTests.cs",
+    "winclient/WinClient.Tests/PairingTests.cs",
+    "docs/winclient/环境一致性说明.md",
+    "docs/winclient/界面说明.md",
+    "docs/winclient/打包与发布说明.md",
+    "docs/口径速查表.md"
+  ],
+  "expectArtifacts": [
+    "winclient/WinClient.Tests/ConnectJournalFlowTests.cs",
+    "docs/winclient/连接记录说明.md"
+  ],
+  "acceptance": [
+    {
+      "id": "BUILD",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "build",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1200
+    },
+    {
+      "id": "TEST",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "test",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--no-build",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1500
+    },
+    {
+      "id": "SHAPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_connect_journal_steps_1128.py",
+        "shape"
+      ],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "TESTS-NEW",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_connect_journal_steps_1128.py",
+        "tests"
+      ],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_connect_journal_steps_1128.py",
+        "docs"
+      ],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "SCOPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_connect_journal_steps_1128.py",
+        "scope"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "timeoutSec": 10800,
+  "repoRoot": "E:/yuanc",
+  "steps": [
+    "读 background 列出的文件与检查脚本。",
+    "先写测试:ConnectJournalFlowTests.cs 十五个用例;申请 BUILD 以编译失败证红,之后固定 BUILD→TEST。",
+    "按 goal 第①条改 ConnectJournal.cs。",
+    "按 goal 第②~⑧条在 ClientController.cs 里加记录行,每加完一段申请一次 BUILD。",
+    "按 goal 第⑨条加两处 catch 与几处「接住任何异常」。",
+    "按 goal 第⑪条写新文档、改加固说明两处;BUILD、TEST、SHAPE、TESTS-NEW、DOCS、SCOPE 绿后交活。",
+    "交活说明逐条对照 goal 第①~⑫条写做到了没有,并单列哪些只有真机能验。"
+  ]
+}
