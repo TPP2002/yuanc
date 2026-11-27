@@ -1,0 +1,173 @@
+{
+  "schemaVersion": 1,
+  "taskId": "WINCLIENT-CONNECT-FAIL-LOCKS-NETWORK-1127",
+  "slug": "yc-connect-abandon-testbuild-1127",
+  "title": "首次连接失败自动恢复原来的网络;连接失败不再记成开机要连;测试包关掉断网保护并加两道保险",
+  "workbuddyTier": "hard",
+  "goal": "以派单时 origin/main 头为基点。看板卡 WINCLIENT-CONNECT-FAIL-LOCKS-NETWORK-1127。\n\n【问题】2026-11-27 晚,国内测试电脑第一次点「连接」(全部流量):断网保护先套上,随后一步出错,控制器走 FailAsync 停在「需人工处理」并留着断网保护。电脑只剩局域网能通,远程操作它的人当场失联,重启才恢复。隧道一直连不上时要重试 11 次、约 9 分钟才收场,期间同样断网。连接失败后期望状态仍被写成「要连」,下次开机还会带着保护接回去。\n负责人 2026-11-27 定了两件事:①「连接从没连上就出错时自动恢复原来的网络」;②下一版测试包先关掉断网保护(原话「不建，继续用国内的，但是先把断网保护给禁用」)。\n\n【做完后】下面的提示语、记录文字照原文一字不差(全角标点照抄)。\n\n① 首次尝试失败:放弃并恢复(ClientController、ConnectionStateMachine)\n\n「首次尝试」的定义:`ConnectAsync` 过了全部早退检查、即将处理 UserConnect 的那一刻,`protection` 为假且 `firewall.HasPendingState` 为假(不分用户点的还是开机自动连的)。状态第一次到 Connected 时结束;`DisconnectAsync`、`ChangeSessionSourceAsync` 拿到串行锁后也把它清掉。进入时已有保护或已有恢复记录的(服务重启接回、连上以后掉线重连、上次留着保护又点连接)不算首次尝试,行为与现在完全一样。\n\n(a) ConnectionStateMachine:`ConnectionEventKind` 枚举末尾加 `AttemptAbandoned`。任何状态下处理它:State 回 Disconnected,sessionAccepted 与 KillSwitchRequired 置假,退避计数清零,返回的效果清单恰好是 `[StopTunnel]`。\n\n(b) 「放弃并恢复」这套动作,全部在串行锁内做完,做完才发最终快照:\n 1. `lifetime.Cancel()`,代数加一(本次尝试排下的定时器全部作废)。\n 2. 处理 `AttemptAbandoned` 并执行它的 StopTunnel。`tunnel.Stop()` 抛可处理异常(IsOperational)时到此为止:再处理一次 `OperationFailed` 让状态变成 NeedsManual,提示「连接内核未能停止，请联系管理员；断网保护保留。」,不撤保护。\n 3. `protection` 为真:调 `firewall.RemoveAsync()`,成功后 protection、protectionVerified 置假,firewallWarning、reapWarning 清空;nicGuard 不为空时接着调 `nicGuard.RestoreAsync()`,它返回的提醒接在提示末尾(前面加一个空格)。`protection` 为假:`RemoveAsync` 和网卡恢复都不调(没套过就不碰系统防火墙)。\n 4. `RestoreEnvironmentAsync()`;返回假时提示末尾接「 时区或浏览器设置未能恢复，请联系管理员。」。\n 5. `session = null`,guardStatus 清空。\n 6. 提示 = `连接失败，已恢复原来的网络，当前没有走澳洲出口。` + 原因句。\n 7. 第 3 步的 `RemoveAsync` 抛可处理异常:处理一次 `OperationFailed`(状态 NeedsManual),protection 保持为真,提示 = `连接失败，原来的网络没能恢复：请点「断开」再试一次，还不行就重启电脑。` + 原因句。\n 8. 不论走到哪一步收场,最后触发一次 `public event Action? AttemptAbandoned;`(订阅者抛的异常要接住),并写一行记录(见④)。\n\n原因句与记录短语:\n | 触发原因 | 原因句 | 记录短语 |\n | WfpUnavailableException | `原因：系统过滤层的保护没能建立。` | `过滤层没建成` |\n | RouteGuardUnavailableException | `原因：兜底路由没能建立。` | `兜底路由没建成` |\n | NicGuardException | `原因：没能关闭网卡「<AdapterName,为空写 未知>」的 IPv6。` | `网卡 IPv6 没关成` |\n | 其余 FirewallIneffectiveException | `原因：系统防火墙没有开启，或被策略覆盖。` | `系统防火墙没生效` |\n | FileNotFoundException | `原因：未找到连接内核。` | `未找到连接内核` |\n | TimeoutException、OperationCanceledException | `原因：有一步操作超过时限没有完成。` | `操作超时` |\n | 重试到头 | `原因：连续 4 次都没连上澳洲出口。` | `连续 4 次没连上` |\n | 其余(含原因为 null) | `原因已写入诊断记录，请导出诊断发给管理员。` | `其他` |\n\n(c) 三个触发点:\n - 首次尝试期间走到 `FailAsync`(不论从哪里调):做(b),不再停在「需人工处理」。`StartTunnel` 里接 FileNotFoundException 的那一支,首次尝试时不许再用「未找到连接内核，请联系管理员配置 sing-box.exe 路径。」盖掉(b)的提示;不是首次尝试时照旧显示这一句。\n - 首次尝试期间第 4 次要安排退避时(前 3 次照常,间隔 2、4、8 秒)不再安排,做(b),原因取「重试到头」。加常量 `internal const int FirstConnectRetries = 3;`。\n - 首次尝试期间状态落到 NeedsLogin 或 NeedsManual(登录到期、会话被拒这类,不是上面两种)而 `protection` 为真:只做(b)的第 3、4 步,状态与状态机给的提示不动,提示末尾接「 已恢复原来的网络。」,首次尝试结束,触发 `AttemptAbandoned` 事件,记录短语 `登录状态失效`。这时 `protection` 为假就什么都不做(与现在一样)。检查点放在 `ConnectAsync` 与定时回调各自收尾处即可。\n\n② 开机要不要接着连(ControlServer、ControlService)\n - ControlServer 加 `public static bool ShouldStayConnected(ClientSnapshot snapshot) => snapshot.ProtectionActive || snapshot.State is ConnectionState.Connecting or ConnectionState.Connected or ConnectionState.Reconnecting;`。connect 分支在 `await facade.ConnectAsync()` 之后写 `desired.Write(ShouldStayConnected(facade.Snapshot));`(原来无条件写 true)。disconnect 分支不动。\n - ControlService:运行时建好后、调 `InitializeRuntimeAsync` 之前,订阅 `runtime.Controller.AttemptAbandoned`,处理里 `desired.Write(false)`,接住 IOException 与 UnauthorizedAccessException。\n\n③ 测试包:关掉断网保护\n - 新文件 winclient/WinClient.Core/Client/BuildInfo.cs:\n   `public static class BuildInfo`,含 `public const string TestBuildKey = \"YuanC.TestBuild\";`、`internal static bool IsTestBuild(IEnumerable<System.Reflection.AssemblyMetadataAttribute> metadata)`(有一条键等于 TestBuildKey、值不分大小写等于 true 才为真)、`public static bool IsTestBuild(System.Reflection.Assembly? assembly)`(null 为假,否则取它的 AssemblyMetadataAttribute 交给前一个)、`public static bool TestBuild { get; } = IsTestBuild(System.Reflection.Assembly.GetEntryAssembly());`、`public static bool KeepOnStartup(bool testBuild, bool? desired) => !testBuild && desired != false;`。\n - winclient/WinClient.App/WinClient.App.csproj 加一组:`<ItemGroup Condition=\"'$(YuanCTestBuild)' == 'true'\"><AssemblyMetadata Include=\"YuanC.TestBuild\" Value=\"true\" /></ItemGroup>`。\n - scripts/release/build-winclient.ps1:参数改成 `param([string]$Version, [switch]$TestBuild)`。带 `-TestBuild` 时 publish 多传 `-p:YuanCTestBuild=true`,产物名 `YuanC-Client-<Version>-test.exe`(校验文件同名加 .sha256,里面写的文件名一致),末尾多打一行 `测试包：断网保护已关闭，不能交给客户。`。不带时参数、产物名、输出与现在完全一样。子进程隐藏窗口的写法不动。\n - 新文件 winclient/WinClient.Core/Firewall/DisabledKillSwitch.cs:`public sealed class DisabledKillSwitch(IKillSwitch inner) : IKillSwitch`。`HasPendingState`、`PendingMode` 透传;`RecoverAsync()` 转给 inner;`RemoveAsync()` 只在 `inner.HasPendingState` 为真时转给 inner,否则直接完成;接口里的两个 ApplyAsync、两个 ApplyAppsAsync、两个 UpdateNodeAsync、三个 PatrolAsync 重载全部自己实现:不调 inner、不抛(出口端口不是 443 也不抛),Apply 与 UpdateNode 直接完成,Patrol 返回 `PatrolReport.Empty`。\n - 新文件 winclient/WinClient.Core/Network/DisabledNicGuard.cs:`public sealed class DisabledNicGuard(INicGuard inner) : INicGuard`。`HasPendingState` 透传;`PublicIpv4Adapter()` 返回 null、不调 inner;`ApplyAsync` 直接完成、不调 inner;`PatrolAsync` 返回 `new NicPatrolReport([], [])`、不调 inner;`RestoreAsync()` 转给 inner(上一版留下的网卡改动仍要能恢复)。\n - ClientRuntime:`CreateAsync` 末尾加参数 `bool testBuild = false`。加 `internal static IKillSwitch GuardFor(IKillSwitch real, bool testBuild) => testBuild ? new DisabledKillSwitch(real) : real;`。testBuild 为真时,交给控制器的断网保护是 `GuardFor(firewall, true)`,网卡看护是包了 `DisabledNicGuard` 的那一个,`reaper` 传 null,并设 `TestBuild = true`;ClientRuntime 自己留着的 `firewall` 字段(启动恢复、审计路径、RecoveryWarning)仍是真执行器,启动时那次 `firewall.RecoverAsync()` 照旧。testBuild 为假时与现在完全一样。\n - ClientController:`public bool TestBuild { get; init; }`;`internal static readonly TimeSpan TestBuildRecheckInterval = TimeSpan.FromMinutes(1);`。测试包里出口复核的间隔用它,正式包仍是 `ExitRecheckInterval`(5 分钟)。测试包里一轮出口核验以「无法核验」收场(连续 `ExitCheckAttempts` 次都没回应)而状态是 Connected:做(b)的同一套动作,成功时提示 = `测试包：出口核验不了，已自动断开并恢复原来的网络。`(第 7 步失败时原因句写 `原因：出口核验不了。`),记录短语 `测试包出口核验不了`,做完不再排下一次出口核验。正式包这一支不变:保持连接与保护,显示「无法核验」。\n - ControlService:`var testBuild = BuildInfo.TestBuild; var keep = BuildInfo.KeepOnStartup(testBuild, desired.Read());`,`CreateAsync(…, keepProtection: keep, testBuild: testBuild)`;测试包时往 service.log 写一行 `测试包：断网保护已关闭，开机不自动连接。`。\n - StatusPresentation:`Build` 末尾加可选参数 `bool? testBuild = null`,取值 `testBuild ?? BuildInfo.TestBuild`。为真时「断网保护」一行固定是 `Row(\"断网保护\", Tone.Warn, Glyph.Ask, \"测试包已关闭,断线时会直连\")`(不看快照),托盘文字前缀由 `澳洲出口客户端 · ` 换成 `澳洲出口客户端(测试包) · `(63 字截断照旧)。为假时每一项与现在逐字相同。MainViewModel 不改。\n\n④ 记录口(本单只写三种行,下一张单再扩)\n - ClientController:`public Action<string>? Journal { get; init; }`;每次调用都接住它抛的任何异常。\n - 新文件 winclient/WinClient.Core/Client/ConnectJournal.cs:`public static class ConnectJournal`,`public static string Describe(Exception ex)`:从外到内最多 4 层,每层写成 `<类型短名>：<消息>`,层与层之间用 ` <- ` 连接。每层消息先处理:连续的回车换行换成 ` | `;IPv4 点分地址换成 `[地址]`;`<盘符>:\\Users\\<名字>` 里的名字换成 `[用户]`(不分大小写);去首尾空白;超过 300 个字符截到 300 再加 `…`。\n - `FailAsync` 每次被调(是不是首次尝试都写):`连接失败：<Describe(cause)>`;cause 为 null 写 `连接失败：原因未知`。\n - (b)与(c)第三点、测试包自动断开收场时:`放弃并恢复：<记录短语>，撤销=<成功|失败|不需要>`(没调 RemoveAsync 写「不需要」)。\n - ClientRuntime.CreateAsync 把 Journal 接到 `new RedactingLog(new RollingFileLog(<数据目录>/run/connect.log))` 的 Write。\n - 记录里不许出现节点地址、出口地址、令牌、配对内容。\n\n⑤ 文档\n - docs/winclient/断网保护加固说明.md:\n   · 新增一节 `## 首次连接失败自动恢复`:定义、三个触发点、(b)的动作与两句提示原文、撤销失败时停在哪、期望状态写成 false 所以下次开机不带着保护接回去、负责人 2026-11-27 的决定(原话「自动恢复原来的网络」)、真机待验证项(本单未执行)。\n   · 新增一节 `## 测试包(断网保护关闭)`:负责人 2026-11-27 原话「不建，继续用国内的，但是先把断网保护给禁用」;不执行的五样(系统防火墙脚本、系统过滤层、兜底路由、网卡看护、旧连接重置);照常工作的(隧道、分应用、环境一致、出口核验、自检、更新);两道保险(出口核验不了自动断开且复核间隔 1 分钟;开机不自动连接);界面怎么标;写明「防泄漏相关的验收项在测试包上一律不算通过」。\n   · 既有文字里与新口径矛盾的三处改掉:「防火墙配置档被关闭或被策略覆盖」一节的「首次连接仍拒连」那段、「已持有保护时防火墙失效」一节的「首次连接(…)仍拒连。失败后再次点击连接…仍进入需人工处理…」那段、过滤层一节的「首次连接拒绝启动隧道，进入需人工处理，透出原文」那段,都改成:首次连接失败不启动隧道,自动恢复原来的网络,见新节。「服务重启时保持保护」一节补一句期望状态的新写法。\n   · 「任何出口核验或巡检结果都不自动断开隧道，也不自动撤销断网保护。」这句保留,后面加一句:测试包除外,见「测试包(断网保护关闭)」一节。\n - docs/winclient/打包与发布说明.md 的「维护人员出包」一节:加 `-TestBuild` 的用法、产物名 `YuanC-Client-<Version>-test.exe`、它关掉了断网保护、不能交给客户、不签名、不发布到更新源。\n\n⑥ 测试(先写,BUILD 以编译失败证红)\n\n既有用例只许改 winclient/WinClient.Tests/ControllerTests.cs 里的六个,改法写死;别的既有用例的名字、数据行、断言一个不改,只加。还有别的既有用例因本单变红:不许改它,停下交 blocked,写清哪个用例、哪句断言。\n 1. `ApplyFailureDoesNotStartOrSilentlyRemoveProtection` 改名 `ApplyFailureOnFirstConnectRestoresNetworkWithoutStartingTunnel`:断言改成状态 Disconnected、ProtectionActive 为假、提示以 `连接失败，已恢复原来的网络，当前没有走澳洲出口。` 开头、order 不含 \"start\"、含 \"remove\"。\n 2. `IneffectiveFirewallKeepsProtectionAndShowsSpecificReasonWithoutStartingTunnel` 改名 `IneffectiveFirewallOnFirstConnectRestoresNetworkAndNamesReason`:Disconnected、ProtectionActive 为假、提示等于 `连接失败，已恢复原来的网络，当前没有走澳洲出口。原因：系统防火墙没有开启，或被策略覆盖。`、含 \"apply\"、不含 \"start\"、含 \"remove\"。\n 3. `IneffectiveFirewallRejectsFirstConnectionAndRepeatedConnectionWithoutVerifiedProtection` 改名 `IneffectiveFirewallOnRepeatedFirstConnectRestoresEachTime`:循环两次,每次 Disconnected、ProtectionActive 为假、提示同第 2 条、不含 \"start\";循环后 \"apply\" 恰好 2 次、\"remove\" 恰好 2 次。\n 4. `FirstWfpFailureRefusesTunnelAndRequiresManualRecovery` 改名 `FirstWfpFailureRestoresNetworkAndNamesReason`:Disconnected、ProtectionActive 为假、提示等于 `连接失败，已恢复原来的网络，当前没有走澳洲出口。原因：系统过滤层的保护没能建立。`、含 \"apply\"、不含 \"start\"、含 \"remove\"。\n 5. `NicGuardFailureRefusesTunnelWhenNotHeld` 改名 `NicGuardFailureOnFirstConnectRestoresNetworkAndNic`:Disconnected、ProtectionActive 为假、提示等于 `连接失败，已恢复原来的网络，当前没有走澳洲出口。原因：没能关闭网卡「以太网」的 IPv6。`、不含 \"start\"、不含 \"reap\"、\"nic-restore\" 出现在 \"remove\" 之后。\n 6. `PairingRetriesReachManualWithAddressHintAndKeepProtection`(名字不变):防火墙替身换成 `new Firewall(order) { HasPendingState = true }`,第一处 `await controller.ConnectAsync();` 换成 `await controller.InitializeAsync(autoConnect: false, keepProtection: true);`,其余行一个字不动(仍是 11 次退避、12 次 \"start\"、需人工处理、保护为真、不含 \"remove\")。\n\n新用例,名字固定。控制器用例写在 ControllerTests.cs 末尾或新文件 winclient/WinClient.Tests/ConnectAbandonTests.cs 都行(新文件里替身自己写);其余按下面写的文件放:\n - `FirstConnectTunnelRetriesStopAfterThreeBackoffsAndRestoreNetwork`:配对来源,隧道替身每次启动都抛 IOException,防火墙替身没有恢复记录。连接后依次取到 2、4、8 秒三个「退避」并放行;之后状态 Disconnected、ProtectionActive 为假、提示等于 `连接失败，已恢复原来的网络，当前没有走澳洲出口。原因：连续 4 次都没连上澳洲出口。`;\"start\" 恰好 4 次,\"remove\" 恰好 1 次且在最后一个 \"start\" 之后;没有第 4 个「退避」。\n - `FirstConnectAuthNetworkRetriesStopWithoutTouchingFirewall`:会话来源连续 4 次返回 `AuthResult.Network`。三次退避后状态 Disconnected,提示同上一条;order 里没有 \"apply\"、没有 \"remove\"。\n - `FirstConnectMissingKernelRestoresNetworkAndKeepsRestoreMessage`:隧道替身启动抛 FileNotFoundException。Disconnected、ProtectionActive 为假、提示等于 `连接失败，已恢复原来的网络，当前没有走澳洲出口。原因：未找到连接内核。`、含 \"remove\"。\n - `HeldProtectionMissingKernelStillNeedsManualWithOriginalMessage`:持有保护(替身 HasPendingState 为真,`InitializeAsync(autoConnect: false, keepProtection: true)`),隧道替身启动抛 FileNotFoundException。状态 NeedsManual、ProtectionActive 为真、提示含 `未找到连接内核，请联系管理员配置 sing-box.exe 路径。`、不含 \"remove\"。\n - `FirstConnectApplyTimeoutRestoresNetworkAndNamesTimeout`:防火墙替身套用时抛 TimeoutException。提示等于 `连接失败，已恢复原来的网络，当前没有走澳洲出口。原因：有一步操作超过时限没有完成。`,Disconnected,含 \"remove\"。\n - `FirstConnectRestoreFailureNeedsManualKeepsProtectionAndTellsHowToRecover`:套用抛 WfpUnavailableException,撤销抛 InvalidOperationException。状态 NeedsManual、ProtectionActive 为真、提示等于 `连接失败，原来的网络没能恢复：请点「断开」再试一次，还不行就重启电脑。原因：系统过滤层的保护没能建立。`。\n - `FirstConnectSessionExpiredAfterApplyDropsProtectionButKeepsNeedsLogin`:会话在套用断网保护期间到期(替身的套用挂在一个由测试放行的任务上,过了到期时间再放行)。状态 NeedsLogin、ProtectionActive 为假、提示等于 `登录已到期，请重新登录。 已恢复原来的网络。`、含 \"remove\"、不含 \"start\"。\n - `ReconnectAfterConnectedStillRetriesBeyondThreeBackoffs`:先连上,再让隧道掉线并一直起不来。至少取到 2、4、8、16 秒四个「退避」;期间 ProtectionActive 一直为真,没有 \"remove\"。\n - `DisconnectDuringFirstAttemptUsesNormalDisconnectPath`:首次尝试停在第一次退避等待时调 `DisconnectAsync`。状态 Disconnected、提示等于 `已断开，原网络设置已恢复。`、\"remove\" 恰好 1 次、`AttemptAbandoned` 事件没有触发。\n - `AbandonRaisesEventOnceAndWritesJournal`:首次连接,防火墙替身套用时抛 FirewallIneffectiveException。`AttemptAbandoned` 恰好触发 1 次;Journal 收到一行以 `连接失败：` 开头的,和一行等于 `放弃并恢复：系统防火墙没生效，撤销=成功` 的;记录里不含测试会话的节点地址。再跑一遍,这次事件订阅者和 Journal 都抛 InvalidOperationException:`ConnectAsync` 照常返回,状态仍是 Disconnected。\n - `TestBuildDisconnectsAndRestoresWhenExitCannotBeVerified`:`TestBuild = true`,出口探针一直没有回应。连上后放行 3 秒一次、5 秒四次「出口核验」;之后状态 Disconnected、ProtectionActive 为假、提示等于 `测试包：出口核验不了，已自动断开并恢复原来的网络。`、\"stop\" 在 \"remove\" 之前、`AttemptAbandoned` 触发 1 次、Journal 有一行 `放弃并恢复：测试包出口核验不了，撤销=成功`、没有排下一次「出口核验」。\n - `TestBuildRechecksExitEveryMinute`:出口探针返回与节点一致的地址。`TestBuild = true` 时首轮核验后下一次「出口核验」排在 1 分钟后;不设时排在 5 分钟后。\n - winclient/WinClient.Tests/StateTests.cs 加 `AttemptAbandonedReturnsToDisconnectedWithOnlyStopTunnel`:从 Connecting、退避等待中的 Reconnecting、NeedsManual 三种状态各处理一次,都是 State 为 Disconnected、HasSession 为假、KillSwitchRequired 为假、效果恰好一个 StopTunnel;之后 UserConnect、SessionOk 仍给出 `[ApplyKillSwitch, StartTunnel]`,再掉线的第一次退避是 2 秒。\n - winclient/WinClient.Tests/IpcTests.cs:FakeFacade 只加一个可选属性(给了就把它当作 `ConnectAsync` 之后的快照,不给时行为不变),加 `[Theory] ConnectWritesDesiredFromResultingSnapshot` 六行:(Disconnected, 保护假)→false;(NeedsManual, 假)→false;(NeedsLogin, 假)→false;(NeedsManual, 真)→true;(Reconnecting, 假)→true;(Connected, 真)→true。\n - 新文件 winclient/WinClient.Tests/BuildInfoTests.cs:`KeepOnStartupTruthTable`(测试包为假:null→true、true→true、false→false;测试包为真:三种都是 false);`IsTestBuildReadsMetadata`(空集合→false;键对值为 \"true\"→true;值 \"TRUE\"→true;值 \"false\"→false;键不对→false;`IsTestBuild((Assembly?)null)`→false;本测试程序集→false)。\n - 新文件 winclient/WinClient.Tests/DisabledGuardTests.cs:`DisabledKillSwitchNeverAppliesOrPatrolsButStillRecoversAndRemovesLeftovers`(记录型 inner:九个 Apply、ApplyApps、UpdateNode、Patrol 重载全调一遍,含出口端口不是 443 的,inner 一次没被调、不抛,Patrol 的结果 Clean 为真;`RecoverAsync` 转给 inner 并原样返回;inner 没有恢复记录时 `RemoveAsync` 不调 inner,有时调;HasPendingState、PendingMode 透传);`DisabledNicGuardOnlyRestores`(PublicIpv4Adapter 返回 null、Apply 与 Patrol 不调 inner、Patrol 两个名单为空、RestoreAsync 转给 inner 并原样返回提醒、HasPendingState 透传);`GuardForWrapsOnlyInTestBuild`(`ClientRuntime.GuardFor(real, false)` 返回同一个对象,`GuardFor(real, true)` 返回 DisabledKillSwitch)。\n - 新文件 winclient/WinClient.Tests/ConnectJournalTests.cs:`DescribeChainsTypesAndScrubsAddressesAndUserFolders`:`new InvalidOperationException(\"外层 203.0.113.9\", new IOException(\"C:\\\\Users\\\\alice\\\\x\\r\\n第二行\"))` 的结果等于 `InvalidOperationException：外层 [地址] <- IOException：C:\\Users\\[用户]\\x | 第二行`;400 个字符的消息截成 300 个字符加 `…`;嵌套 6 层只写前 4 层。\n - winclient/WinClient.UiTests/StatusPresentationTests.cs 加 `TestBuildGuardRowAndTrayTextAreMarked`:`StatusPresentation.Build(快照, ServiceAvailability.Ready, false, testBuild: true)` 的「断网保护」一行文字是 `测试包已关闭,断线时会直连`、Tile 的 Tone 是 Warn、Glyph 是 Ask(快照 ProtectionActive 真假两种都一样),TrayText 以 `澳洲出口客户端(测试包) · ` 开头;`testBuild: false` 的结果与不传第四个参数时逐项相同。\n\n交活说明逐条对照①~⑥写做到了没有;六个改过的旧用例逐个列出改了哪几行;单列只有真机能验的:测试包在真机上确实不改防火墙与过滤层、首次连接失败后真机网络确实恢复、带 `-TestBuild` 打出的包界面上确实标出测试包。",
+  "background": "项目:外包「澳洲出口节点 + Windows 一键客户端」。客户端 .NET 9(winclient/WinClient.sln:Core + App + Tests + UiTests)。连接由 ClientController(串行锁内执行状态机给出的效果)驱动;后台服务 ControlService 建 ClientRuntime、经命名管道由 ControlServer 接界面的指令;run/desired.json 记「开机要不要接着连」。断网保护经 IKillSwitch(真实现 KillSwitchApplier:系统防火墙脚本 + 系统过滤层 + 兜底路由),另有网卡看护 INicGuard 与旧连接重置 IConnectionReaper。\n\n先读(都读全文):winclient/WinClient.Core/Client/ClientController.cs(983 行)、ClientRuntime.cs、DesiredStateStore.cs、winclient/WinClient.Core/State/ConnectionStateMachine.cs、winclient/WinClient.Core/Ipc/ControlServer.cs 的 ExecuteAsync、winclient/WinClient.Core/Firewall/KillSwitchApplier.cs 开头的 IKillSwitch 与四个异常类型、winclient/WinClient.Core/Network/NicGuard.cs 开头的 INicGuard 与 NicGuardException、winclient/WinClient.App/Hosting/ControlService.cs、winclient/WinClient.App/Presentation/StatusPresentation.cs、scripts/release/build-winclient.ps1、winclient/WinClient.Tests/ControllerTests.cs 里的替身(Firewall、Tunnel、ObservableTunnel、Timers、ScriptedSource、ScriptedProbe、FakeNic、FakeReaper、FireAndPublish、Until)与要改的六个用例、PairingTests.cs 末尾的 FakeFirewall 与 FakeTunnel、IpcTests.cs 的 FakeFacade、StateTests.cs、docs/winclient/断网保护加固说明.md、检查脚本 docs/plans/checks/yc_connect_abandon_testbuild_1127.py(它就是 SHAPE、TESTS-NEW、DOCS、SCOPE 四项验收,照它的字样写)。\n\n与本单同时在施工的另一张单(yc-killswitch-restore-fast-1127)改 KillSwitchPlanner.cs、KillSwitchApplier.cs、CommandRunner.cs、KillSwitchHardenTests.cs,本单一个都不许碰,也不许依赖它新增的任何成员。\n\n硬规矩:①只改允许清单里的文件;②既有测试只许按 goal 第⑥条写死的改法改 ControllerTests.cs 里那六个用例(IpcTests 的 FakeFacade 只加一个可选属性),其余既有用例的名字、数据行、断言不改,只加;③不许 git 写操作,不许自己跑 dotnet(build / test / restore 一律按验收编号申请),命令单独一条执行(不用 cd &&、管道、2>&1);④每次 Edit / Write 的新内容控制在 150 行以内;⑤goal 里的提示语、记录文字照原文一字不差(含全角标点),新增注释用中文;⑥新增的子进程一律隐藏窗口(本单预计不新增子进程);⑦测试不许启用、停用、新建、删除任何真防火墙规则,不许改防火墙配置档、装过滤器、改网卡、起真隧道;⑧不许读写 secrets/,工位里不许装依赖(缺依赖停下交 blocked);⑨不改管道协议(ControlProtocol、ControlSnapshot、IClientFacade)、不改 MainViewModel、不改界面截图基线;⑩拿不准停下交 blocked 并写 forks,不猜。\n\n项目红线:只管本项目自己建的服务、路由、防火墙规则;凭据不落库不落日志(记录里不写节点地址、出口地址、令牌、配对内容);隧道断了不许悄悄退回直连(正式包里已连上之后的一切行为不变,本单只改「从没连上」的那次尝试和测试包);安装更新幂等可回退;真机没测的不标通过;Windows 子进程一律隐藏窗口。",
+  "nonGoals": [
+    "不改已连上之后的行为:掉线重连的退避次数、需人工处理时保持保护、正式包出口核验不了不自动断开,都不动",
+    "不改断网保护本身:KillSwitchPlanner、KillSwitchApplier、CommandRunner、WfpEngine、RouteGuard、NicGuard、ConnectionReaper 一律不动",
+    "不改管道协议、IClientFacade、ControlSnapshot、MainViewModel、界面布局与截图基线",
+    "不做导出诊断,不扩充记录的其余内容(下一张单做)",
+    "不做真机实测,不打正式发布包,不改默认版本号"
+  ],
+  "allowedPaths": [
+    "winclient/WinClient.Core/Client/ClientController.cs",
+    "winclient/WinClient.Core/Client/ClientRuntime.cs",
+    "winclient/WinClient.Core/Client/BuildInfo.cs",
+    "winclient/WinClient.Core/Client/ConnectJournal.cs",
+    "winclient/WinClient.Core/Firewall/DisabledKillSwitch.cs",
+    "winclient/WinClient.Core/Network/DisabledNicGuard.cs",
+    "winclient/WinClient.Core/State/ConnectionStateMachine.cs",
+    "winclient/WinClient.Core/Ipc/ControlServer.cs",
+    "winclient/WinClient.App/Hosting/ControlService.cs",
+    "winclient/WinClient.App/Presentation/StatusPresentation.cs",
+    "winclient/WinClient.App/WinClient.App.csproj",
+    "scripts/release/build-winclient.ps1",
+    "winclient/WinClient.Tests/ControllerTests.cs",
+    "winclient/WinClient.Tests/ConnectAbandonTests.cs",
+    "winclient/WinClient.Tests/StateTests.cs",
+    "winclient/WinClient.Tests/IpcTests.cs",
+    "winclient/WinClient.Tests/BuildInfoTests.cs",
+    "winclient/WinClient.Tests/DisabledGuardTests.cs",
+    "winclient/WinClient.Tests/ConnectJournalTests.cs",
+    "winclient/WinClient.UiTests/StatusPresentationTests.cs",
+    "docs/winclient/断网保护加固说明.md",
+    "docs/winclient/打包与发布说明.md"
+  ],
+  "forbiddenPaths": [
+    ".codex/**",
+    ".github/**",
+    ".gitignore",
+    "pyproject.toml",
+    "authserver/**",
+    "node/**",
+    "docs/plans/**",
+    "docs/design/**",
+    "docs/node/**",
+    "winclient/*.sln",
+    "winclient/Directory.Build.props",
+    "winclient/third_party/**",
+    "winclient/WinClient.Core/Firewall/KillSwitchPlanner.cs",
+    "winclient/WinClient.Core/Firewall/KillSwitchApplier.cs",
+    "winclient/WinClient.Core/Firewall/CommandRunner.cs",
+    "winclient/WinClient.Core/Firewall/WfpEngine.cs",
+    "winclient/WinClient.Core/Firewall/RouteGuard.cs",
+    "winclient/WinClient.Core/Network/NicGuard.cs",
+    "winclient/WinClient.Core/Ipc/ControlProtocol.cs",
+    "winclient/WinClient.Core/Ipc/IClientFacade.cs",
+    "winclient/WinClient.Core/Update/**",
+    "winclient/WinClient.Core/WinClient.Core.csproj",
+    "winclient/WinClient.App/MainViewModel.cs",
+    "winclient/WinClient.App/Views/**",
+    "winclient/WinClient.Tests/WinClient.Tests.csproj",
+    "winclient/WinClient.Tests/KillSwitchHardenTests.cs",
+    "winclient/WinClient.Tests/KillSwitchRecoveryTests.cs",
+    "winclient/WinClient.Tests/PairingTests.cs",
+    "winclient/WinClient.UiTests/RenderTests.cs",
+    "winclient/WinClient.UiTests/ScreenshotBaselineTests.cs",
+    "scripts/release/sign-winclient.py",
+    "scripts/release/fetch-third-party.ps1"
+  ],
+  "expectArtifacts": [
+    "winclient/WinClient.Core/Client/BuildInfo.cs",
+    "winclient/WinClient.Core/Client/ConnectJournal.cs",
+    "winclient/WinClient.Core/Firewall/DisabledKillSwitch.cs",
+    "winclient/WinClient.Core/Network/DisabledNicGuard.cs",
+    "winclient/WinClient.Tests/BuildInfoTests.cs",
+    "winclient/WinClient.Tests/DisabledGuardTests.cs",
+    "winclient/WinClient.Tests/ConnectJournalTests.cs"
+  ],
+  "acceptance": [
+    {
+      "id": "BUILD",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "build",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1200
+    },
+    {
+      "id": "TEST",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "test",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--no-build",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1500
+    },
+    {
+      "id": "SHAPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_connect_abandon_testbuild_1127.py",
+        "shape"
+      ],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "TESTS-NEW",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_connect_abandon_testbuild_1127.py",
+        "tests"
+      ],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_connect_abandon_testbuild_1127.py",
+        "docs"
+      ],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "SCOPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_connect_abandon_testbuild_1127.py",
+        "scope"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "timeoutSec": 10800,
+  "repoRoot": "E:/yuanc",
+  "steps": [
+    "读 background 列出的文件与检查脚本。",
+    "先写测试:新文件与新用例,按 goal 第⑥条改 ControllerTests 里那六个用例;申请 BUILD 以编译失败证红,之后固定 BUILD→TEST。",
+    "按 goal 第①~④条改代码:先状态机与控制器,再管道服务端与后台服务,再测试包开关(BuildInfo、两个关闭用的包装、运行时、界面显示、工程文件、打包脚本)。",
+    "按 goal 第⑤条改两份文档;BUILD、TEST、SHAPE、TESTS-NEW、DOCS、SCOPE 绿后交活。",
+    "交活说明逐条对照 goal 第①~⑥条写做到了没有,六个改过的旧用例逐个列出改动,并单列哪些只有真机能验。"
+  ]
+}
