@@ -1,0 +1,551 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>节点管理网页样张</title>
+<style>
+/* ==== 搬进 console.css:开始(从这一行到「搬进 console.css:结束」原样搬,一字不改) ==== */
+/* 令牌:与客户端 DESIGN.md 同一套,组件只引用变量 */
+:root {
+  --bg: #fbfbfa; --surface: #ffffff; --surface-2: #f6f6f5; --surface-3: #eeeeed;
+  --line: #e4e4e2; --line-strong: #d2d2cf; --ctrl-border: #8a8a85;
+  --text: #1a1a19; --text-2: #5c5c58; --text-3: #6b6b66;
+  --ok: #2c7a45; --ok-bg: #e8f4ec; --warn: #7d5609; --warn-bg: #fdf3e0;
+  --bad: #b3382f; --bad-bg: #fdecea; --info: #2b5fa8; --info-bg: #e8f0fb;
+  --n: #6b6b66; --n-bg: #eeeeed;
+  --action: #1a1a19; --action-text: #fbfbfa; --action-hover: #2e2e2c; --action-press: #000000;
+  --focus: #2b5fa8;
+  --shadow: 0 1px 2px rgba(0, 0, 0, .05), 0 1px 3px rgba(0, 0, 0, .04);
+  --spec-info: #4a9eff, #4ad9c4, #6d8cff, #4a9eff;
+  --spec-warn: #f0b429, #f5825b, #f6d365, #f0b429;
+  --r-sm: 4px; --r: 6px; --r-lg: 8px;
+  --s1: 4px; --s2: 8px; --s3: 12px; --s4: 16px; --s5: 24px; --s6: 32px; --s7: 48px;
+  --fs-xs: .75rem; --fs-sm: .875rem; --fs-base: 1rem; --fs-md: 1.125rem; --fs-lg: 1.25rem; --fs-xl: 1.5rem;
+  --cn: "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", "Hiragino Sans GB", system-ui, sans-serif;
+  --mono: "Cascadia Mono", Consolas, "SF Mono", Menlo, ui-monospace, monospace;
+  --dur-press: 120ms; --dur-small: 180ms; --flow: 3.4s; --flow-fast: 2.4s;
+  --ease-out: cubic-bezier(0, 0, 0, 1);
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0d0d0e; --surface: #151516; --surface-2: #1b1b1d; --surface-3: #232326;
+    --line: #242426; --line-strong: #343437; --ctrl-border: #6a6a6f;
+    --text: #e7e7e8; --text-2: #9a9a9e; --text-3: #8d8d92;
+    --ok: #6fbf82; --ok-bg: #17251b; --warn: #d9a441; --warn-bg: #241d10; --bad: #e0736a; --bad-bg: #2a1715;
+    --info: #6d9eea; --info-bg: #141d2b; --n: #8e8e8e; --n-bg: #232326;
+    --action: #e7e7e8; --action-text: #0d0d0e; --action-hover: #d3d3d5; --action-press: #ffffff;
+    --focus: #6d9eea; --shadow: none; color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0d0d0e; --surface: #151516; --surface-2: #1b1b1d; --surface-3: #232326;
+  --line: #242426; --line-strong: #343437; --ctrl-border: #6a6a6f;
+  --text: #e7e7e8; --text-2: #9a9a9e; --text-3: #8d8d92;
+  --ok: #6fbf82; --ok-bg: #17251b; --warn: #d9a441; --warn-bg: #241d10; --bad: #e0736a; --bad-bg: #2a1715;
+  --info: #6d9eea; --info-bg: #141d2b; --n: #8e8e8e; --n-bg: #232326;
+  --action: #e7e7e8; --action-text: #0d0d0e; --action-hover: #d3d3d5; --action-press: #ffffff;
+  --focus: #6d9eea; --shadow: none; color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font-family: var(--cn); font-size: var(--fs-base); line-height: 1.5; -webkit-font-smoothing: antialiased; -webkit-tap-highlight-color: transparent; }
+[hidden] { display: none !important; }
+button, input { font: inherit; color: inherit; }
+.mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+
+/* 页面骨架 */
+.app { max-width: 960px; margin: 0 auto; padding: var(--s4) var(--s5) var(--s7); }
+.top { display: flex; align-items: center; gap: var(--s3); min-height: 48px; }
+.who { display: flex; align-items: baseline; gap: var(--s2); flex: 1; min-width: 0; }
+.who .name { overflow: hidden; font-size: var(--fs-lg); font-weight: 700; line-height: 1.25; text-overflow: ellipsis; white-space: nowrap; }
+.who .ver { color: var(--text-3); font-size: var(--fs-sm); white-space: nowrap; }
+.tabs { display: flex; gap: var(--s5); border-bottom: 1px solid var(--line); }
+.tab { position: relative; min-height: 44px; padding: 0 var(--s1); border: 0; background: transparent; color: var(--text-2); cursor: pointer; font-size: var(--fs-base); touch-action: manipulation; }
+.tab[aria-selected="true"] { color: var(--text); font-weight: 700; }
+.tab[aria-selected="true"]::after { content: ""; position: absolute; right: 0; bottom: -1px; left: 0; height: 2px; background: var(--text); }
+.msg { min-height: calc(var(--fs-sm) * 1.5); margin: var(--s2) 0; color: var(--text-2); font-size: var(--fs-sm); line-height: 1.5; }
+.msg.bad { color: var(--bad); }
+.msg.ok { color: var(--ok); }
+.view { display: grid; gap: var(--s3); }
+.h2 { margin: var(--s3) 0 0; font-size: var(--fs-base); font-weight: 700; }
+.card { padding: var(--s4); background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-lg); box-shadow: var(--shadow); }
+.empty { margin: 0; padding: var(--s4); border: 1px dashed var(--line-strong); border-radius: var(--r); color: var(--text-3); font-size: var(--fs-sm); }
+
+/* 按钮:默认 / 悬停 / 聚焦 / 按下 / 忙碌 */
+.btn { display: inline-flex; align-items: center; justify-content: center; min-height: 40px; padding: var(--s2) var(--s4); border: 1px solid var(--ctrl-border); border-radius: var(--r); background: var(--surface-2); color: var(--text); cursor: pointer; font-size: var(--fs-base); line-height: 1.3; white-space: nowrap; touch-action: manipulation; }
+.btn:active { background: var(--surface-3); }
+.btn.primary { border-color: var(--action); background: var(--action); color: var(--action-text); font-weight: 700; }
+.btn.primary:active { background: var(--action-press); }
+.btn.quiet { border-color: transparent; background: transparent; color: var(--text-2); }
+.btn.quiet:active { background: var(--surface-3); color: var(--text); }
+.btn.danger { color: var(--bad); }
+.btn.sm { min-height: 32px; padding: var(--s1) var(--s3); font-size: var(--fs-sm); }
+.btn[aria-busy="true"] { color: var(--text-2); cursor: progress; }
+.btn.primary[aria-busy="true"] { background: var(--action-hover); color: var(--action-text); }
+@media (hover: hover) and (pointer: fine) {
+  .btn:hover { background: var(--surface-3); }
+  .btn.primary:hover { background: var(--action-hover); }
+  .btn.quiet:hover { background: var(--surface-2); color: var(--text); }
+  .tab:hover { color: var(--text); }
+  .chip:hover { background: var(--surface-3); }
+}
+
+/* 输入 */
+.field-label { display: block; margin-bottom: var(--s1); color: var(--text-2); font-size: var(--fs-sm); }
+.field { width: 100%; min-height: 40px; padding: var(--s2) var(--s3); border: 1px solid var(--ctrl-border); border-radius: var(--r); background: var(--surface); font-size: var(--fs-base); }
+.field:focus { outline: 2px solid var(--focus); outline-offset: -1px; border-color: transparent; }
+.field.num { width: 88px; font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.field::placeholder { color: var(--text-3); opacity: 1; }
+.chips { display: flex; flex-wrap: wrap; gap: var(--s2); }
+.chip { min-height: 40px; padding: 0 var(--s3); border: 1px solid var(--ctrl-border); border-radius: var(--r); background: var(--surface-2); cursor: pointer; font-size: var(--fs-sm); white-space: nowrap; touch-action: manipulation; }
+.chip[aria-pressed="true"] { border-color: var(--info); outline: 1px solid var(--info); background: var(--info-bg); color: var(--info); font-weight: 700; }
+.with-unit { display: flex; align-items: center; gap: var(--s2); color: var(--text-2); font-size: var(--fs-sm); }
+
+/* 徽章(结果文字,和小方块一起说,不只靠颜色) */
+.badge { display: inline-block; padding: 2px var(--s2); border-radius: var(--r-sm); font-size: var(--fs-xs); line-height: 1.6; white-space: nowrap; }
+.badge.n { background: var(--n-bg); color: var(--n); }
+.badge.ok { background: var(--ok-bg); color: var(--ok); }
+.badge.warn { background: var(--warn-bg); color: var(--warn); }
+.badge.bad { background: var(--bad-bg); color: var(--bad); }
+.badge.info { background: var(--info-bg); color: var(--info); }
+
+/* 状态小方块:底色讲好坏,记号讲在干嘛,边框流动讲正在等 */
+.tile { display: inline-grid; flex: none; place-items: center; background: var(--line); }
+.tile > i { display: grid; width: 100%; height: 100%; place-items: center; background: var(--tone-bg); }
+.tile svg { overflow: visible; fill: none; stroke: var(--tone); stroke-linecap: round; stroke-linejoin: round; }
+.tile.fill > i { background: var(--tone); }
+.tile.fill svg { stroke: var(--bg); }
+.tile.dim { opacity: .5; }
+.tile.spec { background: var(--tone); }
+.s20 { width: 20px; height: 20px; padding: 1.5px; border-radius: 6px; }
+.s20 > i { border-radius: 4.5px; }
+.s20 svg { width: 14px; height: 14px; stroke-width: 2.2; }
+.s40 { width: 40px; height: 40px; padding: 2px; border-radius: 10px; }
+.s40 > i { border-radius: 8px; }
+.s40 svg { width: 26px; height: 26px; stroke-width: 2; }
+.tone-n { --tone: var(--n); --tone-bg: var(--n-bg); }
+.tone-info { --tone: var(--info); --tone-bg: var(--info-bg); --tone-spec: var(--spec-info); }
+.tone-warn { --tone: var(--warn); --tone-bg: var(--warn-bg); --tone-spec: var(--spec-warn); }
+.tone-ok { --tone: var(--ok); --tone-bg: var(--ok-bg); }
+.tone-bad { --tone: var(--bad); --tone-bg: var(--bad-bg); }
+
+/* 状态页 */
+.hero { display: grid; grid-template-columns: 40px minmax(0, 1fr) auto; align-items: center; gap: var(--s4); }
+.hero .state { font-size: var(--fs-xl); font-weight: 700; line-height: 1.25; }
+.hero .reason { margin-top: var(--s1); color: var(--text-2); font-size: var(--fs-sm); }
+.meta { display: grid; grid-template-columns: auto auto; gap: 2px var(--s3); margin: 0; font-size: var(--fs-sm); }
+.meta dt { color: var(--text-2); }
+.meta dd { margin: 0; text-align: right; font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.stale { margin: 0; padding: var(--s2) var(--s3); border-radius: var(--r); background: var(--warn-bg); color: var(--warn); font-size: var(--fs-sm); }
+.rows { display: grid; gap: var(--s1); }
+.row { display: flex; align-items: center; gap: var(--s3); min-height: 44px; padding: var(--s2) var(--s3); background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--r); }
+.row .label { width: 112px; flex: none; color: var(--text-2); font-size: var(--fs-sm); }
+.row .val { flex: 1; min-width: 0; line-height: 1.45; overflow-wrap: anywhere; }
+.row .rt { color: var(--text-3); font-size: var(--fs-sm); white-space: nowrap; }
+.row.off, .row.off .val { color: var(--text-3); }
+
+/* 邀请码页 */
+.invite-form { display: flex; flex-wrap: wrap; align-items: flex-end; gap: var(--s3) var(--s4); }
+.invite-form .grow { flex: 1 1 200px; min-width: 0; }
+.days { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s2); }
+.form-msg { flex: 1 1 100%; min-height: calc(var(--fs-sm) * 1.5); margin: 0; color: var(--bad); font-size: var(--fs-sm); }
+.newcode { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s2) var(--s4); border-color: var(--ok); }
+.newcode .code { font-family: var(--mono); font-size: var(--fs-xl); font-weight: 700; letter-spacing: .04em; user-select: all; }
+.newcode .sub { flex: 1; min-width: 0; color: var(--text-2); font-size: var(--fs-sm); }
+.inv .code { width: 168px; flex: none; font-family: var(--mono); letter-spacing: .02em; user-select: all; }
+.inv .num { width: 136px; flex: none; color: var(--text-2); font-size: var(--fs-sm); white-space: nowrap; }
+.inv .val { overflow: hidden; color: var(--text-2); font-size: var(--fs-sm); text-overflow: ellipsis; white-space: nowrap; }
+
+/* 账号页 */
+.accts { display: grid; gap: var(--s3); }
+.acct { display: grid; gap: var(--s3); }
+.acct-head { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s2) var(--s3); }
+.acct-title { min-width: 0; overflow: hidden; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
+.acct-exp { flex: 1; min-width: 0; color: var(--text-2); font-size: var(--fs-sm); }
+.acct-exp.warn { color: var(--warn); }
+.acct-actions { display: flex; gap: var(--s2); }
+.acct-meta { margin: calc(-1 * var(--s2)) 0 0; color: var(--text-3); font-size: var(--fs-sm); }
+.extend { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s2); padding: var(--s3); border-radius: var(--r); background: var(--surface-2); }
+.extend .lead { color: var(--text-2); font-size: var(--fs-sm); }
+.dev .label { width: 72px; }
+.confirm { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: var(--s2); color: var(--bad); font-size: var(--fs-sm); }
+.acct .msg { margin: 0; }
+.acct .msg:empty { display: none; }
+
+/* 登录 */
+.login { display: grid; min-height: 100vh; min-height: 100dvh; place-items: center; padding: var(--s4); }
+.login-card { display: grid; width: 100%; max-width: 360px; gap: var(--s3); }
+.login-card h1 { margin: 0 0 var(--s2); font-size: var(--fs-xl); line-height: 1.25; }
+.login-card .field { font-family: var(--mono); letter-spacing: .04em; }
+.login-card .msg { margin: 0; color: var(--bad); }
+
+/* 窄屏:一行放不下就折行,不横向滚动 */
+@media (max-width: 640px) {
+  .app { padding: var(--s3) var(--s4) var(--s6); }
+  .tabs { gap: var(--s4); }
+  .hero { grid-template-columns: 40px minmax(0, 1fr); }
+  .hero .meta { grid-column: 1 / -1; }
+  .meta dd { text-align: left; }
+  .row { flex-wrap: wrap; gap: var(--s1) var(--s3); }
+  .row .val { flex-basis: 100%; order: 3; }
+  .row .label { flex: 1; width: auto; }
+  .inv .code { flex: 1; width: auto; }
+  .inv .num { width: auto; }
+  .invite-form .grow { flex-basis: 100%; }
+  .acct-title { flex: 1; }
+  .acct-exp { flex-basis: 100%; order: 3; }
+}
+
+/* 动效:只做按下反馈、状态换色和「正在等」的流动;位移和流光都在 no-preference 里 */
+@media (prefers-reduced-motion: no-preference) {
+  :root:not([data-motion="reduce"]) .btn, :root:not([data-motion="reduce"]) .chip { transition: background-color var(--dur-press) var(--ease-out), color var(--dur-press) var(--ease-out), transform var(--dur-press) var(--ease-out); }
+  :root:not([data-motion="reduce"]) .btn:active { transform: scale(.97); }
+  :root:not([data-motion="reduce"]) .tile > i { transition: background-color var(--dur-small) var(--ease-out); }
+  :root:not([data-motion="reduce"]) .tile.spec { background-image: linear-gradient(90deg, var(--tone-spec)); background-size: 200% 100%; animation: slide var(--flow) linear infinite; }
+  :root:not([data-motion="reduce"]) .tile.spec.fast { animation-duration: var(--flow-fast); }
+  :root:not([data-motion="reduce"]) .tile.spec .a-spin { transform-box: fill-box; transform-origin: center; animation: spin 3.2s cubic-bezier(.45, 0, .2, 1) infinite; }
+  :root:not([data-motion="reduce"]) .tile.spec .a-pulse { transform-box: fill-box; transform-origin: center; animation: pulse 2.4s ease-in-out infinite; }
+}
+@keyframes slide { to { background-position: -200% 0; } }
+@keyframes spin { 0%, 15% { transform: rotate(0); } 60%, 100% { transform: rotate(-360deg); } }
+@keyframes pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: .45; transform: scale(.9); } }
+/* ==== 搬进 console.css:结束 ==== */
+
+/* 样张自己的壳(不搬) */
+.sz-bar { position: sticky; top: 0; z-index: 9; display: flex; flex-wrap: wrap; align-items: center; gap: var(--s2) var(--s4); padding: var(--s3) var(--s4); background: var(--surface); border-bottom: 1px solid var(--line); }
+.sz-bar h1 { flex: 1 1 auto; margin: 0; font-size: var(--fs-lg); }
+.sz-shot { max-width: 1060px; margin: var(--s6) auto 0; padding: 0 var(--s4); }
+.sz-shot h2 { margin: 0 0 var(--s1); font-size: var(--fs-md); }
+.sz-cap { margin: 0 0 var(--s3); color: var(--text-2); font-size: var(--fs-sm); }
+.sz-frame { overflow: auto; border: 1px solid var(--line-strong); border-radius: var(--r-lg); background: var(--bg); }
+.sz-desk { width: 1024px; max-width: 100%; }
+.sz-phone { width: 375px; height: 760px; }
+.sz-frame .login { min-height: 520px; }
+</style>
+</head>
+<body>
+<div class="sz-bar">
+  <h1>节点管理网页样张</h1>
+  <button class="btn sm" type="button" id="sz-theme">切换深浅色</button>
+  <button class="btn sm" type="button" id="sz-motion">切换减少动效</button>
+</div>
+
+<section class="sz-shot">
+  <h2>① 登录(输错一次以后)</h2>
+  <p class="sz-cap">没登录时整页只有这一块。密码由节点上的命令生成,形如 K7MQ2-ABCDE-FGHJK-LMNPQ,大小写、横线、空格都不讲究。</p>
+  <div class="sz-frame sz-desk">
+    <main class="login">
+      <form class="card login-card" novalidate>
+        <h1>节点管理</h1>
+        <div>
+          <label class="field-label" for="sz-pw">管理密码</label>
+          <input id="sz-pw" class="field" type="password" value="K7MQ2ABCDE" autocomplete="off">
+        </div>
+        <button class="btn primary" type="submit">登录</button>
+        <p class="msg" role="alert">密码不对。忘了密码可以在节点上运行 exitnode console password 换一个</p>
+      </form>
+    </main>
+  </div>
+</section>
+
+<section class="sz-shot">
+  <h2>② 状态 · 正常</h2>
+  <p class="sz-cap">登录后默认在这一页,每 30 秒自动刷新一次。各层顺序和文字原样来自节点检查记录。</p>
+  <div class="sz-frame sz-desk">
+    <div class="app">
+      <header class="top">
+        <div class="who"><span class="name">悉尼家里</span><span class="ver mono">0.9.0</span></div>
+        <button class="btn quiet sm" type="button">退出登录</button>
+      </header>
+      <nav class="tabs" role="tablist">
+        <button class="tab" role="tab" type="button" aria-selected="true">状态</button>
+        <button class="tab" role="tab" type="button" aria-selected="false">邀请码</button>
+        <button class="tab" role="tab" type="button" aria-selected="false">账号</button>
+      </nav>
+      <p class="msg" role="status"></p>
+      <section class="view" role="tabpanel">
+        <div class="card hero">
+          <span class="tile s40 tone-ok fill" role="img" aria-label="正常"><i><svg viewBox="0 0 24 24"><path d="m7 12.4 3.3 3.3 6.7-7.4"/></svg></i></span>
+          <div><div class="state">正常</div><div class="reason">已接入的网络检查通过；入口、代理和真实出口未接入，尚不能确认可上网</div></div>
+          <dl class="meta"><dt>出口 IP</dt><dd>203.0.113.24</dd><dt>检查时间</dt><dd>1 分钟前</dd></dl>
+        </div>
+        <h2 class="h2">各层检查</h2>
+        <div class="rows">
+          <div class="row"><span class="tile s20 tone-ok" role="img" aria-label="通过"><i><svg viewBox="0 0 24 24"><path d="m7 12.4 3.3 3.3 6.7-7.4"/></svg></i></span><span class="label">网卡与默认路由</span><span class="val">enp1s0 有地址 192.168.1.52 和默认路由</span><span class="badge ok">通过</span></div>
+          <div class="row"><span class="tile s20 tone-ok" role="img" aria-label="通过"><i><svg viewBox="0 0 24 24"><path d="m7 12.4 3.3 3.3 6.7-7.4"/></svg></i></span><span class="label">上游连通</span><span class="val">至少一个目标可连通</span><span class="badge ok">通过</span></div>
+          <div class="row"><span class="tile s20 tone-n" role="img" aria-label="未接入"><i><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4.6" stroke-dasharray="2.3 2.3"/></svg></i></span><span class="label">入口可达</span><span class="val">本阶段未接入此项检查，不能据此判断出口可用</span><span class="badge n">未接入</span></div>
+          <div class="row"><span class="tile s20 tone-n" role="img" aria-label="未接入"><i><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4.6" stroke-dasharray="2.3 2.3"/></svg></i></span><span class="label">代理进程</span><span class="val">本阶段未接入此项检查，不能据此判断出口可用</span><span class="badge n">未接入</span></div>
+          <div class="row"><span class="tile s20 tone-n" role="img" aria-label="未接入"><i><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4.6" stroke-dasharray="2.3 2.3"/></svg></i></span><span class="label">真实出口</span><span class="val">本阶段未接入此项检查，不能据此判断出口可用</span><span class="badge n">未接入</span></div>
+          <div class="row"><span class="tile s20 tone-ok" role="img" aria-label="通过"><i><svg viewBox="0 0 24 24"><path d="m7 12.4 3.3 3.3 6.7-7.4"/></svg></i></span><span class="label">看门狗</span><span class="val">最近一轮巡检正常</span><span class="badge ok">通过</span></div>
+          <div class="row"><span class="tile s20 tone-ok" role="img" aria-label="通过"><i><svg viewBox="0 0 24 24"><path d="m7 12.4 3.3 3.3 6.7-7.4"/></svg></i></span><span class="label">救援单元</span><span class="val">救援定时器已启用</span><span class="badge ok">通过</span></div>
+          <div class="row"><span class="tile s20 tone-ok" role="img" aria-label="通过"><i><svg viewBox="0 0 24 24"><path d="m7 12.4 3.3 3.3 6.7-7.4"/></svg></i></span><span class="label">服务加固</span><span class="val">各服务的隔离设置与安装时一致</span><span class="badge ok">通过</span></div>
+          <div class="row"><span class="tile s20 tone-ok" role="img" aria-label="通过"><i><svg viewBox="0 0 24 24"><path d="m7 12.4 3.3 3.3 6.7-7.4"/></svg></i></span><span class="label">名单同步</span><span class="val">3 分钟前同步过,共 5 台设备</span><span class="badge ok">通过</span></div>
+          <div class="row"><span class="tile s20 tone-warn" role="img" aria-label="需手动转发"><i><svg viewBox="0 0 24 24"><path d="M12 7v5.5"/><path d="M12 16.8h.01" stroke-width="2.8"/></svg></i></span><span class="label">入口端口映射</span><span class="val">路由器没开 UPnP,请在路由器上把 443 端口转发到 192.168.1.52</span><span class="badge warn">需手动转发</span></div>
+          <div class="row"><span class="tile s20 tone-ok" role="img" aria-label="通过"><i><svg viewBox="0 0 24 24"><path d="m7 12.4 3.3 3.3 6.7-7.4"/></svg></i></span><span class="label">隧道服务</span><span class="val">sing-box 正在运行</span><span class="badge ok">通过</span></div>
+          <div class="row"><span class="tile s20 tone-ok" role="img" aria-label="通过"><i><svg viewBox="0 0 24 24"><path d="m7 12.4 3.3 3.3 6.7-7.4"/></svg></i></span><span class="label">客户端托管服务</span><span class="val">客户端安装包可以下载</span><span class="badge ok">通过</span></div>
+          <div class="row"><span class="tile s20 tone-ok" role="img" aria-label="通过"><i><svg viewBox="0 0 24 24"><path d="m7 12.4 3.3 3.3 6.7-7.4"/></svg></i></span><span class="label">管理网页</span><span class="val">管理网页可以打开</span><span class="badge ok">通过</span></div>
+        </div>
+      </section>
+    </div>
+  </div>
+</section>
+
+<section class="sz-shot">
+  <h2>③ 状态 · 正在重连,且记录过期</h2>
+  <p class="sz-cap">小方块边框在流动表示正在等;记录超过 3 分钟没更新时,总状态下面出琥珀色一行。只画到前三层。</p>
+  <div class="sz-frame sz-desk">
+    <div class="app">
+      <section class="view" role="tabpanel">
+        <div class="card hero">
+          <span class="tile s40 tone-info spec" role="img" aria-label="正在重连"><i><svg viewBox="0 0 24 24"><g class="a-spin"><path d="M7 12.6a5 5 0 1 0 1.6-3.7"/><path d="M6.4 6.2v3.4h3.4"/></g></svg></i></span>
+          <div><div class="state">正在重连</div><div class="reason">所有上游目标均无法连通</div></div>
+          <dl class="meta"><dt>出口 IP</dt><dd>未取到</dd><dt>检查时间</dt><dd>12 分钟前</dd></dl>
+        </div>
+        <p class="stale">这份记录是 12 分钟前的,节点上的定时检查可能停了</p>
+        <h2 class="h2">各层检查</h2>
+        <div class="rows">
+          <div class="row"><span class="tile s20 tone-ok" role="img" aria-label="通过"><i><svg viewBox="0 0 24 24"><path d="m7 12.4 3.3 3.3 6.7-7.4"/></svg></i></span><span class="label">网卡与默认路由</span><span class="val">enp1s0 有地址 192.168.1.52 和默认路由</span><span class="badge ok">通过</span></div>
+          <div class="row"><span class="tile s20 tone-bad" role="img" aria-label="失败"><i><svg viewBox="0 0 24 24"><path d="m8.5 8.5 7 7M15.5 8.5l-7 7"/></svg></i></span><span class="label">上游连通</span><span class="val">所有上游目标均无法连通</span><span class="badge bad">失败</span></div>
+          <div class="row"><span class="tile s20 tone-n dim" role="img" aria-label="跳过"><i><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4.6" stroke-dasharray="2.3 2.3"/></svg></i></span><span class="label">名单同步</span><span class="val">没开邀请码模式</span><span class="badge n">跳过</span></div>
+        </div>
+      </section>
+    </div>
+  </div>
+</section>
+
+<section class="sz-shot">
+  <h2>④ 邀请码 · 刚生成一张</h2>
+  <p class="sz-cap">点快捷天数会改输入框里的数,手填的数正好是 7、30、90、365 时对应的那个也亮。新码在表单下面大字显示,列表里也多一行。表单下面一行留给填错的提示,空着也占位。</p>
+  <div class="sz-frame sz-desk">
+    <div class="app">
+      <header class="top">
+        <div class="who"><span class="name">悉尼家里</span><span class="ver mono">0.9.0</span></div>
+        <button class="btn quiet sm" type="button">退出登录</button>
+      </header>
+      <nav class="tabs" role="tablist">
+        <button class="tab" role="tab" type="button" aria-selected="false">状态</button>
+        <button class="tab" role="tab" type="button" aria-selected="true">邀请码</button>
+        <button class="tab" role="tab" type="button" aria-selected="false">账号</button>
+      </nav>
+      <p class="msg" role="status"></p>
+      <section class="view" role="tabpanel">
+        <form class="card invite-form" novalidate>
+          <div>
+            <label class="field-label" for="sz-days">天数</label>
+            <div class="days">
+              <span class="chips" role="group" aria-label="常用天数">
+                <button class="chip" type="button" aria-pressed="false">7 天</button>
+                <button class="chip" type="button" aria-pressed="true">30 天</button>
+                <button class="chip" type="button" aria-pressed="false">90 天</button>
+                <button class="chip" type="button" aria-pressed="false">365 天</button>
+              </span>
+              <input id="sz-days" class="field num" type="number" inputmode="numeric" min="1" max="3650" step="1" value="30">
+            </div>
+          </div>
+          <div>
+            <label class="field-label" for="sz-uses">可用人数</label>
+            <input id="sz-uses" class="field num" type="number" inputmode="numeric" min="1" max="100" step="1" value="1">
+          </div>
+          <div class="grow">
+            <label class="field-label" for="sz-note">备注</label>
+            <input id="sz-note" class="field" type="text" maxlength="200" placeholder="给谁用,可不填" autocomplete="off">
+          </div>
+          <button class="btn primary" type="submit">生成</button>
+          <p class="form-msg" role="alert"></p>
+        </form>
+        <div class="card newcode">
+          <span class="code">K7MQ-ABCD-EFGH</span>
+          <span class="sub">30 天 · 1 人可用 · 张三</span>
+          <button class="btn sm" type="button">已复制</button>
+        </div>
+        <h2 class="h2">已生成的邀请码</h2>
+        <div class="rows">
+          <div class="row inv"><span class="code">K7MQ-ABCD-EFGH</span><span class="num">30 天 · 已用 0/1</span><span class="val">张三</span><span class="rt">11-27 生成</span><button class="btn quiet sm" type="button">复制</button></div>
+          <div class="row inv"><span class="code">P3XW-9RTN-HJ2K</span><span class="num">90 天 · 已用 1/3</span><span class="val">李四一家</span><span class="rt">11-24 生成</span><button class="btn quiet sm" type="button">复制</button></div>
+          <div class="row inv off"><span class="code">ZQ8M-4VBC-7DLE</span><span class="num">30 天 · 已用 1/1</span><span class="val">王五</span><span class="rt">11-20 生成</span><span class="badge n">已用完</span></div>
+        </div>
+      </section>
+    </div>
+  </div>
+</section>
+
+<section class="sz-shot">
+  <h2>⑤ 账号 · 一块正在延期,一台设备正在确认吊销</h2>
+  <p class="sz-cap">按「使用中 → 已过期 → 已停用」排,同组先到期的在前。块头写备注,没有备注写邀请码。7 天内到期的到期日变琥珀色。同一时间只开一个延期框。</p>
+  <div class="sz-frame sz-desk">
+    <div class="app">
+      <nav class="tabs" role="tablist">
+        <button class="tab" role="tab" type="button" aria-selected="false">状态</button>
+        <button class="tab" role="tab" type="button" aria-selected="false">邀请码</button>
+        <button class="tab" role="tab" type="button" aria-selected="true">账号</button>
+      </nav>
+      <p class="msg" role="status"></p>
+      <section class="view" role="tabpanel">
+        <div class="accts">
+          <article class="card acct">
+            <div class="acct-head">
+              <span class="badge ok">使用中</span>
+              <span class="acct-title">王五</span>
+              <span class="acct-exp warn">2026-12-01 到期 · 还剩 4 天</span>
+              <span class="acct-actions"><button class="btn sm" type="button">延期</button><button class="btn sm" type="button">停用</button></span>
+            </div>
+            <p class="acct-meta">邀请码 <span class="mono">ZQ8M-4VBC-7DLE</span> · 设备 1/2 台 · 11-01 注册</p>
+            <form class="extend" novalidate>
+              <span class="lead">延长</span>
+              <span class="chips" role="group" aria-label="常用天数">
+                <button class="chip" type="button" aria-pressed="false">7 天</button>
+                <button class="chip" type="button" aria-pressed="true">30 天</button>
+                <button class="chip" type="button" aria-pressed="false">90 天</button>
+                <button class="chip" type="button" aria-pressed="false">365 天</button>
+              </span>
+              <input class="field num" type="number" inputmode="numeric" min="1" max="3650" step="1" value="30" aria-label="延长天数">
+              <span class="lead">天</span>
+              <button class="btn sm" type="submit">确定</button>
+              <button class="btn quiet sm" type="button">取消</button>
+            </form>
+            <div class="rows">
+              <div class="row dev"><span class="label">安卓</span><span class="val">王五的手机</span><span class="rt">最近在线 11-27 09:12</span><button class="btn quiet sm danger" type="button">吊销</button></div>
+            </div>
+          </article>
+          <article class="card acct">
+            <div class="acct-head">
+              <span class="badge ok">使用中</span>
+              <span class="acct-title">李四一家</span>
+              <span class="acct-exp">2027-02-22 到期 · 还剩 87 天</span>
+              <span class="acct-actions"><button class="btn sm" type="button">延期</button><button class="btn sm" type="button">停用</button></span>
+            </div>
+            <p class="acct-meta">邀请码 <span class="mono">P3XW-9RTN-HJ2K</span> · 设备 2/3 台 · 11-24 注册</p>
+            <div class="rows">
+              <div class="row dev"><span class="label">Windows</span><span class="val">书房台式机</span><span class="rt">最近在线 11-27 14:05</span><button class="btn quiet sm danger" type="button">吊销</button></div>
+              <div class="row dev"><span class="label">安卓</span><span class="val">旧手机</span><span class="rt">最近在线 11-25 21:40</span><span class="confirm">吊销后这台设备不能再连,不能撤回<button class="btn sm danger" type="button">确认吊销</button><button class="btn quiet sm" type="button">取消</button></span></div>
+              <div class="row dev off"><span class="label">安卓</span><span class="val">借给朋友的平板</span><span class="rt">最近在线 11-24 18:02</span><span class="badge n">已吊销</span></div>
+            </div>
+          </article>
+          <article class="card acct">
+            <div class="acct-head">
+              <span class="badge warn">已过期</span>
+              <span class="acct-title mono">HV7N-2KQX-M8RD</span>
+              <span class="acct-exp warn">2026-11-20 到期 · 已过期 7 天</span>
+              <span class="acct-actions"><button class="btn sm" type="button">延期</button><button class="btn sm" type="button">停用</button></span>
+            </div>
+            <p class="acct-meta">设备 1/1 台 · 10-21 注册</p>
+            <div class="rows">
+              <div class="row dev"><span class="label">Windows</span><span class="val">DESKTOP-7QH2</span><span class="rt">最近在线 11-19 23:55</span><button class="btn quiet sm danger" type="button">吊销</button></div>
+            </div>
+          </article>
+          <article class="card acct">
+            <div class="acct-head">
+              <span class="badge n">已停用</span>
+              <span class="acct-title">赵六</span>
+              <span class="acct-exp">原定 2027-01-10 到期</span>
+              <span class="acct-actions"><button class="btn sm" type="button">延期</button><button class="btn sm" type="button">恢复</button></span>
+            </div>
+            <p class="acct-meta">邀请码 <span class="mono">C4TJ-W9PF-3NYB</span> · 设备 0/1 台 · 10-11 注册</p>
+          </article>
+        </div>
+      </section>
+    </div>
+  </div>
+</section>
+
+<section class="sz-shot">
+  <h2>⑥ 手机宽度 · 账号</h2>
+  <p class="sz-cap">375 宽:一行放不下的自动折行,整页不横向滚动。</p>
+  <div class="sz-frame sz-phone">
+    <div class="app">
+      <header class="top">
+        <div class="who"><span class="name">悉尼家里</span><span class="ver mono">0.9.0</span></div>
+        <button class="btn quiet sm" type="button">退出登录</button>
+      </header>
+      <nav class="tabs" role="tablist">
+        <button class="tab" role="tab" type="button" aria-selected="false">状态</button>
+        <button class="tab" role="tab" type="button" aria-selected="false">邀请码</button>
+        <button class="tab" role="tab" type="button" aria-selected="true">账号</button>
+      </nav>
+      <p class="msg bad" role="status">连不上鉴权服务</p>
+      <section class="view" role="tabpanel">
+        <div class="accts">
+          <article class="card acct">
+            <div class="acct-head">
+              <span class="badge ok">使用中</span>
+              <span class="acct-title">李四一家</span>
+              <span class="acct-exp">2027-02-22 到期 · 还剩 87 天</span>
+              <span class="acct-actions"><button class="btn sm" type="button">延期</button><button class="btn sm" type="button">停用</button></span>
+            </div>
+            <p class="acct-meta">邀请码 <span class="mono">P3XW-9RTN-HJ2K</span> · 设备 2/3 台 · 11-24 注册</p>
+            <div class="rows">
+              <div class="row dev"><span class="label">Windows</span><span class="val">书房台式机</span><span class="rt">最近在线 11-27 14:05</span><button class="btn quiet sm danger" type="button">吊销</button></div>
+              <div class="row dev"><span class="label">安卓</span><span class="val">旧手机</span><span class="rt">最近在线 11-25 21:40</span><span class="confirm">吊销后这台设备不能再连,不能撤回<button class="btn sm danger" type="button">确认吊销</button><button class="btn quiet sm" type="button">取消</button></span></div>
+            </div>
+          </article>
+        </div>
+      </section>
+    </div>
+  </div>
+</section>
+
+<section class="sz-shot">
+  <h2>⑦ 手机宽度 · 没开邀请码模式</h2>
+  <p class="sz-cap">只有状态一页,不显示页签;本机自用设备列在最后。</p>
+  <div class="sz-frame sz-phone">
+    <div class="app">
+      <header class="top">
+        <div class="who"><span class="name">墨尔本</span><span class="ver mono">0.9.0</span></div>
+        <button class="btn quiet sm" type="button">退出登录</button>
+      </header>
+      <p class="msg" role="status"></p>
+      <section class="view" role="tabpanel">
+        <div class="card hero">
+          <span class="tile s40 tone-bad" role="img" aria-label="需要处理"><i><svg viewBox="0 0 24 24"><path d="M12 7v5.5"/><path d="M12 16.8h.01" stroke-width="2.8"/></svg></i></span>
+          <div><div class="state">需要处理</div><div class="reason">网络可用，但服务检查失败，请联系维护人员</div></div>
+          <dl class="meta"><dt>出口 IP</dt><dd>203.0.113.77</dd><dt>检查时间</dt><dd>刚刚</dd></dl>
+        </div>
+        <h2 class="h2">各层检查</h2>
+        <div class="rows">
+          <div class="row"><span class="tile s20 tone-ok" role="img" aria-label="通过"><i><svg viewBox="0 0 24 24"><path d="m7 12.4 3.3 3.3 6.7-7.4"/></svg></i></span><span class="label">网卡与默认路由</span><span class="val">enp1s0 有地址 10.0.0.8 和默认路由</span><span class="badge ok">通过</span></div>
+          <div class="row"><span class="tile s20 tone-bad" role="img" aria-label="失败"><i><svg viewBox="0 0 24 24"><path d="m8.5 8.5 7 7M15.5 8.5l-7 7"/></svg></i></span><span class="label">隧道服务</span><span class="val">sing-box 没有运行</span><span class="badge bad">失败</span></div>
+        </div>
+        <h2 class="h2">本机自用设备</h2>
+        <div class="rows">
+          <div class="row dev"><span class="label">Windows</span><span class="val">办公室电脑</span><span class="rt">11-20 加入</span></div>
+          <div class="row dev off"><span class="label">安卓</span><span class="val">旧手机</span><span class="badge n">已吊销</span></div>
+        </div>
+      </section>
+    </div>
+  </div>
+</section>
+
+<script>
+(function () {
+  var root = document.documentElement;
+  /* 手机宽度的两张放进 375 宽的内嵌小窗口,让窄屏规则按真实宽度生效 */
+  var css = document.querySelector('style').textContent;
+  var phones = [];
+  document.querySelectorAll('.sz-phone').forEach(function (box) {
+    var frame = document.createElement('iframe');
+    frame.width = 375; frame.height = 760; frame.style.border = '0'; frame.style.display = 'block';
+    phones.push({ frame: frame, html: box.innerHTML });
+    box.innerHTML = ''; box.appendChild(frame);
+  });
+  function paint() {
+    phones.forEach(function (p) {
+      var attrs = (root.dataset.theme ? ' data-theme="' + root.dataset.theme + '"' : '') + (root.dataset.motion ? ' data-motion="' + root.dataset.motion + '"' : '');
+      p.frame.srcdoc = '<!doctype html><html lang="zh-CN"' + attrs + '><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><style>' + css + '</style></head><body>' + p.html + '</body></html>';
+    });
+  }
+  paint();
+  document.getElementById('sz-theme').addEventListener('click', function () {
+    var dark = root.dataset.theme === 'dark' || (!root.dataset.theme && matchMedia('(prefers-color-scheme: dark)').matches);
+    root.dataset.theme = dark ? 'light' : 'dark';
+    paint();
+  });
+  document.getElementById('sz-motion').addEventListener('click', function () {
+    if (root.dataset.motion === 'reduce') delete root.dataset.motion; else root.dataset.motion = 'reduce';
+    paint();
+  });
+})();
+</script>
+</body>
+</html>

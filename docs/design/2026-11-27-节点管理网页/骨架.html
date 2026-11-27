@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>节点管理</title>
+<link rel="stylesheet" href="/console.css">
+<script src="/console.js" defer></script>
+</head>
+<body>
+<main id="login" class="login" hidden>
+  <form id="login-form" class="card login-card" novalidate>
+    <h1>节点管理</h1>
+    <div>
+      <label class="field-label" for="login-password">管理密码</label>
+      <input id="login-password" class="field" type="password" autocomplete="current-password" autocapitalize="characters" spellcheck="false">
+    </div>
+    <button id="login-submit" class="btn primary" type="submit">登录</button>
+    <p id="login-msg" class="msg" role="alert"></p>
+  </form>
+</main>
+<div id="app" class="app" hidden>
+  <header class="top">
+    <div class="who"><span id="node-name" class="name"></span><span id="node-version" class="ver mono"></span></div>
+    <button id="logout" class="btn quiet sm" type="button">退出登录</button>
+  </header>
+  <nav id="tabs" class="tabs" role="tablist">
+    <button id="tab-status" class="tab" role="tab" type="button" aria-controls="view-status" aria-selected="true">状态</button>
+    <button id="tab-invites" class="tab" role="tab" type="button" aria-controls="view-invites" aria-selected="false">邀请码</button>
+    <button id="tab-accounts" class="tab" role="tab" type="button" aria-controls="view-accounts" aria-selected="false">账号</button>
+  </nav>
+  <p id="page-msg" class="msg" role="status"></p>
+  <section id="view-status" class="view" role="tabpanel" aria-labelledby="tab-status">
+    <div class="card hero">
+      <span id="state-tile" class="tile s40 tone-n" role="img" aria-label=""><i><svg viewBox="0 0 24 24"></svg></i></span>
+      <div><div id="state-name" class="state"></div><div id="state-reason" class="reason"></div></div>
+      <dl id="state-meta" class="meta"><dt>出口 IP</dt><dd id="public-ip"></dd><dt>检查时间</dt><dd id="checked-at"></dd></dl>
+    </div>
+    <p id="stale" class="stale" hidden></p>
+    <h2 id="layers-title" class="h2">各层检查</h2>
+    <div id="layers" class="rows"></div>
+    <h2 id="local-title" class="h2" hidden>本机自用设备</h2>
+    <div id="local-devices" class="rows" hidden></div>
+  </section>
+  <section id="view-invites" class="view" role="tabpanel" aria-labelledby="tab-invites" hidden>
+    <form id="invite-form" class="card invite-form" novalidate>
+      <div>
+        <label class="field-label" for="inv-days">天数</label>
+        <div class="days">
+          <span class="chips" role="group" aria-label="常用天数">
+            <button class="chip" type="button" data-days="7" aria-pressed="false">7 天</button>
+            <button class="chip" type="button" data-days="30" aria-pressed="true">30 天</button>
+            <button class="chip" type="button" data-days="90" aria-pressed="false">90 天</button>
+            <button class="chip" type="button" data-days="365" aria-pressed="false">365 天</button>
+          </span>
+          <input id="inv-days" class="field num" type="number" inputmode="numeric" min="1" max="3650" step="1" value="30">
+        </div>
+      </div>
+      <div>
+        <label class="field-label" for="inv-uses">可用人数</label>
+        <input id="inv-uses" class="field num" type="number" inputmode="numeric" min="1" max="100" step="1" value="1">
+      </div>
+      <div class="grow">
+        <label class="field-label" for="inv-note">备注</label>
+        <input id="inv-note" class="field" type="text" maxlength="200" placeholder="给谁用,可不填" autocomplete="off">
+      </div>
+      <button id="inv-submit" class="btn primary" type="submit">生成</button>
+      <p id="inv-msg" class="form-msg" role="alert"></p>
+    </form>
+    <div id="inv-new" class="card newcode" hidden>
+      <span id="inv-new-code" class="code"></span>
+      <span id="inv-new-meta" class="sub"></span>
+      <button id="inv-new-copy" class="btn sm" type="button">复制</button>
+    </div>
+    <h2 class="h2">已生成的邀请码</h2>
+    <div id="invites" class="rows"></div>
+    <p id="invites-empty" class="empty" hidden>还没有生成过邀请码</p>
+  </section>
+  <section id="view-accounts" class="view" role="tabpanel" aria-labelledby="tab-accounts" hidden>
+    <div id="accounts" class="accts"></div>
+    <p id="accounts-empty" class="empty" hidden>还没有人用邀请码注册</p>
+  </section>
+</div>
+</body>
+</html>

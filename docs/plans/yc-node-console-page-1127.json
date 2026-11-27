@@ -1,0 +1,142 @@
+{
+  "schemaVersion": 1,
+  "taskId": "NODE-WEB-CONSOLE-1127",
+  "slug": "yc-node-console-page-1127",
+  "title": "节点管理网页的页面:登录、状态、邀请码、账号与设备四块界面,照样张与骨架原样搬样式和结构,只写交互脚本",
+  "goal": "以派单时 origin/main 头为基点。看板卡 NODE-WEB-CONSOLE-1127。\n\n问题:设计正本 §5 定了节点要有一页极简管理网页(看状态、生成邀请码、看账号与设备、延期、停用、吊销)。负责人 2026-11-27 定网页做在节点程序里。整件事拆三单:后台单 yc-node-console-core-1127(并行施工中:node/exitnode/console/ 下的 Python 模块、接口、命令行)、本单(页面三件静态文件与静态检查测试)、安装单(以后)。本单不碰 node/exitnode/console/ 下 static/ 以外的任何文件,测试里也不 import exitnode.console 的任何模块(后台单还没合并,基线上没有)。\n\n设计稿(先全文读):docs/design/2026-11-27-节点管理网页/样张.html(七张画面)、骨架.html、01-事实卡.md。\n\n【管理网页接口约定】(后台单与页面单共用,一字不差;两边都照这份做)\n\n地址:局域网 http://<小主机局域网地址>:<console.port>/ ,隧道里 http://198.18.255.2/ (隧道接线在后续单)。只有下面列出的路径存在,其余一律回「通用 404 网页」(见后台单)。\n\n静态文件(只允许 GET):\n- GET /  → static/index.html,Content-Type: text/html; charset=utf-8\n- GET /console.js → static/console.js,Content-Type: text/javascript; charset=utf-8\n- GET /console.css → static/console.css,Content-Type: text/css; charset=utf-8\n页面只引用这三个文件,不引用任何外部地址、字体、图片;不写内联 <script> 内容、不写 style 属性、不写 onclick 这类内联事件(内容安全策略只放行同源文件)。\n\n接口(JSON 一律 UTF-8,Content-Type: application/json; charset=utf-8):\n1. GET /api/session → 200。未登录:{\"logged_in\": false};已登录:{\"logged_in\": true, \"csrf\": \"<口令>\", \"node_name\": \"<节点名>\", \"invite_mode\": true|false}。invite_mode 为 false 表示这台节点没开邀请码模式(只有自用设备)。\n2. POST /api/login,请求体 {\"password\": \"<字符串>\"} → 200 同上「已登录」形状,并下发会话 Cookie;401 {\"detail\": \"密码不对\", \"code\": \"wrong_password\"};429 {\"detail\": \"登录失败次数太多,请 15 分钟后再试\", \"code\": \"throttled\"};409 {\"detail\": \"还没设管理密码,请在节点上运行 exitnode console password\", \"code\": \"password_missing\"};422 {\"detail\": \"请求格式不对\", \"code\": \"bad_request\"}。\n3. POST /api/logout → 200 {\"logged_in\": false},并清除 Cookie。\n4. GET /api/status → 200。没有检查记录或记录损坏:{\"available\": false};有记录:{\"available\": true, \"age_seconds\": <整数秒>, \"stale\": true|false, \"generated_at\": \"<UTC ISO 时间>\", \"node_name\": \"…\", \"program_version\": \"…\", \"state\": \"normal|reconnecting|reauth|manual\", \"reason\": \"<一句中文>\", \"public_ipv4\": \"<IPv4>\"|null, \"layers\": [{\"layer\": \"<英文标识>\", \"name\": \"<中文层名>\", \"result\": \"<中文结果>\", \"reason\": \"<中文说明>\"}], \"local_devices\": [{\"name\": \"…\", \"platform\": \"windows|android\", \"created_at\": \"<ISO>\", \"revoked_at\": \"<ISO>\"|null}]}。stale 为真表示记录超过 3 分钟没更新(或时间在未来 1 分钟以上)。layers 的 result 取值来自节点检查,已知有「通过」「失败」「未接入」「需手动转发」「需重新授权」「跳过」「未知」,页面要能显示任意中文结果。\n5. GET /api/directory → 200 {\"invites\": [邀请码…], \"accounts\": [账号…], \"devices\": [设备…]}。\n   - 邀请码:{\"code\", \"days\", \"max_uses\", \"used\", \"note\", \"created_at\"},按生成时间新的在前。\n   - 账号:{\"id\", \"invite_code\", \"status\": \"active|disabled\", \"expires_at\", \"device_limit\", \"created_at\"}。\n   - 设备:{\"id\", \"account_id\", \"platform\", \"name\", \"last_seen\", \"revoked_at\": \"<ISO>\"|null}。\n   - 所有时间是带时区的 UTC ISO 8601 字符串。\n6. POST /api/invites,请求体 {\"days\": 1~3650 的整数, \"max_uses\": 1~100 的整数, \"note\": 最多 200 字、不含换行的字符串} → 200 {\"invite\": {\"code\", \"days\", \"max_uses\", \"used\", \"note\"}}。\n7. POST /api/accounts/<账号id>/extend,请求体 {\"days\": 1~3650 的整数} → 200 {\"account\": 账号}。已过期的账号从当时起算,未过期的在原到期日上叠加(鉴权服务的现行口径)。\n8. POST /api/accounts/<账号id>/disable → 200 {\"account\": 账号};POST /api/accounts/<账号id>/enable → 200 {\"account\": 账号}。请求体可以为空或 {}。\n9. POST /api/devices/<设备id>/revoke → 200 {\"device_id\": \"<id>\", \"revoked\": true}。请求体可以为空或 {}。吊销不能撤回。\n\n会话与防伪:\n- 登录成功下发 Cookie:yc_console=<随机值>; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200。页面用 fetch 时带 credentials: \"same-origin\"。\n- 除 /api/login 外,所有 POST 必须带请求头 X-Console-CSRF: <登录时拿到的 csrf>,否则 403 {\"detail\": \"页面已过期,请刷新后再试\", \"code\": \"csrf\"}。\n- 所有 POST 的请求体用 JSON,请求头 Content-Type: application/json。\n- 3~9 号接口没登录或会话过期:401 {\"detail\": \"请先登录\", \"code\": \"login_required\"}。\n\n5~9 号接口的错误(页面按 code 分支,显示 detail 原文):\n- 409 {\"code\": \"invite_mode_off\", \"detail\": \"这台节点没开邀请码模式\"}\n- 409 {\"code\": \"admin_key_missing\", \"detail\": \"还没填鉴权服务的管理密钥,请在节点上运行 exitnode console admin-key\"}\n- 502 {\"code\": \"authserver_unreachable\", \"detail\": \"连不上鉴权服务\"}\n- 502 {\"code\": \"authserver_pin_mismatch\", \"detail\": \"鉴权服务的证书指纹对不上,请核对节点配置里的 authsync.spki_sha256\"}\n- 502 {\"code\": \"admin_key_rejected\", \"detail\": \"鉴权服务不认这把管理密钥,请在节点上用 exitnode console admin-key 重新填写\"}\n- 502 {\"code\": \"authserver_bad_response\", \"detail\": \"鉴权服务回的内容不对\"}\n- 4xx {\"code\": \"authserver_error\", \"detail\": \"<鉴权服务给的中文原因,如「账号不存在」>\"},状态码照鉴权服务原样\n- 422 {\"code\": \"bad_request\", \"detail\": \"<哪一项不对>\"}:天数「天数要填 1 到 3650 的整数」;人数「人数要填 1 到 100 的整数」;备注「备注最多 200 个字,不能换行」;其他格式问题「请求格式不对」\n- 500 {\"code\": \"internal\", \"detail\": \"管理网页出错了,请稍后再试\"}\n\n\n一、node/exitnode/console/static/console.css\n把样张.html 里从「/* ==== 搬进 console.css:开始」那一行起、到「/* ==== 搬进 console.css:结束 ==== */」那一行止(两行本身都要)的内容原样拷过来,一个字符不改、不增删,文件末尾一个换行。不许另加样式;脚本要的外观全部靠给元素加这份样式里已有的类名做到。\n\n二、node/exitnode/console/static/index.html\n原样拷贝 docs/design/2026-11-27-节点管理网页/骨架.html,一个字符不改。页面里所有固定元素与 id 都在骨架里;列表和行由脚本按下面的写法生成。\n\n三、node/exitnode/console/static/console.js(本单的主要工作)\n总规矩:\n1. 一个文件,最外层一个立即执行函数,首句 'use strict';只用浏览器自带接口,不引任何库;写法限 ES2017(不用 ?.、??、模块语法)。\n2. 用户能写的内容(节点名、备注、设备名、检查原因、邀请码等任何来自接口的字符串)一律经 textContent 或 createTextNode 放进页面。全文不出现 innerHTML、outerHTML、insertAdjacentHTML、document.write、eval、new Function;不用 localStorage、sessionStorage(csrf 只放在内存变量里);不用 XMLHttpRequest,只用 fetch;不出现 http:// 或 https://;不用 alert、confirm、prompt;不留 console.log。\n3. 小方块的记号用 document.createElementNS(\"http://www.w3.org/2000/svg\", …) 按固定表生成(注意:这一处命名空间字符串是唯一允许出现的网址,写成 \"http:\" + \"//www.w3.org/2000/svg\" 拼接,避免整串出现 http://)。记号表与样张一致:check = path d=\"m7 12.4 3.3 3.3 6.7-7.4\";x = path d=\"m8.5 8.5 7 7M15.5 8.5l-7 7\";ring = circle cx=12 cy=12 r=4.6 stroke-dasharray=\"2.3 2.3\";bang = path d=\"M12 7v5.5\" + path d=\"M12 16.8h.01\" stroke-width=\"2.8\";ask = g class=\"a-pulse\" 内含 path d=\"M9.4 9.3a2.7 2.7 0 1 1 3.9 2.3c-1 .5-1.3 1.1-1.3 2.1\" + path d=\"M12 17.4h.01\" stroke-width=\"2.8\";spin = g class=\"a-spin\" 内含 path d=\"M7 12.6a5 5 0 1 0 1.6-3.7\" + path d=\"M6.4 6.2v3.4h3.4\"。小方块结构:span.tile.<尺寸>.<tone-x>[.fill|.spec|.fast|.dim],role=\"img\",aria-label=结果或状态文字,内含 i > svg(viewBox=\"0 0 24 24\") > 记号。\n4. 取元素一律 document.getElementById(\"<骨架里的 id>\") 或在脚本自己建的元素上查;不许引用骨架里没有的 id。\n5. 时间:接口给的是带时区的 UTC ISO 字符串,用 new Date(…) 转成浏览器本地时间显示。日期 = YYYY-MM-DD;短日 = MM-DD;短时 = MM-DD HH:mm(两位补零)。解析失败显示「—」。\n\n请求:\n6. 统一的 api(method, path, body) 用 fetch,credentials: \"same-origin\",请求头 Accept: application/json;POST 时加 Content-Type: application/json、带 X-Console-CSRF(已有 csrf 时),请求体 JSON.stringify(body || {})。\n7. fetch 本身失败(网络断)→ 文字「连不上节点,请检查网络后再试」。响应解析不成 JSON → 文字「管理网页出错了,请稍后再试」。有 JSON 且有字符串 detail → 显示 detail 原文。\n8. 除启动时那次 /api/session 和登录请求外,任何请求回 401 且 code 为 login_required → 停掉定时刷新、清掉内存里的 csrf 与列表缓存,转到登录界面,登录提示写「登录已过期,请重新登录」。\n\n启动与登录:\n9. 页面加载后 GET /api/session:logged_in 为真 → 进入管理界面;为假 → 显示登录界面(#login 去掉 hidden,#app 加 hidden);请求失败 → 显示登录界面并在 #login-msg 写「连不上节点,请检查网络后再试」。\n10. 登录表单提交(阻止默认提交):密码去首尾空白后为空 → #login-msg「请填管理密码」;否则按钮进忙碌态(文字「正在登录」、aria-busy=\"true\",忙碌时再点不发请求),POST /api/login {password}。成功 → 清空密码框、进入管理界面。失败:code 为 wrong_password → 「密码不对。忘了密码可以在节点上运行 exitnode console password 换一个」;其余按第 7 条。失败后焦点回到密码框并全选。结束时按钮恢复「登录」、去掉 aria-busy。\n11. 进入管理界面:记下 csrf;#login 加 hidden、#app 去 hidden;#node-name 写 node_name;document.title = node_name + \" · 节点管理\";invite_mode 为假时 #tabs 加 hidden(只有状态一页);选中状态页签。\n12. #logout:忙碌文字「正在退出」;POST /api/logout(失败也照样往下);清 csrf、停定时刷新,显示登录界面(#login-msg 清空)。\n\n页签:\n13. 三个页签按钮点了切换:被选中的 aria-selected=\"true\",其余 \"false\";对应 section 去 hidden,其余加 hidden;切换时清空 #page-msg 的文字与 bad 类。切到状态页签 → 立即取一次状态,并开 30 秒一次的定时刷新(只在状态页签选中、且 document.visibilityState 为 \"visible\" 时真正发请求;visibilitychange 变回可见时立刻补取一次);切到另外两个 → 停定时刷新,GET /api/directory。\n14. #page-msg:出错时写文字并加 bad 类;每次目录或状态成功取回时清空文字、去掉 bad 类。\n\n状态页签(GET /api/status):\n15. available 为假:#state-tile 用 tone-n + ring;#state-name「还没有检查记录」;#state-reason「装好两分钟后仍没有,请在节点上运行 exitnode check」;#state-meta、#stale、#layers-title、#layers、#local-title、#local-devices 全部加 hidden,#layers 清空;#node-version 清空。\n16. available 为真:#node-version 写 program_version;#node-name 写 node_name;#state-meta、#layers-title、#layers 去 hidden。总状态按 state 取:normal →「正常」,类 tile s40 tone-ok fill,记号 check;reconnecting →「正在重连」,tile s40 tone-info spec,spin;reauth →「需要重新授权」,tile s40 tone-warn spec fast,ask;manual →「需要处理」,tile s40 tone-bad,bang;其他值 → 原样显示 state,tile s40 tone-n,ask。aria-label 与状态名相同。#state-reason 写 reason。#public-ip 写 public_ipv4,为空写「未取到」。#checked-at 写时间文字。\n17. 时间文字(按 age_seconds):小于 0 →「时间不对」;小于 60 →「刚刚」;小于 3600 → 向下取整的分钟数 + \" 分钟前\";小于 86400 → 小时数 + \" 小时前\";否则天数 + \" 天前\"。\n18. stale 为真时 #stale 去 hidden:age_seconds 小于 0 写「这份记录的时间比现在还晚,节点时钟可能不准」,否则写「这份记录是」+ 时间文字 +「的,节点上的定时检查可能停了」;stale 为假时加 hidden。\n19. #layers 清空后每层一行(顺序照记录):div.row > 小方块(s20) + span.label(name)+ span.val(reason)+ span.badge(result 文字)。按 result 定:「通过」→ tone-ok、check、badge ok;「失败」→ tone-bad、x、badge bad;「需重新授权」→ tone-warn、ask、badge warn;「需手动转发」→ tone-warn、bang、badge warn;「未接入」→ tone-n、ring、badge n;「跳过」→ tone-n 加 dim、ring、badge n;其他任何文字 → tone-n、ask、badge n(徽章照写原文)。\n20. local_devices 非空时 #local-title、#local-devices 去 hidden 并逐台一行:div.row.dev > span.label(平台:windows →「Windows」,android →「安卓」,其他原样)+ span.val(name)+ 未吊销时 span.rt(短日 +「 加入」),已吊销(revoked_at 非空)时行加 off 类、不写 rt、末尾 span.badge.n「已吊销」。为空时两者加 hidden。\n\n邀请码页签:\n21. 四个快捷天数按钮(.chip,data-days)点了把数字填进 #inv-days;#inv-days 每次 input 后、以及点快捷按钮后,数值正好等于某个按钮 data-days 的那个 aria-pressed=\"true\",其余 \"false\"。\n22. 表单提交(阻止默认提交)先校验:天数去空白后必须全是数字且在 1~3650 →否则 #inv-msg「天数要填 1 到 3650 的整数」并聚焦该框;人数同理 1~100 →「人数要填 1 到 100 的整数」;备注去首尾空白,按 Array.from 计字数超过 200 →「备注最多 200 个字,不能换行」。都通过则清空 #inv-msg,#inv-submit 忙碌(「正在生成」),POST /api/invites {days, max_uses, note}(数字转成 Number)。成功 → #inv-new 去 hidden,#inv-new-code 写 code,#inv-new-meta 写 days +「 天 · 」+ max_uses +「 人可用」(备注非空再加「 · 」+ 备注),#inv-new-copy 文字恢复「复制」;清空备注框;重新取目录。失败 → #inv-msg 按第 7 条写原因。结束恢复「生成」。\n23. #invites 清空后按接口顺序每张码一行:div.row.inv > span.code(code)+ span.num(days +「 天 · 已用 」+ used + \"/\" + max_uses)+ span.val(note)+ span.rt(短日 +「 生成」)+ 末尾:used 小于 max_uses 时 button.btn.quiet.sm「复制」,否则行加 off 类、末尾 span.badge.n「已用完」。没有邀请码时 #invites-empty 去 hidden,否则加 hidden。\n24. 复制:navigator.clipboard 存在且 window.isSecureContext 为真时用 writeText;否则新建 textarea(readonly,用 element.style 放到屏幕外)、填入、select、document.execCommand(\"copy\")、移除。成功 → 按钮文字变「已复制」,2 秒后恢复「复制」。失败 → 用 window.getSelection().selectAllChildren 选中那一行(或新码)的 code 元素,#page-msg 写「浏览器不让自动复制,邀请码已选中,请手动复制」并加 bad 类。\n\n账号页签:\n25. 每个账号一块 article.card.acct,放进 #accounts(先清空)。分组排序:「使用中」(status 为 active 且 expires_at 晚于现在)、「已过期」(active 且不晚于现在)、「已停用」(disabled)三组依次;组内按 expires_at 从早到晚,相同再按 created_at 从晚到早。没有账号时 #accounts-empty 去 hidden,否则加 hidden。\n26. 块头 div.acct-head 依次:span.badge(使用中 ok、已过期 warn、已停用 n,文字即组名)+ span.acct-title + span.acct-exp + span.acct-actions。acct-title:目录里 code 等于该账号 invite_code 的那张邀请码 note 非空时写 note;否则写 invite_code 并加 mono 类。\n27. acct-exp(剩余毫秒 = 到期时间 − 现在):使用中 → 日期 +「 到期 · 还剩 」+ 向上取整的天数 +「 天」,天数不超过 7 时加 warn 类;已过期 → 过期天数 = 向下取整(−剩余毫秒 ÷ 86400000),为 0 时写日期 +「 到期 · 已过期」,否则日期 +「 到期 · 已过期 」+ 天数 +「 天」,加 warn 类;已停用 →「原定 」+ 日期 +「 到期」。\n28. acct-actions:button.btn.sm「延期」+ 使用中与已过期时 button.btn.sm「停用」、已停用时 button.btn.sm「恢复」。\n29. 块头下 p.acct-meta,用「 · 」连接:(标题写的是备注时)「邀请码 」+ span.mono(invite_code);「设备 」+ 该账号未吊销设备数 + \"/\" + device_limit +「 台」;短日(created_at)+「 注册」。\n30. 「延期」点了在 acct-meta 后插入 form.extend(同一时间全页只开一个,再点「延期」或点「取消」收起):span.lead「延长」+ span.chips(role=\"group\",aria-label「常用天数」,四个 button.chip,data-days 7/30/90/365,文字「7 天」「30 天」「90 天」「365 天」)+ input.field.num(type=\"number\",inputmode=\"numeric\",min 1,max 3650,step 1,初值 30,aria-label「延长天数」)+ span.lead「天」+ button.btn.sm「确定」(type submit)+ button.btn.quiet.sm「取消」。快捷按钮与输入框联动同第 21 条。提交:天数校验同第 22 条,错误写进本块的提示行;确定按钮忙碌「正在延期」;POST /api/accounts/<id>/extend {days}。成功 → 重新取目录(整页重画,延期框自然收起)。\n31. 「停用」/「恢复」:按钮忙碌「正在停用」/「正在恢复」,POST /api/accounts/<id>/disable 或 /enable(请求体 {}),成功重新取目录。\n32. 设备:该账号的设备(目录里 account_id 相同的)放进块内 div.rows(没有设备时不建这个 div);排序先未吊销后已吊销,同类按 last_seen 从晚到早(空的排最后)。每台 div.row.dev > span.label(平台,同第 20 条)+ span.val(name)+ span.rt(last_seen 非空写「最近在线 」+ 短时,空写「没上过线」)+ 末尾:未吊销 button.btn.quiet.sm.danger「吊销」;已吊销时行加 off 类、末尾 span.badge.n「已吊销」。\n33. 吊销两步确认(不用浏览器原生弹窗):点「吊销」→ 该按钮换成 span.confirm,内含文字「吊销后这台设备不能再连,不能撤回」+ button.btn.sm.danger「确认吊销」+ button.btn.quiet.sm「取消」;全页同一时间只有一处在确认,打开新的会把旧的还原;「取消」还原成「吊销」按钮。「确认吊销」忙碌「正在吊销」,POST /api/devices/<id>/revoke(请求体 {}),成功重新取目录。\n34. 每块末尾 p.msg(role=\"alert\"):本块的延期、停用、恢复、吊销出错时写原因并加 bad 类;空着时 CSS 已让它不占位。\n35. 账号 id、设备 id 拼进路径前用 encodeURIComponent。\n\n四、node/tests/test_console_page.py(只做静态检查;测试按 Path(__file__).resolve().parents[2] 定位仓库根,只读文件,不写任何文件,不起服务)\n- test_css_is_the_design_sample_block:样张里那段(含首尾两行注释)去首尾空白后与 console.css 去首尾空白后逐字相等(两边先把 \\r\\n 换成 \\n)。\n- test_index_is_the_design_skeleton:index.html 与骨架.html 同上逐字相等。\n- test_index_has_no_inline_code_or_external_refs:index.html 里每个 <script 标签都有 src 且标签内无内容;没有 style= 属性、没有 on 开头的事件属性;只引用 /console.css 与 /console.js;不含 http://、https://、src=\"//\"、href=\"//\";html 标签带 lang=\"zh-CN\";viewport 不含 user-scalable=no、maximum-scale。\n- test_js_avoids_html_injection_and_external_calls:console.js 不含第三节第 2 条列的每一个写法(alert、confirm、prompt 按「前面不是字母数字下划线 $ 的单词 + 左括号」匹配),也不含 ?. 与 ??。\n- test_js_uses_every_api_path_with_session_and_csrf:console.js 含 /api/session、/api/login、/api/logout、/api/status、/api/directory、/api/invites、/api/accounts/、/extend、/disable、/enable、/api/devices/、/revoke、X-Console-CSRF、same-origin、application/json。\n- test_js_contains_contract_texts:console.js 含检查脚本 docs/plans/checks/yc_node_console_page_1127.py 里 TEXTS 清单的每一条(把清单原样抄进测试,逐条断言)。\n- test_js_element_ids_exist_in_index:console.js 里每个 getElementById(\"…\") 的参数都是 index.html 里存在的 id,且至少有一个。\n- test_static_dir_has_only_three_files:static 目录恰好 index.html、console.css、console.js 三件。\n",
+  "background": "项目:外包「澳洲出口节点 + Windows 一键客户端」。节点端 Python 3.11(node/exitnode,测试 node/tests,根目录 pyproject.toml 管 pytest 与 ruff)。管理网页的后台由并行的后台单做,它会用标准库 http.server 把 node/exitnode/console/static/ 下这三件文件按固定路径发出去,并加内容安全策略:default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; font-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'。所以页面里任何内联脚本、style 属性、onclick 都会被浏览器拦掉(脚本里经 element.style 改样式不受影响)。\n\n使用场景:客户(管理员,不懂技术)在国内经客户端隧道、或在澳洲经局域网,用 Chrome / Edge 打开 http://<地址>/ 管理一台节点;明文 HTTP,所以浏览器不给 navigator.clipboard,复制要走第 24 条的退路。\n\n先读(全文):docs/design/2026-11-27-节点管理网页/ 下三个文件;docs/design/2026-10-22-客户端界面/DESIGN.md(配色与状态小方块的来历,只读)。\n\n硬规矩(做不到就停下交 blocked + forks,不猜):①只改允许清单里的四个文件。②console.css 与 index.html 是原样拷贝,不许「顺手优化」;觉得设计稿有错,停下交 forks 说明哪一处、为什么。③所有页面文字照契约「」里的原文,一字不改;契约没写到、又必须有文字的地方,停下交 forks。④工人不许 git 写操作,不许自己跑 pytest、ruff、node、python(按验收编号走派单器自测通道,命令单独一条执行,不写 cd &&、管道、2>&1);不许装依赖。⑤新增注释用中文大白话;每次 Edit / Write 的新内容不超过 150 行,console.js 分几次写。⑥测试只读仓库文件,不写文件、不联网。",
+  "nonGoals": [
+    "不改 node/exitnode/console/ 下 static/ 以外的任何文件(后台单在做)",
+    "不改设计稿、契约目录、检查脚本",
+    "不加主题切换、不加多语言、不引任何前端库或字体",
+    "不写 systemd 单元与安装接线(安装单做)"
+  ],
+  "allowedPaths": [
+    "node/exitnode/console/static/index.html",
+    "node/exitnode/console/static/console.css",
+    "node/exitnode/console/static/console.js",
+    "node/tests/test_console_page.py"
+  ],
+  "forbiddenPaths": [
+    ".codex/**",
+    ".github/**",
+    ".gitignore",
+    "pyproject.toml",
+    "requirements-dev.txt",
+    "winclient/**",
+    "scripts/**",
+    "authserver/**",
+    "node/exitnode/console/*.py",
+    "node/exitnode/*.py",
+    "node/exitnode/templates/**",
+    "node/exitnode/proxy/**",
+    "node/exitnode/admin/**",
+    "node/examples/**",
+    "node/tests/golden/**",
+    "node/tests/test_console_auth.py",
+    "node/tests/test_console_authclient.py",
+    "node/tests/test_console_server.py",
+    "node/tests/test_console_snapshot.py",
+    "node/tests/test_cli.py",
+    "node/tests/test_config.py",
+    "docs/**"
+  ],
+  "expectArtifacts": [
+    "node/exitnode/console/static/index.html",
+    "node/exitnode/console/static/console.css",
+    "node/exitnode/console/static/console.js",
+    "node/tests/test_console_page.py"
+  ],
+  "acceptance": [
+    {
+      "id": "T-PAGE",
+      "kind": "test:targeted",
+      "target": "node/tests/test_console_page.py",
+      "required": true,
+      "failsOnBase": true
+    },
+    {
+      "id": "PYTEST",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "pytest",
+        "-q"
+      ],
+      "required": true,
+      "timeoutSec": 1500
+    },
+    {
+      "id": "RUFF",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "ruff",
+        "check",
+        "node",
+        "authserver"
+      ],
+      "required": true,
+      "timeoutSec": 300
+    },
+    {
+      "id": "JS-SYNTAX",
+      "kind": "command",
+      "argv": [
+        "node",
+        "--check",
+        "node/exitnode/console/static/console.js"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "SHAPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_node_console_page_1127.py",
+        "shape"
+      ],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "TESTS-NEW",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_node_console_page_1127.py",
+        "tests"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "SCOPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_node_console_page_1127.py",
+        "scope"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "workbuddyTier": "hard",
+  "timeoutSec": 10800,
+  "repoRoot": "E:/yuanc",
+  "steps": [
+    "读 BACKGROUND 列出的文件与检查脚本 docs/plans/checks/yc_node_console_page_1127.py(它就是 SHAPE、TESTS-NEW、SCOPE 三项验收)。",
+    "先写 node/tests/test_console_page.py,申请 T-PAGE 证红;再原样拷贝 console.css 与 index.html。",
+    "分几次写 console.js:请求与登录 → 页签与状态页 → 邀请码页 → 账号页;每写完一段申请 JS-SYNTAX。",
+    "T-PAGE、SHAPE、TESTS-NEW、JS-SYNTAX、PYTEST、RUFF、SCOPE 全绿后交活;交活说明里逐条对照第三节 1~35 条写做到了没有。"
+  ]
+}
