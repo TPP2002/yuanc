@@ -199,6 +199,7 @@ def build_context(config, keys, runner):
         reality_port=config.proxy.reality_port,
         maintenance_device_ids=tuple(config.proxy.maintenance_device_ids),
         admin_bind=config.admin.bind, admin_port=config.admin.port,
+        console_port=config.console.port if config.console.enabled else 0,
         hy2_port=config.proxy.hy2_port, hy2_server_name=config.proxy.hy2_server_name,
         hy2_certificate_path=SECRETS + "/hy2.crt", hy2_key_path=SECRETS + "/hy2.key",
         hy2_certificate=tuple(line for line in

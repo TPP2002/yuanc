@@ -1,0 +1,24 @@
+[Unit]
+Description=出口节点管理网页检查记录
+After=network-online.target
+
+[Service]
+Environment=PYTHONPATH=$program_path
+Type=oneshot
+ExecStart=/usr/bin/python3 -P -m exitnode --config "$config_path" console snapshot
+TimeoutStartSec=50
+Restart=no
+NoNewPrivileges=true
+UMask=0077
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native

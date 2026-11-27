@@ -54,6 +54,26 @@ def test_admin_uses_dynamic_user_without_capabilities_and_only_localhost():
         "ReadOnlyPaths=-/var/lib/exitnode/winclient"]
 
 
+def test_console_units_render_contract_directives():
+    service = render("exitnode-console.service", {})
+    for line in ("Description=出口节点管理网页", "Type=simple",
+                 'ExecStart=/usr/bin/python3 -P -m exitnode --config "/etc/exitnode/config.toml"'
+                 " console serve",
+                 "LoadCredential=console-password:/var/lib/exitnode/secrets/console-password",
+                 "LoadCredential=authserver-admin-key:/var/lib/exitnode/secrets/authserver-admin-key",
+                 "DynamicUser=true", "IPAddressDeny=any",
+                 "IPAddressAllow=localhost 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 "
+                 "169.254.0.0/16"):
+        assert line + "\n" in service
+    status = render("exitnode-console-status.service", {})
+    assert "Type=oneshot\n" in status and "Restart=no\n" in status
+    assert ' console snapshot\n' in status
+    timer = render("exitnode-console-status.timer", {})
+    assert "OnUnitActiveSec=60\n" in timer
+    assert "Unit=exitnode-console-status.service\n" in timer
+    assert "StartLimit" not in status and "StartLimit" not in timer
+
+
 @pytest.mark.parametrize("name", ["exitnode-watchdog.service", "exitnode-recover.service",
                                   "exitnode-rescue.service", "exitnode-authsync.service"])
 def test_root_units_are_sandboxed_but_keep_root(name):

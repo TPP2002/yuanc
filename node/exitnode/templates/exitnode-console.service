@@ -1,0 +1,43 @@
+[Unit]
+Description=出口节点管理网页
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Environment=PYTHONPATH=$program_path
+Type=simple
+ExecStart=/usr/bin/python3 -P -m exitnode --config "$config_path" console serve
+LoadCredential=console-password:/var/lib/exitnode/secrets/console-password
+LoadCredential=authserver-admin-key:/var/lib/exitnode/secrets/authserver-admin-key
+Restart=on-failure
+RestartSec=30
+DynamicUser=true
+CapabilityBoundingSet=
+NoNewPrivileges=true
+UMask=0077
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectProc=invisible
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+IPAddressDeny=any
+IPAddressAllow=localhost 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16
+TasksMax=64
+LimitNOFILE=1024
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

@@ -172,6 +172,35 @@ def test_context_rejects_invalid_maintenance_ids(inputs, ids):
         validate_context(replace(ctx, maintenance_device_ids=ids))
 
 
+def test_console_rule_only_for_local_devices_when_enabled(inputs):
+    ctx, device = inputs
+    assert not any(rule.get("ip_cidr") == ["198.18.255.2/32"]
+                   for rule in render_server(ctx, [device])["route"]["rules"])
+
+    local = replace(device, device_id="local-1", account_id="local")
+    other = replace(device, device_id="other-1", account_id="acc-2",
+                    uuid="00000000-0000-4000-8000-000000000002",
+                    hy2_password="TEST-ONLY-other-password")
+    revoked = replace(device, device_id="local-revoked", account_id="local",
+                      uuid="00000000-0000-4000-8000-000000000003",
+                      hy2_password="TEST-ONLY-revoked-password",
+                      revoked_at="2026-10-22T01:00:00+00:00")
+    rules = render_server(replace(ctx, console_port=8444), [local, other, revoked])["route"]["rules"]
+    indexes = [i for i, rule in enumerate(rules) if rule.get("ip_cidr") == ["198.18.255.2/32"]]
+    assert len(indexes) == 1
+    assert rules[indexes[0]] == {
+        "ip_cidr": ["198.18.255.2/32"], "auth_user": ["local-1"],
+        "action": "route", "outbound": "direct",
+        "override_address": "127.0.0.1", "override_port": 8444}
+    admin_index = next(i for i, rule in enumerate(rules)
+                       if rule.get("ip_cidr") == ["198.18.255.1/32"])
+    assert admin_index < indexes[0]
+
+    # 没有本机自用设备时整条规则不加；其余设备照旧落到 198.18.0.0/15 的拒绝规则。
+    enabled = render_server(replace(ctx, console_port=8444), [other])["route"]["rules"]
+    assert not any(rule.get("ip_cidr") == ["198.18.255.2/32"] for rule in enabled)
+
+
 def test_obfs_key_order_and_shared_password(inputs):
     ctx, device = inputs
     backup = render_server(ctx, [device])["inbounds"][1]
