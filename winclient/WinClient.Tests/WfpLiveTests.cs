@@ -80,6 +80,34 @@ public sealed class WfpLiveTests
         return Task.CompletedTask;
     });
 
+    [WfpLiveFact]
+    public Task DnsPortBlockBeatsLanPermitButNotExactPermit() => WithCleanEngine(async engine =>
+    {
+        InstallGuarded(engine,
+        [
+            new WfpFilterSpec(Prefix + "Lan", WfpLayer.ConnectV4, WfpAction.Permit, WfpPlanner.PermitWeight,
+                RemoteAddresses: ["192.0.2.0/24"]),
+            new WfpFilterSpec(Prefix + "Dns53", WfpLayer.ConnectV4, WfpAction.Block, WfpPlanner.DnsBlockWeight,
+                RemoteAddresses: ["192.0.2.0/24"], RemotePort: 53),
+            new WfpFilterSpec(Prefix + "Exact", WfpLayer.ConnectV4, WfpAction.Permit, WfpPlanner.ExactPermitWeight,
+                RemoteAddresses: ["192.0.2.1/32"]),
+            new WfpFilterSpec(Prefix + "Rest", WfpLayer.ConnectV4, WfpAction.Block, WfpPlanner.BlockWeight,
+                RemoteAddresses: ["192.0.2.0/24"])
+        ]);
+        var dns = await Connect("192.0.2.2", 53);
+        Assert.Equal(SocketError.AccessDenied, dns.Error);
+        Assert.True(dns.Elapsed < TimeSpan.FromSeconds(3), "阻断必须在三秒内返回 AccessDenied。");
+        // UDP 被这一层拦下时系统只丢包、不向发送方报错(2026-11-27 实测:过滤层丢包事件里记有这个包),
+        // 套接字这一侧看不出拦没拦住,这里只确认没有别的错误;过滤器不写协议由 WfpPlannerTests 钉住。
+        using (var udp = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp))
+        {
+            var error = Record.Exception(() => udp.SendTo(new byte[] { 0 }, new IPEndPoint(IPAddress.Parse("192.0.2.2"), 53)));
+            Assert.True(error is null or SocketException { SocketErrorCode: SocketError.AccessDenied }, error?.Message);
+        }
+        Assert.NotEqual(SocketError.AccessDenied, (await Connect("192.0.2.2", 9)).Error);
+        Assert.NotEqual(SocketError.AccessDenied, (await Connect("192.0.2.1", 53)).Error);
+    });
+
     private static WfpFilterSpec Rule(string suffix, string remote) => new(Prefix + suffix,
         WfpLayer.ConnectV4, WfpAction.Block, 0, RemoteAddresses: [remote], Protocol: "TCP", RemotePort: 9);
 
@@ -139,14 +167,16 @@ public sealed class WfpLiveTests
         Assert.True(result.Elapsed < TimeSpan.FromSeconds(3), "阻断必须在三秒内返回 AccessDenied。");
     }
 
-    private static async Task<(SocketError Error, TimeSpan Elapsed)> Connect(string address)
+    private static Task<(SocketError Error, TimeSpan Elapsed)> Connect(string address) => Connect(address, 9);
+
+    private static async Task<(SocketError Error, TimeSpan Elapsed)> Connect(string address, int port)
     {
         using var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(3));
         var watch = Stopwatch.StartNew();
         try
         {
-            await socket.ConnectAsync(new IPEndPoint(IPAddress.Parse(address), 9), timeout.Token);
+            await socket.ConnectAsync(new IPEndPoint(IPAddress.Parse(address), port), timeout.Token);
             return (SocketError.Success, watch.Elapsed);
         }
         catch (SocketException ex) { return (ex.SocketErrorCode, watch.Elapsed); }

@@ -1,4 +1,6 @@
+using System.Net;
 using System.Text.Json;
+using WinClient.Core.Network;
 
 namespace WinClient.Core.Diagnostics;
 
@@ -6,6 +8,7 @@ namespace WinClient.Core.Diagnostics;
 public static class LeakReportFormatter
 {
     private const int SummaryLimit = 20;
+    private const string LanDnsHint = "其中发往局域网 53 端口的是域名查询:路由器会把它转给所在地运营商的解析器。";
 
     public static string Json(DateTime startedAt, LeakCheckOptions options, LeakCheckResult result)
     {
@@ -52,6 +55,9 @@ public static class LeakReportFormatter
         }
         if (verdict.Suspicious.Count > SummaryLimit)
             output.WriteLine($"  …… 另有 {verdict.Suspicious.Count - SummaryLimit} 条可疑流,见报告。");
+        if (!options.AppsMode && verdict.Suspicious.Any(flow => flow.RemotePort == 53
+            && IPAddress.TryParse(flow.Remote, out var peer) && !PublicAddress.IsPublic(peer)))
+            output.WriteLine("  " + LanDnsHint);
         output.WriteLine("结论:" + (result.ExitCode == 0 ? "未发现可疑流量。" : "发现可疑流量!") + Conclusion(options, result));
         output.WriteLine("报告:" + Path.Combine(outDir, "leak-report.json"));
     }
