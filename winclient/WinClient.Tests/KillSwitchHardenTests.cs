@@ -35,8 +35,8 @@ public sealed class KillSwitchHardenTests
         var write = script.IndexOf("Write-State $state", record, StringComparison.Ordinal);
         var disable = script.IndexOf("Disable-NetFirewallRule", StringComparison.Ordinal);
         Assert.True(record >= 0 && write > record && disable > write);
-        Assert.Contains("foreach ($rule in $foreignRules)", script);
-        Assert.Contains("$rule | Disable-NetFirewallRule -ErrorAction SilentlyContinue -ErrorVariable disableError", script);
+        Assert.DoesNotContain("foreach ($rule in $foreignRules)", script);
+        Assert.Contains("$foreignRules | Disable-NetFirewallRule -ErrorAction SilentlyContinue -ErrorVariable disableError", script);
         Assert.Contains("catch { $disableError = @($_) }", script);
         Assert.Contains("if ($disableError)", script);
         Assert.Contains("$state.disableFailed", script);
@@ -59,7 +59,7 @@ public sealed class KillSwitchHardenTests
     }
 
     [Fact]
-    public void RemoveRestoresRulesBeforeProfilesAndDeletingSnapshotWithLegacyGuard()
+    public void RemoveRestoresProfilesBeforeRulesAndDeletingSnapshotWithLegacyGuard()
     {
         var plan = KillSwitchPlanner.Plan([], "", "", 0, KillSwitchMode.Remove);
         Assert.Equal(new[] { "RemoveRulesByPrefix", "RestoreProfileDefault" }, plan.Select(action => action.GetType().Name));
@@ -68,11 +68,12 @@ public sealed class KillSwitchHardenTests
         Assert.DoesNotContain("Disable-NetFirewallRule", script);
         Assert.Contains("if ($null -ne $state.disabledRules)", script);
         Assert.Contains("foreach ($name in @($state.disabledRules))", script);
-        Assert.Contains("Get-NetFirewallRule -PolicyStore PersistentStore -Name $name -ErrorAction SilentlyContinue", script);
-        Assert.Contains("Where-Object { $_.Name -eq $name } | Enable-NetFirewallRule", script);
+        Assert.DoesNotContain("-PolicyStore PersistentStore -Name $name", script);
+        Assert.Contains("$targets | Enable-NetFirewallRule", script);
         Assert.Contains("Enable-NetFirewallRule -ErrorAction SilentlyContinue", script);
         Assert.Contains("catch { $enableError = @($_) }", script);
-        Before(script, "Enable-NetFirewallRule", "Set-NetFirewallProfile -Profile $p.Name");
+        Before(script, "Set-NetFirewallProfile -Profile $p.Name", "Enable-NetFirewallRule");
+        Before(script, "Enable-NetFirewallRule", "Remove-Item -LiteralPath $statePath");
         Before(script, "Set-NetFirewallProfile -Profile $p.Name", "Remove-Item -LiteralPath $statePath");
         Assert.Contains("-Profile Domain,Private,Public -DefaultOutboundAction Allow", script);
     }
