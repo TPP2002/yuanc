@@ -1,6 +1,7 @@
 """逐层检查，不将系统输出或凭据带入原因文案。"""
 
 from .. import netinfo
+from ..netinfo import listen_state
 from ..service import LIVE
 
 
@@ -8,24 +9,7 @@ def row(layer, name, result, reason):
     return {"layer": layer, "name": name, "result": result, "reason": reason}
 
 
-def _listen(runner, argv, port):
-    try:
-        result = runner.run(argv, check=False)
-    except FileNotFoundError:
-        return "未知"
-    except (OSError, RuntimeError):
-        # Runner 隐藏了命令缺失与超时的底层异常；二者均无法确知监听情况。
-        return "未知"
-    if result.code == 127:
-        return "未知"
-    if result.code:
-        return "失败"
-    for line in result.out.splitlines():
-        columns = line.split()
-        # ss -H: State Recv-Q Send-Q Local-Address:Port Peer-Address:Port
-        if len(columns) >= 5 and columns[3].rsplit(":", 1)[-1] == str(port):
-            return "通过"
-    return "失败"
+_listen = listen_state
 
 
 def probe(config, runner):
