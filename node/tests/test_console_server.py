@@ -10,7 +10,9 @@ from exitnode.console.auth import hash_password
 from exitnode.runner import FakeRunner
 from test_cli import TEXT
 
-PASSWORD = "TEST-PASSWORD"
+# 管理密码固定 20 位、只用这套字母表；测试值本身就能过格式检查。
+PASSWORD = "ABCDE-FGHJK-LMNPQ-RSTUV"
+WRONG_PASSWORD = "ABCDE-FGHJK-LMNPQ-RSTUW"
 ADMIN_KEY = "test-admin-only"
 PASSWORD_HASH = hash_password(PASSWORD)
 
@@ -197,7 +199,7 @@ def test_unknown_paths_methods_and_missing_static_get_decoy(tmp_path):
 def test_no_server_header_anywhere(tmp_path):
     with Running(make(tmp_path)) as server:
         cases = [("GET", "/", {}), ("GET", "/api/session", {}), ("GET", "/nope", {}),
-                 ("POST", "/api/login", {"json_body": {"password": "wrong"}})]
+                 ("POST", "/api/login", {"json_body": {"password": WRONG_PASSWORD}})]
         for method, path, options in cases:
             _, headers, _ = call(server, path, method, **options)
             assert "server" not in headers
@@ -256,7 +258,7 @@ def test_login_wrong_password_and_throttle(tmp_path):
     with Running(make(tmp_path, clock=clock)) as server:
         for _ in range(5):
             status, _, body = call(server, "/api/login", "POST",
-                                   json_body={"password": "wrong-password"})
+                                   json_body={"password": WRONG_PASSWORD})
             assert status == 401
             assert json.loads(body) == {"detail": "密码不对", "code": "wrong_password"}
         status, _, body = call(server, "/api/login", "POST", json_body={"password": PASSWORD})
@@ -264,6 +266,116 @@ def test_login_wrong_password_and_throttle(tmp_path):
         assert json.loads(body)["code"] == "throttled"
         clock.tick(901)
         assert call(server, "/api/login", "POST", json_body={"password": PASSWORD})[0] == 200
+
+
+def test_login_concurrency_gate_returns_429(tmp_path, monkeypatch):
+    # 把验密码换成一个卡在闸里的替身：同时只准两个进去，第三个立刻被挡。
+    entered = threading.Event()
+    release = threading.Event()
+    counter = {"now": 0}
+    counter_lock = threading.Lock()
+
+    def stuck(raw, stored):
+        with counter_lock:
+            counter["now"] += 1
+            if counter["now"] >= 2:
+                entered.set()
+        release.wait(timeout=10)
+        return True
+
+    monkeypatch.setattr("exitnode.console.auth.verify_password", stuck)
+
+    results = {}
+
+    def attempt(name):
+        try:
+            results[name] = call(server, "/api/login", "POST",
+                                 json_body={"password": PASSWORD})
+        except OSError as error:  # pragma: no cover - 只在连接被断开时出现
+            results[name] = error
+
+    with Running(make(tmp_path)) as server:
+        first = threading.Thread(target=attempt, args=("first",))
+        second = threading.Thread(target=attempt, args=("second",))
+        first.start()
+        second.start()
+        assert entered.wait(timeout=10)
+        try:
+            status, _, body = call(server, "/api/login", "POST",
+                                   json_body={"password": PASSWORD})
+            assert status == 429
+            assert json.loads(body)["code"] == "throttled"
+        finally:
+            release.set()
+        first.join(timeout=10)
+        second.join(timeout=10)
+    for name in ("first", "second"):
+        status, _, body = results[name]
+        assert status == 200, body
+        assert json.loads(body)["logged_in"] is True
+
+
+def read_until_close(address, payload):
+    sock = socket.create_connection(address, timeout=10)
+    try:
+        sock.sendall(payload)
+        raw = b""
+        while True:
+            try:
+                chunk = sock.recv(4096)
+            except ConnectionResetError:  # pragma: no cover - 只在系统直接重置时出现
+                break
+            if not chunk:
+                break
+            raw += chunk
+        return raw
+    finally:
+        sock.close()
+
+
+def test_malformed_requests_get_decoy(tmp_path):
+    page = console_server.NOT_FOUND_PAGE.encode("utf-8")
+    with Running(make(tmp_path)) as server:
+        address = server.server_address
+        host = f"127.0.0.1:{address[1]}\r\n"
+        cases = {
+            "PATCH": f"PATCH / HTTP/1.0\r\nHost: {host}\r\n",
+            "FOO": f"FOO / HTTP/1.0\r\nHost: {host}\r\n",
+            # 坏请求行：只发那一行，服务器读完就回通用 404。
+            "bad-line": "GARBAGE\r\n",
+            # 请求行 65537 个字节，刚超过 65536 的上限，服务器读到就 414。
+            "long-line": "GET /" + "a" * 65532,
+            # 101 个请求头超过上限 100，服务器读完第 101 个就 431。
+            "many-headers": (f"GET / HTTP/1.0\r\nHost: {host}"
+                             + "".join(f"X-Pad-{index}: 1\r\n" for index in range(100))),
+        }
+        for name, request in cases.items():
+            raw = read_until_close(address, request.encode("ascii"))
+            # 读到连接关闭才停：通用 404 回完就断开，不再搭理后续请求。
+            assert page in raw, name
+            for banned in (b"Error response", b"Python", b"BaseHTTP", b"Server:"):
+                assert banned not in raw, (name, banned)
+
+
+def test_cookie_header_parsing(tmp_path):
+    with Running(make(tmp_path)) as server:
+        data, cookie = login(server)
+        value = cookie.split("=", 1)[1]
+        # 夹在别的 cookie 中间也认得出来。
+        session = call(server, "/api/session", cookie=f"a=1; yc_console={value}; b=2")[2]
+        assert json.loads(session)["logged_in"] is True
+        # 超长 Cookie 头当没带（同一个值放在末尾也不认）。
+        long_header = "a=" + "1" * 4100 + f"; yc_console={value}"
+        assert json.loads(call(server, "/api/session", cookie=long_header)[2]) == {
+            "logged_in": False}
+        # 值里带引号或逗号当没带。
+        for bad in (f'yc_console="{value}"', f"yc_console={value},x"):
+            assert json.loads(call(server, "/api/session", cookie=bad)[2]) == {
+                "logged_in": False}
+        # 只有冒号后面空着也算没带。
+        assert json.loads(call(server, "/api/session", cookie="yc_console=")[2]) == {
+            "logged_in": False}
+        assert data["csrf"]
 
 
 def test_password_missing_returns_409(tmp_path):

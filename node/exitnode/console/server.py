@@ -11,15 +11,14 @@ import signal
 import threading
 import time
 import unicodedata
-from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from .. import service
 from ..log import redact
-from . import authclient, snapshot
-from .auth import LoginThrottle, Sessions, verify_password
+from . import auth, authclient, snapshot
+from .auth import LoginThrottle, Sessions
 
 # 与鉴权服务逐字节相同的通用 404 网页（复制字符串，不导入对方包）。
 NOT_FOUND_PAGE = (
@@ -49,6 +48,9 @@ BAD_REQUEST = {"detail": "请求格式不对", "code": "bad_request"}
 LOGIN_REQUIRED = {"detail": "请先登录", "code": "login_required"}
 COOKIE_ATTRIBUTES = "; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200"
 CLEAR_COOKIE = COOKIE + "=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"
+# Cookie 头最长 4096 个字符；会话令牌只收这套字符表。
+COOKIE_HEADER_LIMIT = 4096
+COOKIE_VALUE_FORMAT = re.compile(r"[A-Za-z0-9_-]{1,128}")
 
 STATIC_ROUTES = {
     "/": ("index.html", "text/html; charset=utf-8"),
@@ -178,15 +180,17 @@ class ConsoleHandler(BaseHTTPRequestHandler):
 
     def _token(self):
         header = self.headers.get("Cookie")
-        if not header:
+        if not header or len(header) > COOKIE_HEADER_LIMIT:
+            # 没带、或者长得离谱，一律当没带。
             return None
-        try:
-            jar = SimpleCookie()
-            jar.load(header)
-        except CookieError:
-            return None
-        morsel = jar.get(COOKIE)
-        return morsel.value if morsel is not None else None
+        for segment in header.split(";"):
+            item = segment.strip()
+            if not item.startswith(COOKIE + "="):
+                continue
+            value = item[len(COOKIE) + 1:]
+            # 值只认令牌那套字符，别的写法一律当没带；取第一段就停。
+            return value if COOKIE_VALUE_FORMAT.fullmatch(value) else None
+        return None
 
     def _send(self, status, body, content_type, cookie=None):
         self.send_response(status)
@@ -211,6 +215,20 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
+        # 通用 404 回完就断开，不再搭理这条连接上的后续请求。
+        self.close_connection = True
+        self._drain_input()
+
+    def _drain_input(self):
+        # 断开前把对方已经到了的请求字节读掉：连接里留着没读的字节，
+        # 系统会直接给对端回 RST，把刚写好的 404 一起冲掉。
+        try:
+            self.wfile.flush()
+            self.connection.settimeout(0.2)
+            while self.rfile.read1(65536):
+                pass
+        except OSError:
+            pass
 
     def _static(self, target):
         name, content_type = target
@@ -261,13 +279,14 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 "invite_mode": bool(self.server.config.authsync.enabled)}
 
     def _login(self):
+        ip = self.client_address[0]
+        # 第 1 步：先占名额再看别的；这次尝试一律先按失败记。
+        if not self.server.throttle.attempt(ip):
+            return self._json(429, {"detail": "登录失败次数太多,请 15 分钟后再试",
+                                    "code": "throttled"})
         body = self._read_body({"password"})
         if body is None:
             return
-        ip = self.client_address[0]
-        if self.server.throttle.blocked(ip):
-            return self._json(429, {"detail": "登录失败次数太多,请 15 分钟后再试",
-                                    "code": "throttled"})
         stored = (self.server.credentials or {}).get("password")
         if not stored:
             return self._json(409, {
@@ -276,8 +295,16 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         password = body.get("password")
         if not isinstance(password, str):
             return self._json(422, BAD_REQUEST)
-        if not verify_password(password, stored):
-            self.server.throttle.fail(ip)
+        # 验密码一次最多两个：每次 scrypt 要吃 16 MiB 内存，32 个并发会把单元撑爆。
+        if not self.server.password_slots.acquire(blocking=False):
+            return self._json(429, {"detail": "登录失败次数太多,请 15 分钟后再试",
+                                    "code": "throttled"})
+        try:
+            passed = auth.verify_password(password, stored)
+        finally:
+            self.server.password_slots.release()
+        if not passed:
+            # 失败已在上面 attempt 时记下了，这里不再记一次。
             return self._json(401, {"detail": "密码不对", "code": "wrong_password"})
         self.server.throttle.succeed(ip)
         token, csrf = self.server.sessions.create()
@@ -409,6 +436,8 @@ def create_server(config, *, credentials, static_dir=None, snapshot_path=None, c
     server.sources = tuple(ipaddress.ip_network(item) for item in sources)
     server.sessions = Sessions(clock)
     server.throttle = LoginThrottle(clock)
+    # 同时最多两个请求在验密码：scrypt 一次要 16 MiB，多了会把单元撑爆。
+    server.password_slots = threading.BoundedSemaphore(2)
     return server
 
 

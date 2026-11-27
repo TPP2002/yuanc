@@ -3,10 +3,14 @@
 import base64
 import hashlib
 import hmac
+import ipaddress
+import re
 import secrets
 import threading
 
 ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+# 密码正规化之后必须是 20 位、只含上面那套字母表；先查格式再花钱算哈希。
+PASSWORD_FORMAT = re.compile(r"[A-HJ-NP-Z2-9]{20}")
 
 
 def generate_password():
@@ -33,6 +37,9 @@ def hash_password(raw, salt=None):
 def verify_password(raw, stored):
     try:
         if not isinstance(raw, str) or len(raw) > 200 or not isinstance(stored, str):
+            return False
+        # 先按格式挡掉明显不是密码的输入，省掉一次 16 MiB 内存的 scrypt。
+        if PASSWORD_FORMAT.fullmatch(normalize(raw)) is None:
             return False
         parts = stored.split("$")
         if len(parts) != 6 or parts[:4] != ["scrypt", "16384", "8", "1"]:
@@ -91,7 +98,7 @@ class Sessions:
 
 
 class LoginThrottle:
-    """按来源 IP 与全体两个口径数失败次数。"""
+    """按来源 IP 与全体两个口径数失败次数；回环来源不受全体上限管。"""
 
     def __init__(self, clock, per_ip=5, global_limit=30, window=900):
         self.clock = clock
@@ -99,37 +106,50 @@ class LoginThrottle:
         self.global_limit = global_limit
         self.window = window
         self.lock = threading.Lock()
-        self.failures = {}
-        self.total = []
+        # 只存一个列表，每项是 (时刻, 来源 IP 字符串)。
+        self.items = []
 
     def _clean(self, now):
+        # 进锁后先丢掉窗口以前的记录。
         cutoff = now - self.window
-        for address in list(self.failures):
-            kept = [at for at in self.failures[address] if at > cutoff]
-            if kept:
-                self.failures[address] = kept
-            else:
-                del self.failures[address]
-        self.total = [at for at in self.total if at > cutoff]
+        self.items = [item for item in self.items if item[0] > cutoff]
+
+    def _blocked(self, ip):
+        if sum(1 for item in self.items if item[1] == ip) >= self.per_ip:
+            return True
+        if _is_loopback(ip):
+            # 回环来源只按自己的次数管，既不查全体上限也不计入全体合计。
+            return False
+        return sum(1 for item in self.items
+                   if not _is_loopback(item[1])) >= self.global_limit
 
     def blocked(self, ip):
         with self.lock:
-            now = self.clock()
-            self._clean(now)
-            return (len(self.failures.get(ip, [])) >= self.per_ip
-                    or len(self.total) >= self.global_limit)
+            self._clean(self.clock())
+            return self._blocked(ip)
 
-    def fail(self, ip):
+    def attempt(self, ip):
+        # 判断与登记在同一把锁里做完，并发请求越不过上限。
         with self.lock:
             now = self.clock()
             self._clean(now)
-            self.failures.setdefault(ip, []).append(now)
-            self.total.append(now)
+            if self._blocked(ip):
+                return False
+            self.items.append((now, ip))
+            return True
 
     def succeed(self, ip):
         with self.lock:
             self._clean(self.clock())
-            self.failures.pop(ip, None)
+            self.items = [item for item in self.items if item[1] != ip]
+
+
+def _is_loopback(ip):
+    try:
+        return ipaddress.ip_address(ip).is_loopback
+    except ValueError:
+        # 解析不了就按非回环算，宁可多限一次。
+        return False
 
 
 def _hash(token):
