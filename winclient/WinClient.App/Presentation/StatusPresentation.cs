@@ -1,3 +1,4 @@
+using WinClient.Core.Client;
 using WinClient.Core.Ipc;
 using WinClient.Core.State;
 
@@ -17,9 +18,10 @@ public sealed record HeroPresentation(TileSpec Tile, string Title, string Subtit
 /// <summary>设计正本第 4 节的显示映射，不执行命令，也不依赖界面框架。</summary>
 public static class StatusPresentation
 {
-    public static HeroPresentation Build(ControlSnapshot snapshot, ServiceAvailability availability, bool shouldDisconnect)
+    public static HeroPresentation Build(ControlSnapshot snapshot, ServiceAvailability availability, bool shouldDisconnect, bool? testBuild = null)
     {
-        var rows = new[] { Exit(snapshot), Guard(snapshot), SelfCheck(snapshot), Environment(snapshot) };
+        var isTestBuild = testBuild ?? BuildInfo.TestBuild;
+        var rows = new[] { Exit(snapshot), isTestBuild ? TestBuildGuard() : Guard(snapshot), SelfCheck(snapshot), Environment(snapshot) };
         var primary = shouldDisconnect ? "断开" : "连接";
         var title = "未连接";
         var subtitle = snapshot.Message;
@@ -79,7 +81,7 @@ public static class StatusPresentation
                 }
                 break;
         }
-        var trayText = "澳洲出口客户端 · " + title;
+        var trayText = (isTestBuild ? "澳洲出口客户端(测试包) · " : "澳洲出口客户端 · ") + title;
         if (trayText.Length > 63) trayText = trayText[..63];
         return new(tile, title, subtitle, subtitleTone, primary,
             primary switch { "连接" => "正在连接", "断开" => "正在断开", _ => "正在处理" }, account, tray, trayText, rows);
@@ -109,6 +111,8 @@ public static class StatusPresentation
     };
 
     private static bool IsPatrolRetry(string value) => value is "巡检失败,下一轮重试" or "巡检失败，下一轮重试";
+    /// <summary>测试包的断网保护一行固定标注已关闭,不看快照。</summary>
+    private static StatusRow TestBuildGuard() => Row("断网保护", Tone.Warn, Glyph.Ask, "测试包已关闭,断线时会直连");
     private static StatusRow Guard(ControlSnapshot s)
     {
         if (!s.ProtectionActive) return Row("断网保护", Tone.N, Glyph.Ring, "未启用,连接时自动开启");

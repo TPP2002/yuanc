@@ -61,8 +61,20 @@ public sealed class ControlService : ServiceBase
                 UpdateRecovery.Run(updateStore, InstallerRunner.CurrentExecutable, new UpdateWindowsHost(), UpdatePlanner.DefaultAppRoot, UpdateWindowsHost.Log);
                 var secure = Path.Combine(ClientSettings.DataDirectory, "secure");
                 var desired = new DesiredStateStore();
-                var keep = desired.Read() != false;
-                runtime = await ClientRuntime.CreateAsync(new KernelInstaller(new EmbeddedKernelSource()), secure, DataProtectionScope.LocalMachine, keepProtection: keep).ConfigureAwait(false);
+                var testBuild = BuildInfo.TestBuild;
+                var keep = BuildInfo.KeepOnStartup(testBuild, desired.Read());
+                if (testBuild)
+                {
+                    try { Log.Write("测试包：断网保护已关闭，开机不自动连接。"); }
+                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+                }
+                runtime = await ClientRuntime.CreateAsync(new KernelInstaller(new EmbeddedKernelSource()), secure, DataProtectionScope.LocalMachine, keepProtection: keep, testBuild: testBuild).ConfigureAwait(false);
+                // 首次尝试放弃并恢复后,期望状态改为不连,下次开机不带着保护接回去。
+                runtime.Controller.AttemptAbandoned += () =>
+                {
+                    try { desired.Write(false); }
+                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
+                };
                 if (runtime.RecoveryWarning is { } warning) Log.Write("启动时断网保护降级恢复：" + warning);
                 if (lifetime.IsCancellationRequested) return;
                 // Expose status while connecting: network delay must not look like a dead new service.

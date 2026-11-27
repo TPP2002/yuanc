@@ -92,6 +92,33 @@ public sealed class StateTests
     public void NonDisconnectEventsNeverRemove(ConnectionEventKind kind)
         => Assert.DoesNotContain(Connected().Handle(new(kind)).Effects, e => e.Kind == EffectKind.RemoveKillSwitch);
     [Fact]
+    public void AttemptAbandonedReturnsToDisconnectedWithOnlyStopTunnel()
+    {
+        var connecting = new ConnectionStateMachine();
+        connecting.Handle(new(ConnectionEventKind.UserConnect));
+        var backoff = Connected();
+        backoff.Handle(new(ConnectionEventKind.TunnelDown));
+        var manual = new ConnectionStateMachine();
+        manual.Handle(new(ConnectionEventKind.UserConnect));
+        manual.Handle(new(ConnectionEventKind.OperationFailed));
+        foreach (var machine in new[] { connecting, backoff, manual })
+        {
+            var result = machine.Handle(new(ConnectionEventKind.AttemptAbandoned));
+            Assert.Equal(ConnectionState.Disconnected, result.State);
+            Assert.False(machine.HasSession);
+            Assert.False(machine.KillSwitchRequired);
+            Assert.Equal(EffectKind.StopTunnel, Assert.Single(result.Effects).Kind);
+
+            Assert.Equal(ConnectionState.Connecting, machine.Handle(new(ConnectionEventKind.UserConnect)).State);
+            var accepted = machine.Handle(new(ConnectionEventKind.SessionOk));
+            Assert.Equal(new[] { EffectKind.ApplyKillSwitch, EffectKind.StartTunnel }, accepted.Effects.Select(e => e.Kind));
+            machine.Handle(new(ConnectionEventKind.TunnelUp));
+            var down = machine.Handle(new(ConnectionEventKind.TunnelDown));
+            Assert.Equal(TimeSpan.FromSeconds(2), Assert.Single(down.Effects.Where(e => e.Kind == EffectKind.ScheduleBackoff)).Delay);
+        }
+    }
+
+    [Fact]
     public void AddressChangeHasDedicatedEffect()
     {
         var machine = Connected();

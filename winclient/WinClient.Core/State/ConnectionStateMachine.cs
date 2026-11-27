@@ -6,7 +6,7 @@ public enum ConnectionState { Disconnected, Connecting, Connected, Reconnecting,
 public enum ConnectionEventKind
 {
     UserConnect, UserDisconnect, SessionOk, SessionExpired, AuthRejected,
-    TunnelUp, TunnelDown, BackoffElapsed, NodeChanged, OperationFailed
+    TunnelUp, TunnelDown, BackoffElapsed, NodeChanged, OperationFailed, AttemptAbandoned
 }
 public enum EffectKind { StartTunnel, StopTunnel, ApplyKillSwitch, RemoveKillSwitch, ScheduleBackoff, ShowMessage, UpdateKillSwitchNode }
 public sealed record ConnectionEvent(ConnectionEventKind Kind, AuthResult? AuthResult = null,
@@ -52,6 +52,17 @@ public sealed class ConnectionStateMachine
             ResetBackoff();
             effects.Add(new(EffectKind.StopTunnel));
             effects.Add(new(EffectKind.RemoveKillSwitch));
+            return Finish(effects);
+        }
+
+        if (input.Kind == ConnectionEventKind.AttemptAbandoned)
+        {
+            // 从没连上就放弃的那次尝试：任何状态都回到未连接，只停隧道，保护由控制器另行撤销并记录。
+            State = ConnectionState.Disconnected;
+            sessionAccepted = false;
+            KillSwitchRequired = false;
+            ResetBackoff();
+            effects.Add(new(EffectKind.StopTunnel));
             return Finish(effects);
         }
 

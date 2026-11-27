@@ -1,4 +1,4 @@
-﻿param([string]$Version)
+﻿param([string]$Version, [switch]$TestBuild)
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
@@ -18,6 +18,8 @@ try {
     $start = New-Object Diagnostics.ProcessStartInfo
     $start.FileName = 'dotnet'
     $start.Arguments = 'publish "' + $project + '" -c Release -p:PublishProfile=SingleFile -p:Version=' + $Version + ' -o "' + $publish + '" --nologo'
+    # 测试包:把开关写进程序集元数据,客户端据此关闭断网保护、出口核验不了自动断开、开机不自动连接。
+    if ($TestBuild) { $start.Arguments += ' -p:YuanCTestBuild=true' }
     $start.WorkingDirectory = $root
     $start.UseShellExecute = $false
     $start.CreateNoWindow = $true
@@ -41,7 +43,7 @@ try {
     # 与客户端自动更新接收的防呆线(UpdateManifest.MaxPayloadBytes,1 GiB)同数,超过它的包客户端不收。
     if ((Get-Item -LiteralPath $executable).Length -gt 1GB) { throw '客户端超过 1GB，自动更新不会接收，请先查是什么撑大了包。' }
     [IO.Directory]::CreateDirectory($release) | Out-Null
-    $name = 'YuanC-Client-' + $Version + '.exe'
+    $name = 'YuanC-Client-' + $Version + $(if ($TestBuild) { '-test' } else { '' }) + '.exe'
     $destination = Join-Path $release $name
     Copy-Item -LiteralPath $executable -Destination $destination -Force
     $hash = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -49,6 +51,7 @@ try {
     Write-Host "发布完成：$destination"
     Write-Host "大小（字节）：$((Get-Item -LiteralPath $destination).Length)"
     Write-Host "SHA256：$hash"
+    if ($TestBuild) { Write-Host '测试包：断网保护已关闭，不能交给客户。' }
 } catch {
     [Console]::Error.WriteLine('Windows 客户端出包失败：' + $_.Exception.Message)
     exit 1
