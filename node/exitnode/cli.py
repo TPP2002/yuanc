@@ -1,30 +1,30 @@
 """面向维护人员的七个命令，所有主机副作用通过 Runner。"""
 
 import argparse
+import contextlib
 import io
 import ipaddress
 import json
 import subprocess
 import sys
+import unicodedata
 import zipfile
 from pathlib import PurePosixPath
 
-from . import __version__, authsync, device, nft, publisher, service, systemd
+from . import __version__, authsync, device, nft, publisher, report, service, systemd
 from .admin import publish as winclient_publish
 from .admin import server as admin_server
 from .config import ConfigError, load
 from .log import redact
 from .manifest import UNITS, Manifest
-from .netinfo import check, public_ipv4
+from .netinfo import check
 from .proxy.kernel import require_kernel
 from .rescue import probes as rescue_probes
 from .rescue import state as rescue_state
 from .rescue.runner import RealRunner as RescueRealRunner
 from .runner import RealRunner, RunnerError
 from .status import State, evaluate
-from .watchdog import check as watchdog_check
 from .watchdog import state as watchdog_state
-from .watchdog import summary as watchdog_summary
 from .watchdog import tick as watchdog_tick
 
 JOURNAL_UNITS = ("exitnode-proxy.service", "exitnode-admin.service", "exitnode-nft.service",
@@ -137,6 +137,14 @@ def parser():
     actions = admin.add_subparsers(dest="admin_action", required=True)
     foreground = actions.add_parser("serve", help="前台运行只读托管服务")
     foreground.add_argument("--config", default=argparse.SUPPRESS, help="配置文件路径")
+    console = sub.add_parser("console", help="节点管理网页")
+    console.add_argument("--config", default=argparse.SUPPRESS, help="配置文件路径")
+    actions = console.add_subparsers(dest="console_action", required=True, title="管理网页操作")
+    for name, description in (("serve", "前台运行管理网页"), ("snapshot", "写一份检查记录"),
+                              ("password", "生成并设置新的管理密码"),
+                              ("admin-key", "设置鉴权服务的管理密钥")):
+        action = actions.add_parser(name, help=description, description=description)
+        action.add_argument("--config", default=argparse.SUPPRESS, help="配置文件路径")
     return root
 
 
@@ -177,30 +185,6 @@ def refresh(source_dir, target_dir, rescue_runner=None):
         except OSError:
             pass  # 磁盘不可写时不能保证记录成功，仍将原异常交给调用方。
         raise
-
-
-def _rescue_record(runner):
-    if not runner.exists(rescue_state.STATE):
-        return {"state": "manual", "reason": "尚无救援记录", "updated_at": None}
-    try:
-        value = json.loads(runner.read_file(rescue_state.STATE))
-        if value["state"] not in {"normal", "processing", "manual"}:
-            raise ValueError
-        rescue_state.timestamp(value["updated_at"])
-        return {"state": value["state"], "reason": str(value["reason"]),
-                "updated_at": value["updated_at"]}
-    except (ValueError, KeyError, TypeError, AttributeError):
-        return {"state": "manual", "reason": "救援记录损坏", "updated_at": None}
-
-
-def _rescue_check(runner):
-    value = _rescue_record(runner)
-    active = runner.run(["systemctl", "is-active", "exitnode-rescue.timer"], check=False)
-    recent = (value["updated_at"] is not None
-              and 0 <= runner.now() - rescue_state.timestamp(value["updated_at"]) <= 86400)
-    ok = active.code == 0 and active.out.strip() == "active" and recent
-    return {"layer": "rescue", "name": "救援单元", "result": "通过" if ok else "失败",
-            "reason": "定时器运行且最近一天有检查记录" if ok else "救援定时器未运行或记录已过期"}
 
 
 def _install(config, config_path, runner, manifest):
@@ -436,6 +420,67 @@ def _diagnose(runner, config, result, output):
     print("诊断包已保存，凭据已打码；分享前请再次检查其中的网络和设备信息。")
 
 
+def _write_secret(runner, name, value):
+    path = service.SECRETS + "/" + name
+    temporary = path + ".tmp"
+    try:
+        runner.write_file(temporary, value + "\n", 0o600)
+        runner.replace(temporary, path)
+    finally:
+        if runner.exists(temporary):
+            runner.write_file(temporary, "", 0o600)
+            runner.remove(temporary)
+
+
+def _restart_console(runner):
+    with contextlib.suppress(RunnerError):
+        runner.run(["systemctl", "try-restart", "exitnode-console.service"], check=False)
+
+
+def _console(args, config, runner):
+    from .console import auth
+    from .console import server as console_server
+    from .console import snapshot as console_snapshot
+
+    action = args.console_action
+    if action == "serve":
+        if not config.console.enabled:
+            print("管理网页未启用(配置 console.enabled 为 false)", file=sys.stderr)
+            return 2
+        from .log import configure
+
+        configure(runner, level=config.node.log_level)
+        try:
+            console_server.serve(config)
+            return 0
+        except OSError:
+            print("管理网页启动失败,请检查监听配置。", file=sys.stderr)
+            return 1
+    if action == "snapshot":
+        try:
+            console_snapshot.write(config, runner, console_snapshot.collect(config, runner))
+        except (OSError, RunnerError, ValueError):
+            print("检查记录写入失败", file=sys.stderr)
+            return 1
+        return 0
+    if action == "password":
+        password = auth.generate_password()
+        _write_secret(runner, "console-password", auth.hash_password(password))
+        _restart_console(runner)
+        print("管理网页新密码:" + password)
+        print("只显示这一次;旧密码已失效,已登录的网页要重新登录。")
+        return 0
+    admin_key = sys.stdin.readline().rstrip("\r\n").strip()
+    if (not admin_key or len(admin_key) > 512
+            or any(unicodedata.category(c) == "Cc" for c in admin_key)):
+        print("管理密钥无效:不能为空、不能超过 512 个字符、不能含控制字符", file=sys.stderr)
+        return 1
+    _write_secret(runner, "authserver-admin-key", admin_key)
+    _restart_console(runner)
+    print("鉴权服务管理密钥已保存。")
+    return 0
+
+
 def main(argv=None, runner=None, rescue_runner=None):
     args = parser().parse_args(argv)
     if args.placeholder == "proxy":
@@ -470,6 +515,8 @@ def main(argv=None, runner=None, rescue_runner=None):
             except OSError:
                 print(redact("客户端包托管服务启动失败，请检查监听配置。"), file=sys.stderr)
                 return 1
+        if args.command == "console":
+            return _console(args, config, runner)
         if args.command == "winclient":
             try:
                 if args.winclient_action == "publish":
@@ -487,7 +534,7 @@ def main(argv=None, runner=None, rescue_runner=None):
                 return 1
         if args.command == "rescue":
             if args.rescue_action == "status":
-                print(redact(rescue_state.summary(_rescue_record(runner))))
+                print(redact(rescue_state.summary(report.rescue_record(runner))))
             else:
                 from .updater.layout import running_package
 
@@ -547,26 +594,13 @@ def main(argv=None, runner=None, rescue_runner=None):
                                      + ("已吊销" if row["revoked_at"] else "未吊销")))
             return 0
         if args.command in {"check", "status", "diagnose"}:
-            result = check(runner, config)
             if args.command == "check":
-                result["layers"].insert(-1, watchdog_check(config, runner))
-                result["layers"].insert(-1, _rescue_check(runner))
-                result["layers"].insert(-1, service.harden_check(runner))
-                if config.authsync.enabled:
-                    result["layers"].insert(-1, authsync.check(config, runner))
-                if config.publisher.mode == "upnp":
-                    result["layers"].insert(-1, publisher.check(config, runner))
-                result["layers"].append(admin_server.check(config))
-            if args.command == "status":
-                result["public_ipv4"] = public_ipv4(runner)
-                result["publisher"] = publisher.status(config, runner) if config.publisher.mode == "upnp" else None
-                try:
-                    result["watchdog"] = watchdog_summary(config, runner)
-                except ValueError:
-                    result["watchdog"] = {"state": "manual", "last_ok_at": None,
-                                          "consecutive_failures": 0, "last_action": None,
-                                          "reason": "看门狗记录损坏，请联系维护人员"}
-            status = evaluate(result)
+                result = report.check_result(config, runner)
+                status = evaluate(result)
+            elif args.command == "status":
+                status = report.status_result(config, runner)
+            else:
+                result = check(runner, config)
             if args.command == "check":
                 if args.json:
                     print(json.dumps(result, ensure_ascii=False))

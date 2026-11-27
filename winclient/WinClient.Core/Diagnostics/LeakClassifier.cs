@@ -19,6 +19,7 @@ public sealed record LeakVerdict(int Total, int Tunnel, int Allowed, int Unparse
 
 public static class LeakClassifier
 {
+    private const int DnsPort = 53;
     private static readonly byte[] TunnelV4 = [172, 19, 0, 0];
     private static readonly byte[] TunnelV6 = [0xFD, 0xFE, 0xDC, 0xBA, 0x98, 0x76, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 
@@ -32,7 +33,7 @@ public static class LeakClassifier
             total++;
             if (packet.Source is null || packet.Destination is null) { unparsed++; continue; }
             if (IsTunnel(packet.Source) || IsTunnel(packet.Destination)) { tunnel++; continue; }
-            var remote = FindSuspiciousPeer(packet, context);
+            var remote = FindLanDnsPeer(packet, context) ?? FindSuspiciousPeer(packet, context);
             if (remote is null) { allowed++; continue; }
             var (address, port) = remote.Value;
             var key = (packet.Protocol, address.ToString(), port, owner(packet));
@@ -47,6 +48,18 @@ public static class LeakClassifier
     /// <summary>仅指定程序模式下的退出码口径:0 无可疑(或可疑流都在名单外),1 有可疑,由调用方在无法检测时自行用 2。</summary>
     public static int ExitCode(LeakVerdict verdict, bool appsMode) =>
         verdict.Suspicious.Any(flow => !appsMode || flow.Listed != false) ? 1 : 0;
+
+    // 全部流量模式下,发往非公网、非本机、非节点对端 53 端口的 TCP / UDP 包记为域名查询可疑;只看目的端。
+    private static (IPAddress, int)? FindLanDnsPeer(CapturedPacket packet, LeakContext context)
+    {
+        if (context.AppsMode) return null;
+        var destination = packet.Destination!;
+        if (context.LocalAddresses.Contains(destination)) return null;
+        if (context.NodeAddresses.Contains(destination)) return null;
+        if (PublicAddress.IsPublic(destination)) return null;
+        if (packet.Protocol is not ("TCP" or "UDP")) return null;
+        return packet.DestinationPort == DnsPort ? (destination, DnsPort) : null;
+    }
 
     // 对端 = 两端里不属于本机的那个;都属于或都不属于时两端都当候选,但本机地址永不作为候选。
     private static (IPAddress, int)? FindSuspiciousPeer(CapturedPacket packet, LeakContext context)

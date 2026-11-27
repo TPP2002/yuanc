@@ -158,3 +158,17 @@ sni = "example.test"
         datetime.fromisoformat(enrolled["expires_at"]) + timedelta(days=5))
     assert main(args + ["revoke", enrolled["device_id"]]) == 0
     assert json.loads(capsys.readouterr().out)["revoked"] is True
+
+
+def test_admin_lists_invites_newest_first(client, admin, clock):
+    first = client.post("/admin/invites", headers=admin,
+                        json={"days": 1, "max_uses": 1, "note": "第一张"}).json()
+    clock.advance(minutes=1)
+    second = client.post("/admin/invites", headers=admin,
+                         json={"days": 2, "max_uses": 2, "note": "第二张"}).json()
+    rows = client.get("/admin/invites", headers=admin).json()
+    assert [row["code"] for row in rows] == [second["code"], first["code"]]
+    keys = {"code", "days", "max_uses", "used", "note", "created_at"}
+    assert all(set(row) == keys for row in rows)
+    assert all("created_by" not in row for row in rows)
+    assert rows[0]["created_at"] >= rows[1]["created_at"]
