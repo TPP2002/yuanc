@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using System.Diagnostics;
 
 namespace WinClient.Core.Process;
@@ -14,6 +15,15 @@ public interface ISingBoxLauncher
 
 public sealed class SingBoxLauncher : ISingBoxLauncher
 {
+    private const string BindFailedMessage = "连接内核未能绑定到后台服务，后台服务意外退出时它可能残留。";
+    private static readonly object JobGate = new();
+
+    /// <summary>
+    /// 整个进程共用一个作业，第一次 Start 时建；本类不释放它，进程退出时系统关句柄，内核随之结束。
+    /// 建失败时保持 null，下次 Start 再试。
+    /// </summary>
+    internal static KernelJob? SharedJob { get; private set; }
+
     public ISingBoxProcess Start(ProcessStartInfo startInfo, Action<string> onLog, Action<int> onExit)
     {
         // Enforce the invariant even if this launcher is used without the manager.
@@ -30,6 +40,15 @@ public sealed class SingBoxLauncher : ISingBoxLauncher
         {
             if (!process.Start()) throw new InvalidOperationException("无法启动连接内核。");
             started = true;
+            // 进程起来后、开始读输出前绑定作业；失败只记一行，进程照常返回，由下次启动清理兜底。
+            var job = EnsureSharedJob();
+            var assigned = false;
+            if (job is not null)
+            {
+                try { job.Assign(process); assigned = true; }
+                catch (Win32Exception) { }
+            }
+            if (!assigned) onLog(BindFailedMessage);
             process.BeginOutputReadLine();
             process.BeginErrorReadLine();
             return new Child(process);
@@ -42,15 +61,30 @@ public sealed class SingBoxLauncher : ISingBoxLauncher
         }
     }
 
-    private sealed class Child(System.Diagnostics.Process process) : ISingBoxProcess
+    private static KernelJob? EnsureSharedJob()
     {
+        lock (JobGate)
+        {
+            if (SharedJob is not null) return SharedJob;
+            try { SharedJob = KernelJob.Create(); }
+            catch (Win32Exception) { SharedJob = null; }
+            return SharedJob;
+        }
+    }
+
+    internal sealed class Child : ISingBoxProcess
+    {
+        internal System.Diagnostics.Process Process { get; }
+
+        internal Child(System.Diagnostics.Process process) => Process = process;
+
         public void Stop()
         {
-            if (process.HasExited) return;
-            process.Kill(entireProcessTree: true);
-            if (!process.WaitForExit(5000))
+            if (Process.HasExited) return;
+            Process.Kill(entireProcessTree: true);
+            if (!Process.WaitForExit(5000))
                 throw new TimeoutException("连接内核未能在限定时间内停止，断网保护必须保留。");
         }
-        public void Dispose() => process.Dispose();
+        public void Dispose() => Process.Dispose();
     }
 }
