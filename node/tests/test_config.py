@@ -288,7 +288,7 @@ def test_console_section_defaults_and_validation():
         with pytest.raises(ConfigError, match="console.port.*1024 至 65535"):
             load("/config", FakeRunner(files={"/config": changed}))
 
-    # 开启后与 admin.port 相同算冲突（示例里 admin.port 是 8443）;没开不占端口，照常加载。
+    # 开启后与 admin.port 相同算冲突（示例里 admin.port 是 8443）；没开不占端口，照常加载。
     same = text + "\n[console]\nenabled = true\nport = 8443\n"
     with pytest.raises(ConfigError, match="console.port.*不能与"):
         load("/config", FakeRunner(files={"/config": same}))

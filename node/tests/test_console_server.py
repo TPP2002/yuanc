@@ -28,7 +28,8 @@ DEVICE = {"id": "dev-1", "account_id": "acc-1", "platform": "windows", "name": "
 
 
 def build_config(*, authsync=False, console=False):
-    text = TEXT
+    # 示例配置末尾可能带管理网页段，先切掉，下面按需再拼，免得段落重复。
+    text = TEXT.split("\n[console]\n")[0]
     if authsync:
         text = text.replace('[authsync]\nenabled = false\nurl = ""',
                             '[authsync]\nenabled = true\nurl = "http://127.0.0.1:8000"')
