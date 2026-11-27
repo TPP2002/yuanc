@@ -1,0 +1,176 @@
+{
+  "schemaVersion": 1,
+  "taskId": "WINCLIENT-DIAG-SERVICE-WIRING-1128",
+  "slug": "yc-diag-service-wiring-1128",
+  "title": "后台服务接上 read_diagnostics:导出诊断带上日志末尾、防火墙与过滤层现状、路由与 DNS 现状;防火墙脚本记录进 connect.log;测试包打开内核日志并在导出时遮域名",
+  "workbuddyTier": "hard",
+  "goal": "目标:上一张单(yc-diag-export-always-writes-1127,已合并)做好了诊断采集库和界面导出,界面会先向后台服务发 read_diagnostics;但后台服务还不认这条指令,导出的文件里没有后台这边的日志和系统现状。本单把后台服务端接上,并补齐四处记录来源。不改连接逻辑、断网保护逻辑和界面。\n\n① IClientFacade(winclient/WinClient.Core/Client/IClientFacade.cs)加一个带默认实现的成员,别的成员不动:\nTask<string?> ReadDiagnosticsAsync(CancellationToken token = default) => Task.FromResult<string?>(null);\n\n② ClientRuntime(winclient/WinClient.Core/Client/ClientRuntime.cs):\n- 连接记录 connectLog 提到最前面创建;断网保护执行器改成 new KillSwitchApplier(<run 目录>, wfp: <过滤层引擎>, routes: new RouteGuard(), log: connectLog.Write),让每次防火墙脚本的阶段、退出码、用时写进 connect.log。过滤层引擎(WfpEngine.CreateProduction() 的结果)和 testBuild 各存进一个私有字段。\n- 加 internal static readonly TimeSpan FirewallProbeTimeout = TimeSpan.FromSeconds(10); 和 internal static readonly TimeSpan NetworkProbeTimeout = TimeSpan.FromSeconds(10);\n- 加 internal static DiagnosticsSources DiagnosticsSourcesFor(string runDirectory, Func<ClientSnapshot> snapshot, bool testBuild, IWfpEngine? wfp, ICommandRunner runner, IAdapterProbe adapters, Func<string?> audit, Func<string?> selfCheck):返回的来源里 RunDirectory、Snapshot、TestBuild、Audit、SelfCheck 原样填;Version = ControlSnapshot.CurrentVersion;Desired = () => new DesiredStateStore(runDirectory).Read();WfpFilterNames 在 wfp 为空时留空,否则 = () => wfp.ListFilterNames();Adapters = () => adapters.Snapshot();Firewall = token => FirewallStateProbe.RunAsync(runner, FirewallProbeTimeout, token);Network = token => NetworkStateProbe.RunAsync(runner, NetworkProbeTimeout, token)(见第⑥条)。\n- 实现 public Task<string?> ReadDiagnosticsAsync(CancellationToken token = default):用 DiagnosticsSourcesFor(<run 目录>, () => Controller.Snapshot, testBuild, <过滤层引擎>, new CommandRunner(), new SystemAdapterProbe(), ReadAudit, ReadSelfCheck) 调 DiagnosticsCollector.CollectAsync,把结果返回。\n- 隧道传输改成 new TunnelTransport(…) { KernelLog = testBuild }(见第④条)。\n- ClientRuntime 别的行为(启动恢复、会话来源、测试包的空实现外壳)一律不变。\n\n③ ControlServer(winclient/WinClient.Core/Ipc/ControlServer.cs):\n- TrustedOnlyOps 加 \"read_diagnostics\"(只有安装目录下的界面程序能读),那段注释补一句说明它含本机规则名、网卡和日志。\n- read_diagnostics 不进指令信号量 commands:在 status 那一行之后、commands.WaitAsync 之前处理,这样连接指令卡住时也能导出。另加一个 private readonly SemaphoreSlim diagnostics = new(1, 1); 让多条 read_diagnostics 之间排队。\n- 处理:等 diagnostics;调 facade.ReadDiagnosticsAsync(token);返回空 → new(request.Id, false, \"不支持的指令\");否则组 new ControlResponse(request.Id, true, Diagnostics: 文本),按 read_audit 同样的写法核编码后大小,超过 ControlProtocol.MaxLineBytes → new(request.Id, false, \"诊断内容过大，请联系管理员。\");采集抛 IOException、InvalidDataException、UnauthorizedAccessException、InvalidOperationException、ArgumentException、JsonException、TimeoutException → new(request.Id, false, \"诊断没有取到，请稍后再试。\");取消(OperationCanceledException)照旧往外抛;finally 里放开 diagnostics。\n- 别的指令的处理一行不改。\n\n④ 测试包打开连接内核的日志(winclient/WinClient.Core/Client/TunnelTransport.cs):\n- 加属性 public bool KernelLog { get; init; }。\n- 加重载 public static JsonElement RenderConfiguration(JsonElement configuration, bool kernelLog):在原有四项注入之后,kernelLog 为真时把顶层 log 换成 {\"disabled\": false, \"level\": \"warn\", \"timestamp\": true};为假时不碰 log。原来的单参数 RenderConfiguration(configuration) 改成调 RenderConfiguration(configuration, false),输出与现在逐字节相同。\n- StartAsync 里改成 manager.Start(RenderConfiguration(configuration, KernelLog))。\n- 正式包(KernelLog 为假)交给内核的配置与现在完全一样。\n\n⑤ 采集库补三处(改上一张单的两个文件 DiagnosticsRedactor.cs、DiagnosticsCollector.cs):\n- DiagnosticsRedactor 加 public const string DomainMark = \"[域名]\"; 和 public static string MaskDomains(string? text):空返回空串;用正则 (?i)\\b(?:[a-z0-9-]+\\.)+[a-z]{2,}\\b(逐字字符串,2 秒超时)把命中的换成 DomainMark;超时返回 TimedOutMark。\n- DiagnosticsCollector:名字是 sing-box.log 的那份日志,取到各行之后、写进 logs 段之前,逐行再过一遍 DiagnosticsRedactor.MaskDomains;其余日志不过。\n- DiagnosticsCollector 的恢复记录摘要(Summarize)补一处:顶层名为 profiles 的数组,原有的 profiles_count 保留,另加键 profiles,值是数组。原数组里是对象的元素各出一项,只带 Name、DefaultOutboundAction、Enabled 三个属性(原对象里有哪个带哪个;值是字符串的过 DiagnosticsRedactor.Redact,不是字符串的取它的 JSON 文本),不是对象的元素跳过。别的键照旧(disabledRules、rules 这些数组仍只给个数)。用途:导出里看得到套用断网保护之前保存的三档防火墙默认出站。\n- CollectAsync 里取 killswitch-state.json、firewall-audit.json 的大小与修改时间那两处,各包进 try:抛 IOException 或 UnauthorizedAccessException 时大小记 0、时间留空,errors[\"killswitch_state_file\"](审计文件是 errors[\"firewall_audit_file\"])记异常类型名,采集继续。这一条不要求测试。\n- 别的采集逻辑、键名、次序、大小裁剪不变。\n\n⑥ 路由与 DNS 现状探测(整机断网时要看的证据:默认路由、本产品的回环兜底路由和隧道路由在不在、各网卡连没连上、DNS 指向哪里、连接内核进程在不在):\n- 新建 winclient/WinClient.Core/Diagnostics/NetworkStateProbe.cs,写法照同目录的 FirewallStateProbe.cs:\n  public sealed record NetworkStateResult(string? Json, string? Error);\n  public static class NetworkStateProbe,成员:public static readonly TimeSpan DefaultTimeout = TimeSpan.FromSeconds(20); public const string TimedOut = \"路由与 DNS 现状没有读到：超过时限没有返回。\"; public const string Failed = \"路由与 DNS 现状没有读到：查询命令没有成功。\"; public const string Script(下面九行,逐字照抄,行与行之间用 \\n 连接;脚本只读,不许加任何会改系统的命令);public static Task<NetworkStateResult> RunAsync(ICommandRunner runner, TimeSpan? timeout = null, CancellationToken token = default)。\n  RunAsync 的行为与 FirewallStateProbe.RunAsync 逐条相同:经 KillSwitchApplier.CreateStartInfo(Script) 起隐藏窗口的子进程;本方法自己的计时器到点返回 new(null, TimedOut),外部令牌取消照旧抛出;启动出错(Win32Exception、IOException、InvalidOperationException)、退出码非 0、没有非空输出行、最后一个非空行不是 JSON 对象,都返回 new(null, Failed);成功返回 new(<最后一个非空行>, null)。\n- 脚本九行(行内没有双引号和反斜杠,可直接写成普通字符串):\n$ErrorActionPreference = 'Stop'\n$ProgressPreference = 'SilentlyContinue'\n$lo = [System.Net.NetworkInformation.NetworkInterface]::LoopbackInterfaceIndex\nfunction Read-Routes($store) { try { @(Get-NetRoute -PolicyStore $store -ErrorAction SilentlyContinue | Where-Object { [string]$_.DestinationPrefix -match '/[0-2]$' } | ForEach-Object { [ordered]@{ prefix = [string]$_.DestinationPrefix; next_hop = [string]$_.NextHop; alias = [string]$_.InterfaceAlias; index = [int]$_.InterfaceIndex; metric = [int]$_.RouteMetric; loopback = ([int]$_.InterfaceIndex -eq $lo) } }) } catch { @() } }\n$interfaces = try { @(Get-NetIPInterface -ErrorAction SilentlyContinue | ForEach-Object { [ordered]@{ alias = [string]$_.InterfaceAlias; index = [int]$_.ifIndex; family = [string]$_.AddressFamily; metric = [int]$_.InterfaceMetric; state = [string]$_.ConnectionState; dhcp = [string]$_.Dhcp } }) } catch { @() }\n$dns = try { @(Get-DnsClientServerAddress -ErrorAction SilentlyContinue | Where-Object { @($_.ServerAddresses).Count -gt 0 } | ForEach-Object { [ordered]@{ alias = [string]$_.InterfaceAlias; family = $(if ([int]$_.AddressFamily -eq 23) { 'IPv6' } else { 'IPv4' }); servers = @($_.ServerAddresses | ForEach-Object { [string]$_ }) } }) } catch { @() }\n$kernel = try { @(Get-Process -Name 'sing-box' -ErrorAction SilentlyContinue | ForEach-Object { [ordered]@{ id = [int]$_.Id; started = try { $_.StartTime.ToUniversalTime().ToString('o') } catch { '' }; path = try { [string]$_.Path } catch { '' } } }) } catch { @() }\n$result = [ordered]@{ loopback_index = $lo; routes_active = @(Read-Routes 'ActiveStore'); routes_persistent = @(Read-Routes 'PersistentStore'); interfaces = @($interfaces); dns = @($dns); kernel_processes = @($kernel) }\nConvertTo-Json -InputObject $result -Depth 5 -Compress\n- DiagnosticsSources(在 DiagnosticsCollector.cs 里)加 public Func<CancellationToken, Task<NetworkStateResult>>? Network { get; init; }。\n- DiagnosticsCollector.CollectAsync:取完防火墙现状之后取 Network,写法同 Firewall(取消照旧抛;别的异常记 errors[\"network\"] = 异常类型名,采集继续)。结果的 Json 解析成 JSON 后,把里面所有字符串值过 DiagnosticsRedactor.Redact,只有属性名是 prefix 的值原样保留(这里的路由前缀只有 /0、/1、/2 三种长度,不指向具体主机);解析不了记 errors[\"network\"] = \"不是有效的 JSON\"。\n- service 段在 firewall_error 之后加两个键:network(上面处理后的对象,没有就是 null)、network_error(结果里的 Error,没有就是 null)。network 不参加超限裁剪。\n\n⑦ 文档:\n- 新建 docs/winclient/诊断导出说明.md,写清:怎么导出(更新页「导出诊断…」,默认落桌面,文件名 澳洲出口客户端-诊断-<时间>.json);文件的顶层结构(exported_at、ui、service、service_error、firewall_audit、self_check)和 service 段里每个键装什么(照 DiagnosticsCollector 的实际实现逐键写,含 killswitch.state.summary 里的 profiles、network 段的 routes_active、routes_persistent、interfaces、dns、kernel_processes 各是什么,怎么从中认出默认路由、回环兜底路由(前缀 0.0.0.0/1 与 128.0.0.0/1、走回环接口、跃点 9473)和隧道路由);五份日志各记什么(service.log、connect.log、sing-box.log、update.log、killswitch-recovery.log);脱敏规则([公网地址]、[用户]、[已隐藏]、[域名],内网地址保留,不含出口 IP);大小上限与超限时的裁剪次序;read_diagnostics 只有界面程序能调、不排在连接指令后面;测试包会打开连接内核 warn 级日志而正式包不开;后台服务没连上时文件里只有界面这边的信息;单列「真机待验证（本单未执行）」。\n- docs/winclient/断网保护加固说明.md 改两处,别处不动:(a)讲 killswitch-recovery.log 的那一条,把末尾「界面导出诊断仍只导出原来的防火墙审计文件，不包含这些恢复证据。」换成「脚本超过时限被中止时也会追加一行（阶段后面写 timeout）。每次防火墙脚本的阶段、退出码、用时与错误摘要另写进 `connect.log`；界面导出诊断会带上这几份日志的末尾和 `killswitch-state.json` 的摘要，见[诊断导出说明](诊断导出说明.md)。」;(b)在「## 防火墙配置档被关闭或被策略覆盖」这个标题之前新加一节「## 撤销次序与脚本时限」,照 KillSwitchApplier.cs 与 KillSwitchPlanner.cs 的实际实现写:撤销和两条恢复路径先恢复三档默认出站、再一次查出目标规则批量启用,套用时批量停用;每份防火墙脚本的时限(180 秒)与超时后的提示原文「系统防火墙设置超过时限没有完成，已中止。」;超时在套用、撤销、恢复、巡检四处各怎么收场;写进 connect.log 的记录行格式(防火墙脚本[<阶段>] …、过滤层安装与移除的结果);末尾列真机待验证项(真机上撤销实际用时)。与代码对不上的地方以代码为准。\n- docs/winclient/架构说明.md 改两句:「诊断按钮合并导出防火墙审计与环境自检报告；完整诊断包、日志打包等仍是后续功能。」换成「诊断按钮导出一个 JSON 文件，含后台服务的日志末尾、系统防火墙与过滤层现状、断网保护恢复记录摘要、防火墙审计与环境自检，见[诊断导出说明](诊断导出说明.md)。」;「仍不实施完整诊断包、运行时内核下载、安装向导或 Windows 代码签名。」换成「仍不实施运行时内核下载、安装向导或 Windows 代码签名。」。\n\n⑧ 测试:新建 winclient/WinClient.Tests/DiagnosticsWiringTests.cs,既有测试文件一个都不许改(需要的管道、临时目录、门面替身、命令替身若是别的测试文件里的私有类,就在新文件里另写等价的)。用例名照下面写:\n1. OldFacadeWithoutOverrideReturnsNull:只实现原有成员的门面替身,ReadDiagnosticsAsync 返回空。\n2. ReadDiagnosticsReturnsFacadeJson:门面返回 {\"schema\":1} → 应答 Ok 为真,Diagnostics 等于这段文本。\n3. ReadDiagnosticsIsTrustedOnly:callerTrusted 为假 → Ok 为假,Error 等于 ControlServer.UntrustedCallerError,门面没被调。\n4. ReadDiagnosticsUnsupportedWhenFacadeReturnsNull:门面返回空 → Ok 为假,Error 等于「不支持的指令」。\n5. ReadDiagnosticsOversizeIsRejected:门面返回 2 MiB 的文本 → Ok 为假,Error 等于「诊断内容过大，请联系管理员。」。\n6. ReadDiagnosticsFailureReturnsFixedError:门面抛 IOException → Ok 为假,Error 等于「诊断没有取到，请稍后再试。」。\n7. ReadDiagnosticsDoesNotWaitForRunningCommand:第一条连接上的 connect 卡在门面里不返回;第二条连接上的 read_diagnostics 在 5 秒内拿到 Ok 为真的应答;然后放行 connect。\n8. KernelLogOffKeepsConfigurationUnchanged:同一份配置,RenderConfiguration(x) 与 RenderConfiguration(x, false) 的 GetRawText() 相等,且 log.disabled 仍为真。\n9. KernelLogOnEnablesWarnLevelOnly:RenderConfiguration(x, true) 的 log 是 disabled=false、level=\"warn\"、timestamp=true;把两份结果里的 log 去掉后其余内容相等。\n10. MaskDomainsHidesHostNamesAndKeepsMarks:MaskDomains(\"dial tcp www.example.com:443: i/o timeout\") 等于「dial tcp [域名]:443: i/o timeout」;「[公网地址] 与 192.168.1.52 与 10.0.19045」原样不变;MaskDomains(null) 是空串。\n11. CollectorMasksDomainsOnlyInKernelLog:临时目录里 sing-box.log 和 service.log 各写一行含 www.example.com;采集结果里 sing-box.log 那行是 [域名]、service.log 那行还是 www.example.com。\n12. SourcesCarryVersionTestBuildAndInjectedProbes:DiagnosticsSourcesFor 用临时目录、过滤层替身、命令替身、网卡替身调用:Version 等于 ControlSnapshot.CurrentVersion,TestBuild 为真,Desired 读的是临时目录里的期望状态,WfpFilterNames 与 Adapters 走替身,Firewall 与 Network 都走传入的命令替身(替身两次收到的启动参数都是隐藏窗口),Audit 与 SelfCheck 原样;wfp 传空时 WfpFilterNames 为空。\n13. StateSummaryKeepsProfileDefaults:临时目录写 killswitch-state.json,内容 {\"applied\":true,\"mode\":\"all\",\"profiles\":[{\"Name\":\"Domain\",\"DefaultOutboundAction\":\"Allow\",\"Enabled\":\"True\",\"Extra\":\"x\"},{\"Name\":\"Private\",\"DefaultOutboundAction\":\"Block\",\"Enabled\":\"True\"},\"oops\"],\"rules\":[\"a\",\"b\"]};采集结果 killswitch.state.summary 里 profiles_count 为 3,profiles 有两项,第一项 Name 为 Domain、DefaultOutboundAction 为 Allow、Enabled 为 True 且没有 Extra,第二项 DefaultOutboundAction 为 Block;rules_count 为 2 且没有 rules 键。\n14. NetworkProbeScriptIsReadOnly:NetworkStateProbe.Script 含 Get-NetRoute、Get-NetIPInterface、Get-DnsClientServerAddress;不含 Set-、New-、Remove-、Enable-、Disable-、Stop-、Restart-、Add-、Clear- 任何一个。\n15. NetworkProbeReturnsLastJsonLineOrError:命令替身返回退出码 0、输出两行(第一行杂项,第二行 {\"loopback_index\":1}) → Json 等于第二行、Error 为空,替身收到的启动参数 CreateNoWindow 为真;退出码 1 → Json 为空、Error 等于 NetworkStateProbe.Failed;替身一直不返回、时限 50 毫秒 → Error 等于 NetworkStateProbe.TimedOut;外部令牌已取消 → 抛 OperationCanceledException。\n16. CollectorEmbedsNetworkAndKeepsRoutePrefixes:Network 来源返回 Json {\"routes_active\":[{\"prefix\":\"128.0.0.0/1\",\"next_hop\":\"8.8.8.8\",\"alias\":\"以太网\"}],\"dns\":[{\"servers\":[\"114.114.114.114\",\"192.168.1.1\"]}]} → 采集结果 network.routes_active[0] 的 prefix 为 128.0.0.0/1、next_hop 为 [公网地址],network.dns[0].servers 为 [公网地址] 和 192.168.1.1,network_error 为空;Network 来源返回 Error 为 NetworkStateProbe.Failed → network 为空、network_error 等于那段文字;Network 来源抛 InvalidOperationException → errors.network 为 InvalidOperationException,logs 段照常在。\n\n交活说明逐条对照第①~⑧条写做到了没有,并单列哪些只有真机能验。",
+  "background": "项目:外包「澳洲出口节点 + Windows 一键客户端」。客户端 .NET 9(winclient/WinClient.sln:Core + App + Tests + UiTests)。界面经命名管道向后台服务发指令,ControlServer 把指令转给门面 IClientFacade(生产实现是 ClientRuntime)。2026-11-27 晚国内测试电脑连接失败后导出诊断,既没写出文件、也没有任何后台记录可查;负责人要求修好导出,并「确保日志搜集的信息足够全面细致」。前面几张单已合并:yc-killswitch-restore-fast-1127(防火墙脚本批量化、加时限、KillSwitchApplier 构造函数多了记录口 log 但还没人接)、yc-diag-export-always-writes-1127(诊断采集库 WinClient.Core/Diagnostics/ 与界面导出,ControlResponse 多了 Diagnostics 字段)、yc-connect-journal-steps-1128(连接过程逐步写进 connect.log)。另有别的对话的 yc-kernel-orphan-1128 也已合并:它在 ClientRuntime.CreateAsync 开头加了清残留内核那一段(log 对象提到了最前面),在 TunnelTransport.StartAsync 里加了 manager.StopAndSweep() 与旧网卡等待;这些改动一处不许动,本单只在它们旁边加自己的东西。本单把后台服务端接上。\n\n先读(都读全文):winclient/WinClient.Core/Client/ClientRuntime.cs、IClientFacade.cs、TunnelTransport.cs、DesiredStateStore.cs;winclient/WinClient.Core/Ipc/ControlServer.cs、ControlProtocol.cs;winclient/WinClient.Core/Diagnostics/ 下四个文件(DiagnosticsCollector.cs、DiagnosticsRedactor.cs、LogTail.cs、FirewallStateProbe.cs);winclient/WinClient.Core/Firewall/KillSwitchApplier.cs(构造函数的 log、ScriptTimeout、ScriptTimedOut、记录行的写法、撤销与恢复的次序)、KillSwitchPlanner.cs 里撤销与恢复脚本的生成、CommandRunner.cs、WfpEngine.cs 的 IWfpEngine、RouteGuard.cs(回环兜底路由的前缀与跃点);winclient/WinClient.Core/Environment/AdapterProbe.cs;winclient/WinClient.Core/Pairing/LocalConfigRenderer.cs(log 段现在写死 disabled=true,本单不改它);winclient/WinClient.Tests/IpcTests.cs(管道测试的写法)、DiagnosticsCollectorTests.cs、DisabledGuardTests.cs;winclient/WinClient.App/Presentation/DiagnosticsExport.cs(界面怎么用 read_diagnostics,只读不改);docs/winclient/ 下的 断网保护加固说明.md、架构说明.md、环境一致性说明.md、连接记录说明.md;检查脚本 docs/plans/checks/yc_diag_service_wiring_1128.py(它就是 SHAPE、TESTS-NEW、DOCS、SCOPE 四项验收,照它的字样写)。\n\n注意名字:Core 里有命名空间 WinClient.Core.Process 和 WinClient.Core.Diagnostics,进程与计时类一律写全名(System.Diagnostics.Process、System.Diagnostics.Stopwatch),不要在这些文件里加 using System.Diagnostics。\n\n硬规矩:①只改允许清单里的文件;②既有测试文件一个都不许改,既有用例不删不改,只加新文件;既有用例若因为本单变红,停下交 blocked 并在 forks 里写出用例名和断言;③不许 git 写操作,不许自己跑 dotnet(build / test / restore 一律按验收编号申请),命令单独一条执行(不用 cd &&、管道、2>&1);④每次 Edit / Write 的新内容控制在 150 行以内;⑤goal 里的成员名、提示语、JSON 键名、正则照原文一字不差(含全角标点),新增注释用中文;⑥本单新增的子进程只有两个:防火墙现状探测(FirewallStateProbe)和路由与 DNS 现状探测(NetworkStateProbe),都经 KillSwitchApplier.CreateStartInfo 走隐藏窗口,两份脚本都只读,不许另起别的进程;⑦测试不许起真进程、不许读写真的数据目录、不许查或改真防火墙与过滤层(不许调 ClientRuntime.CreateAsync、WfpEngine.CreateProduction、new CommandRunner、new KillSwitchApplier),文件只写在测试自己建的临时目录里并在结束时清掉;⑧不许读写 secrets/,工位里不许装依赖(缺依赖停下交 blocked);⑨不改界面工程、截图基线、连接与断网保护逻辑;⑩拿不准停下交 blocked 并写 forks,不猜。\n\n项目红线:只管本项目自己建的服务、路由、防火墙规则(本单对系统只读);凭据不落库不落日志(诊断里不写出口地址、节点公网地址、令牌、配对内容、用户目录名);隧道断了不许悄悄退回直连(本单不碰连接逻辑);安装更新幂等可回退;真机没测的不标通过;Windows 子进程一律隐藏窗口。",
+  "nonGoals": [
+    "不改界面工程(WinClient.App)、截图基线、更新页文字",
+    "不改连接逻辑、断网保护逻辑、状态机、ClientController",
+    "不改 LocalConfigRenderer;正式包交给内核的配置不许有任何变化",
+    "不改既有测试文件",
+    "不做真机实测,不打包"
+  ],
+  "allowedPaths": [
+    "winclient/WinClient.Core/Client/IClientFacade.cs",
+    "winclient/WinClient.Core/Client/ClientRuntime.cs",
+    "winclient/WinClient.Core/Client/TunnelTransport.cs",
+    "winclient/WinClient.Core/Ipc/ControlServer.cs",
+    "winclient/WinClient.Core/Diagnostics/DiagnosticsRedactor.cs",
+    "winclient/WinClient.Core/Diagnostics/DiagnosticsCollector.cs",
+    "winclient/WinClient.Core/Diagnostics/NetworkStateProbe.cs",
+    "winclient/WinClient.Tests/DiagnosticsWiringTests.cs",
+    "docs/winclient/诊断导出说明.md",
+    "docs/winclient/断网保护加固说明.md",
+    "docs/winclient/架构说明.md"
+  ],
+  "forbiddenPaths": [
+    ".codex/**",
+    ".github/**",
+    ".gitignore",
+    "pyproject.toml",
+    "authserver/**",
+    "node/**",
+    "scripts/**",
+    "docs/plans/**",
+    "docs/design/**",
+    "docs/node/**",
+    "winclient/*.sln",
+    "winclient/Directory.Build.props",
+    "winclient/third_party/**",
+    "winclient/WinClient.App/**",
+    "winclient/WinClient.UiTests/**",
+    "winclient/WinClient.Core/Firewall/**",
+    "winclient/WinClient.Core/Network/**",
+    "winclient/WinClient.Core/State/**",
+    "winclient/WinClient.Core/Update/**",
+    "winclient/WinClient.Core/Logging/**",
+    "winclient/WinClient.Core/Process/**",
+    "winclient/WinClient.Core/Pairing/**",
+    "winclient/WinClient.Core/Environment/**",
+    "winclient/WinClient.Core/WinClient.Core.csproj",
+    "winclient/WinClient.Core/Client/ClientController.cs",
+    "winclient/WinClient.Core/Client/ConnectJournal.cs",
+    "winclient/WinClient.Core/Client/BuildInfo.cs",
+    "winclient/WinClient.Core/Client/DesiredStateStore.cs",
+    "winclient/WinClient.Core/Ipc/ControlProtocol.cs",
+    "winclient/WinClient.Core/Ipc/ControlClient.cs",
+    "winclient/WinClient.Core/Diagnostics/LogTail.cs",
+    "winclient/WinClient.Core/Diagnostics/FirewallStateProbe.cs",
+    "winclient/WinClient.Tests/WinClient.Tests.csproj",
+    "winclient/WinClient.Tests/IpcTests.cs",
+    "winclient/WinClient.Tests/ControllerTests.cs",
+    "winclient/WinClient.Tests/DiagnosticsCollectorTests.cs",
+    "winclient/WinClient.Tests/DiagnosticsRedactorTests.cs",
+    "winclient/WinClient.Tests/ConnectJournalFlowTests.cs",
+    "winclient/WinClient.Tests/ConnectAbandonTests.cs",
+    "winclient/WinClient.Tests/KernelLifetimeTests.cs",
+    "winclient/WinClient.Tests/ProcessStorageTests.cs",
+    "docs/winclient/服务化与自启说明.md",
+    "docs/winclient/环境一致性说明.md",
+    "docs/winclient/界面说明.md",
+    "docs/winclient/连接记录说明.md",
+    "docs/winclient/打包与发布说明.md",
+    "docs/口径速查表.md"
+  ],
+  "expectArtifacts": [
+    "winclient/WinClient.Core/Diagnostics/NetworkStateProbe.cs",
+    "winclient/WinClient.Tests/DiagnosticsWiringTests.cs",
+    "docs/winclient/诊断导出说明.md"
+  ],
+  "acceptance": [
+    {
+      "id": "BUILD",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "build",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1200
+    },
+    {
+      "id": "TEST",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "test",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--no-build",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1500
+    },
+    {
+      "id": "SHAPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_diag_service_wiring_1128.py",
+        "shape"
+      ],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "TESTS-NEW",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_diag_service_wiring_1128.py",
+        "tests"
+      ],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_diag_service_wiring_1128.py",
+        "docs"
+      ],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "SCOPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_diag_service_wiring_1128.py",
+        "scope"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "timeoutSec": 10800,
+  "repoRoot": "E:/yuanc",
+  "steps": [
+    "读 background 列出的文件与检查脚本。",
+    "先写测试:DiagnosticsWiringTests.cs 十六个用例;申请 BUILD 以编译失败证红,之后固定 BUILD→TEST。",
+    "按 goal 第①③条改 IClientFacade.cs 与 ControlServer.cs。",
+    "按 goal 第④⑤条改 TunnelTransport.cs、DiagnosticsRedactor.cs、DiagnosticsCollector.cs。",
+    "按 goal 第⑥条新建 NetworkStateProbe.cs(脚本九行逐字照抄),并接进 DiagnosticsCollector.cs。",
+    "按 goal 第②条改 ClientRuntime.cs。",
+    "按 goal 第⑦条写新文档、改两份旧文档;BUILD、TEST、SHAPE、TESTS-NEW、DOCS、SCOPE 绿后交活。",
+    "交活说明逐条对照 goal 第①~⑧条写做到了没有,并单列哪些只有真机能验。"
+  ]
+}
