@@ -7,7 +7,7 @@ public enum Tone { N, Info, Warn, Ok, Bad }
 public enum Glyph { Ring, Dots, Bars, Check, Spin, Ask, Bang, X, Plug }
 public enum Flow { None, Forward, Reverse, Fast }
 public enum TrayIcon { N, Info, Ok, Warn, Bad }
-public enum ServiceAvailability { Unavailable, NeedInstall, NeedRepair, Ready }
+public enum ServiceAvailability { Unavailable, NeedInstall, NeedRepair, Ready, NeedUpgrade }
 public enum PageKind { Connect, Routing, Environment, Account, Update }
 public sealed record TileSpec(Tone Tone, Glyph Glyph, Flow Flow, bool Filled = false, bool Dim = false);
 public sealed record StatusRow(string Label, TileSpec Tile, string Text, Tone TextTone, string Right = "");
@@ -36,6 +36,10 @@ public static class StatusPresentation
             case ServiceAvailability.NeedRepair:
                 tile = new(Tone.Warn, Glyph.Bang, Flow.None); title = "后台服务未运行";
                 subtitle = "点「修复后台服务」把它启动起来(需管理员确认一次)"; primary = "修复后台服务"; tray = TrayIcon.Warn;
+                break;
+            case ServiceAvailability.NeedUpgrade:
+                tile = new(Tone.N, Glyph.Plug, Flow.None); title = "可安装新版本";
+                subtitle = "这个文件比电脑上装的版本新"; primary = "安装这个版本";
                 break;
             case ServiceAvailability.Unavailable:
                 tile = new(Tone.Bad, Glyph.X, Flow.None); title = snapshot.Status;
