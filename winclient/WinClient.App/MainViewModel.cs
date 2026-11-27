@@ -76,6 +76,10 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         ? $" 后台已更新到 {serviceVersion}，下次打开界面将使用新版" : "");
 
     public string UpdateMessage => updateMessage;
+    public string DiagnosticsMessage { get; private set; } = "";
+    internal Func<string, bool> RevealFile { get; set; } = DiagnosticsExport.RevealInExplorer;
+    internal Func<string, string, CancellationToken, Task>? WriteDiagnosticsFile { get; set; }
+    public string SuggestedDiagnosticsFileName => DiagnosticsExport.DefaultFileName(NowProvider().ToLocalTime());
 
     public bool IsBusy { get; private set; }
     public bool CanUseConnection => (client is not null || previewConnection) && availability == ServiceAvailability.Ready && !IsBusy;
@@ -479,29 +483,16 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         }
         CommandManager.InvalidateRequerySuggested();
     }
-    public Task ExportAuditAsync(string path) => RunAsync(async () =>
+    public Task ExportDiagnosticsAsync(string path) => RunAsync(async () =>
     {
-        var response = await (client ?? throw new IOException()).SendAsync("read_audit", cancellationToken: lifetime.Token);
-        if (!response.Ok)
-        {
-            Update(snapshot with { Message = response.Error ?? "诊断读取失败，请联系管理员。" }); return;
-        }
-        var selfCheck = await client.SendAsync("read_selfcheck", cancellationToken: lifetime.Token);
-        if (!selfCheck.Ok)
-        {
-            Update(snapshot with { Message = selfCheck.Error ?? "诊断读取失败，请联系管理员。" }); return;
-        }
-        if (response.Audit is null && selfCheck.SelfCheck is null)
-        {
-            Update(snapshot with { Message = "尚无可导出的诊断记录,请完成一次连接后重试。" }); return;
-        }
-        // 验证两段都是 JSON，再原样嵌入，避免把对象变成转义字符串。
-        using var auditJson = response.Audit is null ? null : JsonDocument.Parse(response.Audit);
-        using var selfCheckJson = selfCheck.SelfCheck is null ? null : JsonDocument.Parse(selfCheck.SelfCheck);
-        var diagnostics = "{\"firewall_audit\":" + (auditJson?.RootElement.GetRawText() ?? "null")
-            + ",\"self_check\":" + (selfCheckJson?.RootElement.GetRawText() ?? "null") + "}";
-        await File.WriteAllTextAsync(path, diagnostics, lifetime.Token);
-        Update(snapshot with { Message = "已导出诊断(防火墙审计 + 环境自检)。" });
+        var source = client;
+        var ui = new UiDiagnostics(CurrentVersion, serviceVersion, availability.ToString(), snapshot, updateStatus.Stage, updateMessage);
+        var result = await DiagnosticsExport.RunAsync(
+            source is null ? null : (op, token) => source!.SendAsync(op, cancellationToken: token),
+            ui, NowProvider(), path, lifetime.Token, WriteDiagnosticsFile);
+        DiagnosticsMessage = result.Message;
+        Notify(nameof(DiagnosticsMessage));
+        if (result.Written) RevealFile(path);
     });
     private void Notify([CallerMemberName] string? property = null) => PropertyChanged?.Invoke(this, new(property));
     private void DropClient()

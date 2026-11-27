@@ -11,7 +11,7 @@ namespace WinClient.Core.Ipc;
 
 public sealed record ControlRequest(long Id, string Op, string? Code = null, string? PairingJson = null, bool? Enabled = null,
     string? Mode = null, string[]? Apps = null);
-public sealed record ControlResponse(long? Id, bool Ok, string? Error = null, ControlSnapshot? Snapshot = null, string? Audit = null, string? SelfCheck = null);
+public sealed record ControlResponse(long? Id, bool Ok, string? Error = null, ControlSnapshot? Snapshot = null, string? Audit = null, string? SelfCheck = null, string? Diagnostics = null);
 public sealed record SnapshotEvent(string Event, ControlSnapshot Snapshot);
 public sealed record ControlSnapshot(ConnectionState State, string Status, string Message, bool ProtectionActive)
 {

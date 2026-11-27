@@ -55,8 +55,14 @@ public partial class MainWindow : Window
     }
     private async void Export_Click(object sender, RoutedEventArgs e)
     {
-        var dialog = new SaveFileDialog { Title = "导出诊断", Filter = "诊断文件 (*.json)|*.json", FileName = "诊断报告.json" };
-        if (!model.IsBusy && dialog.ShowDialog(this) == true) await model.ExportAuditAsync(dialog.FileName);
+        var dialog = new SaveFileDialog
+        {
+            Title = "导出诊断",
+            Filter = "诊断文件 (*.json)|*.json",
+            FileName = model.SuggestedDiagnosticsFileName,
+            InitialDirectory = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory)
+        };
+        if (!model.IsBusy && dialog.ShowDialog(this) == true) await model.ExportDiagnosticsAsync(dialog.FileName);
     }
     protected override void OnClosing(CancelEventArgs e)
     {
