@@ -10,6 +10,7 @@ public sealed class DisabledKillSwitch(IKillSwitch inner) : IKillSwitch
 {
     public bool HasPendingState => inner.HasPendingState;
     public string? PendingMode => inner.PendingMode;
+    public string? LastRemoveWarning { get; private set; }
 
     public Task ApplyAsync(IReadOnlyList<IPAddress> ips, string program, int hy2Port, AuthEndpoint? auth = null) => Task.CompletedTask;
     public Task ApplyAsync(IReadOnlyList<IPAddress> ips, string program, int hy2Port, int realityPort, AuthEndpoint? auth = null) => Task.CompletedTask;
@@ -22,6 +23,12 @@ public sealed class DisabledKillSwitch(IKillSwitch inner) : IKillSwitch
     public Task<PatrolReport> PatrolAsync(IReadOnlyList<string> expectedRules, bool enforceDefaultBlock, CancellationToken token) => Task.FromResult(PatrolReport.Empty);
 
     /// <summary>没有恢复记录时不动系统防火墙;有记录(上一版留下的)才撤销。</summary>
-    public Task RemoveAsync() => inner.HasPendingState ? inner.RemoveAsync() : Task.CompletedTask;
+    public async Task RemoveAsync()
+    {
+        LastRemoveWarning = null;
+        if (!inner.HasPendingState) return;
+        await inner.RemoveAsync();
+        LastRemoveWarning = inner.LastRemoveWarning;
+    }
     public Task<string?> RecoverAsync() => inner.RecoverAsync();
 }

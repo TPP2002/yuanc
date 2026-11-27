@@ -20,6 +20,7 @@ public interface IKillSwitch
     string? PendingMode => null;
     Task<PatrolReport> PatrolAsync(IReadOnlyList<string> expectedRules) => Task.FromResult(PatrolReport.Empty);
     bool HasPendingState { get; }
+    string? LastRemoveWarning => null;
     Task ApplyAsync(IReadOnlyList<IPAddress> ips, string program, int hy2Port, AuthEndpoint? auth = null);
     Task UpdateNodeAsync(IReadOnlyList<IPAddress> ips, string program, int hy2Port);
     Task RemoveAsync();
@@ -44,6 +45,7 @@ public sealed class KillSwitchApplier : IKillSwitch
     public const string RouteRemoveFailed = "兜底路由未能撤销,网络可能仍不通;请重试断开或联系管理员。";
     public const string RoutePatrolFailed = "兜底路由缺失且未能重建,隧道中断时虚拟机与 WSL 的流量可能直连,请联系管理员";
     public const string ScriptTimedOut = "系统防火墙设置超过时限没有完成，已中止。";
+    public const string NoRecordRemoveWarning = "断网保护的恢复记录不见了，系统防火墙的默认出站已按 Windows 默认改回「允许」；原来设成「阻止」的，请到 Windows 安全中心改回。";
     internal TimeSpan ScriptTimeout { get; init; } = TimeSpan.FromSeconds(180);
     private readonly ICommandRunner runner;
     private readonly Action<string>? log;
@@ -72,6 +74,7 @@ public sealed class KillSwitchApplier : IKillSwitch
     }
     public string AuditPath { get; }
     public string? LastRecoveryWarning { get; private set; }
+    public string? LastRemoveWarning { get; private set; }
     public KillSwitchApplier(string runDirectory, ICommandRunner? runner = null, IWfpEngine? wfp = null, IRouteGuard? routes = null, Action<string>? log = null)
     {
         this.runner = runner ?? new CommandRunner();
@@ -332,17 +335,19 @@ public sealed class KillSwitchApplier : IKillSwitch
         catch (WfpException) { WriteLog("过滤层安装：失败"); return false; }
     }
 
-    private async Task ExecuteAsync(IReadOnlyList<FirewallAction> actions,
+    private async Task<string> ExecuteAsync(IReadOnlyList<FirewallAction> actions,
         Func<IReadOnlyList<WfpFilterSpec>>? createPolicy = null, bool rememberAuth = false, AuthEndpoint? auth = null,
         bool remove = false, bool installRoutes = false, string phase = "")
     {
         await gate.WaitAsync().ConfigureAwait(false);
         try
         {
+            if (remove) LastRemoveWarning = null;
             var installed = createPolicy is null || InstallWfp(createPolicy, rememberAuth, auth);
             var removed = true;
             var routesRemoved = true;
-            try { await RunActionsAsync(actions, phase).ConfigureAwait(false); }
+            var output = "";
+            try { output = await RunActionsAsync(actions, phase).ConfigureAwait(false); }
             finally
             {
                 if (remove)
@@ -350,6 +355,12 @@ public sealed class KillSwitchApplier : IKillSwitch
                     try { removed = RemoveWfp(); }
                     finally { routesRemoved = await RemoveRoutesAsync().ConfigureAwait(false); }
                 }
+            }
+            // 撤销脚本里那一行证据说明本产品确实改过默认出站;只有这种情形才提示改回了 Windows 默认。
+            if (remove && output.Split('\n').Any(line => line.Trim() == "YUANC-NO-RECORD=windows_default"))
+            {
+                LastRemoveWarning = NoRecordRemoveWarning;
+                await AppendRecoveryLineAsync($"{DateTime.UtcNow:O} remove no_record windows_default").ConfigureAwait(false);
             }
             if (!removed) throw new InvalidOperationException(WfpRemoveFailed);
             if (!routesRemoved) throw new InvalidOperationException(RouteRemoveFailed);
@@ -363,6 +374,7 @@ public sealed class KillSwitchApplier : IKillSwitch
                     catch (RouteGuardException) { throw new RouteGuardUnavailableException(RouteConnectRefused); }
                 }
             }
+            return output;
         }
         finally { gate.Release(); }
     }
@@ -379,7 +391,7 @@ public sealed class KillSwitchApplier : IKillSwitch
         catch (Exception) { return false; }
     }
 
-    private async Task RunActionsAsync(IReadOnlyList<FirewallAction> actions, string phase)
+    private async Task<string> RunActionsAsync(IReadOnlyList<FirewallAction> actions, string phase)
     {
             var started = Stopwatch.GetTimestamp();
             using var timeout = new CancellationTokenSource();
@@ -401,5 +413,6 @@ public sealed class KillSwitchApplier : IKillSwitch
             if (result.ExitCode == VerifyFailedExitCode)
                 throw new FirewallIneffectiveException("系统防火墙已被关闭或被策略覆盖，断网保护无法生效，已拒绝连接。请点击断开，在 Windows 安全中心开启防火墙（或联系管理员解除策略）后重新连接。");
             if (result.ExitCode != 0) throw new InvalidOperationException("防火墙操作失败，恢复记录已保留，请联系管理员。");
+            return result.Output;
     }
 }

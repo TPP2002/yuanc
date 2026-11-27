@@ -139,6 +139,9 @@ public static class KillSwitchPlanner
             script.AppendLine("if (Test-Path -LiteralPath $statePath) { $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json } else { $state = $null }");
         if (hasAllowRules)
             script.AppendLine("if ($null -ne $state -and $null -eq $state.PSObject.Properties['rules']) { $state | Add-Member -NotePropertyName rules -NotePropertyValue @() }");
+        // 撤销前先查证据:本项目全局模式规则仍在,才说明默认出站是本产品改过的。
+        if (actions.OfType<RestoreProfileDefault>().Any())
+            script.AppendLine("$hadGlobalRules = @(Get-NetFirewallRule -Name 'YuanC-KS-*' -ErrorAction SilentlyContinue | Where-Object { $_.Name -notlike 'YuanC-KS-App-*' }).Count -gt 0");
         foreach (var action in actions)
         {
             switch (action)
@@ -296,7 +299,12 @@ public static class KillSwitchPlanner
                     script.AppendLine("  }");
                     script.AppendLine("  if ($restoreFailed.Count -gt 0) { throw '部分防火墙规则恢复失败，恢复记录已保留，请联系管理员。' }");
                     script.AppendLine("  Remove-Item -LiteralPath $statePath");
-                    script.AppendLine("} else { Set-NetFirewallProfile -Profile Domain,Private,Public -DefaultOutboundAction Allow }");
+                    script.AppendLine("} else {");
+                    script.AppendLine("  if ($hadGlobalRules) {");
+                    script.AppendLine("    $blocked = @(Get-NetFirewallProfile | Where-Object { [string]$_.DefaultOutboundAction -eq 'Block' } | ForEach-Object { [string]$_.Name })");
+                    script.AppendLine("    if ($blocked.Count -gt 0) { Set-NetFirewallProfile -Profile $blocked -DefaultOutboundAction Allow; Write-Output 'YUANC-NO-RECORD=windows_default' } else { Write-Output 'YUANC-NO-RECORD=untouched' }");
+                    script.AppendLine("  } else { Write-Output 'YUANC-NO-RECORD=untouched' }");
+                    script.AppendLine("}");
                     break;
                 case RecoverFallback:
                     script.AppendLine("$archived = $null; $state = $null");

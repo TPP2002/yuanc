@@ -573,7 +573,8 @@ public sealed class ControllerTests
         Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
         Assert.True(controller.Snapshot.ProtectionActive);
         Assert.DoesNotContain("stop", order); Assert.DoesNotContain("remove", order);
-        if (address is null or "192.0.2.5") Assert.Equal("虚拟网卡已就绪。", controller.Snapshot.Message);
+        if (address is "192.0.2.5") Assert.Equal("虚拟网卡已就绪。", controller.Snapshot.Message);
+        if (address is null) Assert.Equal(ClientController.AuthUnverifiableHint, controller.Snapshot.Message);
         if (address is not null)
         {
             await FireAndPublish(controller, timers, "出口核验", TimeSpan.FromMinutes(5));
@@ -919,7 +920,7 @@ public sealed class ControllerTests
     }
 
     [Fact]
-    public async Task FiveNullProbesRetryEveryFiveSecondsThenRecheckAfterFiveMinutes()
+    public async Task FiveNullProbesRetryEveryFiveSecondsThenRecheckAfterOneMinute()
     {
         var probe = new ScriptedProbe(null, null, null, null, null, IPAddress.Parse(TestData.Node().Host));
         var (controller, timers, _, order) = await ConnectMonitored(probe);
@@ -935,7 +936,7 @@ public sealed class ControllerTests
             Assert.Equal("无法核验", controller.Snapshot.ExitStatus);
             Assert.Equal("", controller.Snapshot.ExitIp);
             Assert.Equal(4, timers.For("出口核验").Count(d => d == TimeSpan.FromSeconds(5)));
-            await FireAndPublish(controller, timers, "出口核验", TimeSpan.FromMinutes(5));
+            await FireAndPublish(controller, timers, "出口核验", TimeSpan.FromMinutes(1));
             Assert.Equal("已核验", controller.Snapshot.ExitStatus);
             Assert.Equal(TestData.Node().Host, controller.Snapshot.ExitIp);
             Assert.Equal(new[] { "apply", "start" }, order);
@@ -1174,7 +1175,7 @@ public sealed class ControllerTests
     [Theory]
     [InlineData(true)]
     [InlineData(false)]
-    public async Task UnverifiableExitShowsHintAfterThreeRoundsWithoutDisconnecting(bool pairing)
+    public async Task UnverifiableExitShowsHintAfterFirstRoundWithoutDisconnecting(bool pairing)
     {
         var order = new List<string>();
         var timers = new Timers();
@@ -1191,13 +1192,8 @@ public sealed class ControllerTests
         await controller.ConnectAsync();
         for (var round = 0; round < 4; round++)
         {
-            await CompleteUnverifiableRound(controller, timers, round == 0);
-            if (round < 2)
-            {
-                Assert.Equal("虚拟网卡已就绪。", controller.Snapshot.Message);
-                Assert.DoesNotContain("无法核验", controller.Snapshot.Message);
-            }
-            else Assert.Equal(pairing ? ClientController.PairingUnverifiableHint : ClientController.AuthUnverifiableHint,
+            await CompleteUnverifiableRound(controller, timers, round == 0 ? TimeSpan.FromSeconds(3) : TimeSpan.FromMinutes(1));
+            Assert.Equal(pairing ? ClientController.PairingUnverifiableHint : ClientController.AuthUnverifiableHint,
                 controller.Snapshot.Message);
             Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
             Assert.True(controller.Snapshot.ProtectionActive);
@@ -1205,39 +1201,132 @@ public sealed class ControllerTests
             Assert.DoesNotContain("stop", order);
             Assert.DoesNotContain("remove", order);
         }
-        await FireAndPublish(controller, timers, "出口核验", TimeSpan.FromMinutes(5));
+        await FireAndPublish(controller, timers, "出口核验", TimeSpan.FromMinutes(1));
         Assert.Equal("已核验", controller.Snapshot.ExitStatus);
         Assert.Equal("虚拟网卡已就绪。", controller.Snapshot.Message);
     }
 
     [Fact]
-    public async Task UnverifiableCounterResetsWhenExitRecovers()
+    public async Task UnverifiableExitRechecksEveryMinuteUntilVerified()
     {
         var probe = new ScriptedProbe(Enumerable.Repeat<IPAddress?>(null, 10)
-            .Append(IPAddress.Parse(TestData.Node().Host)).Concat(Enumerable.Repeat<IPAddress?>(null, 15)).ToArray());
+            .Append(IPAddress.Parse(TestData.Node().Host)).ToArray());
         var (controller, timers, _, _) = await ConnectMonitored(probe);
         using (controller)
         {
-            await CompleteUnverifiableRound(controller, timers, true);
-            await CompleteUnverifiableRound(controller, timers, false);
-            Assert.Equal("虚拟网卡已就绪。", controller.Snapshot.Message);
-            await FireAndPublish(controller, timers, "出口核验", TimeSpan.FromMinutes(5));
+            await CompleteUnverifiableRound(controller, timers, TimeSpan.FromSeconds(3));
+            Assert.Equal(TimeSpan.FromMinutes(1), timers.For("出口核验").Last());
+            await CompleteUnverifiableRound(controller, timers, TimeSpan.FromMinutes(1));
+            Assert.Equal(TimeSpan.FromMinutes(1), timers.For("出口核验").Last());
+            await FireAndPublish(controller, timers, "出口核验", TimeSpan.FromMinutes(1));
             Assert.Equal("已核验", controller.Snapshot.ExitStatus);
-            Assert.Equal("虚拟网卡已就绪。", controller.Snapshot.Message);
-            for (var round = 0; round < 3; round++)
-            {
-                await CompleteUnverifiableRound(controller, timers, false);
-                Assert.Equal(round < 2 ? "虚拟网卡已就绪。" : ClientController.AuthUnverifiableHint, controller.Snapshot.Message);
-            }
+            Assert.Equal(TimeSpan.FromMinutes(5), timers.For("出口核验").Last());
         }
     }
 
-    private static async Task CompleteUnverifiableRound(ClientController controller, Timers timers, bool first)
+    [Fact]
+    public async Task UnverifiableCounterResetsWhenExitRecovers()
     {
-        await FireAndPublish(controller, timers, "出口核验", first ? TimeSpan.FromSeconds(3) : TimeSpan.FromMinutes(5));
+        var probe = new ScriptedProbe(Enumerable.Repeat<IPAddress?>(null, 5)
+            .Append(IPAddress.Parse(TestData.Node().Host)).Concat(Enumerable.Repeat<IPAddress?>(null, 5)).ToArray());
+        var (controller, timers, _, _) = await ConnectMonitored(probe);
+        using (controller)
+        {
+            await CompleteUnverifiableRound(controller, timers, TimeSpan.FromSeconds(3));
+            Assert.Equal(ClientController.AuthUnverifiableHint, controller.Snapshot.Message);
+            await FireAndPublish(controller, timers, "出口核验", TimeSpan.FromMinutes(1));
+            Assert.Equal("已核验", controller.Snapshot.ExitStatus);
+            Assert.Equal("虚拟网卡已就绪。", controller.Snapshot.Message);
+            Assert.Equal(TimeSpan.FromMinutes(5), timers.For("出口核验").Last());
+            await CompleteUnverifiableRound(controller, timers, TimeSpan.FromMinutes(5));
+            Assert.Equal(ClientController.AuthUnverifiableHint, controller.Snapshot.Message);
+        }
+    }
+
+    private static async Task CompleteUnverifiableRound(ClientController controller, Timers timers, TimeSpan firstWait)
+    {
+        await FireAndPublish(controller, timers, "出口核验", firstWait);
         for (var attempt = 1; attempt < 5; attempt++)
             await FireAndPublish(controller, timers, "出口核验", TimeSpan.FromSeconds(5));
         Assert.Equal("无法核验", controller.Snapshot.ExitStatus);
+    }
+
+    private static async Task<(ClientController Controller, Timers Timers, Firewall Firewall)> ConnectWithJournal(
+        Firewall firewall, System.Collections.Concurrent.ConcurrentQueue<string> journal)
+    {
+        var order = new List<string>();
+        var timers = new Timers();
+        var source = new ScriptedSource();
+        source.Enqueue(Ok(TestData.Session()));
+        source.Enqueue(Ok(TestData.Session()));
+        var controller = new ClientController(source, firewall, new Tunnel(order), Path.GetFullPath("fake.exe"),
+            TestData.Device, timers.Delay) { DelayWithPurposeAsync = timers.Delay, Journal = line => journal.Enqueue(line) };
+        controller.Changed += _ => Interlocked.Increment(ref timers.Published);
+        await controller.ConnectAsync();
+        return (controller, timers, firewall);
+    }
+
+    [Fact]
+    public async Task DisconnectWithoutRecordShowsWindowsDefaultWarning()
+    {
+        var order = new List<string>();
+        var firewall = new Firewall(order) { LastRemoveWarning = KillSwitchApplier.NoRecordRemoveWarning };
+        var journal = new System.Collections.Concurrent.ConcurrentQueue<string>();
+        var (controller, _, _) = await ConnectWithJournal(firewall, journal);
+        using (controller)
+        {
+            await controller.DisconnectAsync();
+            Assert.Equal("已断开。" + KillSwitchApplier.NoRecordRemoveWarning, controller.Snapshot.Message);
+            Assert.Contains(journal, line => line.Contains("撤销断网保护：没有恢复记录，默认出站已按 Windows 默认改回允许"));
+        }
+    }
+
+    [Fact]
+    public async Task DisconnectWithRecordKeepsRestoredMessage()
+    {
+        var order = new List<string>();
+        var firewall = new Firewall(order);
+        var journal = new System.Collections.Concurrent.ConcurrentQueue<string>();
+        var (controller, _, _) = await ConnectWithJournal(firewall, journal);
+        using (controller)
+        {
+            await controller.DisconnectAsync();
+            Assert.Equal("已断开，原网络设置已恢复。", controller.Snapshot.Message);
+            Assert.DoesNotContain(journal, line => line.Contains("撤销断网保护：没有恢复记录，默认出站已按 Windows 默认改回允许"));
+        }
+    }
+
+    [Fact]
+    public async Task AbandonWithoutRecordAppendsWindowsDefaultWarning()
+    {
+        var order = new List<string>();
+        var timers = new Timers();
+        var firewall = new Firewall(order) { LastRemoveWarning = KillSwitchApplier.NoRecordRemoveWarning };
+        var probe = new ScriptedProbe(Enumerable.Repeat<IPAddress?>(null, 6).ToArray());
+        using var controller = new ClientController(new PairingSessionSource(PairingTests.ValidPairing()),
+            firewall, new Tunnel(order), Path.GetFullPath("fake.exe"), TestData.Device, timers.Delay, exitProbe: probe)
+            { DelayWithPurposeAsync = timers.Delay, TestBuild = true };
+        controller.Changed += _ => Interlocked.Increment(ref timers.Published);
+        await controller.ConnectAsync();
+        await FireExitChecksUntilAbandon(controller, timers, probe);
+        Assert.StartsWith("测试包：出口核验不了，已自动断开并恢复原来的网络。", controller.Snapshot.Message);
+        Assert.Contains(KillSwitchApplier.NoRecordRemoveWarning, controller.Snapshot.Message);
+    }
+
+    /// <summary>逐轮触发出口核验,直到测试包自动断开;断开时状态先变、消息后写,所以等到放弃消息落定。</summary>
+    private static async Task FireExitChecksUntilAbandon(ClientController controller, Timers timers, ScriptedProbe probe)
+    {
+        while (controller.Snapshot.State != ConnectionState.Disconnected)
+        {
+            var calls = probe.Calls;
+            var before = timers.For("出口核验").Length;
+            timers.Fire("出口核验", _ => true);
+            await Until(() => probe.Calls > calls || controller.Snapshot.State == ConnectionState.Disconnected);
+            if (controller.Snapshot.State == ConnectionState.Disconnected) break;
+            await Until(() => controller.Snapshot.State == ConnectionState.Disconnected || timers.For("出口核验").Length > before);
+        }
+        await Until(() => controller.Snapshot.State == ConnectionState.Disconnected &&
+            controller.Snapshot.Message.StartsWith("测试包：", StringComparison.Ordinal));
     }
 
     [Fact]
@@ -2218,6 +2307,7 @@ public sealed class ControllerTests
             return Task.FromResult((PatrolReport)next);
         }
         public bool HasPendingState { get; set; }
+        public string? LastRemoveWarning { get; set; }
         public AuthEndpoint? AppliedAuth { get; private set; }
         public string? RecoveryWarning { get; init; }
         public bool FailRecovery { get; init; }
