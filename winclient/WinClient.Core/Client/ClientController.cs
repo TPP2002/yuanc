@@ -43,9 +43,10 @@ public sealed class ClientController : IDisposable
     internal static readonly TimeSpan ExitCheckDelay = TimeSpan.FromSeconds(3);
     internal static readonly TimeSpan ExitCheckRetry = TimeSpan.FromSeconds(5);
     internal const int ExitCheckAttempts = 5;
-    internal const int UnverifiableHintRounds = 3;
-    internal static readonly string PairingUnverifiableHint = $"出口已连续 {UnverifiableHintRounds} 轮无法核验,出口地址可能已变;若持续如此,请在小主机上重新导出配对文件再导入。连接与断网保护保持,未自动断开。";
-    internal static readonly string AuthUnverifiableHint = $"出口已连续 {UnverifiableHintRounds} 轮无法核验,请检查网络或联系管理员;连接与断网保护保持,未自动断开。";
+    internal const int UnverifiableHintRounds = 1;
+    internal static readonly TimeSpan UnverifiableRecheckInterval = TimeSpan.FromMinutes(1);
+    internal const string PairingUnverifiableHint = "连不到澳洲出口，现在可能上不了网。可以点「断开」恢复原来的网络；小主机换过地址的话，在小主机上重新导出配对文件再导入。";
+    internal const string AuthUnverifiableHint = "连不到澳洲出口，现在可能上不了网。可以点「断开」恢复原来的网络，或联系管理员。";
     internal static readonly TimeSpan ExitRecheckInterval = TimeSpan.FromMinutes(5);
     internal static readonly TimeSpan TestBuildRecheckInterval = TimeSpan.FromMinutes(1);
     internal const int FirstConnectRetries = 3;
@@ -105,6 +106,7 @@ public sealed class ClientController : IDisposable
     private readonly IConnectionReaper? reaper;
     private string? reapWarning;
     private string? nicRestoreWarning;
+    private string? removeWarning;
     private bool disposed;
     private long generation;
     // 连接记录:记住上次写进记录的状态与巡检文字,只在变化时补一行。
@@ -365,12 +367,16 @@ public sealed class ClientController : IDisposable
             EndFirstAttempt();
             guardStatus = "";
             nicRestoreWarning = null;
+            removeWarning = null;
             // Execution is ordered: a failure to stop the tunnel must not proceed to Remove.
             await ExecuteAsync(machine.Handle(new(ConnectionEventKind.UserDisconnect)));
             session = null;
             var environmentRestored = await RestoreEnvironmentAsync();
-            message = environmentRestored ? "已断开，原网络设置已恢复。"
-                : "已断开,原网络设置已恢复;但时区或浏览器设置未能恢复,请联系管理员。";
+            if (removeWarning is not null)
+                message = "已断开。" + removeWarning + (environmentRestored ? "" : " 时区或浏览器设置未能恢复，请联系管理员。");
+            else
+                message = environmentRestored ? "已断开，原网络设置已恢复。"
+                    : "已断开,原网络设置已恢复;但时区或浏览器设置未能恢复,请联系管理员。";
             if (nicRestoreWarning is not null) message += " " + nicRestoreWarning;
             WriteJournal($"断开完成：环境恢复={(environmentRestored ? "成功" : "失败")}");
         }
@@ -689,7 +695,10 @@ public sealed class ClientController : IDisposable
                             await firewall.UpdateNodeAsync(effect.NewIps!, program, session!.Node.Hy2Port, session.Node.RealityPort);
                         break;
                     case EffectKind.RemoveKillSwitch:
-                        await firewall.RemoveAsync(); protection = false; protectionVerified = false; firewallWarning = null; reapWarning = null;
+                        await firewall.RemoveAsync(); removeWarning = firewall.LastRemoveWarning;
+                        if (removeWarning is not null)
+                            WriteJournal("撤销断网保护：没有恢复记录，默认出站已按 Windows 默认改回允许");
+                        protection = false; protectionVerified = false; firewallWarning = null; reapWarning = null;
                         if (nicGuard is not null) nicRestoreWarning = await nicGuard.RestoreAsync(); // 恢复失败不抛、不阻止状态迁移。
                         break;
                     case EffectKind.StopTunnel: tunnel.Stop(); break;
@@ -752,8 +761,9 @@ public sealed class ClientController : IDisposable
         }
     }
 
-    /// <summary>测试包出口复核间隔为 1 分钟,正式包仍是 5 分钟。</summary>
-    private TimeSpan RecheckInterval => TestBuild ? TestBuildRecheckInterval : ExitRecheckInterval;
+    /// <summary>测试包出口复核间隔为 1 分钟;正式包无法核验期间也是 1 分钟,其余 5 分钟。</summary>
+    private TimeSpan RecheckInterval => TestBuild ? TestBuildRecheckInterval
+        : unverifiableRounds > 0 ? UnverifiableRecheckInterval : ExitRecheckInterval;
 
     /// <summary>在迁移处理完成后统一更新监测；所有回调沿用串行锁、代数与生命周期。</summary>
     private void UpdateMonitoring()
@@ -1164,6 +1174,9 @@ public sealed class ClientController : IDisposable
             WriteJournal("撤销断网保护没成功：" + ConnectJournal.Describe(ex));
             return (UndoState.Failed, null);
         }
+        var removeText = firewall.LastRemoveWarning;
+        if (removeText is not null)
+            WriteJournal("撤销断网保护：没有恢复记录，默认出站已按 Windows 默认改回允许");
         protection = false;
         protectionVerified = false;
         firewallWarning = null;
@@ -1174,7 +1187,8 @@ public sealed class ClientController : IDisposable
             try { warning = await nicGuard.RestoreAsync(); }
             catch (Exception ex) { WriteJournal("恢复网卡没成功：" + ConnectJournal.Describe(ex)); }
         }
-        return (UndoState.Removed, warning);
+        if (removeText is null) return (UndoState.Removed, warning);
+        return (UndoState.Removed, warning is null ? removeText : removeText + " " + warning);
     }
 
     /// <summary>首次尝试期间落到需重新登录或需人工处理且已套上保护:只撤保护、恢复环境,状态与提示不动。</summary>

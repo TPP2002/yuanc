@@ -77,7 +77,7 @@ public sealed class FirewallTests
         Assert.Single(plan.OfType<RestoreProfileDefault>());
         var script = KillSwitchPlanner.ToPowerShellScript(plan, "state.json", "audit.json");
         Assert.Contains("-DefaultOutboundAction $p.DefaultOutboundAction", script);
-        Assert.Contains("-Profile Domain,Private,Public -DefaultOutboundAction Allow", script);
+        Assert.Contains("YUANC-NO-RECORD=windows_default", script);
         Assert.Throws<ArgumentException>(() => KillSwitchPlanner.ToPowerShellScript([new RemoveRulesByPrefix("Other-")], "state.json", "audit.json"));
     }
     [Fact]

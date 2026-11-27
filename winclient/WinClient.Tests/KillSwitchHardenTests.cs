@@ -75,7 +75,7 @@ public sealed class KillSwitchHardenTests
         Before(script, "Set-NetFirewallProfile -Profile $p.Name", "Enable-NetFirewallRule");
         Before(script, "Enable-NetFirewallRule", "Remove-Item -LiteralPath $statePath");
         Before(script, "Set-NetFirewallProfile -Profile $p.Name", "Remove-Item -LiteralPath $statePath");
-        Assert.Contains("-Profile Domain,Private,Public -DefaultOutboundAction Allow", script);
+        Assert.Contains("YUANC-NO-RECORD=windows_default", script);
     }
 
     [Fact]
