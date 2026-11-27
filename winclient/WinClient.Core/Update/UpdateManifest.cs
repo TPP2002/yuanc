@@ -7,7 +7,8 @@ namespace WinClient.Core.Update;
 public sealed record UpdateManifest(string Product, string Version, string File, string Sha256,
     long Size, DateTimeOffset BuiltAt, string MinServiceVersion)
 {
-    public const long MaxPayloadBytes = 200L * 1024 * 1024;
+    // 负责人 2026-11-27 定:安装包大小不设硬上限。这里只留 1 GiB 防呆线,免得坏掉的下载无限写盘。
+    public const long MaxPayloadBytes = 1024L * 1024 * 1024;
     public static UpdateManifest Parse(byte[] bytes)
     {
         try

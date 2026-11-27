@@ -14,6 +14,13 @@ def render_server(ctx: ProxyContext, devices: list[Device]) -> dict:
     rules = [{"action": "resolve"}]
     rules.append({"ip_cidr": ["198.18.255.1/32"], "action": "route", "outbound": "direct",
                   "override_address": ctx.admin_bind, "override_port": ctx.admin_port})
+    # 隧道里只有本机自用设备能打开管理网页；其余设备落回下面的私网拒绝规则。
+    local_devices = sorted(d.device_id for d in active if d.account_id == "local")
+    if ctx.console_port and local_devices:
+        rules.append({"ip_cidr": ["198.18.255.2/32"], "auth_user": local_devices,
+                      "action": "route", "outbound": "direct",
+                      "override_address": "127.0.0.1",
+                      "override_port": ctx.console_port})
     if maintenance:
         rules.append({"auth_user": maintenance, "ip_is_private": True,
                       "port": [22], "outbound": "direct"})

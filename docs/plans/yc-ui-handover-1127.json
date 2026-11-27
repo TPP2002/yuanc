@@ -1,0 +1,132 @@
+{
+  "schemaVersion": 1,
+  "taskId": "WINCLIENT-UI-HANDOVER-1127",
+  "slug": "yc-ui-handover-1127",
+  "title": "界面不在安装目录时换到服务登记的那一份;这个文件比已装的新时先覆盖安装再换",
+  "workbuddyTier": "hard",
+  "goal": "以派单时 origin/main 头为基点。看板卡 WINCLIENT-UI-HANDOVER-1127。\n\n【问题】客户第一次用,双击的是下载来的那个文件(放在桌面或下载目录)。点「安装后台服务」后,程序被复制到 %ProgramFiles%/YuanC/app/<版本>/YuanC-Client.exe 并登记成后台服务,但界面还是下载位置的那个进程。后台服务按「调用者核验」只接受安装目录之下的程序发指令(ControlService.cs 第 140 行、ControlServer.cs 的 TrustedOnlyOps),于是这个界面发的导入配对、连接、断开、环境开关、分应用、检查更新、导出诊断全部被回「只有本产品的界面程序可以执行此操作」;这句话只显示在「连接」页,别的页上点了像没反应。退出界面后再双击下载的文件,同样如此。2026-11-27 国内真机第一次实测撞上。另外,电脑上已装旧包时,再运行新包没有任何办法换成新版。\n\n【修法】后台服务的核验一行不改。界面每次初始化先看自己在不在安装目录:不在,就换到服务登记的那一份(启动它、自己退出);这个文件的版本号比已装的高,就先提示安装,安装时把后台服务切到新版(起不来改回旧版),再换过去。\n\n【做完后】\n\n① 新文件 winclient/WinClient.Core/Hosting/UiHandover.cs,命名空间 `WinClient.Core.Hosting`,纯判定,不起进程、不读注册表:\n- `public enum UiHandoverKind { Stay, Handover, Upgrade, Reinstall }`\n- `public sealed record UiHandoverDecision(UiHandoverKind Kind, string? Target = null, string? InstalledVersion = null);`\n- `public static class UiHandover`,三个公开静态方法:\n  · `public static string? ServiceExecutable(string? imagePath)`:从服务登记的启动命令里取程序完整路径。去首尾空白后必须恰好是「半角双引号 + 路径 + 半角双引号 + 一个空格 + --service」,路径里没有双引号,且路径是完整路径(Path.IsPathFullyQualified);满足就原样返回路径,其余一律 null(null、空白、没引号、别的参数如 --tray、不带参数、多余尾巴、相对路径)。\n  · `public static UiHandoverDecision Decide(string currentExecutable, string currentVersion, string appRoot, string? serviceExecutable, Func<string, bool> exists, Func<string, string, bool> sameContent)`,按次序:\n    1. currentExecutable 已在 appRoot 之下(用同程序集的 `ServerIdentity.IsImageUnderRoot`)→ `Stay`,此时不调用 exists 与 sameContent;\n    2. serviceExecutable 为 null 或空、不在 appRoot 之下、或 `exists(serviceExecutable)` 为 false → `Reinstall`(前两种情形不调用 exists,三种情形都不调用 sameContent);\n    3. 记 target = `Path.GetFullPath(serviceExecutable)`。`sameContent(currentExecutable, serviceExecutable)` 为 true → `Handover`,Target = target;\n    4. 内容不同:已装版本号取 target 所在目录的名字。currentVersion 与已装版本号都能被 `UpdateVersion`(WinClient.Core.Update)解析,且 currentVersion 严格大于已装版本号 → `Upgrade`,Target = target,InstalledVersion = 已装版本号;\n    5. 其余(已装的一样新或更新,或任一版本号解析不了)→ `Handover`,Target = target。\n    `Stay`、`Reinstall` 的 Target 与 InstalledVersion 为 null;`Handover` 的 InstalledVersion 为 null。`UpdateVersion` 构造失败抛 InvalidDataException,在本方法里接住当作解析不了。\n  · `public static bool SameContent(string first, string second)`:两个文件长度相同且 SHA256 相同才为 true;先比长度,长度不同不算哈希;任一文件不存在或读不了(IOException、UnauthorizedAccessException)返回 false。只读方式打开。\n\n② winclient/WinClient.Core/Hosting/ServiceInstaller.cs 只加一个方法,其余不动:`public static bool SwitchesExecutable(string? previous, string destination)`:previous 非空白,且两者 `Path.GetFullPath` 后不分大小写不相等时为 true;previous 为 null、空白或路径不合法(ArgumentException、NotSupportedException、IOException)为 false。\n\n③ winclient/WinClient.App/Hosting/InstallerRunner.cs:\n- 加 `public static string? RegisteredServiceExecutable()`:只读打开 HKLM 下 `SYSTEM\\CurrentControlSet\\Services\\` + `ServiceInstaller.ServiceName`,取 `ImagePath` 字符串交给 `UiHandover.ServiceExecutable`;键不存在、值不是字符串、无权限(SecurityException、UnauthorizedAccessException、IOException)一律返回 null。不起子进程,不写注册表。\n- 加 `public static UiHandoverDecision HandoverDecision()`:版本号的取法与 InstallAsync 相同(程序集 InformationalVersion 经 `ServiceInstaller.ReleaseVersion`;取不到或抛 ArgumentException 时传空串),然后 `UiHandover.Decide(CurrentExecutable, 版本号, UpdatePlanner.DefaultAppRoot, RegisteredServiceExecutable(), File.Exists, UiHandover.SameContent)`。\n- InstallAsync 改成能覆盖安装:\n  · 在改服务配置之前先记下 `var previous = RegisteredServiceExecutable();`\n  · 复制、数据目录、配置服务、说明、失败动作、自启项这些既有步骤与次序不动;\n  · 最后一步原来是 `await StartAsync();`。改为:`ServiceInstaller.SwitchesExecutable(previous, destination)` 为 false 时照旧 `await StartAsync();`;为 true 时(服务原来登记的是另一份程序):先 `await StopServiceAsync();`(它对已停止的服务直接返回),再启动并确认,即 `await StartAsync();` 之后等 3 秒,`ServiceStatus()` 仍是 Running 才算成功。启动抛出、或 3 秒后不是 Running,都算失败:若 previous 指向的文件还存在,就用 `ServiceInstaller.Configure(previous, true)` 把服务改回旧程序、把自启项改回 `ServiceInstaller.RunValue(previous)`、再尝试 `StartAsync()`(这一次失败只吞掉),最后以 SafeError `新版本的后台服务未能启动，已改回原来的版本。` 失败退出;previous 指向的文件已不存在时不改回,直接以原错误失败。\n  · 停服务只停服务,不发断开指令,不碰断网保护(既有口径:服务停止保留保护,新服务启动后按期望状态接回)。\n- `ElevationInfo`、`ElevateAsync`、StartAsync、UninstallAsync、StopServiceAsync 的既有代码不改;提权入口那一行(`Arguments = action, Verb = \"runas\", UseShellExecute = true, CreateNoWindow = true`)原样保留,全文件 `Verb = \"runas\"` 仍只有这一处。新增的每个子进程都走既有的 RunCommandAsync(隐藏窗口)。\n\n④ winclient/WinClient.App/Presentation/StatusPresentation.cs:\n- `ServiceAvailability` 在末尾追加 `NeedUpgrade`,即 `{ Unavailable, NeedInstall, NeedRepair, Ready, NeedUpgrade }`。\n- `Build` 加一支 NeedUpgrade:磁贴 `new(Tone.N, Glyph.Plug, Flow.None)`,标题 `可安装新版本`,副标题 `这个文件比电脑上装的版本新`,主按钮 `安装这个版本`,托盘 `TrayIcon.N`。其余分支的文字与判定不动。\n\n⑤ winclient/WinClient.App/MainViewModel.cs:\n- 四个接缝(测试要换掉它们;默认值就是现在的真实现):\n  · `internal Func<ServiceControllerStatus?> ServiceStatusProvider { get; set; } = InstallerRunner.ServiceStatus;`\n  · `internal Func<CancellationToken, Task<UiHandoverDecision>> DecideHandoverAsync { get; set; } = token => Task.Run(InstallerRunner.HandoverDecision, token);`(算哈希不占界面线程)\n  · `internal Func<string, Task<bool>> ElevateAsync { get; set; } = InstallerRunner.ElevateAsync;`\n  · `public Func<string, bool>? Handover { get; set; }`:入参是要启动的程序完整路径;返回 true 表示那一份已启动、本进程正在退出。\n- InitializeCoreAsync:`DropClient()` 之后用 `ServiceStatusProvider()` 取服务状态。为 null 照旧进「需安装后台服务」并返回(不做判定)。不为 null 时先 `await DecideHandoverAsync(lifetime.Token)`,按结果:\n  · `Stay` → 接着走既有逻辑(未运行进修复、运行则连管道),既有逻辑的代码与文字不改;\n  · `Handover` → 调 `Handover`(为 null 当作失败)。返回 true 直接 return,不连管道;返回 false 进「交接失败」;\n  · `Upgrade` → `availability = ServiceAvailability.NeedUpgrade`,`Update(snapshot with { Status = \"可安装新版本\", Message = $\"已装 {已装版本号}，这个文件是 {CurrentVersion}。点「安装这个版本」换成新版，需管理员确认一次。\" })`,return,不连管道;\n  · `Reinstall` → 与服务状态为 null 完全同样处理(同样的 availability、Status、Message)。\n  · 交接失败:`availability = ServiceAvailability.Unavailable`,`Update(snapshot with { Status = \"无法打开已安装的客户端\", Message = \"请从右下角托盘图标打开客户端，或重启电脑后再试。\" })`,return。\n- MainActionAsync:原来 NeedInstall、NeedRepair 走提权的那一支,把 NeedUpgrade 并进去(NeedUpgrade 用 `--install`),提权调用改走接缝 `ElevateAsync`;失败提示 `操作未完成，请重试或联系管理员。` 与成功后调 InitializeCoreAsync 都不变(InitializeCoreAsync 现在会自己交接,不另写交接)。\n- `ServiceStateText` 的 switch 加 `ServiceAvailability.NeedUpgrade => \"可安装新版本\"`;`ServiceStateTone` 加 `ServiceAvailability.NeedUpgrade => Tone.N`。\n- 界面不在安装目录之下时,任何路径都不把 availability 设成 Ready。本文件不许出现 `Process.Start` 与 `runas`。\n\n⑥ winclient/WinClient.App/App.xaml.cs:OnStartup 里在调 `InitializeWindowAsync()` 之前给 `window.Model.Handover` 赋值(代码里要出现 `Model.Handover`),处理函数按次序:\n  1. 先放掉单实例事件(注销 `notification`、释放 `showWindow`,两个字段置 null),新进程才能成为唯一实例;\n  2. 启动目标程序:`new ProcessStartInfo { FileName = 目标, WorkingDirectory = 目标所在目录, UseShellExecute = false, CreateNoWindow = true }`;本进程 `StartInTray` 为 true 时用 `ArgumentList` 加 `\"--tray\"`,否则不带参数。不提权:本文件里不许出现 `runas`,也不许出现 `Verb` 这个词(注释里也不写);\n  3. 启动成功 → `Shutdown()`,返回 true;\n  4. 启动抛 Win32Exception、InvalidOperationException、IOException 或返回 null → 重新占上 `Local\\YuanC-ShowWindow` 并恢复对它的监听(第二个实例仍能唤起本窗口),返回 false,不退出。\n  OnExit 对这两个字段为 null 的情形不抛(现有写法已是空安全的,保持)。\n\n⑦ 测试(先写,BUILD 以编译失败证红)。既有用例的名字、数据行、断言一个不改。\n新文件 winclient/WinClient.Tests/UiHandoverTests.cs(命名空间 WinClient.Tests;路径一律用 `Path.GetFullPath(\"Program Files/YuanC/app\")` 这种写法造,不写死盘符,参照 IpcTests.cs 第 370~390 行;本文件不许出现 Registry、Process.Start、ServiceController 这三个词):\n- `ServiceExecutableReadsQuotedPathFromServiceCommand`:`ServiceInstaller.ServiceCommand(exe)` 的结果喂回去得到 exe;前后带空白也行。\n- `ServiceExecutableRejectsOtherShapes`:null、空串、空白、没引号的路径加 --service、带引号路径加 --tray、带引号路径不带参数、带引号路径加「--service extra」、带引号的相对路径加 --service,全部 null。\n- `StaysWhenAlreadyUnderAppRoot`:结果 Stay、Target 为 null;exists 与 sameContent 两个委托一被调用就让测试失败。\n- `HandsOverToIdenticalInstalledCopy`:当前程序在根外,服务程序在根下、存在、内容相同 → Handover,Target 等于服务程序完整路径,InstalledVersion 为 null。\n- `OffersUpgradeWhenThisFileIsNewerThanInstalled`:currentVersion `0.1.1`,服务程序在 `根/0.1.0/YuanC-Client.exe`、存在、内容不同 → Upgrade,Target 为该路径,InstalledVersion 为 `0.1.0`;再验一组 `0.2.0-rc1` 对 `0.1.9` 也是 Upgrade。\n- `HandsOverWhenInstalledIsSameOrNewerOrUnparsable`(理论用例):内容不同时,(currentVersion, 已装目录名)取 (`0.1.0`,`0.1.0`)、(`0.1.0`,`0.2.0`)、(`0.1.1-rc1`,`0.1.1`)、(`0.1.1`,`weird`)、(空串,`0.1.0`),全部 Handover、InstalledVersion 为 null。\n- `ReinstallWhenInstalledCopyIsUnusable`:serviceExecutable 为 null、为空串、在根外(如 `Program Files/Evil/YuanC-Client.exe`)、含 `..` 段(根 + `/0.1.0/../../Evil/YuanC-Client.exe`,用系统分隔符拼)、等于根本身、在根下但 exists 返回 false,全部 Reinstall 且 Target 为 null;sameContent 一被调用就让测试失败。\n- `SameContentNeedsEqualLengthAndHash`:临时目录里写文件。内容相同 → true;长度相同内容不同 → false;长度不同 → false;其中一个不存在 → false。用完删临时目录。\n- `SwitchesExecutableOnlyWhenRegisteredPathDiffers`:previous 为 null、空白 → false;同一路径只差大小写 → false;另一个版本目录 → true。\nwinclient/WinClient.UiTests/StatusPresentationTests.cs:\n- 既有理论用例「服务优先于连接状态」加一行,原文:`[InlineData(ServiceAvailability.NeedUpgrade, \"可安装新版本\", \"安装这个版本\", Tone.N, Glyph.Plug, TrayIcon.N)]`,既有三行与断言不动。\n- 新用例 `可安装新版本时主按钮是安装这个版本`:副标题等于 `这个文件比电脑上装的版本新`,BusyLabel 等于 `正在处理`。\nwinclient/WinClient.UiTests/ViewModelTests.cs(沿用文件里 `ui.Invoke` 加中文方法名的写法。接缝都用同步完成的桩:`ServiceStatusProvider` 返回固定值,`DecideHandoverAsync = _ => Task.FromResult(...)`,`ElevateAsync = _ => Task.FromResult(...)`,这样 `InitializeAsync()` 返回的任务当场完成,每个新用例都断言它 `IsCompletedSuccessfully`。新用例不许用 `.Wait(`、`.Result`、`GetAwaiter().GetResult()` 这类阻塞等待(文件里既有的 4 处 `GetAwaiter().GetResult()` 原样保留,不增不减);不许连真管道、不许真提权、不许启动真进程):\n- `首次安装成功后界面交接给已安装的程序`(今天这个毛病的回归用例):服务状态桩先返回 null → 初始化后 `Hero.PrimaryLabel` 为 `安装后台服务`;提权桩记下收到的参数、把服务状态桩切成 Running、把判定桩切成 Handover(target) 并返回 true;`ConnectCommand.Execute(null)` 之后:提权桩收到的是 `--install`,Handover 桩收到 target 恰好一次,`CanUseConnection` 为 false。\n- `界面在安装目录外且已装同一份时直接交接`:服务 Running、判定 Handover(target) → 初始化后 Handover 桩收到 target 恰好一次,提权桩没被调,`CanUseConnection` 为 false,`ImportPairingCommand.CanExecute(null)` 为 false。\n- `交接失败时停在可重试的提示`:Handover 桩返回 false → `Status` 为 `无法打开已安装的客户端`,`Hero.PrimaryLabel` 为 `重新连接后台服务`,`CanUseConnection` 为 false;`Handover` 没赋值(null)时结果相同。\n- `这个文件比已装的新时先提示安装再交接`:判定 Upgrade(target, `0.1.0`) → 初始化后 `Hero.Title` 为 `可安装新版本`、`Hero.PrimaryLabel` 为 `安装这个版本`、`ServiceStateText` 为 `后台服务 · 可安装新版本`、`Message` 含 `已装 0.1.0` 且以 `点「安装这个版本」换成新版，需管理员确认一次。` 结尾、`CanUseConnection` 为 false、Handover 桩没被调;提权桩把判定桩切成 Handover(target2) 并返回 true,`ConnectCommand.Execute(null)` 之后提权桩收到 `--install`,Handover 桩收到 target2 恰好一次。\n- `安装没完成时不交接`:服务状态 null,提权桩返回 false → `ConnectCommand.Execute(null)` 之后 `Message` 为 `操作未完成，请重试或联系管理员。`,Handover 桩没被调,`Hero.PrimaryLabel` 仍为 `安装后台服务`。\n- `服务登记的程序不可用时回到安装`:服务 Running、判定 Reinstall → `Hero.PrimaryLabel` 为 `安装后台服务`,Handover 桩没被调。\n- `界面已在安装目录时照旧判断服务状态`:服务状态 Stopped、判定 Stay → `Hero.PrimaryLabel` 为 `修复后台服务`,Handover 桩没被调。\n\n⑧ 文档(只写产品行为,不写施工过程;不出现「工人」「派单」这类词)。\ndocs/winclient/服务化与自启说明.md:\n- 在「## 角色、权限与安装位置」一节的末尾(「## 后台与界面分离」之前)加小节 `### 界面换到安装目录里的那一份`。写清:为什么要换(后台服务只接受安装目录之下的程序发指令,客户双击的是下载来的文件);用一张表列出五种情形各怎么做:界面程序已在安装目录 → 照常连后台服务 / 不在安装目录、服务登记的程序内容相同 → 启动服务登记的程序并退出本进程 / 内容不同且这个文件版本号更高 → 显示「可安装新版本」,主按钮「安装这个版本」,安装成功后换过去 / 内容不同且已装的一样新或更新、或版本号认不出 → 直接换到已装的那一份 / 服务登记的程序读不到、不在安装目录之下或文件不存在 → 「需安装后台服务」。表后写:安装或修复成功后界面重新初始化,所以首次安装完界面会自动换过去;服务登记的程序取自 `HKLM\\SYSTEM\\CurrentControlSet\\Services\\YuanCService` 的 `ImagePath`,只读注册表、不起子进程;内容相同指长度与 SHA256 都相同;版本号按安装目录名比较;交接前先释放 `Local\\YuanC-ShowWindow`;新进程隐藏窗口启动、不提权,`--tray` 原样传下去;启动失败留在当前界面,显示「无法打开已安装的客户端」,主按钮可重试;界面在安装目录之外时不会进入可用状态。再写覆盖安装:服务原来登记的是另一份程序时,安装在改完配置后先停服务再启动新版,启动后 3 秒仍在运行才算成功;失败且旧程序文件还在,就把服务与自启项改回旧版并尝试启动,报「新版本的后台服务未能启动，已改回原来的版本。」;停服务不撤断网保护。\n- 文件靠后的真机待验证列表里,在以「- 调用者核验：用安装目录之外的任意程序」开头的那一条之后加两条:\n  `- 首次运行换位：`从下载目录双击、安装后台服务后,界面自动换成安装目录里的那一份(任务管理器里界面进程的路径在 `%ProgramFiles%\\YuanC\\app` 之下);随后导入配对、连接、环境开关、导出诊断都生效,service.log 没有「来自安装目录之外的程序」一行;退出界面后再双击下载的文件,打开的仍是安装目录里的那一份。\n  `- 覆盖安装：`已装旧版时运行版本号更高的新包,显示「可安装新版本」,点「安装这个版本」并确认一次后,后台服务换成新版、界面换成新装的那一份;连接中做同样的事,断网保护不撤、新服务起来后接回;把新版程序弄坏后再装,服务改回旧版并能用。\n  两条都用全角冒号,末尾各加「真机未测。」。\ndocs/winclient/打包与发布说明.md 的「## 客户电脑首次运行」第一段:\n- 在「安装后服务自动启动，」之后紧接着插入这一句原文:`界面随即换成安装目录里的那一份，之后再双击下载的文件，打开的也是安装目录里的那一份（细则见服务化与自启说明「界面换到安装目录里的那一份」）；`\n- 该段末尾加一句:`发给已装过旧包的电脑的新包，版本号必须比已装的高；版本号相同、内容不同的包不会覆盖已装的那一份，双击它打开的是已装的那一份。`\n该段其余文字不动。",
+  "background": "项目:外包「澳洲出口节点 + Windows 一键客户端」。客户端 .NET 9 WPF(winclient/WinClient.sln:Core + App + Tests + UiTests),单文件自包含,同一个 exe 按第一个参数分角色:无参数或 --tray 是界面,--service 是后台服务(LocalSystem),--install / --repair / --uninstall 是提权后的安装动作。界面经命名管道 YuanC-Control 找后台服务;服务按调用者程序路径判定可信,只有 %ProgramFiles%/YuanC/app 之下的程序能发改状态指令和读诊断指令,这是 10 月 22 日加的安全加固,本单不动它。\n\n先读:winclient/WinClient.App/MainViewModel.cs(全文 485 行,重点 InitializeCoreAsync、MainActionAsync、RunAsync、ServiceStateText)、WinClient.App/App.xaml.cs(93 行)、WinClient.App/Hosting/InstallerRunner.cs(189 行)、WinClient.App/Presentation/StatusPresentation.cs、WinClient.App/Hosting/ControlService.cs 第 136~143 行、WinClient.Core/Ipc/ControlServer.cs 的 TrustedOnlyOps、WinClient.Core/Ipc/ServerIdentity.cs、WinClient.Core/Ipc/CallerIdentity.cs、WinClient.Core/Hosting/ServiceInstaller.cs、WinClient.Core/Update/UpdateVersion.cs、WinClient.Tests/IpcTests.cs 第 370~390 行、WinClient.Tests/HostingTests.cs、WinClient.UiTests/ViewModelTests.cs、WinClient.UiTests/StatusPresentationTests.cs、WinClient.UiTests/UiThreadFixture.cs、docs/winclient/服务化与自启说明.md、docs/winclient/打包与发布说明.md 的「客户电脑首次运行」、检查脚本 docs/plans/checks/yc_ui_handover_1127.py(它就是 SHAPE、TESTS-NEW、DOCS、SCOPE 四项验收,照它的字样写)。\n\n硬规矩:①只改允许清单里的十一个文件;②既有测试的名字、数据行、断言不改,只加;③不许 git 写操作,不许自己跑 dotnet(build / test / restore / publish 一律按验收编号申请),命令单独一条执行(不用 cd &&、管道、2>&1);④每次 Edit / Write 的新内容控制在 150 行以内;⑤界面文字、提示语、错误语照 goal 里的原文一字不差(含全角逗号、句号、直角引号),新增注释用中文;⑥新增的子进程一律隐藏窗口:App.xaml.cs 启动已安装的程序用 UseShellExecute = false 且 CreateNoWindow = true,InstallerRunner 里新增的系统命令走既有 RunCommandAsync;⑦测试不许安装服务、不许写 HKLM、不许连真管道、不许真提权、不许启动真进程;⑧不许读写 secrets/,工位里不许装依赖(缺依赖停下交 blocked);⑨不改后台服务端的任何判定;⑩拿不准停下交 blocked 并写 forks,不猜。\n\n项目红线:只管本项目自己建的服务、路由、防火墙规则;凭据不落库不落日志;隧道断了不许悄悄退回直连;安装更新幂等可回退;真机没测的不标通过;Windows 子进程一律隐藏窗口。",
+  "nonGoals": [
+    "不改后台服务的调用者核验、管道协议:ControlService、ControlServer、CallerIdentity、ServerIdentity、PipePeer 一行不动",
+    "不处理版本号相同、内容不同的包覆盖安装(开发自测包靠提版本号解决)",
+    "不加开始菜单或桌面快捷方式,不加卸载入口",
+    "不加截图基线,不改 RenderTests",
+    "不改卸载、修复流程与自动更新",
+    "不改口径速查表、设计正本、验收记录(派单方自己改)"
+  ],
+  "allowedPaths": [
+    "winclient/WinClient.Core/Hosting/UiHandover.cs",
+    "winclient/WinClient.Core/Hosting/ServiceInstaller.cs",
+    "winclient/WinClient.App/Hosting/InstallerRunner.cs",
+    "winclient/WinClient.App/MainViewModel.cs",
+    "winclient/WinClient.App/App.xaml.cs",
+    "winclient/WinClient.App/Presentation/StatusPresentation.cs",
+    "winclient/WinClient.Tests/UiHandoverTests.cs",
+    "winclient/WinClient.UiTests/StatusPresentationTests.cs",
+    "winclient/WinClient.UiTests/ViewModelTests.cs",
+    "docs/winclient/服务化与自启说明.md",
+    "docs/winclient/打包与发布说明.md"
+  ],
+  "forbiddenPaths": [
+    ".codex/**",
+    ".github/**",
+    ".gitignore",
+    "pyproject.toml",
+    "authserver/**",
+    "node/**",
+    "scripts/**",
+    "docs/design/**",
+    "docs/plans/**",
+    "docs/acceptance/**",
+    "docs/交接/**",
+    "docs/node/**",
+    "docs/口径速查表.md",
+    "docs/开工须知.md",
+    "docs/授权页.md",
+    "winclient/*.sln",
+    "winclient/Directory.Build.props",
+    "winclient/third_party/**",
+    "winclient/WinClient.Core/Ipc/**",
+    "winclient/WinClient.Core/Client/**",
+    "winclient/WinClient.Core/Firewall/**",
+    "winclient/WinClient.Core/Network/**",
+    "winclient/WinClient.Core/Update/**",
+    "winclient/WinClient.Core/Hosting/DataDirectorySecurity.cs",
+    "winclient/WinClient.Core/WinClient.Core.csproj",
+    "winclient/WinClient.App/WinClient.App.csproj",
+    "winclient/WinClient.App/Program.cs",
+    "winclient/WinClient.App/Hosting/ControlService.cs",
+    "winclient/WinClient.App/Hosting/PipePeer.cs",
+    "winclient/WinClient.App/Hosting/UpdateWindowsHost.cs",
+    "winclient/WinClient.App/Views/**",
+    "winclient/WinClient.App/Themes/**",
+    "winclient/WinClient.Tests/WinClient.Tests.csproj",
+    "winclient/WinClient.Tests/IpcTests.cs",
+    "winclient/WinClient.Tests/HostingTests.cs",
+    "winclient/WinClient.UiTests/WinClient.UiTests.csproj",
+    "winclient/WinClient.UiTests/Baselines/**",
+    "winclient/WinClient.UiTests/RenderTests.cs"
+  ],
+  "expectArtifacts": [
+    "winclient/WinClient.Core/Hosting/UiHandover.cs",
+    "winclient/WinClient.Tests/UiHandoverTests.cs"
+  ],
+  "acceptance": [
+    {
+      "id": "BUILD",
+      "kind": "command",
+      "argv": ["dotnet", "build", "winclient/WinClient.sln", "-c", "Release", "--nologo"],
+      "required": true,
+      "timeoutSec": 1200
+    },
+    {
+      "id": "TEST",
+      "kind": "command",
+      "argv": ["dotnet", "test", "winclient/WinClient.sln", "-c", "Release", "--no-build", "--nologo"],
+      "required": true,
+      "timeoutSec": 1500
+    },
+    {
+      "id": "SHAPE",
+      "kind": "command",
+      "argv": ["python", "docs/plans/checks/yc_ui_handover_1127.py", "shape"],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "TESTS-NEW",
+      "kind": "command",
+      "argv": ["python", "docs/plans/checks/yc_ui_handover_1127.py", "tests"],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "argv": ["python", "docs/plans/checks/yc_ui_handover_1127.py", "docs"],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "SCOPE",
+      "kind": "command",
+      "argv": ["python", "docs/plans/checks/yc_ui_handover_1127.py", "scope"],
+      "required": true,
+      "timeoutSec": 120
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "timeoutSec": 7200,
+  "repoRoot": "E:/yuanc",
+  "steps": [
+    "读 background 列出的文件与检查脚本。",
+    "先写测试:新建 UiHandoverTests,给 StatusPresentationTests、ViewModelTests 加新用例;申请 BUILD 以编译失败证红,之后固定 BUILD→TEST。",
+    "按 goal 第①~⑥条改代码;BUILD、TEST、SHAPE、TESTS-NEW 绿。",
+    "改两份文档;DOCS、SCOPE 绿后交活。交活说明逐条对照 goal 第①~⑧条写做到了没有,并单列哪些只有真机能验。"
+  ]
+}

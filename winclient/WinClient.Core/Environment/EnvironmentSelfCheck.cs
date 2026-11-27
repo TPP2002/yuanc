@@ -31,6 +31,8 @@ public sealed record SelfCheckInput(ExitProbeResult? Exit, string NodeHost, stri
     public string? ServiceProcessPath { get; init; }
     public IReadOnlyList<AdapterInfo>? Adapters { get; init; }
     public IReadOnlyList<string>? BrowsersAtApply { get; init; }
+    /// <summary>代理设置探测结果;null 表示未取得,只报告发现类别,不含任何设置值。</summary>
+    public IReadOnlyList<string>? ProxyFindings { get; init; }
 }
 
 public interface IIpv6Probe
@@ -63,7 +65,7 @@ public static class EnvironmentSelfCheck
 
     public static EnvironmentReport Evaluate(SelfCheckInput input)
     {
-        var items = new List<CheckItem>(11);
+        var items = new List<CheckItem>(12);
         void Add(string id, string name, bool pass, string detail) => items.Add(new(id, name, pass ? "通过" : "未通过", detail));
         if (input.Exit is null)
             items.Add(new("exit_country", "出口归属澳洲", "无法核验", "未取得出口探测结果"));
@@ -153,7 +155,19 @@ public static class EnvironmentSelfCheck
         items.Add(CheckTunSubnet(input.Adapters));
         items.Add(CheckBrowsersClosed(input));
         items.Add(CheckAdapterPublicAddress(input.Adapters));
+        items.Add(CheckSystemProxy(input.ProxyFindings));
         return new(input.Now, items);
+    }
+
+    /// <summary>只报告开着哪类代理设置；两种代理范围都评估，明细不写任何地址、端口、账号或脚本网址。</summary>
+    private static CheckItem CheckSystemProxy(IReadOnlyList<string>? findings)
+    {
+        const string id = "system_proxy";
+        const string name = "未设系统代理";
+        if (findings is null) return new(id, name, "无法核验", "未取得代理设置");
+        if (findings.Count == 0) return new(id, name, "通过", "没有发现系统代理、自动代理脚本或命令行代理环境变量");
+        return new(id, name, "未通过", "发现:" + string.Join("、", findings)
+            + ";这些设置会让浏览器或命令行程序先把流量交给那个代理,查到的地址可能不是节点地址;连接期间请关掉系统代理并退出其他代理软件");
     }
 
     /// <summary>除隧道网卡外任一网卡有公网地址即未通过;明细只写网卡名,不写任何地址。</summary>

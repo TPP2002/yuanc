@@ -38,7 +38,8 @@ try {
     if ($unexpected.Count -gt 0) { throw ('单文件发布检查失败，目录仍含外置依赖或数据文件：' + ($unexpected.Name -join ', ')) }
     $executable = Join-Path $publish 'WinClient.App.exe'
     if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) { throw '发布结果缺少客户端程序。' }
-    if ((Get-Item -LiteralPath $executable).Length -ge 200MB) { throw '客户端大小必须小于 200MB。' }
+    # 与客户端自动更新接收的防呆线(UpdateManifest.MaxPayloadBytes,1 GiB)同数,超过它的包客户端不收。
+    if ((Get-Item -LiteralPath $executable).Length -gt 1GB) { throw '客户端超过 1GB，自动更新不会接收，请先查是什么撑大了包。' }
     [IO.Directory]::CreateDirectory($release) | Out-Null
     $name = 'YuanC-Client-' + $Version + '.exe'
     $destination = Join-Path $release $name

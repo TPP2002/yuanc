@@ -156,6 +156,7 @@ button, input { font: inherit; color: inherit; }
 .acct { display: grid; gap: var(--s3); }
 .acct-head { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s2) var(--s3); }
 .acct-title { min-width: 0; overflow: hidden; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
+.acct-title.mono { white-space: normal; overflow-wrap: anywhere; }
 .acct-exp { flex: 1; min-width: 0; color: var(--text-2); font-size: var(--fs-sm); }
 .acct-exp.warn { color: var(--warn); }
 .acct-actions { display: flex; gap: var(--s2); }
@@ -184,7 +185,7 @@ button, input { font: inherit; color: inherit; }
   .row { flex-wrap: wrap; gap: var(--s1) var(--s3); }
   .row .val { flex-basis: 100%; order: 3; }
   .row .label { flex: 1; width: auto; }
-  .inv .code { flex: 1; width: auto; }
+  .inv .code { flex: 1 1 100%; width: auto; white-space: nowrap; }
   .inv .num { width: auto; }
   .invite-form .grow { flex-basis: 100%; }
   .acct-title { flex: 1; }

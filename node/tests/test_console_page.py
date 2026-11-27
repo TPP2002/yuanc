@@ -52,6 +52,50 @@ def console_js():
     return read_text(STATIC / "console.js")
 
 
+def console_css():
+    return read_text(STATIC / "console.css")
+
+
+def phone_css_block():
+    """只取 640px 窄屏那一段,按花括号配平截出来。"""
+    css = console_css()
+    marker = "@media (max-width: 640px) {"
+    start = css.index(marker)
+    depth = 0
+    for index in range(start, len(css)):
+        if css[index] == "{":
+            depth += 1
+        elif css[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return css[start:index + 1]
+    raise AssertionError("console.css 的 640px 段没有闭合")
+
+
+def test_account_order_kept_after_actions():
+    js = console_js()
+    for snippet in (
+        "var accountOrder = [];",
+        "function loadDirectory(keepOrder) {",
+        "renderAccounts(keepOrder);",
+        "function renderAccounts(keepOrder) {",
+        "function orderIndex(id) {",
+    ):
+        assert snippet in js, f"console.js 缺「{snippet}」"
+    refreshed = js.count("loadDirectory(true);")
+    assert refreshed == 4, f"操作后刷新 loadDirectory(true); 应有 4 处,实际 {refreshed} 处"
+    plain = js.count("loadDirectory();")
+    assert plain == 1, f"切页刷新 loadDirectory(); 应保留 1 处,实际 {plain} 处"
+
+
+def test_codes_never_truncated_on_phone():
+    css = console_css()
+    assert ".acct-title.mono { white-space: normal; overflow-wrap: anywhere; }" in css
+    phone = phone_css_block()
+    assert ".inv .code { flex: 1 1 100%; width: auto; white-space: nowrap; }" in phone
+    assert ".inv .code { flex: 1; width: auto; }" not in phone
+
+
 def index_html():
     return read_text(STATIC / "index.html")
 

@@ -14,7 +14,7 @@ from exitnode.cli import main
 from exitnode.config import load
 from exitnode.runner import CompletedResult, FakeRunner
 from exitnode.updater import layout, package, trust
-from exitnode.updater.upgrade import UpdateError, _healthy, _request, recover, upgrade
+from exitnode.updater.upgrade import UpdateError, _healthy, _request, _restart, recover, upgrade
 from exitnode.updater.version import Version
 from test_cli import CONFIG, TEXT
 
@@ -669,6 +669,34 @@ def test_cli_switch_works_offline_without_source_or_package(signing, capsys):
                    for c in runner.calls)
     assert "切换完成" in capsys.readouterr().out
     assert_releases_untouched(runner, before)
+
+
+def test_restart_try_restarts_console_without_failing_upgrade(signing):
+    console = ("systemctl", "try-restart", "exitnode-console.service")
+    config, runner = prepared(signing)
+    runner.responses[console] = CompletedResult(5)
+    _restart(runner)
+    assert console in [c[1] for c in runner.calls if c[0] == "run"]
+    # 退出码非 0 只影响网页自己，升级照常成功。
+    assert run(config, runner) == 0
+    assert runner.readlink(CURRENT) == NEW
+
+    config, runner = prepared(signing)
+    runner.responses[console] = OSError("模拟命令失败")
+    _restart(runner)
+    assert run(config, runner) == 0
+    assert runner.readlink(CURRENT) == NEW
+
+    # 隧道与托管服务重启失败仍然报错，不受管理网页影响。
+    _, runner = prepared(signing)
+    runner.responses[("systemctl", "restart", "exitnode-admin.service")] = CompletedResult(1)
+    with pytest.raises(UpdateError, match="重启失败"):
+        _restart(runner)
+
+    _, runner = prepared(signing)
+    runner.responses[("systemctl", "restart", "exitnode-proxy.service")] = OSError("模拟命令失败")
+    with pytest.raises(UpdateError, match="重启失败"):
+        _restart(runner)
 
 
 @pytest.mark.parametrize("target,damage,message", [

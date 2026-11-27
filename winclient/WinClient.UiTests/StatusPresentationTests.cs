@@ -14,6 +14,7 @@ public class StatusPresentationTests
     [InlineData(ServiceAvailability.NeedInstall, "需安装后台服务", "安装后台服务", Tone.N, Glyph.Plug, TrayIcon.N)]
     [InlineData(ServiceAvailability.NeedRepair, "后台服务未运行", "修复后台服务", Tone.Warn, Glyph.Bang, TrayIcon.Warn)]
     [InlineData(ServiceAvailability.Unavailable, "后台服务连接已中断", "重新连接后台服务", Tone.Bad, Glyph.X, TrayIcon.Bad)]
+    [InlineData(ServiceAvailability.NeedUpgrade, "可安装新版本", "安装这个版本", Tone.N, Glyph.Plug, TrayIcon.N)]
     public void 服务优先于连接状态(ServiceAvailability availability, string title, string primary, Tone tone, Glyph glyph, TrayIcon tray)
     {
         var hero = StatusPresentation.Build(Snapshot(ConnectionState.Connected), availability, true);
@@ -142,5 +143,13 @@ public class StatusPresentationTests
     {
         var row = Build(Snapshot() with { EnvironmentStatus = status, EnvironmentEnabled = enabled }).Rows[3];
         Assert.Equal(new TileSpec(tone, glyph, Flow.None, Dim: dim), row.Tile); Assert.Equal(text, row.Text);
+    }
+
+    [Fact]
+    public void 可安装新版本时主按钮是安装这个版本()
+    {
+        var hero = StatusPresentation.Build(Snapshot(), ServiceAvailability.NeedUpgrade, false);
+        Assert.Equal("这个文件比电脑上装的版本新", hero.Subtitle);
+        Assert.Equal("正在处理", hero.BusyLabel);
     }
 }

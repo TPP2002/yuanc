@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.IO;
 using System.IO.Pipes;
 using System.Reflection;
+using System.Security;
 using System.Security.Cryptography;
 using System.Security.Principal;
 using System.ServiceProcess;
@@ -29,6 +30,28 @@ public sealed class InstallerRunner
         catch (InvalidOperationException ex) when (ex.InnerException is Win32Exception { NativeErrorCode: 1060 }) { return null; }
     }
     public static string CurrentExecutable => Path.GetFullPath(Environment.ProcessPath ?? throw new InvalidOperationException("找不到客户端程序。"));
+
+    /// <summary>只读服务登记的程序路径；读不到或不是本产品的启动命令时返回 null。</summary>
+    public static string? RegisteredServiceExecutable()
+    {
+        try
+        {
+            using var key = Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services\" + ServiceInstaller.ServiceName);
+            return UiHandover.ServiceExecutable(key?.GetValue("ImagePath") as string);
+        }
+        catch (Exception ex) when (ex is SecurityException or UnauthorizedAccessException or IOException) { return null; }
+    }
+
+    public static UiHandoverDecision HandoverDecision()
+    {
+        var informational = Assembly.GetExecutingAssembly().GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion;
+        string version;
+        try { version = informational is null ? "" : ServiceInstaller.ReleaseVersion(informational); }
+        catch (ArgumentException) { version = ""; }
+        return UiHandover.Decide(CurrentExecutable, version, UpdatePlanner.DefaultAppRoot,
+            RegisteredServiceExecutable(), File.Exists, UiHandover.SameContent);
+    }
+
     public static ProcessStartInfo ElevationInfo(string action)
     {
         if (action is not ("--install" or "--repair" or "--uninstall")) throw new ArgumentException("安装操作无效。");
@@ -72,6 +95,7 @@ public sealed class InstallerRunner
         var version = Assembly.GetExecutingAssembly().GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion
             ?? throw SafeError("无法读取客户端版本。");
         var destination = ServiceInstaller.InstalledExecutable(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), version);
+        var previous = RegisteredServiceExecutable();
         static string Hash(string path) { using var file = File.OpenRead(path); return Convert.ToHexString(SHA256.HashData(file)); }
         if (ServiceInstaller.ShouldCopy(Hash(CurrentExecutable), File.Exists(destination) ? Hash(destination) : null))
         {
@@ -90,7 +114,32 @@ public sealed class InstallerRunner
             if (!string.Equals(key.GetValue(ServiceInstaller.RunValueName) as string, value, StringComparison.Ordinal))
                 key.SetValue(ServiceInstaller.RunValueName, value, RegistryValueKind.String);
         }
-        await StartAsync();
+        if (ServiceInstaller.SwitchesExecutable(previous, destination)) await StartSwitchedAsync(previous);
+        else await StartAsync();
+    }
+
+    /// <summary>服务原来登记的是另一份程序：先停服务，再启动新版并确认稳定；失败时改回旧版。</summary>
+    private async Task StartSwitchedAsync(string? previous)
+    {
+        await StopServiceAsync();
+        try
+        {
+            await StartAsync();
+            await Task.Delay(TimeSpan.FromSeconds(3));
+            if (ServiceStatus() == ServiceControllerStatus.Running) return;
+            throw SafeError("新版本的后台服务未能启动，已改回原来的版本。");
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or IOException or UnauthorizedAccessException or
+            Win32Exception or TimeoutException or OperationCanceledException)
+        {
+            if (previous is null || !File.Exists(previous)) throw;
+            await RunCommandAsync(ServiceInstaller.Configure(previous, true), "改回原来的后台服务失败。");
+            using (var key = Registry.LocalMachine.CreateSubKey(ServiceInstaller.RunKey, writable: true))
+                key.SetValue(ServiceInstaller.RunValueName, ServiceInstaller.RunValue(previous), RegistryValueKind.String);
+            try { await StartAsync(); }
+            catch (Exception) { /* 改回旧版的启动失败只吞掉，仍报原来的失败。 */ }
+            throw SafeError("新版本的后台服务未能启动，已改回原来的版本。");
+        }
     }
 
     private async Task StartAsync()

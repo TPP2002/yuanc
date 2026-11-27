@@ -12,6 +12,7 @@ using WinClient.App.Presentation;
 using WinClient.Core.Client;
 using WinClient.Core.EnvironmentSupport;
 using WinClient.Core.Firewall;
+using WinClient.Core.Hosting;
 using WinClient.Core.Ipc;
 using WinClient.Core.State;
 using WinClient.Core.Update;
@@ -27,6 +28,13 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
     private bool disposed;
     internal static readonly TimeSpan UpdateIndicatorDelay = TimeSpan.FromSeconds(1);
     internal Func<DateTimeOffset> NowProvider { get; set; } = () => DateTimeOffset.UtcNow;
+    internal Func<ServiceControllerStatus?> ServiceStatusProvider { get; set; } = InstallerRunner.ServiceStatus;
+    // 算哈希不占界面线程。
+    internal Func<CancellationToken, Task<UiHandoverDecision>> DecideHandoverAsync { get; set; } =
+        token => Task.Run(InstallerRunner.HandoverDecision, token);
+    internal Func<string, Task<bool>> ElevateAsync { get; set; } = InstallerRunner.ElevateAsync;
+    /// <summary>入参是要启动的程序完整路径；返回 true 表示那一份已启动、本进程正在退出。</summary>
+    public Func<string, bool>? Handover { get; set; }
     private DateTimeOffset? updateInProgressSince;
     private DispatcherTimer? updateIndicatorTimer;
     public bool IsUpdateIndicatorVisible { get; private set; }
@@ -102,13 +110,14 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
     public string ServiceStateText => "后台服务 · " + (availability switch
     {
         ServiceAvailability.Ready => "运行中", ServiceAvailability.NeedInstall => "未安装", ServiceAvailability.NeedRepair => "未运行",
+        ServiceAvailability.NeedUpgrade => "可安装新版本",
         _ when snapshot.Status.Contains("身份核验失败") => "身份核验失败",
         _ when snapshot.Status.Contains("中断") => "已中断", _ => "未运行"
     });
     public Tone ServiceStateTone => availability switch
     {
         ServiceAvailability.Ready => Tone.Ok, ServiceAvailability.NeedInstall => Tone.N,
-        ServiceAvailability.NeedRepair => Tone.Warn, _ => Tone.Bad
+        ServiceAvailability.NeedRepair => Tone.Warn, ServiceAvailability.NeedUpgrade => Tone.N, _ => Tone.Bad
     };
     public string ServiceVersionText => serviceVersion.Length == 0 ? "" : "版本 " + serviceVersion;
     public string ServiceVersionDisplay => ServiceVersionText.Length == 0 ? "等待连接" : ServiceVersionText;
@@ -204,12 +213,30 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
     private async Task InitializeCoreAsync()
     {
         DropClient();
-        var status = InstallerRunner.ServiceStatus();
+        var status = ServiceStatusProvider();
         if (status is null)
         {
-            availability = ServiceAvailability.NeedInstall;
-            Update(snapshot with { Status = "需安装后台服务", Message = "首次使用请安装后台服务，确认一次管理员权限后即可使用。" });
+            ShowNeedInstall();
             return;
+        }
+        var decision = await DecideHandoverAsync(lifetime.Token);
+        switch (decision.Kind)
+        {
+            case UiHandoverKind.Handover:
+                if (Handover is not null && decision.Target is { } handoverTarget && Handover(handoverTarget)) return;
+                ShowHandoverFailed();
+                return;
+            case UiHandoverKind.Upgrade:
+                availability = ServiceAvailability.NeedUpgrade;
+                Update(snapshot with
+                {
+                    Status = "可安装新版本",
+                    Message = $"已装 {decision.InstalledVersion}，这个文件是 {CurrentVersion}。点「安装这个版本」换成新版，需管理员确认一次。"
+                });
+                return;
+            case UiHandoverKind.Reinstall:
+                ShowNeedInstall();
+                return;
         }
         if (status != ServiceControllerStatus.Running)
         {
@@ -251,12 +278,22 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         availability = ServiceAvailability.Unavailable;
         Update(snapshot with { Status = "无法连接后台服务", Message = "无法连接后台服务,请重启电脑或联系管理员" });
     }
+    private void ShowNeedInstall()
+    {
+        availability = ServiceAvailability.NeedInstall;
+        Update(snapshot with { Status = "需安装后台服务", Message = "首次使用请安装后台服务，确认一次管理员权限后即可使用。" });
+    }
+    private void ShowHandoverFailed()
+    {
+        availability = ServiceAvailability.Unavailable;
+        Update(snapshot with { Status = "无法打开已安装的客户端", Message = "请从右下角托盘图标打开客户端，或重启电脑后再试。" });
+    }
     private async Task MainActionAsync()
     {
-        if (availability is ServiceAvailability.NeedInstall or ServiceAvailability.NeedRepair)
+        if (availability is ServiceAvailability.NeedInstall or ServiceAvailability.NeedRepair or ServiceAvailability.NeedUpgrade)
         {
-            var action = availability == ServiceAvailability.NeedInstall ? "--install" : "--repair";
-            if (!await InstallerRunner.ElevateAsync(action))
+            var action = availability == ServiceAvailability.NeedRepair ? "--repair" : "--install";
+            if (!await ElevateAsync(action))
             {
                 Update(snapshot with { Message = "操作未完成，请重试或联系管理员。" });
                 return;

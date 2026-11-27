@@ -80,11 +80,14 @@ def test_uninstall_removes_mappings_first():
 
 CONFIG = "/etc/exitnode/config.toml"
 TEXT = (Path(__file__).parents[1] / "examples" / "config.example.toml").read_text(encoding="utf-8")
+# 示例配置默认开着管理网页，共用夹具默认切掉那一段：检查类用例少一层，
+# 需要管理网页的用例自己把 CONFIG 换成完整示例。
+BASE = TEXT.split("\n[console]\n")[0]
 
 
 def fake(*, pairing=False):
     runner = FakeRunner(files={
-        CONFIG: TEXT, "/usr/bin/sing-box": "测试内核",
+        CONFIG: BASE, "/usr/bin/sing-box": "测试内核",
         (Path(__file__).parents[1] / "exitnode" / "__init__.py").as_posix():
             '__version__ = "0.1.0"\n',
         "/var/lib/exitnode/secrets/hy2.crt": "测试证书",
@@ -149,8 +152,12 @@ def test_check_unintegrated_layers_are_not_passed(capsys, monkeypatch):
     from exitnode.watchdog import state
 
     runner = fake()
+    # 这个用例要数完整所有层，用开着管理网页的完整示例。
+    runner.files[CONFIG] = TEXT
     monkeypatch.setattr("exitnode.admin.server.check", lambda config: {
         "layer": "winclient", "name": "客户端托管服务", "result": "通过", "reason": "测试响应"})
+    monkeypatch.setattr("exitnode.console.server.check", lambda config: {
+        "layer": "console", "name": "管理网页", "result": "通过", "reason": "测试响应"})
     config = load(CONFIG, runner)
     state.save(config, runner, state.fresh(), datetime.now(UTC))
     runner.responses[("systemctl", "is-active", "exitnode-watchdog.timer")] = CompletedResult(out="active")
@@ -169,13 +176,15 @@ def test_check_unintegrated_layers_are_not_passed(capsys, monkeypatch):
     assert main(["check", "--json"], runner) == 0
     layers = json.loads(capsys.readouterr().out)["layers"]
     assert [layer["result"] for layer in layers] == [
-        "通过", "通过", "未知", "跳过", "跳过", "通过", "通过", "通过", "通过", "通过", "通过"]
-    assert layers[-6]["name"] == "看门狗"
-    assert layers[-5]["name"] == "救援单元"
-    assert layers[-4]["name"] == "服务加固"
-    assert layers[-4]["layer"] == "hardening"
-    assert layers[-2]["name"] == "隧道服务"
-    assert layers[-1]["name"] == "客户端托管服务"
+        "通过", "通过", "未知", "跳过", "跳过", "通过", "通过", "通过", "通过", "通过", "通过",
+        "通过"]
+    assert layers[-7]["name"] == "看门狗"
+    assert layers[-6]["name"] == "救援单元"
+    assert layers[-5]["name"] == "服务加固"
+    assert layers[-5]["layer"] == "hardening"
+    assert layers[-3]["name"] == "隧道服务"
+    assert layers[-2]["name"] == "客户端托管服务"
+    assert layers[-1]["name"] == "管理网页"
 
 
 def harden(runner, user="exitnode\n", code=0, active="active"):
@@ -791,6 +800,8 @@ def test_console_subcommands_dispatch(monkeypatch, capsys):
     from exitnode.console import auth
 
     runner = fake()
+    runner.files[CONFIG] = TEXT.replace("[console]\nenabled = true",
+                                        "[console]\nenabled = false")
     assert main(["console", "serve"], runner) == 2
     assert "管理网页未启用" in capsys.readouterr().err
     assert not any(call[0] == "run" for call in runner.calls)
@@ -830,18 +841,125 @@ def test_console_subcommands_dispatch(monkeypatch, capsys):
     assert "/var/lib/exitnode/secrets/authserver-admin-key" not in runner.files
 
 
+def test_init_installs_console_when_enabled(capsys):
+    from exitnode.console import install
+
+    runner = fake(pairing=True)
+    # 完整示例就是开着管理网页的配置。
+    runner.files[CONFIG] = TEXT
+    assert main(["init"], runner) == 0
+    for unit in ("exitnode-console.service", "exitnode-console-status.service",
+                 "exitnode-console-status.timer"):
+        assert "/etc/systemd/system/" + unit in runner.files
+    assert install.DROPIN in runner.files
+    assert runner.files[install.DROPIN] == install.dropin_text(load(CONFIG, runner))
+    sent = [c[1] for c in runner.calls if c[0] == "run"]
+    assert ("systemctl", "enable", "--now", "exitnode-console.service") in sent
+    assert ("systemctl", "enable", "--now", "exitnode-console-status.timer") in sent
+    assert runner.files[install.PASSWORD].startswith("scrypt$")
+    assert runner.modes[install.PASSWORD] == 0o600
+    assert runner.files[install.ADMIN_KEY] == ""
+    assert runner.modes[install.ADMIN_KEY] == 0o600
+    assert capsys.readouterr().out.count("管理网页密码:") == 1
+
+    boundary = len(runner.calls)
+    assert main(["init"], runner) == 0
+    assert "管理网页密码:" not in capsys.readouterr().out
+    rerun = [c[1] for c in runner.calls[boundary:] if c[0] == "run"]
+    assert ("systemctl", "daemon-reload") not in rerun
+    assert ("systemctl", "try-restart", "exitnode-console.service") not in rerun
+
+
+def test_init_regenerates_missing_console_password(capsys):
+    from exitnode.console import install
+
+    runner = fake(pairing=True)
+    runner.files[CONFIG] = TEXT
+    assert main(["init"], runner) == 0
+    capsys.readouterr()
+    del runner.files[install.PASSWORD]
+    assert main(["init"], runner) == 0
+    assert capsys.readouterr().out.count("管理网页密码:") == 1
+    assert runner.files[install.PASSWORD].startswith("scrypt$")
+
+
+def test_init_updates_console_allow_when_authserver_moves(capsys):
+    from exitnode import authsync
+    from exitnode.console import install
+
+    runner = fake(pairing=True)
+    runner.files[CONFIG] = TEXT
+    assert main(["init"], runner) == 0
+    runner.files[CONFIG] = TEXT.replace(
+        '[authsync]\nenabled = false\nurl = ""\nspki_sha256 = ""',
+        '[authsync]\nenabled = true\nurl = "https://203.0.113.5:8443"\n'
+        'spki_sha256 = "' + "A" * 43 + '="')
+    # 与既有名单同步用例一样备好节点密钥。
+    runner.files[authsync.KEY_PATH] = "测试密钥"
+    boundary = len(runner.calls)
+    assert main(["init"], runner) == 0
+    assert "IPAddressAllow=203.0.113.5/32" in runner.files[install.DROPIN]
+    sent = [c[1] for c in runner.calls[boundary:] if c[0] == "run"]
+    assert ("systemctl", "daemon-reload") in sent
+    assert ("systemctl", "try-restart", "exitnode-console.service") in sent
+
+
+def test_init_skips_console_when_disabled(capsys):
+    from exitnode.console import install
+
+    runner = fake(pairing=True)
+    runner.files[CONFIG] = TEXT.replace("[console]\nenabled = true",
+                                        "[console]\nenabled = false")
+    assert main(["init"], runner) == 0
+    sent = [c[1] for c in runner.calls if c[0] == "run"]
+    assert ("systemctl", "enable", "--now", "exitnode-console.service") not in sent
+    assert ("systemctl", "enable", "--now", "exitnode-console-status.timer") not in sent
+    assert install.PASSWORD not in runner.files
+    assert install.ADMIN_KEY not in runner.files
+    assert install.DROPIN_DIR not in runner.directories
+    assert not any(path.startswith(install.DROPIN_DIR + "/") for path in runner.files)
+    assert "管理网页密码:" not in capsys.readouterr().out
+    for unit in ("exitnode-console.service", "exitnode-console-status.service",
+                 "exitnode-console-status.timer"):
+        assert "/etc/systemd/system/" + unit in runner.files
+
+
+def test_console_admin_key_hides_input_on_tty(monkeypatch, capsys):
+    readline_calls = []
+
+    class TtyInput(io.StringIO):
+        def isatty(self):
+            return True
+
+        def readline(self, *args, **kwargs):
+            readline_calls.append(True)
+            return super().readline(*args, **kwargs)
+
+    monkeypatch.setattr("sys.stdin", TtyInput("should-not-be-used\n"))
+    monkeypatch.setattr("exitnode.cli.getpass.getpass", lambda prompt: "test-tty-admin-key")
+    runner = fake()
+    assert main(["console", "admin-key"], runner) == 0
+    saved = runner.files["/var/lib/exitnode/secrets/authserver-admin-key"].strip()
+    assert saved == "test-tty-admin-key"
+    assert readline_calls == []
+    assert "test-tty-admin-key" not in capsys.readouterr().out
+
+
 def test_check_includes_console_layer_only_when_enabled(monkeypatch, capsys):
     monkeypatch.setattr("exitnode.admin.server.check", lambda config: {
         "layer": "winclient", "name": "客户端托管服务", "result": "通过", "reason": "测试"})
     monkeypatch.setattr("exitnode.console.server.check", lambda config: {
         "layer": "console", "name": "管理网页", "result": "通过", "reason": "测试"})
+    # 示例配置末尾带管理网页段，先切掉，下面按需再拼，免得段落重复。
+    base = TEXT.split("\n[console]\n")[0]
     runner = fake()
+    runner.files[CONFIG] = base
     main(["check", "--json"], runner)
     layers = json.loads(capsys.readouterr().out)["layers"]
     assert not any(layer["layer"] == "console" for layer in layers)
 
     runner = fake()
-    runner.files[CONFIG] = runner.files[CONFIG] + "\n[console]\nenabled = true\n"
+    runner.files[CONFIG] = base + "\n[console]\nenabled = true\n"
     main(["check", "--json"], runner)
     layers = json.loads(capsys.readouterr().out)["layers"]
     assert layers[-1]["layer"] == "console"

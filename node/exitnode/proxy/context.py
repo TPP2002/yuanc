@@ -37,6 +37,8 @@ class ProxyContext:
     urltest_tolerance_ms: int = 300
     admin_bind: str = "127.0.0.1"
     admin_port: int = 8443
+    # 管理网页端口；0 表示未启用，此时不生成隧道里的 198.18.255.2 规则。
+    console_port: int = 0
     maintenance_device_ids: tuple[str, ...] = ()
     time_zone: str = ""
     country: str = ""
@@ -66,6 +68,10 @@ def validate_context(ctx: ProxyContext) -> None:
         raise TypeError("备用通道端口无效")
     if not 1 <= ctx.hy2_port <= 65535:
         raise ValueError("备用通道端口无效")
+    if isinstance(ctx.console_port, bool) or not isinstance(ctx.console_port, int):
+        raise TypeError("管理网页端口无效")
+    if ctx.console_port != 0 and not 1024 <= ctx.console_port <= 65535:
+        raise ValueError("管理网页端口无效")
     if not ctx.sni or not ctx.handshake_server or not ctx.hy2_server_name:
         raise ValueError("证书名称与伪装目标不能为空")
     if ctx.sni != ctx.handshake_server:

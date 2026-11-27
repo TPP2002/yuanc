@@ -1,5 +1,7 @@
-using System.Windows;
 using System.ComponentModel;
+using System.Diagnostics;
+using System.IO;
+using System.Windows;
 using WinClient.App.Presentation;
 using WinClient.App.Themes;
 using Forms = System.Windows.Forms;
@@ -54,6 +56,7 @@ public partial class App : Application
             Shutdown(1);
         };
         if (!StartInTray) ShowWindow();
+        window.Model.Handover = StartInstalledClient;
         _ = InitializeWindowAsync();
     }
     private void ModelChanged(object? sender, PropertyChangedEventArgs e)
@@ -70,6 +73,42 @@ public partial class App : Application
             MessageBox.Show("界面未能初始化，请重新打开客户端或联系管理员。", "澳洲出口客户端");
             Shutdown(1);
         }
+    }
+    // 换到已安装的那一份：先放掉单实例事件，新进程才能成为唯一实例。
+    private bool StartInstalledClient(string target)
+    {
+        notification?.Unregister(null);
+        notification = null;
+        showWindow?.Dispose();
+        showWindow = null;
+        try
+        {
+            var info = new ProcessStartInfo
+            {
+                FileName = target,
+                WorkingDirectory = Path.GetDirectoryName(target)!,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+            if (StartInTray) info.ArgumentList.Add("--tray");
+            var started = Process.Start(info);
+            if (started is null) return RestoreSingleInstance();
+            started.Dispose();
+        }
+        catch (Exception ex) when (ex is Win32Exception or InvalidOperationException or IOException)
+        { return RestoreSingleInstance(); }
+        Shutdown();
+        return true;
+    }
+    // 启动失败：重新占上单实例事件并恢复监听，第二个实例仍能唤起本窗口。
+    private bool RestoreSingleInstance()
+    {
+        showWindow = new EventWaitHandle(false, EventResetMode.AutoReset, @"Local\YuanC-ShowWindow", out _);
+        notification = ThreadPool.RegisterWaitForSingleObject(showWindow, (_, _) =>
+        {
+            if (!Dispatcher.HasShutdownStarted) Dispatcher.InvokeAsync(ShowWindow);
+        }, null, Timeout.Infinite, executeOnlyOnce: false);
+        return false;
     }
     private void ShowWindow()
     {

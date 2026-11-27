@@ -60,3 +60,9 @@ max_backoff_seconds = 300
 enabled = false
 url = ""
 spki_sha256 = ""
+
+# 节点管理网页:局域网用 http://<本机局域网地址>:8444/ 打开;隧道里只有本机自用设备能用 http://198.18.255.2/ 打开
+[console]
+enabled = true
+port = 8444
+lan = true

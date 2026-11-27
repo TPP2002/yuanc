@@ -2,6 +2,7 @@
 
 import argparse
 import contextlib
+import getpass
 import io
 import ipaddress
 import json
@@ -30,7 +31,8 @@ from .watchdog import tick as watchdog_tick
 JOURNAL_UNITS = ("exitnode-proxy.service", "exitnode-admin.service", "exitnode-nft.service",
                  "exitnode-watchdog.service", "exitnode-rescue.service",
                  "exitnode-recover.service", "exitnode-authsync.service",
-                 "exitnode-publisher.service")
+                 "exitnode-publisher.service", "exitnode-console.service",
+                 "exitnode-console-status.service")
 
 
 class ChineseParser(argparse.ArgumentParser):
@@ -328,6 +330,54 @@ def _install(config, config_path, runner, manifest):
                   {"kind": "systemctl", "unit": "exitnode-publisher.timer"})
             if not runner.exists(publisher.TOOL):
                 successful.append("入口端口映射:未找到 upnpc,请执行 apt install miniupnpc,否则需在路由器上手动转发端口")
+        if config.console.enabled:
+            from .console import install as console_install
+
+            # 放行目录被别人建过时拒绝认领，避免撤回删除别人的文件。
+            if (runner.exists(console_install.DROPIN_DIR)
+                    and not any(s["step"] == "管理网页放行目录" for s in manifest.steps)):
+                raise ValueError("已有同名服务文件未在本安装清单中，请联系维护人员")
+            apply("管理网页放行目录",
+                  lambda: runner.mkdir(console_install.DROPIN_DIR, 0o755),
+                  {"kind": "remove_file", "path": console_install.DROPIN_DIR})
+            changed = []
+
+            def write_console_allow():
+                # 每次 init 都按当前配置再比对一次，鉴权服务搬走后不会留下旧地址。
+                if console_install.sync_dropin(config, runner):
+                    changed.append(True)
+
+            if not apply("写入管理网页放行", write_console_allow,
+                         {"kind": "remove_file", "path": console_install.DROPIN}):
+                write_console_allow()
+            if any(changed):
+                runner.run(["systemctl", "daemon-reload"])
+                runner.run(["systemctl", "try-restart", "exitnode-console.service"], check=False)
+            password = []
+
+            def prepare_console_credentials():
+                value = console_install.prepare(config, runner)
+                if value is not None:
+                    password.append(value)
+
+            # 凭据文件被删时下次 init 会补生成，所以这一步没做完也要再跑一次。
+            if not apply("准备管理网页凭据", prepare_console_credentials,
+                         {"kind": "remove_file",
+                          "path": service.SECRETS + "/console-password",
+                          "preserve": True}):
+                prepare_console_credentials()
+            if password:
+                print("管理网页密码:" + password[0]
+                      + "(只显示这一次;忘了可在节点上运行 exitnode console password 重新生成)")
+                print("管理网页地址:" + "、".join(console_install.urls(config, runner)))
+            apply("启用管理网页",
+                  lambda: runner.run(["systemctl", "enable", "--now",
+                                      "exitnode-console.service"]),
+                  {"kind": "systemctl", "unit": "exitnode-console.service"})
+            apply("启用管理网页检查定时器",
+                  lambda: runner.run(["systemctl", "enable", "--now",
+                                      "exitnode-console-status.timer"]),
+                  {"kind": "systemctl", "unit": "exitnode-console-status.timer"})
 
         def install_rescue():
             current = layout.current_target(config, runner)
@@ -470,7 +520,12 @@ def _console(args, config, runner):
         print("管理网页新密码:" + password)
         print("只显示这一次;旧密码已失效,已登录的网页要重新登录。")
         return 0
-    admin_key = sys.stdin.readline().rstrip("\r\n").strip()
+    # 终端里用不回显的方式读密钥，避免密钥显示在屏幕和远控画面上。
+    if sys.stdin.isatty():
+        admin_key = getpass.getpass("请粘贴鉴权服务管理密钥后回车(输入不显示):")
+    else:
+        admin_key = sys.stdin.readline().rstrip("\r\n")
+    admin_key = admin_key.strip()
     if (not admin_key or len(admin_key) > 512
             or any(unicodedata.category(c) == "Cc" for c in admin_key)):
         print("管理密钥无效:不能为空、不能超过 512 个字符、不能含控制字符", file=sys.stderr)
