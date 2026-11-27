@@ -162,7 +162,7 @@ public sealed class ControllerTests
         await controller.ConnectAsync();
         await FireAndPublish(controller, timers, "出口核验", TimeSpan.FromSeconds(3));
         var report = Assert.Single(reports);
-        Assert.Equal(11, report.Items.Count);
+        Assert.Equal(12, report.Items.Count);
         Assert.Equal("未通过", report.Items[9].Result);
         Assert.Contains("Chrome", report.Items[9].Detail);
         Assert.Equal("1 项未通过:浏览器在环境切换前已关闭", report.Summary);
@@ -564,7 +564,7 @@ public sealed class ControllerTests
             for (var i = 1; i < 5; i++) await FireAndPublish(controller, timers, "出口核验", TimeSpan.FromSeconds(5));
         }
         var report = Assert.Single(reports);
-        Assert.Equal(11, report.Items.Count);
+        Assert.Equal(12, report.Items.Count);
         Assert.Equal(report.Summary, controller.Snapshot.SelfCheckStatus);
         Assert.DoesNotContain(controller.Snapshot.SelfCheckStatus, new[] { "未检测", "检测中" });
         Assert.Equal(1, ipv6.Calls);
@@ -581,6 +581,31 @@ public sealed class ControllerTests
         }
         await controller.DisconnectAsync();
         Assert.Equal("未检测", controller.Snapshot.SelfCheckStatus);
+    }
+
+    [Fact]
+    public async Task SelfCheckIncludesProxyFindingsFromProbe()
+    {
+        var order = new List<string>();
+        var timers = new Timers();
+        var source = new ScriptedSource(); source.Enqueue(Ok(TestData.Session()));
+        var reports = new List<EnvironmentReport>();
+        using var controller = new ClientController(source, new Firewall(order), new Tunnel(order), Path.GetFullPath("fake.exe"),
+            TestData.Device, timers.Delay, exitProbe: new DetailedProbe(), ipv6Probe: new ScriptedIpv6(false),
+            reportSink: reports.Add, adapterProbe: new StaticAdapterProbe(TunAdapters),
+            proxyProbe: new StaticProxyProbe(["系统代理"])) { DelayWithPurposeAsync = timers.Delay };
+        controller.Changed += _ => Interlocked.Increment(ref timers.Published);
+        await controller.ConnectAsync();
+        await FireAndPublish(controller, timers, "出口核验", TimeSpan.FromSeconds(3));
+        var report = Assert.Single(reports);
+        var item = report.Items[report.Items.Count - 1];
+        Assert.Equal("system_proxy", item.Id);
+        Assert.Equal("未通过", item.Result);
+    }
+
+    private sealed class StaticProxyProbe(IReadOnlyList<string>? findings) : IProxySettingsProbe
+    {
+        public IReadOnlyList<string>? Snapshot() => findings;
     }
 
     private static IReadOnlyList<AdapterInfo> TunAdapters =>
@@ -612,10 +637,10 @@ public sealed class ControllerTests
         await controller.ConnectAsync();
         await FireAndPublish(controller, timers, "出口核验", TimeSpan.FromSeconds(3));
         var report = Assert.Single(reports);
-        Assert.Equal(11, report.Items.Count);
+        Assert.Equal(12, report.Items.Count);
         Assert.Equal("无法核验", report.Items[8].Result);
         Assert.Equal("未取得本机网卡清单", report.Items[8].Detail);
-        Assert.Equal("8 项通过,3 项未能检查", report.Summary);
+        Assert.Equal("8 项通过,4 项未能检查", report.Summary);
         Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
         Assert.True(controller.Snapshot.ProtectionActive);
         Assert.Equal(new[] { "apply", "start" }, order);
@@ -655,7 +680,7 @@ public sealed class ControllerTests
         var report = Assert.Single(reports);
         Assert.Contains(snapshots, snapshot => snapshot.SelfCheckStatus == "检测中");
         Assert.Equal(report.Summary, controller.Snapshot.SelfCheckStatus);
-        Assert.Equal(fail ? "5 项通过,6 项未能检查" : enabled ? "10 项通过,1 项未能检查" : "6 项通过,5 项未能检查", report.Summary);
+        Assert.Equal(fail ? "5 项通过,7 项未能检查" : enabled ? "10 项通过,2 项未能检查" : "6 项通过,6 项未能检查", report.Summary);
         Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
         Assert.Equal("虚拟网卡已就绪。", controller.Snapshot.Message);
         Assert.True(controller.Snapshot.ProtectionActive);
