@@ -25,6 +25,17 @@ public static class ServiceInstaller
     public static bool ShouldCopy(string sourceSha256, string? destinationSha256) =>
         !string.Equals(sourceSha256, destinationSha256, StringComparison.OrdinalIgnoreCase);
 
+    /// <summary>服务原来登记的是另一份程序（路径按完整路径、不分大小写比较）时为 true。</summary>
+    public static bool SwitchesExecutable(string? previous, string destination)
+    {
+        if (string.IsNullOrWhiteSpace(previous)) return false;
+        try
+        {
+            return !string.Equals(Path.GetFullPath(previous), Path.GetFullPath(destination), StringComparison.OrdinalIgnoreCase);
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or IOException) { return false; }
+    }
+
     public static string[] Configure(string executable, bool exists) =>
         [exists ? "config" : "create", ServiceName, "binPath=", ServiceCommand(executable), "start=", "auto", "depend=", "BFE", "DisplayName=", DisplayName, "obj=", "LocalSystem"];
     public static string[] Describe() => ["description", ServiceName, Description];

@@ -1,5 +1,8 @@
+using System.IO;
+using System.ServiceProcess;
 using WinClient.App;
 using WinClient.App.Presentation;
+using WinClient.Core.Hosting;
 using WinClient.Core.Ipc;
 using WinClient.Core.Client;
 using WinClient.Core.State;
@@ -175,5 +178,155 @@ public class ViewModelTests(UiThreadFixture ui)
         Assert.Equal("会话已到期 后台已更新到 1.3.0，下次打开界面将使用新版", model.Message);
         Assert.True(model.IsUpdateInProgress);
         model.GoToAccountCommand.Execute(null); Assert.Equal(PageKind.Account, model.CurrentPage);
+    });
+
+    [Fact]
+    public void 首次安装成功后界面交接给已安装的程序() => ui.Invoke(() =>
+    {
+        using var model = new MainViewModel(() => null, () => null);
+        ServiceControllerStatus? status = null;
+        var decision = new UiHandoverDecision(UiHandoverKind.Reinstall);
+        var target = Path.GetFullPath("Program Files/YuanC/app/0.1.0/YuanC-Client.exe");
+        var elevated = "";
+        var handed = new List<string>();
+        model.ServiceStatusProvider = () => status;
+        model.DecideHandoverAsync = _ => Task.FromResult(decision);
+        model.ElevateAsync = action =>
+        {
+            elevated = action;
+            status = ServiceControllerStatus.Running;
+            decision = new UiHandoverDecision(UiHandoverKind.Handover, target);
+            return Task.FromResult(true);
+        };
+        model.Handover = path => { handed.Add(path); return true; };
+        var init = model.InitializeAsync();
+        Assert.True(init.IsCompletedSuccessfully);
+        Assert.Equal("安装后台服务", model.Hero.PrimaryLabel);
+        model.ConnectCommand.Execute(null);
+        Assert.Equal("--install", elevated);
+        Assert.Single(handed);
+        Assert.Equal(target, handed[0]);
+        Assert.False(model.CanUseConnection);
+    });
+
+    [Fact]
+    public void 界面在安装目录外且已装同一份时直接交接() => ui.Invoke(() =>
+    {
+        using var model = new MainViewModel(() => null, () => null);
+        var target = Path.GetFullPath("Program Files/YuanC/app/0.1.0/YuanC-Client.exe");
+        var handed = new List<string>();
+        var elevated = false;
+        model.ServiceStatusProvider = () => ServiceControllerStatus.Running;
+        model.DecideHandoverAsync = _ => Task.FromResult(new UiHandoverDecision(UiHandoverKind.Handover, target));
+        model.ElevateAsync = _ => { elevated = true; return Task.FromResult(true); };
+        model.Handover = path => { handed.Add(path); return true; };
+        var init = model.InitializeAsync();
+        Assert.True(init.IsCompletedSuccessfully);
+        Assert.Single(handed);
+        Assert.Equal(target, handed[0]);
+        Assert.False(elevated);
+        Assert.False(model.CanUseConnection);
+        Assert.False(model.ImportPairingCommand.CanExecute(null));
+    });
+
+    [Fact]
+    public void 交接失败时停在可重试的提示() => ui.Invoke(() =>
+    {
+        using var model = new MainViewModel(() => null, () => null);
+        var target = Path.GetFullPath("Program Files/YuanC/app/0.1.0/YuanC-Client.exe");
+        model.ServiceStatusProvider = () => ServiceControllerStatus.Running;
+        model.DecideHandoverAsync = _ => Task.FromResult(new UiHandoverDecision(UiHandoverKind.Handover, target));
+        model.ElevateAsync = _ => Task.FromResult(true);
+        model.Handover = _ => false;
+        var init = model.InitializeAsync();
+        Assert.True(init.IsCompletedSuccessfully);
+        Assert.Equal("无法打开已安装的客户端", model.Status);
+        Assert.Equal("重新连接后台服务", model.Hero.PrimaryLabel);
+        Assert.False(model.CanUseConnection);
+        model.Handover = null;
+        var again = model.InitializeAsync();
+        Assert.True(again.IsCompletedSuccessfully);
+        Assert.Equal("无法打开已安装的客户端", model.Status);
+        Assert.Equal("重新连接后台服务", model.Hero.PrimaryLabel);
+    });
+
+    [Fact]
+    public void 这个文件比已装的新时先提示安装再交接() => ui.Invoke(() =>
+    {
+        using var model = new MainViewModel(() => null, () => null);
+        var target = Path.GetFullPath("Program Files/YuanC/app/0.1.0/YuanC-Client.exe");
+        var target2 = Path.GetFullPath("Program Files/YuanC/app/0.1.1/YuanC-Client.exe");
+        var decision = new UiHandoverDecision(UiHandoverKind.Upgrade, target, "0.1.0");
+        var elevated = "";
+        var handed = new List<string>();
+        model.ServiceStatusProvider = () => ServiceControllerStatus.Running;
+        model.DecideHandoverAsync = _ => Task.FromResult(decision);
+        model.ElevateAsync = action =>
+        {
+            elevated = action;
+            decision = new UiHandoverDecision(UiHandoverKind.Handover, target2);
+            return Task.FromResult(true);
+        };
+        model.Handover = path => { handed.Add(path); return true; };
+        var init = model.InitializeAsync();
+        Assert.True(init.IsCompletedSuccessfully);
+        Assert.Equal("可安装新版本", model.Hero.Title);
+        Assert.Equal("安装这个版本", model.Hero.PrimaryLabel);
+        Assert.Equal("后台服务 · 可安装新版本", model.ServiceStateText);
+        Assert.Contains("已装 0.1.0", model.Message);
+        Assert.EndsWith("点「安装这个版本」换成新版，需管理员确认一次。", model.Message);
+        Assert.False(model.CanUseConnection);
+        Assert.Empty(handed);
+        model.ConnectCommand.Execute(null);
+        Assert.Equal("--install", elevated);
+        Assert.Single(handed);
+        Assert.Equal(target2, handed[0]);
+    });
+
+    [Fact]
+    public void 安装没完成时不交接() => ui.Invoke(() =>
+    {
+        using var model = new MainViewModel(() => null, () => null);
+        var handed = new List<string>();
+        model.ServiceStatusProvider = () => null;
+        model.DecideHandoverAsync = _ => Task.FromResult(new UiHandoverDecision(UiHandoverKind.Reinstall));
+        model.ElevateAsync = _ => Task.FromResult(false);
+        model.Handover = path => { handed.Add(path); return true; };
+        var init = model.InitializeAsync();
+        Assert.True(init.IsCompletedSuccessfully);
+        model.ConnectCommand.Execute(null);
+        Assert.Equal("操作未完成，请重试或联系管理员。", model.Message);
+        Assert.Empty(handed);
+        Assert.Equal("安装后台服务", model.Hero.PrimaryLabel);
+    });
+
+    [Fact]
+    public void 服务登记的程序不可用时回到安装() => ui.Invoke(() =>
+    {
+        using var model = new MainViewModel(() => null, () => null);
+        var handed = new List<string>();
+        model.ServiceStatusProvider = () => ServiceControllerStatus.Running;
+        model.DecideHandoverAsync = _ => Task.FromResult(new UiHandoverDecision(UiHandoverKind.Reinstall));
+        model.ElevateAsync = _ => Task.FromResult(true);
+        model.Handover = path => { handed.Add(path); return true; };
+        var init = model.InitializeAsync();
+        Assert.True(init.IsCompletedSuccessfully);
+        Assert.Equal("安装后台服务", model.Hero.PrimaryLabel);
+        Assert.Empty(handed);
+    });
+
+    [Fact]
+    public void 界面已在安装目录时照旧判断服务状态() => ui.Invoke(() =>
+    {
+        using var model = new MainViewModel(() => null, () => null);
+        var handed = new List<string>();
+        model.ServiceStatusProvider = () => ServiceControllerStatus.Stopped;
+        model.DecideHandoverAsync = _ => Task.FromResult(new UiHandoverDecision(UiHandoverKind.Stay));
+        model.ElevateAsync = _ => Task.FromResult(true);
+        model.Handover = path => { handed.Add(path); return true; };
+        var init = model.InitializeAsync();
+        Assert.True(init.IsCompletedSuccessfully);
+        Assert.Equal("修复后台服务", model.Hero.PrimaryLabel);
+        Assert.Empty(handed);
     });
 }
