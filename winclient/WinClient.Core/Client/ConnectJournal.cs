@@ -1,4 +1,5 @@
 using System.Text.RegularExpressions;
+using WinClient.Core.State;
 
 namespace WinClient.Core.Client;
 
@@ -26,12 +27,13 @@ public static class ConnectJournal
         return string.Join(" <- ", parts);
     }
 
-    private static string Clean(string message)
+    /// <summary>处理要写进连接记录的文字:换行、IPv4 与用户目录名脱敏,去首尾空白,超长截断。</summary>
+    public static string Clean(string? message)
     {
         string text;
         try
         {
-            text = LineBreaks.Replace(message, " | ");
+            text = LineBreaks.Replace(message ?? "", " | ");
             text = Ipv4.Replace(text, "[地址]");
             text = UserFolder.Replace(text, "$1[用户]");
         }
@@ -39,4 +41,29 @@ public static class ConnectJournal
         text = text.Trim();
         return text.Length > MaxMessageLength ? text[..MaxMessageLength] + "…" : text;
     }
+
+    /// <summary>状态名:记录里只写中文名,不写枚举名。</summary>
+    public static string StateName(ConnectionState state) => state switch
+    {
+        ConnectionState.Disconnected => "未连接",
+        ConnectionState.Connecting => "连接中",
+        ConnectionState.Connected => "已连接",
+        ConnectionState.Reconnecting => "重连中",
+        ConnectionState.NeedsLogin => "需重新登录",
+        ConnectionState.NeedsManual => "需人工处理",
+        _ => state.ToString()
+    };
+
+    /// <summary>动作名:退避带上安排好的秒数。</summary>
+    public static string EffectName(ConnectionEffect effect) => effect.Kind switch
+    {
+        EffectKind.ApplyKillSwitch => "套用断网保护",
+        EffectKind.UpdateKillSwitchNode => "更新节点规则",
+        EffectKind.RemoveKillSwitch => "撤销断网保护",
+        EffectKind.StopTunnel => "停止隧道",
+        EffectKind.StartTunnel => "启动隧道",
+        EffectKind.ShowMessage => "显示提示",
+        EffectKind.ScheduleBackoff => "安排退避 " + (effect.Delay is { } delay ? (long)delay.TotalSeconds : 0L) + " 秒",
+        _ => effect.Kind.ToString()
+    };
 }

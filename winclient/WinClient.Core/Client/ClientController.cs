@@ -107,6 +107,9 @@ public sealed class ClientController : IDisposable
     private string? nicRestoreWarning;
     private bool disposed;
     private long generation;
+    // 连接记录:记住上次写进记录的状态与巡检文字,只在变化时补一行。
+    private ConnectionState journaledState = ConnectionState.Disconnected;
+    private string journaledPatrol = "";
     private string message = "";
     // 首次尝试:从没套过保护也没有恢复记录的那次连接;到第一次 Connected 或断开、换来源时结束。
     private bool firstAttempt;
@@ -181,6 +184,8 @@ public sealed class ClientController : IDisposable
         await gate.WaitAsync();
         try
         {
+            WriteJournal($"启动：保持保护={(keepProtection ? "是" : "否")}，自动连接={(autoConnect ? "是" : "否")}，" +
+                $"恢复记录={PendingRecordText()}，模式={sessionSource?.Mode ?? "未配置"}");
             if (keepProtection && firewall.HasPendingState &&
                 (sessionSource is PairingSessionSource or AuthServerSessionSource { HasCredentials: true }))
             {
@@ -189,6 +194,7 @@ public sealed class ClientController : IDisposable
                 message = protectionNotice;
                 keptProtection = true;
                 environmentApplied = environment?.HasPendingState ?? false;
+                WriteJournal("启动：接回断网保护，随后自动连接");
             }
             else
             {
@@ -206,6 +212,7 @@ public sealed class ClientController : IDisposable
                     warning = warning is null ? environmentWarning : warning + " " + environmentWarning;
                     message += " " + environmentWarning;
                 }
+                WriteJournal($"启动：已做启动恢复，提醒={(warning is null ? "无" : "有")}");
             }
         }
         catch (Exception ex) when (IsOperational(ex))
@@ -291,28 +298,41 @@ public sealed class ClientController : IDisposable
         await gate.WaitAsync();
         try
         {
-            if (sessionSource is null) { message = "未配置服务器"; return; }
-            if (machine.State is ConnectionState.Connected or ConnectionState.Connecting or ConnectionState.Reconnecting) return;
+            WriteJournal($"连接请求：来源={(fromUser ? "用户" : "自动")}，状态={ConnectJournal.StateName(machine.State)}，" +
+                $"保护={(protection ? "有" : "无")}，恢复记录={PendingRecordText()}");
+            if (sessionSource is null) { message = "未配置服务器"; WriteJournal("连接未开始：未配置服务器"); return; }
+            if (machine.State is ConnectionState.Connected or ConnectionState.Connecting or ConnectionState.Reconnecting)
+            { WriteJournal("连接未开始：已在连接或已连接"); return; }
             activeRouting = routingSettings?.Read() ?? RoutingPolicy.Global;
             if (activeRouting.Mode == RoutingMode.Apps && activeRouting.Apps.Count == 0)
-            { message = "仅指定程序模式至少要选一个程序,请先添加程序或切回全部流量。"; return; }
+            { message = "仅指定程序模式至少要选一个程序,请先添加程序或切回全部流量。"; WriteJournal("连接未开始：指定程序名单为空"); return; }
             activeScopes = activeRouting.Mode == RoutingMode.Apps ? activeRouting.Apps.Select(scopeResolver).ToArray() : [];
             if (firewall.HasPendingState && (firewall.PendingMode ?? "global") != ModeName(activeRouting))
-            { message = "上次的断网保护记录与当前代理范围不一致,请先用原来的代理范围连接并正常断开,或重启后台服务后再试。"; return; }
+            { message = "上次的断网保护记录与当前代理范围不一致,请先用原来的代理范围连接并正常断开,或重启后台服务后再试。"; WriteJournal("连接未开始：恢复记录与代理范围不一致"); return; }
             if (nicGuard is not null)
             {
                 string? publicAdapter;
                 try { publicAdapter = nicGuard.PublicIpv4Adapter(); }
-                catch (Exception ex) when (IsOperational(ex)) { message = "无法读取网卡地址,已拒绝连接;请重试或联系管理员。"; return; }
+                catch (Exception ex) when (IsOperational(ex))
+                {
+                    message = "无法读取网卡地址,已拒绝连接;请重试或联系管理员。";
+                    WriteJournal("连接未开始：读不到网卡地址");
+                    return;
+                }
                 if (publicAdapter is not null)
                 {
                     message = $"网卡「{publicAdapter}」上直接有公网 IPv4 地址(通常是电脑自己拨号上网),部分软件和网页可以直接读到这个地址,已拒绝连接。请改由路由器拨号上网后再连接,或联系管理员。";
+                    WriteJournal("连接未开始：网卡上有公网 IPv4");
                     return;
                 }
             }
-            if (fromUser && ShouldWarnBrowsers("连接", checkApplied: false)) return;
+            if (fromUser && ShouldWarnBrowsers("连接", checkApplied: false))
+            { WriteJournal("连接未开始：浏览器正在运行，等用户再点一次"); return; }
             firstAttempt = !protection && !firewall.HasPendingState;
             firstBackoffs = 0;
+            WriteJournal($"开始连接：模式={sessionSource.Mode}，代理范围=" +
+                $"{(activeRouting.Mode == RoutingMode.Apps ? $"仅指定程序 {activeRouting.Apps.Count} 个" : "全部流量")}" +
+                $"，首次尝试={(firstAttempt ? "是" : "否")}");
             lifetime.Cancel();
             lifetime.Dispose();
             lifetime = new();
@@ -323,17 +343,25 @@ public sealed class ClientController : IDisposable
         }
         catch (OperationCanceledException) when (lifetime.IsCancellationRequested) { }
         catch (Exception ex) when (IsOperational(ex)) { await FailAsync(ex); }
-        finally { Publish(); gate.Release(); }
+        catch (Exception ex) when (firstAttempt) { await FailAsync(ex); }
+        finally
+        {
+            WriteJournal($"连接请求结束：状态={ConnectJournal.StateName(machine.State)}，保护={(protection ? "有" : "无")}");
+            Publish();
+            gate.Release();
+        }
     }
 
     public async Task DisconnectAsync()
     {
-        if (ShouldWarnBrowsers("断开", checkApplied: true)) { Publish(); return; }
+        if (ShouldWarnBrowsers("断开", checkApplied: true))
+        { WriteJournal("断开未开始：浏览器正在运行，等用户再点一次"); Publish(); return; }
         lifetime.Cancel();
         Interlocked.Increment(ref generation);
         await gate.WaitAsync();
         try
         {
+            WriteJournal($"断开请求：状态={ConnectJournal.StateName(machine.State)}，保护={(protection ? "有" : "无")}");
             EndFirstAttempt();
             guardStatus = "";
             nicRestoreWarning = null;
@@ -344,6 +372,7 @@ public sealed class ClientController : IDisposable
             message = environmentRestored ? "已断开，原网络设置已恢复。"
                 : "已断开,原网络设置已恢复;但时区或浏览器设置未能恢复,请联系管理员。";
             if (nicRestoreWarning is not null) message += " " + nicRestoreWarning;
+            WriteJournal($"断开完成：环境恢复={(environmentRestored ? "成功" : "失败")}");
         }
         catch (Exception ex) when (IsOperational(ex)) { await FailAsync(ex); }
         finally { Publish(); gate.Release(); }
@@ -478,11 +507,16 @@ public sealed class ClientController : IDisposable
     {
         var response = await sessionSource!.GetSessionAsync(lifetime.Token);
         lifetime.Token.ThrowIfCancellationRequested();
+        WriteJournal("取会话：" + response.Result);
         if (response.Result != AuthResult.Ok || response.Value is null)
         { await ExecuteAsync(machine.Handle(new(ConnectionEventKind.AuthRejected, response.Result))); return; }
         var next = response.Value;
         if (next.SessionExpiresAt <= DateTimeOffset.UtcNow || next.AccountExpiresAt <= DateTimeOffset.UtcNow)
-        { await ExecuteAsync(machine.Handle(new(ConnectionEventKind.SessionExpired))); return; }
+        {
+            WriteJournal("取会话：会话或账号已到期");
+            await ExecuteAsync(machine.Handle(new(ConnectionEventKind.SessionExpired)));
+            return;
+        }
         await ApplySessionAsync(next);
     }
 
@@ -545,6 +579,7 @@ public sealed class ClientController : IDisposable
         if (!ReferenceEquals(value, session) || machine.State is not (ConnectionState.Connected or ConnectionState.Reconnecting)) return;
         var response = await sessionSource!.GetSessionAsync(lifetime.Token);
         lifetime.Token.ThrowIfCancellationRequested();
+        WriteJournal("续期：" + response.Result);
         if (response.Result == AuthResult.Ok && response.Value is not null)
         {
             var next = response.Value;
@@ -597,6 +632,7 @@ public sealed class ClientController : IDisposable
         try { await ExecuteEffectsAsync(transition); }
         finally
         {
+            JournalState();
             UpdateMonitoring();
             // 状态第一次到 Connected 即视为首次尝试结束,之后的掉线重连按既有规则处理。
             if (machine.State == ConnectionState.Connected) EndFirstAttempt();
@@ -605,87 +641,113 @@ public sealed class ClientController : IDisposable
 
     private async Task ExecuteEffectsAsync(Transition transition)
     {
+        JournalState();
         Publish();
         foreach (var effect in transition.Effects)
         {
-            switch (effect.Kind)
+            if (effect.Kind == EffectKind.ShowMessage)
             {
-                case EffectKind.ShowMessage:
-                    message = sessionSource is PairingSessionSource && transition.State == ConnectionState.NeedsManual && machine.HasSession
-                        ? "连不上澳洲出口，出口地址可能已变，请在小主机上重新导出配对文件再导入。断网保护仍保持。"
-                        : effect.Message ?? "";
-                    break;
-                case EffectKind.ApplyKillSwitch:
-                    var held = protectionVerified;
-                    protection = true; // Even partial Apply must be treated as requiring explicit recovery.
-                    try
-                    {
-                        if (activeRouting.Mode == RoutingMode.Apps) await ApplyAppsAsync();
-                        else await firewall.ApplyAsync(NodeIps(session!), program, session!.Node.Hy2Port, session.Node.RealityPort,
-                                sessionSource is AuthServerSessionSource ? authEndpoint : null);
-                        protectionVerified = true;
-                        firewallWarning = null;
-                        reapWarning = null;
-                        if (nicGuard is not null) await nicGuard.ApplyAsync(lifetime.Token);
-                        ReapStaleConnections();
-                    }
-                    catch (FirewallIneffectiveException ex) when (held)
-                    {
-                        var keep = ex is NicGuardException nicFailure ? NicKeepTunnelWarning(nicFailure)
-                            : ex is WfpUnavailableException ? WfpKeepTunnelWarning
-                            : ex is RouteGuardUnavailableException ? RouteKeepTunnelWarning : KeepTunnelWarning;
-                        firewallWarning = keep;
-                        guardStatus = keep;
-                        message = keep;
-                    }
-                    break;
-                case EffectKind.UpdateKillSwitchNode:
-                    if (activeRouting.Mode != RoutingMode.Apps)
-                        await firewall.UpdateNodeAsync(effect.NewIps!, program, session!.Node.Hy2Port, session.Node.RealityPort);
-                    break;
-                case EffectKind.RemoveKillSwitch:
-                    await firewall.RemoveAsync(); protection = false; protectionVerified = false; firewallWarning = null; reapWarning = null;
-                    if (nicGuard is not null) nicRestoreWarning = await nicGuard.RestoreAsync(); // 恢复失败不抛、不阻止状态迁移。
-                    break;
-                case EffectKind.StopTunnel: tunnel.Stop(); break;
-                case EffectKind.StartTunnel:
-                    if (session is null || session.SessionExpiresAt <= DateTimeOffset.UtcNow || session.AccountExpiresAt <= DateTimeOffset.UtcNow)
-                    { await ExecuteAsync(machine.Handle(new(ConnectionEventKind.SessionExpired))); break; }
-                    try
-                    {
-                        await tunnel.StartAsync(RenderedConfiguration(session), lifetime.Token);
-                        lifetime.Token.ThrowIfCancellationRequested();
-                        await ExecuteAsync(machine.Handle(new(ConnectionEventKind.TunnelUp)));
-                        message = (firewallWarning ?? "虚拟网卡已就绪。") + (reapWarning is null ? "" : " " + reapWarning);
-                        await ApplyEnvironmentAsync();
-                    }
-                    catch (FileNotFoundException ex)
-                    {
-                        // 首次尝试由放弃并恢复统一给提示;只有已持有保护的路径保留这句原文。
-                        var wasFirstAttempt = firstAttempt;
-                        await FailAsync(ex);
-                        if (!wasFirstAttempt) message = "未找到连接内核，请联系管理员配置 sing-box.exe 路径。";
-                    }
-                    catch (InvalidDataException) { throw; }
-                    catch (Exception ex) when (ex is IOException or TimeoutException)
-                    { await ExecuteAsync(machine.Handle(new(ConnectionEventKind.TunnelDown))); }
-                    break;
-                case EffectKind.ScheduleBackoff:
-                    if (firstAttempt && firstBackoffs >= FirstConnectRetries)
-                    {
-                        // 首次尝试前三次退避(2、4、8 秒)照常;第 4 次要安排时放弃并恢复原网络。
-                        await AbandonAsync(null, phrase: "连续 4 次没连上", reason: "原因：连续 4 次都没连上澳洲出口。");
+                message = sessionSource is PairingSessionSource && transition.State == ConnectionState.NeedsManual && machine.HasSession
+                    ? "连不上澳洲出口，出口地址可能已变，请在小主机上重新导出配对文件再导入。断网保护仍保持。"
+                    : effect.Message ?? "";
+                continue;
+            }
+            var action = ConnectJournal.EffectName(effect);
+            WriteJournal("动作开始：" + action);
+            var watch = System.Diagnostics.Stopwatch.StartNew();
+            try
+            {
+                switch (effect.Kind)
+                {
+                    case EffectKind.ApplyKillSwitch:
+                        var held = protectionVerified;
+                        protection = true; // Even partial Apply must be treated as requiring explicit recovery.
+                        try
+                        {
+                            if (activeRouting.Mode == RoutingMode.Apps) await ApplyAppsAsync();
+                            else await firewall.ApplyAsync(NodeIps(session!), program, session!.Node.Hy2Port, session.Node.RealityPort,
+                                    sessionSource is AuthServerSessionSource ? authEndpoint : null);
+                            protectionVerified = true;
+                            firewallWarning = null;
+                            reapWarning = null;
+                            if (nicGuard is not null) await nicGuard.ApplyAsync(lifetime.Token);
+                            ReapStaleConnections();
+                        }
+                        catch (FirewallIneffectiveException ex) when (held)
+                        {
+                            WriteJournal("套用断网保护没成功，隧道保持：" + ConnectJournal.Describe(ex));
+                            var keep = ex is NicGuardException nicFailure ? NicKeepTunnelWarning(nicFailure)
+                                : ex is WfpUnavailableException ? WfpKeepTunnelWarning
+                                : ex is RouteGuardUnavailableException ? RouteKeepTunnelWarning : KeepTunnelWarning;
+                            firewallWarning = keep;
+                            guardStatus = keep;
+                            message = keep;
+                        }
                         break;
-                    }
-                    if (firstAttempt) firstBackoffs++;
-                    Schedule(effect.Delay!.Value, async () =>
-                    {
-                        var next = machine.Handle(new(ConnectionEventKind.BackoffElapsed));
-                        await ExecuteAsync(next);
-                        if (machine.State == ConnectionState.Reconnecting && !next.Effects.Any(e => e.Kind == EffectKind.StartTunnel))
-                            await FetchSessionAsync();
-                    }, "退避");
-                    break;
+                    case EffectKind.UpdateKillSwitchNode:
+                        if (activeRouting.Mode != RoutingMode.Apps)
+                            await firewall.UpdateNodeAsync(effect.NewIps!, program, session!.Node.Hy2Port, session.Node.RealityPort);
+                        break;
+                    case EffectKind.RemoveKillSwitch:
+                        await firewall.RemoveAsync(); protection = false; protectionVerified = false; firewallWarning = null; reapWarning = null;
+                        if (nicGuard is not null) nicRestoreWarning = await nicGuard.RestoreAsync(); // 恢复失败不抛、不阻止状态迁移。
+                        break;
+                    case EffectKind.StopTunnel: tunnel.Stop(); break;
+                    case EffectKind.StartTunnel:
+                        if (session is null || session.SessionExpiresAt <= DateTimeOffset.UtcNow || session.AccountExpiresAt <= DateTimeOffset.UtcNow)
+                        { await ExecuteAsync(machine.Handle(new(ConnectionEventKind.SessionExpired))); break; }
+                        try
+                        {
+                            await tunnel.StartAsync(RenderedConfiguration(session), lifetime.Token);
+                            lifetime.Token.ThrowIfCancellationRequested();
+                            await ExecuteAsync(machine.Handle(new(ConnectionEventKind.TunnelUp)));
+                            message = (firewallWarning ?? "虚拟网卡已就绪。") + (reapWarning is null ? "" : " " + reapWarning);
+                            await ApplyEnvironmentAsync();
+                        }
+                        catch (FileNotFoundException ex)
+                        {
+                            WriteJournal("启动隧道没成功：" + ConnectJournal.Describe(ex));
+                            // 首次尝试由放弃并恢复统一给提示;只有已持有保护的路径保留这句原文。
+                            var wasFirstAttempt = firstAttempt;
+                            await FailAsync(ex);
+                            if (!wasFirstAttempt) message = "未找到连接内核，请联系管理员配置 sing-box.exe 路径。";
+                        }
+                        catch (InvalidDataException ex)
+                        {
+                            WriteJournal("启动隧道没成功：" + ConnectJournal.Describe(ex));
+                            throw;
+                        }
+                        catch (Exception ex) when (ex is IOException or TimeoutException)
+                        {
+                            WriteJournal("启动隧道没成功：" + ConnectJournal.Describe(ex));
+                            await ExecuteAsync(machine.Handle(new(ConnectionEventKind.TunnelDown)));
+                        }
+                        break;
+                    case EffectKind.ScheduleBackoff:
+                        if (firstAttempt && firstBackoffs >= FirstConnectRetries)
+                        {
+                            // 首次尝试前三次退避(2、4、8 秒)照常;第 4 次要安排时放弃并恢复原网络。
+                            await AbandonAsync(null, phrase: "连续 4 次没连上", reason: "原因：连续 4 次都没连上澳洲出口。");
+                            break;
+                        }
+                        if (firstAttempt) firstBackoffs++;
+                        Schedule(effect.Delay!.Value, async () =>
+                        {
+                            var next = machine.Handle(new(ConnectionEventKind.BackoffElapsed));
+                            await ExecuteAsync(next);
+                            if (machine.State == ConnectionState.Reconnecting && !next.Effects.Any(e => e.Kind == EffectKind.StartTunnel))
+                                await FetchSessionAsync();
+                        }, "退避");
+                        break;
+                }
+                watch.Stop();
+                WriteJournal($"动作结束：{action}，用时 {watch.ElapsedMilliseconds} 毫秒");
+            }
+            catch (Exception ex)
+            {
+                watch.Stop();
+                WriteJournal($"动作出错：{action}，用时 {watch.ElapsedMilliseconds} 毫秒，{ConnectJournal.Describe(ex)}");
+                throw;
             }
         }
     }
@@ -753,11 +815,13 @@ public sealed class ClientController : IDisposable
             exitIp = address.ToString();
             var matches = IPAddress.TryParse(session.Node.Host, out var expected) && address.Equals(expected);
             exitStatus = matches ? "已核验" : "不一致";
+            WriteJournal(matches ? "出口核验：已核验" : "出口核验：不一致");
             if (activeRouting.Mode == RoutingMode.Apps) exitStatus += "(后台服务出口)";
             if (!matches) message = "出口地址与澳洲节点不一致,请联系管理员;断网保护保持,未自动断开。";
         }
         else if (attempt < ExitCheckAttempts)
         {
+            WriteJournal($"出口核验：第 {attempt} 次没有回应");
             ScheduleExitCheck(ExitCheckRetry, cycle, attempt + 1);
             return;
         }
@@ -766,6 +830,7 @@ public sealed class ClientController : IDisposable
             exitStatus = "无法核验";
             exitIp = "";
             unverifiableRounds++;
+            WriteJournal($"出口核验：无法核验，已连续 {unverifiableRounds} 轮");
             if (TestBuild && machine.State == ConnectionState.Connected)
             {
                 // 测试包的第二道保险:一轮核验以「无法核验」收场就自动断开并恢复原网络,不再排下一次。
@@ -863,6 +928,7 @@ public sealed class ClientController : IDisposable
         finally
         {
             await PatrolNicAsync(); // 防火墙巡检(含规则重建分路)之后再巡检网卡。
+            JournalPatrol();
             Publish();
             if (!disposed && !lifetime.IsCancellationRequested && ShouldPatrol && ReferenceEquals(cycle, patrolCycle)) SchedulePatrol(cycle);
         }
@@ -957,14 +1023,18 @@ public sealed class ClientController : IDisposable
             }
             catch (OperationCanceledException) when (token.IsCancellationRequested) { }
             catch (Exception ex) when (IsOperational(ex)) { await FailAsync(ex); }
+            catch (Exception ex) when (firstAttempt) { await FailAsync(ex); }
             finally { Publish(); gate.Release(); }
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested) { }
     }
     private Task DelayForPurposeAsync(TimeSpan delay, CancellationToken token, string purpose)
         => DelayWithPurposeAsync?.Invoke(delay, token, purpose) ?? delayAsync(delay, token);
-    private void OnTunnelDown(object? sender, EventArgs e) => Schedule(TimeSpan.Zero,
-        () => ExecuteAsync(machine.Handle(new(ConnectionEventKind.TunnelDown))));
+    private void OnTunnelDown(object? sender, EventArgs e) => Schedule(TimeSpan.Zero, () =>
+    {
+        WriteJournal("隧道掉线"); // 回调在串行锁内执行,不写在事件线程上。
+        return ExecuteAsync(machine.Handle(new(ConnectionEventKind.TunnelDown)));
+    });
 
     public async Task ChangeSessionSourceAsync(Func<ISessionSource?> change, string notice)
     {
@@ -1039,7 +1109,11 @@ public sealed class ClientController : IDisposable
         Interlocked.Increment(ref generation);
         var stopped = true;
         try { await ExecuteAsync(machine.Handle(new(ConnectionEventKind.AttemptAbandoned))); }
-        catch (Exception ex) when (IsOperational(ex)) { stopped = false; }
+        catch (Exception ex)
+        {
+            WriteJournal("停止隧道没成功：" + ConnectJournal.Describe(ex));
+            stopped = false;
+        }
         var undo = UndoState.NotNeeded;
         string? nicWarning = null;
         var environmentRestored = false;
@@ -1048,7 +1122,12 @@ public sealed class ClientController : IDisposable
             (undo, nicWarning) = await RemoveProtectionAsync();
             if (undo != UndoState.Failed)
             {
-                environmentRestored = await RestoreEnvironmentAsync();
+                try { environmentRestored = await RestoreEnvironmentAsync(); }
+                catch (Exception ex)
+                {
+                    WriteJournal("恢复环境没成功：" + ConnectJournal.Describe(ex));
+                    environmentRestored = false;
+                }
                 session = null;
                 guardStatus = "";
             }
@@ -1057,7 +1136,7 @@ public sealed class ClientController : IDisposable
         {
             // 内核停不下来或保护撤不掉:停在需人工处理,不再做环境恢复,保护保持。
             try { await ExecuteAsync(machine.Handle(new(ConnectionEventKind.OperationFailed))); }
-            catch (Exception ex) when (IsOperational(ex)) { }
+            catch (Exception) { }
             message = !stopped
                 ? "连接内核未能停止，请联系管理员；断网保护保留。"
                 : AbandonNotRestored + (reason ?? ReasonSentence(cause));
@@ -1080,7 +1159,11 @@ public sealed class ClientController : IDisposable
     {
         if (!protection) return (UndoState.NotNeeded, null);
         try { await firewall.RemoveAsync(); }
-        catch (Exception ex) when (IsOperational(ex)) { return (UndoState.Failed, null); }
+        catch (Exception ex)
+        {
+            WriteJournal("撤销断网保护没成功：" + ConnectJournal.Describe(ex));
+            return (UndoState.Failed, null);
+        }
         protection = false;
         protectionVerified = false;
         firewallWarning = null;
@@ -1089,7 +1172,7 @@ public sealed class ClientController : IDisposable
         if (nicGuard is not null)
         {
             try { warning = await nicGuard.RestoreAsync(); }
-            catch (Exception ex) when (IsOperational(ex)) { }
+            catch (Exception ex) { WriteJournal("恢复网卡没成功：" + ConnectJournal.Describe(ex)); }
         }
         return (UndoState.Removed, warning);
     }
@@ -1103,7 +1186,14 @@ public sealed class ClientController : IDisposable
         {
             message += " 已恢复原来的网络。";
             if (warning is not null) message += " " + warning;
-            if (!await RestoreEnvironmentAsync()) message += " 时区或浏览器设置未能恢复，请联系管理员。";
+            var environmentRestored = false;
+            try { environmentRestored = await RestoreEnvironmentAsync(); }
+            catch (Exception ex)
+            {
+                WriteJournal("恢复环境没成功：" + ConnectJournal.Describe(ex));
+                environmentRestored = false;
+            }
+            if (!environmentRestored) message += " 时区或浏览器设置未能恢复，请联系管理员。";
         }
         EndFirstAttempt();
         RaiseAttemptAbandoned();
@@ -1127,6 +1217,39 @@ public sealed class ClientController : IDisposable
     {
         try { Journal?.Invoke(line); }
         catch (Exception) { } // 记录写不进不影响连接与恢复。
+    }
+
+    /// <summary>恢复记录的状态:读取失败只写「读不到」,不让记录读取影响连接流程。</summary>
+    private string PendingRecordText()
+    {
+        try { return firewall.HasPendingState ? "有" : "无"; }
+        catch (Exception) { return "读不到"; }
+    }
+
+    /// <summary>状态与上次写进记录的不同时,补一行「状态：旧→新」。</summary>
+    private void JournalState()
+    {
+        var state = machine.State;
+        if (state == journaledState) return;
+        WriteJournal("状态：" + ConnectJournal.StateName(journaledState) + "→" + ConnectJournal.StateName(state));
+        journaledState = state;
+    }
+
+    /// <summary>巡检文字只在变化时写一行;从异常回到正常单独写「巡检：恢复正常」。</summary>
+    private void JournalPatrol()
+    {
+        if (guardStatus.Length == 0) return;
+        if (guardStatus == "正常")
+        {
+            if (journaledPatrol.Length == 0) return;
+            WriteJournal("巡检：恢复正常");
+            journaledPatrol = "";
+            return;
+        }
+        if (guardStatus.StartsWith("已为新出现的", StringComparison.Ordinal)) return;
+        if (guardStatus == journaledPatrol) return;
+        WriteJournal("巡检：" + ConnectJournal.Clean(guardStatus));
+        journaledPatrol = guardStatus;
     }
 
     private static IPAddress[] NodeIps(SessionResponse value)
