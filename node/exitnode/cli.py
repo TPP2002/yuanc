@@ -27,6 +27,11 @@ from .status import State, evaluate
 from .watchdog import state as watchdog_state
 from .watchdog import tick as watchdog_tick
 
+JOURNAL_UNITS = ("exitnode-proxy.service", "exitnode-admin.service", "exitnode-nft.service",
+                 "exitnode-watchdog.service", "exitnode-rescue.service",
+                 "exitnode-recover.service", "exitnode-authsync.service",
+                 "exitnode-publisher.service")
+
 
 class ChineseParser(argparse.ArgumentParser):
     def __init__(self, *args, **kwargs):
@@ -245,7 +250,8 @@ def _install(config, config_path, runner, manifest):
             apply(step, write_unit, {"kind": "systemctl", "unit": unit})
         apply("重载服务定义", lambda: runner.run(["systemctl", "daemon-reload"]),
               {"kind": "systemctl", "unit": "exitnode-admin.service", "reload_only": True})
-        apply("启用管理面", lambda: runner.run(["systemctl", "enable", "exitnode-admin.service"]),
+        apply("启用管理面",
+              lambda: runner.run(["systemctl", "enable", "--now", "exitnode-admin.service"]),
               {"kind": "systemctl", "unit": "exitnode-admin.service"})
         if not any(s["step"] == "安装网络规则" for s in manifest.steps) and nft._exists(runner):
             raise ValueError("已有同名规则表未在本安装清单中，请联系维护人员")
@@ -253,9 +259,9 @@ def _install(config, config_path, runner, manifest):
                    "admin_port": config.admin.port, "admin_bind": config.admin.bind,
                    "service_user": service.SERVICE_USER}
         apply("安装网络规则", lambda: nft.apply(runner, context), {"kind": "nft"})
-        # 规则已由上一步加载，只设开机重新加载，不加 --now。
+        # 规则文件先删表再建表，重复加载不累加规则；当场启动，装完「服务加固」检查即可通过。
         apply("启用防火墙规则单元",
-              lambda: runner.run(["systemctl", "enable", "exitnode-nft.service"]),
+              lambda: runner.run(["systemctl", "enable", "--now", "exitnode-nft.service"]),
               {"kind": "systemctl", "unit": "exitnode-nft.service"})
         apply("检查 sing-box 二进制", lambda: None,
               {"kind": "remove_file", "path": config.proxy.binary, "preserve": True})
@@ -394,11 +400,22 @@ def _diagnose(runner, config, result, output):
     tail = "暂无日志"
     if runner.exists(log_path):
         tail = "\n".join(runner.read_file(log_path).splitlines()[-100:])
+    argv = ["journalctl", "--no-pager", "-o", "short-iso", "-n", "300"]
+    for unit in JOURNAL_UNITS:
+        argv.extend(["-u", unit])
+    try:
+        journal = runner.run(argv, check=False, timeout=20)
+    except (OSError, RuntimeError):
+        system_log = "无法读取系统日志"
+    else:
+        system_log = ("无法读取系统日志" if journal.code
+                      else journal.out.strip() or "暂无系统日志")
     payload = {"version": __version__, "check": result, "config": config.sanitized()}
     stream = io.BytesIO()
     with zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("诊断.json", redact(json.dumps(payload, ensure_ascii=False, indent=2)))
-        archive.writestr("最近日志.txt", redact(tail))
+        archive.writestr("最近日志.txt",
+                         redact("【程序日志】\n" + tail + "\n\n【系统日志】\n" + system_log))
     runner.write_bytes(output, stream.getvalue(), 0o600)
     print("诊断包已保存，凭据已打码；分享前请再次检查其中的网络和设备信息。")
 

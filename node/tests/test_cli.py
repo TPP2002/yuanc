@@ -139,7 +139,7 @@ def test_status_json_fields_and_four_states(capsys):
     assert set(result["network"]) == {"iface", "gateway", "dhcp", "addr"}
     assert result["network"]["dhcp"] == "unknown"
     assert result["path"] == "unknown" and result["last_ok_at"] is None
-    assert "未接入" in result["reason"]
+    assert "尚不能确认可上网" in result["reason"]
     assert {s.value for s in State} == {"normal", "reconnecting", "reauth", "manual"}
 
 
@@ -169,7 +169,7 @@ def test_check_unintegrated_layers_are_not_passed(capsys, monkeypatch):
     assert main(["check", "--json"], runner) == 0
     layers = json.loads(capsys.readouterr().out)["layers"]
     assert [layer["result"] for layer in layers] == [
-        "通过", "通过", "未接入", "未接入", "未接入", "通过", "通过", "通过", "通过", "通过", "通过"]
+        "通过", "通过", "未知", "跳过", "跳过", "通过", "通过", "通过", "通过", "通过", "通过"]
     assert layers[-6]["name"] == "看门狗"
     assert layers[-5]["name"] == "救援单元"
     assert layers[-4]["name"] == "服务加固"
@@ -308,11 +308,9 @@ def test_repeated_init_does_not_repeat_commands_and_uninstall_keeps_secrets():
         "kind": "systemctl", "unit": "exitnode-nft.service"}
     assert runner.modes[CONFIG] == 0o644
     sent = [c[1] for c in runner.calls if c[0] == "run"]
-    assert ("systemctl", "enable", "exitnode-nft.service") in sent
-    assert not any(c[:2] == ("systemctl", "enable") and "exitnode-nft.service" in c
-                   and "--now" in c for c in sent)
+    assert ("systemctl", "enable", "--now", "exitnode-nft.service") in sent
     assert sent.index(("nft", "-f", "/var/lib/exitnode/exitnode.nft")) < sent.index(
-        ("systemctl", "enable", "exitnode-nft.service"))
+        ("systemctl", "enable", "--now", "exitnode-nft.service"))
     assert "/var/lib/exitnode/exitnode.nft" in runner.files
     assert ('meta skuid "exitnode" ct direction original ip ttl set 128'
             in runner.files["/var/lib/exitnode/exitnode.nft"])
@@ -848,3 +846,60 @@ def test_check_includes_console_layer_only_when_enabled(monkeypatch, capsys):
     layers = json.loads(capsys.readouterr().out)["layers"]
     assert layers[-1]["layer"] == "console"
     assert layers[-1]["name"] == "管理网页"
+
+
+def test_init_starts_admin_and_rules_now():
+    from exitnode.manifest import Manifest
+
+    runner = fake(pairing=True)
+    assert main(["init"], runner) == 0
+    sent = [c[1] for c in runner.calls if c[0] == "run"]
+    for unit in ("exitnode-admin.service", "exitnode-nft.service"):
+        assert ("systemctl", "enable", "--now", unit) in sent
+        assert not any(c[:2] == ("systemctl", "enable") and unit in c and "--now" not in c
+                       for c in sent)
+    steps = Manifest("/var/lib/exitnode/manifest.json", runner).steps
+    undo = {s["step"]: s["undo"] for s in steps}
+    assert undo["启用管理面"] == {"kind": "systemctl", "unit": "exitnode-admin.service"}
+    assert undo["启用防火墙规则单元"] == {"kind": "systemctl", "unit": "exitnode-nft.service"}
+    boundary = len(runner.calls)
+    assert main(["rollback"], runner) == 0
+    undone = runner.calls[boundary:]
+    for unit in ("exitnode-admin.service", "exitnode-nft.service"):
+        assert ("run", ("systemctl", "disable", "--now", unit), True, None) in undone
+
+
+def test_diagnose_includes_journal_and_redacts():
+    from exitnode.cli import JOURNAL_UNITS
+
+    runner = fake()
+    journal = ("2026-11-27T00:00:00+0000 host exitnode-proxy[1]: 启动隧道服务\n"
+               "2026-11-27T00:00:01+0000 host exitnode-admin[2]: "
+               "设备 12345678-1234-1234-1234-123456789abc 登录\n"
+               "2026-11-27T00:00:02+0000 host exitnode-nft[3]: password=abcdefgh\n")
+    runner.responses[("journalctl",)] = CompletedResult(out=journal)
+    assert main(["diagnose", "--output", "/diagnose.zip"], runner) == 0
+    argv = next(c[1] for c in runner.calls if c[0] == "run" and c[1][0] == "journalctl")
+    assert argv[:6] == ("journalctl", "--no-pager", "-o", "short-iso", "-n", "300")
+    assert [argv[i + 1] for i in range(len(argv) - 1) if argv[i] == "-u"] == list(JOURNAL_UNITS)
+    with zipfile.ZipFile(io.BytesIO(runner.files["/diagnose.zip"])) as archive:
+        content = archive.read("最近日志.txt").decode("utf-8")
+    assert "【程序日志】" in content and "【系统日志】" in content
+    assert "启动隧道服务" in content and "登录" in content
+    assert "12345678-1234-1234-1234-123456789abc" not in content
+    assert "abcdefgh" not in content
+
+
+@pytest.mark.parametrize("response,expected", [
+    (CompletedResult(1, err="读取失败"), "无法读取系统日志"),
+    (None, "无法读取系统日志"),
+    (CompletedResult(out="  \n"), "暂无系统日志"),
+])
+def test_diagnose_journal_failure_is_reported(response, expected):
+    runner = fake()
+    if response is not None:
+        runner.responses[("journalctl",)] = response
+    assert main(["diagnose", "--output", "/diagnose.zip"], runner) == 0
+    with zipfile.ZipFile(io.BytesIO(runner.files["/diagnose.zip"])) as archive:
+        content = archive.read("最近日志.txt").decode("utf-8")
+    assert expected in content

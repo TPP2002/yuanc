@@ -34,6 +34,13 @@ class Status:
 
 def evaluate(check_result):
     layers = {item["layer"]: item for item in check_result["layers"]}
+    channels = layers.get("proxy", {}).get("channels") or {}
+    if channels.get("main"):
+        path = "main"
+    elif channels.get("backup"):
+        path = "backup"
+    else:
+        path = "unknown"
     failures = [layers[key] for key in ("network", "upstream")
                 if layers.get(key, {}).get("result") != "通过"]
     if failures:
@@ -45,7 +52,19 @@ def evaluate(check_result):
         state, reason = State.MANUAL, "网络可用，但服务检查失败，请联系维护人员"
     else:
         state = State.NORMAL
-        reason = "已接入的网络检查通过；入口、代理和真实出口未接入，尚不能确认可上网"
+        egress = layers.get("egress")
+        if egress and egress.get("result") == "通过":
+            if channels.get("main") and channels.get("backup"):
+                reason = "检查通过，经隧道可以上网"
+            elif channels.get("main"):
+                reason = "检查通过，经主通道可以上网；备用通道自测不通"
+            elif channels.get("backup"):
+                reason = "检查通过，经备用通道可以上网；主通道自测不通"
+            else:
+                reason = "检查通过，但尚不能确认可上网：" + egress.get("reason", "")
+        else:
+            reason = ("检查通过，但尚不能确认可上网："
+                      + (egress["reason"] if egress else "缺少隧道自测结果"))
     watchdog = check_result.get("watchdog")
     if watchdog and watchdog["state"] in {"manual", "degraded"}:
         state = State.MANUAL if watchdog["state"] == "manual" else State.RECONNECTING
@@ -53,5 +72,5 @@ def evaluate(check_result):
     address = check_result.get("public_ipv4")
     if address and ipaddress.IPv4Address(address) in ipaddress.IPv4Network("100.64.0.0/10"):
         reason += "；疑似运营商内网地址(CGNAT),外网无法直连"
-    return Status(state, __version__, check_result["network"], reason=reason,
+    return Status(state, __version__, check_result["network"], path=path, reason=reason,
                   public_ipv4=address, watchdog=watchdog, publisher=check_result.get("publisher"))
