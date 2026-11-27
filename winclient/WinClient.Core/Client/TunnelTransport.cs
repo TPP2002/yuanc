@@ -24,6 +24,8 @@ public sealed class TunnelTransport : ITunnelTransport
     private readonly Func<bool> ready;
     private readonly Func<TimeSpan, CancellationToken, Task> delay;
     private bool exited;
+    /// <summary>测试包打开连接内核的 warn 级日志；正式包保持配置里写死的关闭状态。</summary>
+    public bool KernelLog { get; init; }
     public event EventHandler? TunnelDown;
     public TunnelTransport(SingBoxProcessManager manager, Func<bool>? readyProbe = null,
         Func<TimeSpan, CancellationToken, Task>? delay = null)
@@ -55,7 +57,7 @@ public sealed class TunnelTransport : ITunnelTransport
                 break;
             }
         }
-        manager.Start(RenderConfiguration(configuration));
+        manager.Start(RenderConfiguration(configuration, KernelLog));
         // A child process merely existing is not readiness: wait for its TUN interface.
         var settled = 0;
         for (var attempt = 0; attempt < ReadyPolls; attempt++)
@@ -78,7 +80,9 @@ public sealed class TunnelTransport : ITunnelTransport
         throw new TimeoutException("连接内核尚未建立虚拟网卡。");
     }
 
-    public static JsonElement RenderConfiguration(JsonElement configuration)
+    public static JsonElement RenderConfiguration(JsonElement configuration) => RenderConfiguration(configuration, false);
+
+    public static JsonElement RenderConfiguration(JsonElement configuration, bool kernelLog)
     {
         var node = JsonNode.Parse(configuration.GetRawText()) as JsonObject
             ?? throw new InvalidDataException("服务器连接配置无效。");
@@ -89,6 +93,8 @@ public sealed class TunnelTransport : ITunnelTransport
         tuns[0]["strict_route"] = true;
         tuns[0]["auto_route"] = true;
         tuns[0]["route_address"] = new JsonArray(RouteGuard.TunRoutes.Select(value => (JsonNode?)JsonValue.Create(value)).ToArray());
+        // 只有测试包把顶层 log 换成 warn 级；正式包不碰配置里的 log 段，输出与改动前逐字节相同。
+        if (kernelLog) node["log"] = new JsonObject { ["disabled"] = false, ["level"] = "warn", ["timestamp"] = true };
         return JsonSerializer.SerializeToElement(node);
     }
     public void Stop() => manager.Stop();

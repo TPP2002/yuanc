@@ -2,6 +2,7 @@ using System.Runtime.Versioning;
 using System.Security.Cryptography;
 using System.Text.Json;
 using WinClient.Core.Auth;
+using WinClient.Core.Diagnostics;
 using WinClient.Core.Firewall;
 using WinClient.Core.Network;
 using WinClient.Core.Process;
@@ -11,6 +12,7 @@ using WinClient.Core.Pairing;
 using WinClient.Core.Kernel;
 using WinClient.Core.Hosting;
 using WinClient.Core.EnvironmentSupport;
+using WinClient.Core.Ipc;
 
 namespace WinClient.Core.Client;
 
@@ -23,6 +25,12 @@ public sealed class ClientRuntime : IClientFacade, IDisposable
     private readonly RedactingLog log;
     private readonly string? storeRoot;
     private readonly DataProtectionScope scope;
+    // 过滤层引擎与测试包标记存下来供诊断采集复用；不改变启动与连接行为。
+    private readonly IWfpEngine? wfp;
+    private readonly bool testBuild;
+    /// <summary>防火墙现状与路由 DNS 现状探测各自的时限；超时只让对应诊断段留空。</summary>
+    internal static readonly TimeSpan FirewallProbeTimeout = TimeSpan.FromSeconds(10);
+    internal static readonly TimeSpan NetworkProbeTimeout = TimeSpan.FromSeconds(10);
     public ClientController Controller { get; }
     public ClientSnapshot Snapshot => Controller.Snapshot;
     public string? RecoveryWarning => firewall.LastRecoveryWarning;
@@ -40,13 +48,15 @@ public sealed class ClientRuntime : IClientFacade, IDisposable
         return File.Exists(path) ? File.ReadAllText(path) : null;
     }
     private ClientRuntime(ClientController controller, KillSwitchApplier firewall, HttpClient? http, PairingStore pairingStore, RedactingLog log,
-        string? storeRoot, DataProtectionScope scope)
-    { Controller = controller; this.firewall = firewall; this.http = http; this.pairingStore = pairingStore; this.log = log; this.storeRoot = storeRoot; this.scope = scope; }
+        string? storeRoot, DataProtectionScope scope, IWfpEngine? wfp, bool testBuild)
+    { Controller = controller; this.firewall = firewall; this.http = http; this.pairingStore = pairingStore; this.log = log; this.storeRoot = storeRoot; this.scope = scope; this.wfp = wfp; this.testBuild = testBuild; }
 
     public static async Task<ClientRuntime> CreateAsync(IKernelInstaller installer, string? storeRoot = null,
         DataProtectionScope scope = DataProtectionScope.CurrentUser, bool keepProtection = false, bool testBuild = false)
     {
         var log = new RedactingLog(new RollingFileLog(Path.Combine(ClientSettings.DataDirectory, "run", "sing-box.log")));
+        // 连接记录单写一份,只放本单定义的三类行;节点地址、出口地址与令牌不进这份记录。
+        var connectLog = new RedactingLog(new RollingFileLog(Path.Combine(ClientSettings.DataDirectory, "run", "connect.log")));
         // 后台服务启动时先清一次上次残留的连接内核；这一层失败不让服务起不来，连接时 Start 还会再清一次并报错。
         var kernelDirectory = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), ClientSettings.ProductName, "bin");
@@ -58,7 +68,8 @@ public sealed class ClientRuntime : IClientFacade, IDisposable
         {
             // 服务不能因为清残留失败而起不来；保持保护与不保持两条路都一样。
         }
-        var firewall = new KillSwitchApplier(Path.Combine(ClientSettings.DataDirectory, "run"), wfp: WfpEngine.CreateProduction(), routes: new RouteGuard());
+        var wfp = WfpEngine.CreateProduction();
+        var firewall = new KillSwitchApplier(Path.Combine(ClientSettings.DataDirectory, "run"), wfp: wfp, routes: new RouteGuard(), log: connectLog.Write);
         if (!keepProtection)
         {
             try { await firewall.RecoverAsync(); } // 恢复路径仍先于读取服务器配置。
@@ -68,8 +79,6 @@ public sealed class ClientRuntime : IClientFacade, IDisposable
             }
         }
         var pairingStore = new PairingStore(root: storeRoot, scope: scope);
-        // 连接记录单写一份,只放本单定义的三类行;节点地址、出口地址与令牌不进这份记录。
-        var connectLog = new RedactingLog(new RollingFileLog(Path.Combine(ClientSettings.DataDirectory, "run", "connect.log")));
         var settings = ClientSettings.Load(ownerIsTrusted: DataDirectorySecurity.IsTrustedOwner);
         HttpClient? http = null;
         try
@@ -81,7 +90,7 @@ public sealed class ClientRuntime : IClientFacade, IDisposable
                 return new AuthServerSessionSource(new AuthApiClient(http, log), new DpapiCredentialStore(ClientSettings.ProductName, root: storeRoot, scope: scope));
             }, log);
             var program = settings?.SingBoxPath ?? installer.Ensure();
-            var transport = new TunnelTransport(new SingBoxProcessManager(program, ClientSettings.ProductName, logger: log));
+            var transport = new TunnelTransport(new SingBoxProcessManager(program, ClientSettings.ProductName, logger: log)) { KernelLog = testBuild };
             var nic = new NicGuard(Path.Combine(ClientSettings.DataDirectory, "run"), new SystemAdapterProbe());
             var controller = new ClientController(source, GuardFor(firewall, testBuild),
                 transport, program, new DeviceInfo { Platform = "windows", Name = Environment.MachineName, Fingerprint = ClientSettings.GetDeviceFingerprint(storeRoot, scope) },
@@ -96,13 +105,38 @@ public sealed class ClientRuntime : IClientFacade, IDisposable
                 proxyProbe: new RegistryProxySettingsProbe(),
                 scopeResolver: path => AppScopeResolver.Resolve(path, AppScopeResolver.SystemFolders(), new SystemAppScopeFileSystem()))
                 { Journal = connectLog.Write, TestBuild = testBuild };
-            return new(controller, firewall, http, pairingStore, log, storeRoot, scope);
+            return new(controller, firewall, http, pairingStore, log, storeRoot, scope, wfp, testBuild);
         }
         catch { http?.Dispose(); throw; }
     }
 
     /// <summary>测试包交给控制器的断网保护换成不执行的外壳;正式包原样返回同一个对象。</summary>
     internal static IKillSwitch GuardFor(IKillSwitch real, bool testBuild) => testBuild ? new DisabledKillSwitch(real) : real;
+
+    /// <summary>诊断采集的来源装配;测试直接注入命令、网卡与过滤层替身,生产用真实实现。</summary>
+    internal static DiagnosticsSources DiagnosticsSourcesFor(string runDirectory, Func<ClientSnapshot> snapshot, bool testBuild,
+        IWfpEngine? wfp, ICommandRunner runner, IAdapterProbe adapters, Func<string?> audit, Func<string?> selfCheck) => new()
+        {
+            RunDirectory = runDirectory,
+            Snapshot = snapshot,
+            Version = ControlSnapshot.CurrentVersion,
+            TestBuild = testBuild,
+            Desired = () => new DesiredStateStore(runDirectory).Read(),
+            WfpFilterNames = wfp is null ? null : () => wfp.ListFilterNames(),
+            Adapters = () => adapters.Snapshot(),
+            Firewall = token => FirewallStateProbe.RunAsync(runner, FirewallProbeTimeout, token),
+            Network = token => NetworkStateProbe.RunAsync(runner, NetworkProbeTimeout, token),
+            Audit = audit,
+            SelfCheck = selfCheck
+        };
+
+    /// <summary>界面经管道读诊断;采集库自己兜住各段异常,拿不到结果才交给服务端回「不支持的指令」。</summary>
+    public Task<string?> ReadDiagnosticsAsync(CancellationToken token = default) =>
+        CollectDiagnosticsAsync(DiagnosticsSourcesFor(Path.Combine(ClientSettings.DataDirectory, "run"), () => Controller.Snapshot,
+            testBuild, wfp, new CommandRunner(), new SystemAdapterProbe(), ReadAudit, ReadSelfCheck), token);
+
+    private static async Task<string?> CollectDiagnosticsAsync(DiagnosticsSources sources, CancellationToken token) =>
+        await DiagnosticsCollector.CollectAsync(sources, token).ConfigureAwait(false);
 
     internal static void WriteSelfCheck(string path, EnvironmentReport report)
     {

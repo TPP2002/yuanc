@@ -17,11 +17,13 @@ public sealed class ControlServer(IClientFacade facade, DesiredStateStore desire
         snapshot.ProtectionActive || snapshot.State is ConnectionState.Connecting or ConnectionState.Connected or ConnectionState.Reconnecting;
     /// <summary>不可信调用者发会改变连接状态的指令时返回的错误文案。</summary>
     public const string UntrustedCallerError = "只有本产品的界面程序可以执行此操作";
-    // 会改变连接状态的指令，以及 check_update（会触发对外网络检查）、read_audit（含本机其他程序的规则名与完整路径）、read_selfcheck（含产品核验到的真实出口地址），只允许程序位于安装目录之下的调用者执行；status 与 subscribe 对任何本机程序开放。
+    // 会改变连接状态的指令，以及 check_update（会触发对外网络检查）、read_audit（含本机其他程序的规则名与完整路径）、read_selfcheck（含产品核验到的真实出口地址）、read_diagnostics（含本机防火墙规则名、网卡与日志末尾），只允许程序位于安装目录之下的调用者执行；status 与 subscribe 对任何本机程序开放。
     // restore_environment 会修改系统环境，同样只允许可信调用者。
-    private static readonly HashSet<string> TrustedOnlyOps = ["connect", "disconnect", "redeem", "import_pairing", "clear_pairing", "set_environment", "restore_environment", "set_routing", "check_update", "read_audit", "read_selfcheck"];
+    private static readonly HashSet<string> TrustedOnlyOps = ["connect", "disconnect", "redeem", "import_pairing", "clear_pairing", "set_environment", "restore_environment", "set_routing", "check_update", "read_audit", "read_selfcheck", "read_diagnostics"];
     // One ordering across connections keeps persisted intent consistent with completed commands.
     private readonly SemaphoreSlim commands = new(1, 1);
+    // 多条 read_diagnostics 之间排队；它不进指令信号量，连接指令卡住时也能导出。
+    private readonly SemaphoreSlim diagnostics = new(1, 1);
     // 未订阅连接的空闲上限；零或负数表示不限。已订阅连接靠推送保活，不受此限。
     private readonly TimeSpan idleLimit = idleTimeout ?? DefaultIdleTimeout;
     private ControlSnapshot Snapshot() => ((ControlSnapshot)facade.Snapshot) with
@@ -116,6 +118,26 @@ public sealed class ControlServer(IClientFacade facade, DesiredStateStore desire
         }
         // status 只读快照，不进指令信号量：长指令执行期间探活与界面刷新也能立即拿到状态。
         if (request.Op == "status") return new(request.Id, true, Snapshot: Snapshot());
+        // read_diagnostics 只读采集，同样不进指令信号量：连接指令卡住时也能导出诊断。
+        if (request.Op == "read_diagnostics")
+        {
+            await diagnostics.WaitAsync(token).ConfigureAwait(false);
+            try
+            {
+                var text = await facade.ReadDiagnosticsAsync(token).ConfigureAwait(false);
+                if (text is null) return new(request.Id, false, "不支持的指令");
+                var diagnosticsResponse = new ControlResponse(request.Id, true, Diagnostics: text);
+                return ControlProtocol.Utf8.GetByteCount(ControlProtocol.Encode(diagnosticsResponse)) - 1 <= ControlProtocol.MaxLineBytes
+                    ? diagnosticsResponse : new(request.Id, false, "诊断内容过大，请联系管理员。");
+            }
+            catch (Exception ex) when (ex is IOException or InvalidDataException or UnauthorizedAccessException or InvalidOperationException
+                or ArgumentException or JsonException or TimeoutException)
+            {
+                // 不把异常原文发回界面：诊断里可能有本机规则名与网卡。
+                return new(request.Id, false, "诊断没有取到，请稍后再试。");
+            }
+            finally { diagnostics.Release(); }
+        }
         await commands.WaitAsync(token).ConfigureAwait(false);
         try
         {
