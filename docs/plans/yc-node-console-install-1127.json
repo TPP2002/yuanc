@@ -1,0 +1,196 @@
+{
+  "schemaVersion": 1,
+  "taskId": "NODE-WEB-CONSOLE-1127",
+  "slug": "yc-node-console-install-1127",
+  "title": "节点管理网页装上节点:两个常驻单元、首装打印密码、隧道里给本机自用设备开 198.18.255.2、升级时跟着重启、示例配置默认开启",
+  "goal": "以派单时 origin/main 头为基点。看板卡 NODE-WEB-CONSOLE-1127。\n\n背景:节点管理网页(设计正本 §5「一页极简网页」,负责人 2026-11-27 定做在节点程序里)的后台与页面已合并进主干:node/exitnode/console/ 包(auth、authclient、snapshot、server 四个模块,static/ 三件页面文件)、命令行 `exitnode console serve|snapshot|password|admin-key`、配置段 [console](enabled 默认 false、port 默认 8444、lan 默认 true)。本单是最后一单:把它装上节点并接进隧道。做完后:装机时开着管理网页的节点会多两个常驻单元(网页服务与每分钟写检查记录的定时器),第一次安装打印一次管理密码;本机自用设备在隧道里能用 http://198.18.255.2/ 打开网页;升级时网页服务跟着重启。\n\n一、node/exitnode/manifest.py:UNITS 加 \"exitnode-console.service\"、\"exitnode-console-status.service\"、\"exitnode-console-status.timer\"。init 现有的循环会按 UNITS 写入这三个单元文件(与其他单元同样的「已有同名文件拒绝认领」「内容不同拒绝覆盖」规矩),不用另写写入步骤。\n\n二、三个模板(node/exitnode/templates/ 下,内容必须与下面原文逐字一致,文件末尾一个换行)。\nexitnode-console.service:\n    [Unit]\n    Description=出口节点管理网页\n    After=network-online.target\n    Wants=network-online.target\n    StartLimitIntervalSec=300\n    StartLimitBurst=3\n\n    [Service]\n    Environment=PYTHONPATH=$program_path\n    Type=simple\n    ExecStart=/usr/bin/python3 -P -m exitnode --config \"$config_path\" console serve\n    LoadCredential=console-password:/var/lib/exitnode/secrets/console-password\n    LoadCredential=authserver-admin-key:/var/lib/exitnode/secrets/authserver-admin-key\n    Restart=on-failure\n    RestartSec=30\n    DynamicUser=true\n    CapabilityBoundingSet=\n    NoNewPrivileges=true\n    UMask=0077\n    ProtectSystem=strict\n    ProtectHome=true\n    PrivateTmp=true\n    PrivateDevices=true\n    ProtectKernelTunables=true\n    ProtectKernelModules=true\n    ProtectKernelLogs=true\n    ProtectControlGroups=true\n    ProtectProc=invisible\n    RestrictAddressFamilies=AF_INET AF_INET6\n    RestrictNamespaces=true\n    RestrictRealtime=true\n    RestrictSUIDSGID=true\n    LockPersonality=true\n    SystemCallArchitectures=native\n    SystemCallFilter=@system-service\n    IPAddressDeny=any\n    IPAddressAllow=localhost 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16\n    TasksMax=64\n    LimitNOFILE=1024\n    MemoryMax=256M\n\n    [Install]\n    WantedBy=multi-user.target\nexitnode-console-status.service:\n    [Unit]\n    Description=出口节点管理网页检查记录\n    After=network-online.target\n\n    [Service]\n    Environment=PYTHONPATH=$program_path\n    Type=oneshot\n    ExecStart=/usr/bin/python3 -P -m exitnode --config \"$config_path\" console snapshot\n    TimeoutStartSec=50\n    Restart=no\n    NoNewPrivileges=true\n    UMask=0077\n    ProtectSystem=full\n    ProtectHome=true\n    PrivateTmp=true\n    ProtectKernelModules=true\n    ProtectKernelLogs=true\n    ProtectControlGroups=true\n    RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK\n    RestrictNamespaces=true\n    RestrictRealtime=true\n    RestrictSUIDSGID=true\n    LockPersonality=true\n    SystemCallArchitectures=native\nexitnode-console-status.timer:\n    [Unit]\n    Description=出口节点每分钟写管理网页检查记录\n\n    [Timer]\n    OnBootSec=30\n    OnUnitActiveSec=60\n    AccuracySec=5s\n    Persistent=false\n    Unit=exitnode-console-status.service\n\n    [Install]\n    WantedBy=timers.target\n(上面每行前的四个空格是排版缩进,不属于文件内容。)\n\n三、管理网页的地址放行分两处(会审结论:安装清单里做完的步骤再跑 init 会跳过,放行地址若只写进单元文件,鉴权服务搬走后永远不更新):\n1. 单元文件 exitnode-console.service 里固定放行本机和局域网四段(见上面原文),不随配置变。\n2. 鉴权服务搬到别的公网地址时要多放行的那一个地址,写在附加配置文件 /etc/systemd/system/exitnode-console.service.d/authserver.conf 里;这个文件每次 init 都按当前配置比对,内容不同就重写。systemd.py 不改。\n\n四、新模块 node/exitnode/console/install.py(首行中文文档字符串):\n1. DROPIN_DIR = \"/etc/systemd/system/exitnode-console.service.d\";DROPIN = DROPIN_DIR + \"/authserver.conf\"。\n2. LAN = (ipaddress.ip_network(\"10.0.0.0/8\"), ipaddress.ip_network(\"172.16.0.0/12\"), ipaddress.ip_network(\"192.168.0.0/16\"), ipaddress.ip_network(\"169.254.0.0/16\"))。\n3. extra_allow(config) -> str | None:config.authsync.enabled 为真,且 urllib.parse.urlsplit(config.authsync.url).hostname 能被 ipaddress.IPv4Address 解析、不是回环、不落在 LAN 任一网段时,返回 \"<该地址>/32\";其余情况(含解析失败)返回 None。\n4. dropin_text(config) -> str:固定前两行「# 由 exitnode init 按配置 authsync.url 生成,不要手改」与「[Service]」,extra_allow 不为 None 时第三行「IPAddressAllow=<值>」;每行以换行结尾。\n5. sync_dropin(config, runner) -> bool:runner.mkdir(DROPIN_DIR, 0o755);DROPIN 已存在且 runner.read_file 的内容等于 dropin_text(config) → 返回 False;否则 runner.write_file(DROPIN, 内容, 0o644) 返回 True。\n6. prepare(config, runner) -> str | None:service.SECRETS + \"/console-password\" 不存在时,用 console.auth.generate_password() 生成密码、写入 hash_password 的结果(先写 .tmp,0o600,再 replace),返回明文密码;已存在则不动、返回 None。service.SECRETS + \"/authserver-admin-key\" 不存在时写入空文件(0o600;systemd 的 LoadCredential 要求文件存在,空内容由网页识别为「还没填管理密钥」);已存在不动。只经 Runner 读写。\n7. urls(config, runner) -> list[str]:config.console.lan 为真且 netinfo.read_network(runner, config.network.iface) 取到 network[\"addr\"] 时,第一项 \"http://<addr>:<console.port>/\";最后一项固定 \"http://198.18.255.2/\"。读网络出任何异常都只返回隧道那一项。\n\n五、node/exitnode/cli.py:\n1. _install:在「启用入口端口映射定时器」那段之后、install_rescue 之前,config.console.enabled 为真时依次做下面几步(为假时一步都不做、不打印;三个单元文件照常由写单元的循环写入,只是不启用):\n   - 认领检查:DROPIN_DIR 已存在,而安装清单里没有「管理网页放行目录」这一步 → raise ValueError(\"已有同名服务文件未在本安装清单中，请联系维护人员\")(与写单元循环里同一句)。\n   - apply(\"管理网页放行目录\", lambda: runner.mkdir(DROPIN_DIR, 0o755), {\"kind\": \"remove_file\", \"path\": DROPIN_DIR})。\n   - 写附加配置:changed = [];动作 write 把 console_install.sync_dropin(config, runner) 的结果追加进 changed;照「安装程序目录」那一步的写法 `if not apply(\"写入管理网页放行\", write, {\"kind\": \"remove_file\", \"path\": DROPIN}): write()`(第一次经清单记撤回,以后每次 init 都直接再比对一次)。any(changed) 为真时 runner.run([\"systemctl\", \"daemon-reload\"]),再 runner.run([\"systemctl\", \"try-restart\", \"exitnode-console.service\"], check=False)。\n   - 准备凭据:同样的写法 `if not apply(\"准备管理网页凭据\", prep, {\"kind\": \"remove_file\", \"path\": service.SECRETS + \"/console-password\", \"preserve\": True}): prep()`,prep 调 console_install.prepare 并记下返回值(凭据文件被人删掉时,下次 init 会补生成)。拿到密码时立刻打印两行:「管理网页密码:<密码>(只显示这一次;忘了可在节点上运行 exitnode console password 重新生成)」和「管理网页地址:」+ urls 用「、」连接。密码只打印到标准输出,不进日志、不进 successful 列表。\n   - apply(\"启用管理网页\", systemctl enable --now exitnode-console.service, {\"kind\": \"systemctl\", \"unit\": \"exitnode-console.service\"})。\n   - apply(\"启用管理网页检查定时器\", systemctl enable --now exitnode-console-status.timer, {\"kind\": \"systemctl\", \"unit\": \"exitnode-console-status.timer\"})。\n2. `exitnode console admin-key`:sys.stdin.isatty() 为真时改用 getpass.getpass(\"请粘贴鉴权服务管理密钥后回车(输入不显示):\") 读密钥(会审结论:readline 会把密钥显示在屏幕和远控画面上);不是终端时照旧 sys.stdin.readline()。其余校验、写文件、提示文字不变。\n3. JOURNAL_UNITS(诊断包收系统日志的单元列表)末尾加 \"exitnode-console.service\"、\"exitnode-console-status.service\";既有 test_diagnose_includes_journal_and_redacts 按 JOURNAL_UNITS 比对,不用改。\n4. console.port 已由 config.py 校验在 1024~65535 且不与其他端口相同,这里不重复校验。\n\n六、隧道路由(只给本机自用设备开 198.18.255.2):\n1. proxy/context.py 的 ProxyContext 加字段 console_port: int = 0(放在 admin_port 之后);validate_context 加:不是 int 或是 bool → TypeError(\"管理网页端口无效\");不为 0 且不在 1024~65535 → ValueError(\"管理网页端口无效\")。\n2. proxy/server_config.py 的 render_server:在 198.18.255.1 那条规则之后、维护规则之前,ctx.console_port 不为 0 且未吊销设备里 account_id == \"local\" 的至少一台时,加一条 {\"ip_cidr\": [\"198.18.255.2/32\"], \"auth_user\": [这些设备的 device_id,按 device_id 排序], \"action\": \"route\", \"outbound\": \"direct\", \"override_address\": \"127.0.0.1\", \"override_port\": ctx.console_port}。其余设备访问 198.18.255.2 照旧落到后面 198.18.0.0/15 的拒绝规则。\n3. service.build_context 传 console_port=config.console.port if config.console.enabled else 0。console_port 为 0 时渲染结果与现在逐字节相同,node/tests/golden/ 下的黄金样本一个字节不许改。\n\n七、node/exitnode/updater/upgrade.py 的 _restart:在重启 exitnode-admin.service 之后、daemon-reload 之前,运行 [\"systemctl\", \"try-restart\", \"exitnode-console.service\"];它的退出码与异常一律忽略、不计入 failed(网页起不来只在检查里显示失败,不触发升级回退)。\n\n八、node/examples/config.example.toml:在文件末尾(现有 [authsync] 段之后)追加下面这段,前面空一行,文件以换行结尾(检查脚本按原文比对文件结尾):\n    # 节点管理网页:局域网用 http://<本机局域网地址>:8444/ 打开;隧道里只有本机自用设备能用 http://198.18.255.2/ 打开\n    [console]\n    enabled = true\n    port = 8444\n    lan = true\n示例里开了管理网页,所以用示例配置的既有测试里 check 会多一层「管理网页」:照现有测试替换 exitnode.admin.server.check 的写法,同样替换 exitnode.console.server.check(按 report.py 实际的调用方式选替换点),让既有断言保持原意;改动在交活说明里逐条列出。\n\n九、测试(用例名固定,可再加;测试只用 FakeRunner、tmp_path 与 127.0.0.1 本机端口,不联网,不往仓库目录写文件):\n- node/tests/test_console_install.py:test_extra_allow_only_for_remote_authserver(authsync 关、http://127.0.0.1:8000、https://192.168.1.9:8443、https://203.0.113.5:8443 四种,只有最后一种返回 \"203.0.113.5/32\");test_sync_dropin_writes_only_on_change(第一次写入并返回 True;再调一次返回 False 且没有新的写文件调用;把配置改成远端鉴权服务后返回 True、文件里出现 IPAddressAllow=203.0.113.5/32;再改回本机后返回 True、IPAddressAllow 行消失);test_prepare_generates_password_once_and_empty_admin_key(第一次返回密码且写的是 scrypt$ 开头的哈希、模式 0o600、管理密钥文件为空;第二次返回 None、两文件不变;已有管理密钥文件时不覆盖);test_urls_lan_and_tunnel(有地址、lan 关、读网络失败三种)。\n- node/tests/test_console_static_served.py:test_package_static_files_are_served(用 console.server.create_server 起服务,static_dir 用默认值,也就是包里的 static 目录;GET /、/console.js、/console.css 都 200,正文与包里三件文件逐字节相同,Content-Type 依次为 text/html、text/javascript、text/css 开头)。\n- node/tests/test_proxy_server_render.py:test_console_rule_only_for_local_devices_when_enabled(console_port 为 0 时没有 198.18.255.2;为 8444 且有一台 local、一台别的账号、一台已吊销的 local 时,规则只含那台未吊销的 local,位置在 198.18.255.1 规则之后;没有 local 设备时不加)。\n- node/tests/test_cli.py:\n  - test_init_installs_console_when_enabled:用示例配置跑 init,三个单元文件与 DROPIN 写入、两个 enable --now 命令出现、console-password 与 authserver-admin-key 写入且 0o600、标准输出出现一次「管理网页密码:」;再跑一次 init 不再打印密码、不再为管理网页 daemon-reload。\n  - test_init_regenerates_missing_console_password:装好后从 FakeRunner 删掉 console-password,再跑 init 打印新密码、文件重新出现。\n  - test_init_updates_console_allow_when_authserver_moves:装好后把配置的 authsync 改成启用、url 为 https://203.0.113.5:8443(spki_sha256 用 44 字符的测试值;名单同步所需的其他前提照 test_cli.py 里现有名单同步用例的做法备好)再跑 init,DROPIN 里出现 IPAddressAllow=203.0.113.5/32,并出现 daemon-reload 与 try-restart exitnode-console.service。\n  - test_init_skips_console_when_disabled:配置里 [console] enabled = false 时,没有两条 enable --now、没有两份凭据文件、没有 DROPIN、不打印密码(三个单元文件仍照常写入)。\n  - test_console_admin_key_hides_input_on_tty:monkeypatch 一个 isatty() 为真的 sys.stdin 与 exitnode.cli 里用到的 getpass.getpass,密钥从 getpass 读到并写入文件,readline 没被调用。\n- node/tests/test_updater.py:test_restart_try_restarts_console_without_failing_upgrade(try-restart 返回非 0 或抛异常时 _restart 不报错;proxy 或 admin 重启失败时照旧报错)。\n",
+  "background": "项目:外包「澳洲出口节点 + Windows 一键客户端」。节点端 Python 3.11(node/exitnode,测试 node/tests),Debian 12 + systemd 252 + sing-box 1.13。所有主机副作用只经 Runner(node/exitnode/runner.py,测试用 FakeRunner)。安装步骤经 Manifest.apply 记撤回方案,init 可重复跑(幂等、可续跑),rollback / uninstall 按清单倒序撤回。\n\n先读(全文):node/exitnode/cli.py(重点 _install 与 console 分支)、manifest.py、systemd.py、service.py、proxy/context.py、proxy/server_config.py、updater/upgrade.py(_restart)、netinfo.py(read_network)、console/ 下全部模块、report.py、config.py;templates/exitnode-admin.service 与 exitnode-watchdog.service、exitnode-authsync.timer(新模板照它们的写法);node/tests/test_cli.py、test_systemd_render.py、test_proxy_server_render.py、test_updater.py、test_console_server.py;docs/node/服务加固说明.md、隧道配置说明.md(只读,文档由契约方另写)。\n\n已定的取舍(不要改):网页服务以 DynamicUser 运行、两份凭据经 LoadCredential 交给它;检查记录由 root 的 oneshot 定时任务每分钟写;服务单元的地址放行只开本机、局域网四段,搬走的鉴权服务地址放在每次 init 都重新比对的附加配置文件里;隧道里只给本机自用设备(account_id 为 local)开 198.18.255.2,邀请码用户的设备打不开;升级时网页服务 try-restart 且不影响升级成败;示例配置默认开启管理网页。\n\n硬规矩(做不到就停下交 blocked + forks,不猜):①只改允许清单里的文件;docs/ 下一个字不改。②凭据不进代码库、不进示例、不进日志;测试里的密码与密钥用明显的测试值。③黄金样本 node/tests/golden/ 一个字节不改;console_port 为 0 时隧道配置渲染结果逐字节不变。④既有测试断言不删、不跳过、不放宽;因示例配置多出管理网页一层而要补的替身与期望,在交活说明逐条列出。⑤工人不许 git 写操作,不许自己跑 pytest / ruff / python(按验收编号走派单器自测通道,命令单独一条执行,不写 cd &&、管道、2>&1);不许装依赖。⑥新增文案、注释用中文大白话;每次 Edit / Write 的新内容不超过 150 行。⑦模板与示例配置段照契约原文,一字不改;觉得原文有错,停下交 forks。",
+  "nonGoals": [
+    "不改 console/ 下已合并的 auth、authclient、snapshot、server 四个模块与 static/ 页面(登录限流与请求解析的加固由并行的另一单做;发现它们有错交 forks)",
+    "不写 docs/ 下任何文档(契约方另写)",
+    "不改 nft 规则(现有规则表是放行策略,管理网页端口不需要另开)",
+    "不改 systemd.py(管理网页单元不带随配置变化的替换量)",
+    "不改 Windows 客户端"
+  ],
+  "allowedPaths": [
+    "node/examples/config.example.toml",
+    "node/exitnode/cli.py",
+    "node/exitnode/console/install.py",
+    "node/exitnode/manifest.py",
+    "node/exitnode/proxy/context.py",
+    "node/exitnode/proxy/server_config.py",
+    "node/exitnode/service.py",
+    "node/exitnode/templates/exitnode-console-status.service",
+    "node/exitnode/templates/exitnode-console-status.timer",
+    "node/exitnode/templates/exitnode-console.service",
+    "node/exitnode/updater/upgrade.py",
+    "node/tests/test_cli.py",
+    "node/tests/test_config.py",
+    "node/tests/test_console_install.py",
+    "node/tests/test_console_static_served.py",
+    "node/tests/test_manifest.py",
+    "node/tests/test_proxy_server_render.py",
+    "node/tests/test_systemd_render.py",
+    "node/tests/test_updater.py"
+  ],
+  "forbiddenPaths": [
+    ".codex/**",
+    ".github/**",
+    ".gitignore",
+    "pyproject.toml",
+    "requirements-dev.txt",
+    "winclient/**",
+    "scripts/**",
+    "authserver/**",
+    "docs/**",
+    "node/exitnode/console/auth.py",
+    "node/exitnode/console/authclient.py",
+    "node/exitnode/console/snapshot.py",
+    "node/exitnode/console/server.py",
+    "node/exitnode/systemd.py",
+    "node/exitnode/console/static/**",
+    "node/exitnode/report.py",
+    "node/exitnode/config.py",
+    "node/exitnode/nft.py",
+    "node/exitnode/runner.py",
+    "node/exitnode/netinfo.py",
+    "node/exitnode/admin/**",
+    "node/exitnode/rescue/**",
+    "node/exitnode/watchdog/**",
+    "node/tests/golden/**"
+  ],
+  "expectArtifacts": [
+    "node/exitnode/console/install.py",
+    "node/exitnode/templates/exitnode-console.service",
+    "node/exitnode/templates/exitnode-console-status.service",
+    "node/exitnode/templates/exitnode-console-status.timer"
+  ],
+  "acceptance": [
+    {
+      "id": "T-INSTALL",
+      "kind": "test:targeted",
+      "target": "node/tests/test_console_install.py",
+      "required": true,
+      "failsOnBase": true
+    },
+    {
+      "id": "T-STATIC",
+      "kind": "test:targeted",
+      "target": "node/tests/test_console_static_served.py",
+      "required": true,
+      "failsOnBase": true
+    },
+    {
+      "id": "T-PROXY",
+      "kind": "test:targeted",
+      "target": "node/tests/test_proxy_server_render.py",
+      "required": true,
+      "failsOnBase": true
+    },
+    {
+      "id": "T-CLI",
+      "kind": "test:targeted",
+      "target": "node/tests/test_cli.py",
+      "required": true,
+      "failsOnBase": true
+    },
+    {
+      "id": "T-UPDATER",
+      "kind": "test:targeted",
+      "target": "node/tests/test_updater.py",
+      "required": true,
+      "failsOnBase": true
+    },
+    {
+      "id": "T-GOLDEN",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+        "node/tests/test_systemd_render.py",
+        "node/tests/test_renderer_parity.py",
+        "node/tests/test_proxy_client_render.py",
+        "node/tests/test_config.py",
+        "node/tests/test_manifest.py"
+      ],
+      "required": true,
+      "timeoutSec": 600
+    },
+    {
+      "id": "PYTEST",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "pytest",
+        "-q"
+      ],
+      "required": true,
+      "timeoutSec": 1500
+    },
+    {
+      "id": "RUFF",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "ruff",
+        "check",
+        "node",
+        "authserver"
+      ],
+      "required": true,
+      "timeoutSec": 300
+    },
+    {
+      "id": "SHAPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_node_console_install_1127.py",
+        "shape"
+      ],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "TESTS-NEW",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_node_console_install_1127.py",
+        "tests"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "SCOPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_node_console_install_1127.py",
+        "scope"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "workbuddyTier": "hard",
+  "timeoutSec": 10800,
+  "repoRoot": "E:/yuanc",
+  "steps": [
+    "读 BACKGROUND 列出的文件与检查脚本 docs/plans/checks/yc_node_console_install_1127.py(它就是 SHAPE、TESTS-NEW、SCOPE 三项验收)。",
+    "manifest、三个模板;既有 test_systemd_render 按 UNITS 参数化的用例会覆盖新单元。",
+    "proxy/context.py、server_config.py、service.build_context 与 test_proxy_server_render 新用例,T-PROXY、T-GOLDEN 绿。",
+    "console/install.py 与 test_console_install、test_console_static_served,T-INSTALL、T-STATIC 绿。",
+    "cli._install 接线、admin-key 的不回显输入、JOURNAL_UNITS、示例配置段、既有测试的替身补齐与 test_cli 新用例,T-CLI 绿;updater._restart 与 test_updater 新用例,T-UPDATER 绿。",
+    "PYTEST、RUFF、SHAPE、TESTS-NEW、SCOPE 全绿后交活;交活说明逐条列出既有测试改了哪些替身与期望、为什么。"
+  ]
+}
