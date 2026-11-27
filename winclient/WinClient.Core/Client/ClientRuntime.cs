@@ -46,6 +46,18 @@ public sealed class ClientRuntime : IClientFacade, IDisposable
     public static async Task<ClientRuntime> CreateAsync(IKernelInstaller installer, string? storeRoot = null,
         DataProtectionScope scope = DataProtectionScope.CurrentUser, bool keepProtection = false, bool testBuild = false)
     {
+        var log = new RedactingLog(new RollingFileLog(Path.Combine(ClientSettings.DataDirectory, "run", "sing-box.log")));
+        // 后台服务启动时先清一次上次残留的连接内核；这一层失败不让服务起不来，连接时 Start 还会再清一次并报错。
+        var kernelDirectory = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), ClientSettings.ProductName, "bin");
+        try
+        {
+            new StrayKernelSweeper().Sweep(Path.Combine(kernelDirectory, "sing-box.exe"), kernelDirectory, log.Write);
+        }
+        catch (Exception ex) when (ex is IOException or InvalidOperationException or UnauthorizedAccessException or System.ComponentModel.Win32Exception)
+        {
+            // 服务不能因为清残留失败而起不来；保持保护与不保持两条路都一样。
+        }
         var firewall = new KillSwitchApplier(Path.Combine(ClientSettings.DataDirectory, "run"), wfp: WfpEngine.CreateProduction(), routes: new RouteGuard());
         if (!keepProtection)
         {
@@ -56,7 +68,6 @@ public sealed class ClientRuntime : IClientFacade, IDisposable
             }
         }
         var pairingStore = new PairingStore(root: storeRoot, scope: scope);
-        var log = new RedactingLog(new RollingFileLog(Path.Combine(ClientSettings.DataDirectory, "run", "sing-box.log")));
         // 连接记录单写一份,只放本单定义的三类行;节点地址、出口地址与令牌不进这份记录。
         var connectLog = new RedactingLog(new RollingFileLog(Path.Combine(ClientSettings.DataDirectory, "run", "connect.log")));
         var settings = ClientSettings.Load(ownerIsTrusted: DataDirectorySecurity.IsTrustedOwner);

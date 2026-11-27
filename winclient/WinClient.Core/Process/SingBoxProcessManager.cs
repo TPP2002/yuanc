@@ -11,15 +11,19 @@ public sealed class SingBoxProcessManager : IDisposable
     private readonly string executablePath;
     private readonly ISingBoxLauncher launcher;
     private readonly RedactingLog log;
+    private readonly StrayKernelSweeper sweeper;
     private ISingBoxProcess? process;
     private long generation;
     private bool disposed;
 
     public string ConfigPath { get; }
+    /// <summary>本产品各版本内核的安装目录（与 KernelInstaller 一致）。</summary>
+    public string OwnedKernelDirectory { get; }
     public event EventHandler<int>? TunnelDown;
 
     public SingBoxProcessManager(string executablePath, string productName,
-        ISingBoxLauncher? launcher = null, ILog? logger = null, string? programDataRoot = null)
+        ISingBoxLauncher? launcher = null, ILog? logger = null, string? programDataRoot = null,
+        StrayKernelSweeper? sweeper = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(executablePath);
         ArgumentException.ThrowIfNullOrWhiteSpace(productName);
@@ -28,7 +32,9 @@ public sealed class SingBoxProcessManager : IDisposable
             throw new ArgumentException("产品名必须是单个目录名称。", nameof(productName));
         this.executablePath = Path.GetFullPath(executablePath);
         this.launcher = launcher ?? new SingBoxLauncher();
+        this.sweeper = sweeper ?? new StrayKernelSweeper();
         var root = programDataRoot ?? Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData);
+        OwnedKernelDirectory = Path.Combine(root, productName, "bin");
         var runPath = Path.Combine(root, productName, "run");
         ConfigPath = Path.Combine(runPath, "config.json");
         log = new RedactingLog(logger ?? new RollingFileLog(Path.Combine(runPath, "sing-box.log")));
@@ -44,6 +50,8 @@ public sealed class SingBoxProcessManager : IDisposable
             if (!File.Exists(executablePath))
                 throw new FileNotFoundException("未找到连接内核，请联系管理员配置 sing-box.exe 路径。", executablePath);
             StopCore();
+            // 每次起内核前先结束本产品上次残留的内核；结束不掉就抛 IOException，不起新内核。
+            sweeper.Sweep(executablePath, OwnedKernelDirectory, log.Write);
             RegisterSecrets(config);
             WriteConfigAtomically(config);
             var currentGeneration = ++generation;
@@ -78,6 +86,17 @@ public sealed class SingBoxProcessManager : IDisposable
     public void Stop()
     {
         lock (gate) StopCore();
+    }
+
+    /// <summary>停掉当前内核并结束本产品残留的内核，返回成功结束的残留个数。</summary>
+    public int StopAndSweep()
+    {
+        lock (gate)
+        {
+            ObjectDisposedException.ThrowIf(disposed, this);
+            StopCore();
+            return sweeper.Sweep(executablePath, OwnedKernelDirectory, log.Write);
+        }
     }
 
     private void StopCore()
