@@ -1,0 +1,286 @@
+{
+  "schemaVersion": 1,
+  "taskId": "NODE-WEB-CONSOLE-1127",
+  "slug": "yc-node-console-core-1127",
+  "title": "节点管理网页的后台:密码登录、读每分钟的检查记录、经鉴权服务发邀请码和管账号设备;鉴权服务加邀请码列表",
+  "goal": "以派单时 origin/main 头为基点。看板卡 NODE-WEB-CONSOLE-1127。\n\n问题:设计正本 docs/design/方案v2-中国客户端-澳洲出口.md §5 定了「管理员操作:首期命令行 + 一页极简网页(生成邀请码、看账号与设备、吊销、延期);只经隧道内地址或白名单访问,不裸露在公网」。现在只有命令行(authserver/authserver/admin_cli.py)和鉴权服务的 JSON 管理接口(/admin/*,X-Admin-Key),没有网页。负责人 2026-11-27 定:网页做在节点程序里(原话「那就做成节点程序吧」)。\n\n整件事拆三单:本单做网页后台(节点 node/exitnode/console/ 包、检查记录、命令行、配置段)和鉴权服务的邀请码列表接口;页面三件文件(static/index.html、console.js、console.css)由并行的页面单做,本单不建、不改;systemd 单元、init 接线、隧道内地址、示例配置与说明文档由后续安装单做,本单不做。\n\n整体做法(已定,不要改):\n- 管理网页是节点上一个独立进程 `exitnode console serve`,标准库 http.server 实现,以后由 systemd 用动态账户(DynamicUser)运行、不读凭据目录;两份凭据(管理密码的哈希、鉴权服务管理密钥)由 systemd LoadCredential 交给它,文件名 console-password、authserver-admin-key。\n- 节点状态由 root 定时任务 `exitnode console snapshot` 每分钟写一份脱敏的检查记录 /var/lib/exitnode/console/status.json,网页只读这份记录,自己不跑任何检查命令。\n- 发码、账号、设备的操作,网页经鉴权服务现有的 /admin/* 接口做(地址与证书指纹取节点配置的 [authsync] 段,管理密钥取 authserver-admin-key),不直接碰鉴权服务的数据库,不 import authserver 包。\n- 未知路径、错误方法、来源地址不在局域网与本机、Host 头不是 IP 地址时,一律回与鉴权服务逐字节相同的通用 404 网页(沿用 2026-10-24 拍板的鉴权服务最小加固口径),响应头不带 Server。\n\n【管理网页接口约定】(后台单与页面单共用,一字不差;两边都照这份做)\n\n地址:局域网 http://<小主机局域网地址>:<console.port>/ ,隧道里 http://198.18.255.2/ (隧道接线在后续单)。只有下面列出的路径存在,其余一律回「通用 404 网页」(见后台单)。\n\n静态文件(只允许 GET):\n- GET /  → static/index.html,Content-Type: text/html; charset=utf-8\n- GET /console.js → static/console.js,Content-Type: text/javascript; charset=utf-8\n- GET /console.css → static/console.css,Content-Type: text/css; charset=utf-8\n页面只引用这三个文件,不引用任何外部地址、字体、图片;不写内联 <script> 内容、不写 style 属性、不写 onclick 这类内联事件(内容安全策略只放行同源文件)。\n\n接口(JSON 一律 UTF-8,Content-Type: application/json; charset=utf-8):\n1. GET /api/session → 200。未登录:{\"logged_in\": false};已登录:{\"logged_in\": true, \"csrf\": \"<口令>\", \"node_name\": \"<节点名>\", \"invite_mode\": true|false}。invite_mode 为 false 表示这台节点没开邀请码模式(只有自用设备)。\n2. POST /api/login,请求体 {\"password\": \"<字符串>\"} → 200 同上「已登录」形状,并下发会话 Cookie;401 {\"detail\": \"密码不对\", \"code\": \"wrong_password\"};429 {\"detail\": \"登录失败次数太多,请 15 分钟后再试\", \"code\": \"throttled\"};409 {\"detail\": \"还没设管理密码,请在节点上运行 exitnode console password\", \"code\": \"password_missing\"};422 {\"detail\": \"请求格式不对\", \"code\": \"bad_request\"}。\n3. POST /api/logout → 200 {\"logged_in\": false},并清除 Cookie。\n4. GET /api/status → 200。没有检查记录或记录损坏:{\"available\": false};有记录:{\"available\": true, \"age_seconds\": <整数秒>, \"stale\": true|false, \"generated_at\": \"<UTC ISO 时间>\", \"node_name\": \"…\", \"program_version\": \"…\", \"state\": \"normal|reconnecting|reauth|manual\", \"reason\": \"<一句中文>\", \"public_ipv4\": \"<IPv4>\"|null, \"layers\": [{\"layer\": \"<英文标识>\", \"name\": \"<中文层名>\", \"result\": \"<中文结果>\", \"reason\": \"<中文说明>\"}], \"local_devices\": [{\"name\": \"…\", \"platform\": \"windows|android\", \"created_at\": \"<ISO>\", \"revoked_at\": \"<ISO>\"|null}]}。stale 为真表示记录超过 3 分钟没更新(或时间在未来 1 分钟以上)。layers 的 result 取值来自节点检查,已知有「通过」「失败」「未接入」「需手动转发」「需重新授权」「跳过」「未知」,页面要能显示任意中文结果。\n5. GET /api/directory → 200 {\"invites\": [邀请码…], \"accounts\": [账号…], \"devices\": [设备…]}。\n   - 邀请码:{\"code\", \"days\", \"max_uses\", \"used\", \"note\", \"created_at\"},按生成时间新的在前。\n   - 账号:{\"id\", \"invite_code\", \"status\": \"active|disabled\", \"expires_at\", \"device_limit\", \"created_at\"}。\n   - 设备:{\"id\", \"account_id\", \"platform\", \"name\", \"last_seen\", \"revoked_at\": \"<ISO>\"|null}。\n   - 所有时间是带时区的 UTC ISO 8601 字符串。\n6. POST /api/invites,请求体 {\"days\": 1~3650 的整数, \"max_uses\": 1~100 的整数, \"note\": 最多 200 字、不含换行的字符串} → 200 {\"invite\": {\"code\", \"days\", \"max_uses\", \"used\", \"note\"}}。\n7. POST /api/accounts/<账号id>/extend,请求体 {\"days\": 1~3650 的整数} → 200 {\"account\": 账号}。已过期的账号从当时起算,未过期的在原到期日上叠加(鉴权服务的现行口径)。\n8. POST /api/accounts/<账号id>/disable → 200 {\"account\": 账号};POST /api/accounts/<账号id>/enable → 200 {\"account\": 账号}。请求体可以为空或 {}。\n9. POST /api/devices/<设备id>/revoke → 200 {\"device_id\": \"<id>\", \"revoked\": true}。请求体可以为空或 {}。吊销不能撤回。\n\n会话与防伪:\n- 登录成功下发 Cookie:yc_console=<随机值>; HttpOnly; SameSite=Strict; Path=/; Max-Age=43200。页面用 fetch 时带 credentials: \"same-origin\"。\n- 除 /api/login 外,所有 POST 必须带请求头 X-Console-CSRF: <登录时拿到的 csrf>,否则 403 {\"detail\": \"页面已过期,请刷新后再试\", \"code\": \"csrf\"}。\n- 所有 POST 的请求体用 JSON,请求头 Content-Type: application/json。\n- 3~9 号接口没登录或会话过期:401 {\"detail\": \"请先登录\", \"code\": \"login_required\"}。\n\n5~9 号接口的错误(页面按 code 分支,显示 detail 原文):\n- 409 {\"code\": \"invite_mode_off\", \"detail\": \"这台节点没开邀请码模式\"}\n- 409 {\"code\": \"admin_key_missing\", \"detail\": \"还没填鉴权服务的管理密钥,请在节点上运行 exitnode console admin-key\"}\n- 502 {\"code\": \"authserver_unreachable\", \"detail\": \"连不上鉴权服务\"}\n- 502 {\"code\": \"authserver_pin_mismatch\", \"detail\": \"鉴权服务的证书指纹对不上,请核对节点配置里的 authsync.spki_sha256\"}\n- 502 {\"code\": \"admin_key_rejected\", \"detail\": \"鉴权服务不认这把管理密钥,请在节点上用 exitnode console admin-key 重新填写\"}\n- 502 {\"code\": \"authserver_bad_response\", \"detail\": \"鉴权服务回的内容不对\"}\n- 4xx {\"code\": \"authserver_error\", \"detail\": \"<鉴权服务给的中文原因,如「账号不存在」>\"},状态码照鉴权服务原样\n- 422 {\"code\": \"bad_request\", \"detail\": \"<哪一项不对>\"}:天数「天数要填 1 到 3650 的整数」;人数「人数要填 1 到 100 的整数」;备注「备注最多 200 个字,不能换行」;其他格式问题「请求格式不对」\n- 500 {\"code\": \"internal\", \"detail\": \"管理网页出错了,请稍后再试\"}\n\n\n一、鉴权服务(authserver/)\n1. service.py 加 `Service.invites()`:返回邀请码数组,每项只含 code、days、max_uses、used、note、created_at 六个键(不含 created_by),按 created_at 降序,同一时刻按 code 升序。\n2. app.py 加 `GET /admin/invites`,dependencies 用现有的 admin 密钥校验(缺密钥、错密钥照旧回通用 404 网页),返回 service.invites()。现有路由、错误口径、限速一律不动。\n3. docs/authserver/接口说明.md 的接口表在 POST `/admin/invites` 那行下面加一行:| GET `/admin/invites` | 管理员,`X-Admin-Key` | 邀请码数组(code、days、max_uses、used、note、created_at),新的在前 | 401 |。不改别的行。\n\n二、节点配置(node/exitnode/config.py)\n1. 新 dataclass Console:enabled: bool = False;port: int = 8444;lan: bool = True。Config 加字段 console: Console = field(default_factory=Console)。models 里加 \"console\";它和 watchdog、authsync 一样是可选段(缺段用默认值)。\n2. 加载后校验(不论 enabled 与否都校验):port 不在 1024~65535 → invalid(\"console.port\", \"须在 1024 至 65535 之间(管理网页以无特权账户运行)\");port 等于 admin.port、proxy.reality_port、proxy.hy2_port 之一 → invalid(\"console.port\", \"不能与 admin.port、proxy.reality_port、proxy.hy2_port 相同\")。类型与未知键沿用现有通用校验。\n3. 不改 node/examples/config.example.toml(后续安装单加 [console] 段)。\n\n三、检查与状态的组装抽到 node/exitnode/report.py(命令行输出逐字节不变)\n1. `check_result(config, runner, base=None) -> dict`:就是现在 `exitnode check` 打印的那个 result。base 为 None 时调 netinfo.check(runner, config);然后照 cli.py 现有顺序 insert(-1, …) 看门狗、救援、服务加固、名单同步(仅 authsync.enabled)、入口端口映射(仅 publisher.mode == \"upnp\")几层,再 append 客户端托管服务层;新增:config.console.enabled 为真时最后再 append console.server.check(config)。\n2. `status_result(config, runner, base=None) -> Status`:就是现在 `exitnode status` 算出的 Status。base 为 None 时调 netinfo.check;再照现有写法补 public_ipv4、publisher(仅 upnp,否则 None)、watchdog(含 ValueError 时那份「看门狗记录损坏」兜底),最后 evaluate。\n3. 两个函数都不许改动调用方传进来的 base(内部先 copy.deepcopy)。\n4. cli.py 的 check、status 两个分支改为调用这两个函数,打印与返回码逐字节不变;diagnose 分支照旧只用 netinfo.check 的结果,不变。既有 test_cli.py 的断言一条不改仍全绿(本单新增的用例另算)。\n\n四、管理网页后台:新包 node/exitnode/console/(__init__.py 只写一行中文文档字符串)\nA. auth.py(纯逻辑,无网络、无文件)\n1. ALPHABET = \"ABCDEFGHJKLMNPQRSTUVWXYZ23456789\"。generate_password() -> str:用 secrets.choice 取 20 个字符,每 5 个一组用 \"-\" 连成 4 组(形如 K7MQ2-ABCDE-FGHJK-LMNPQ)。\n2. normalize(raw) -> str:去掉全部空白和 \"-\",转大写。\n3. hash_password(raw, salt=None) -> str:对 normalize(raw) 的 UTF-8 做 hashlib.scrypt(n=16384, r=8, p=1, dklen=32),salt 为 None 时 secrets.token_bytes(16);返回 \"scrypt$16384$8$1$<salt 的标准 base64>$<哈希的标准 base64>\"。\n4. verify_password(raw, stored) -> bool:stored 不是上述六段格式、参数不是 16384/8/1、base64 解不开、raw 不是字符串或超过 200 字符 → False,不抛异常;用 hmac.compare_digest 比较。\n5. Sessions(clock, idle=7200, absolute=43200, limit=20):clock 是返回秒数的可调用对象。create() -> (token, csrf),token 与 csrf 都用 secrets.token_urlsafe(32);内部只按 sha256(token) 存,不存 token 原文;超过 limit 个时删最早建的。get(token) -> csrf 或 None:不存在、闲置超过 idle 秒、建立超过 absolute 秒都返回 None 并删掉;命中时刷新闲置计时。drop(token)。全部方法加 threading.Lock。\n6. LoginThrottle(clock, per_ip=5, global_limit=30, window=900):blocked(ip) -> bool:该 IP 在最近 window 秒内失败次数 ≥ per_ip,或全体失败次数 ≥ global_limit,即为真;fail(ip) 记一次失败;succeed(ip) 清掉该 IP 的失败记录(不清全体计数)。过期记录在每次调用时清理。加锁。\nB. authclient.py(经鉴权服务 /admin/* 接口)\n1. AuthError(Exception):属性 status(int)、code(str)、detail(str);str(e) 只返回 detail。错误信息里绝不出现管理密钥、请求体或对方返回的原文(authserver_error 那种只取对方 JSON 里的 detail 字段)。\n2. AuthClient(url, spki_sha256, admin_key, transport=None, timeout=10)。url 是节点配置 authsync.url(形如 http://127.0.0.1:8000 或 https://<IPv4>:<端口>,不带路径;config.py 已校验)。transport 是可调用对象 transport(method, path, body, headers) -> (status, content_type, data),body 为 bytes 或 None;为 None 时用内置实现:\n   - http:http.client.HTTPConnection(主机, 端口, timeout)。\n   - https:ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT),check_hostname=False,verify_mode=ssl.CERT_NONE;http.client.HTTPSConnection(..., context=ctx);先 connection.connect(),取 connection.sock.getpeercert(binary_form=True),用 cryptography 的 x509.load_der_x509_certificate(...).public_key().public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo) 算 sha256 再标准 base64,与 spki_sha256 用 hmac.compare_digest 比;不一致立即关连接、抛 AuthError(502, \"authserver_pin_mismatch\", …),此前不得发送任何请求字节(管理密钥只在指纹核对通过后才发出)。\n   - 响应体最多读 4 MiB(4194304 字节),超过算 authserver_bad_response。OSError、ssl.SSLError、http.client.HTTPException、超时 → AuthError(502, \"authserver_unreachable\", …)。\n   - 请求头:X-Admin-Key、Accept: application/json;有请求体时加 Content-Type: application/json。\n3. 响应映射:200 且 JSON 解析成功 → 返回解析结果;404 且 content_type 以 text/html 开头 → AuthError(502, \"admin_key_rejected\", …);400~499 且 JSON 里有字符串 detail → AuthError(原状态码, \"authserver_error\", 该 detail);其余 → AuthError(502, \"authserver_bad_response\", …)。各 detail 文字照【接口约定】。\n4. 方法(返回值只保留【接口约定】里列出的键,多出来的键丢掉):invites() → GET /admin/invites;create_invite(days, max_uses, note) → POST /admin/invites 请求体 {\"days\",\"max_uses\",\"note\"},返回 {\"code\",\"days\",\"max_uses\",\"used\",\"note\"};accounts() → GET /admin/accounts;devices() → GET /admin/devices;account_action(account_id, action, days=None):action 为 extend 时 POST /admin/accounts/<id>/extend 请求体 {\"days\"},disable/enable 时 POST 对应路径、无请求体;revoke(device_id) → POST /admin/devices/<id>/revoke、无请求体,返回 {\"device_id\",\"revoked\"}。账号 id、设备 id 进路径前用 urllib.parse.quote(…, safe=\"\") 转义。\nC. snapshot.py(检查记录)\n1. path(config) -> config.node.data_dir.rstrip(\"/\") + \"/console/status.json\"。\n2. collect(config, runner) -> dict:只调一次 netinfo.check(runner, config) 得 base,然后 report.check_result(config, runner, base=base) 与 report.status_result(config, runner, base=base) 各用一次。返回 {\"version\": 1, \"generated_at\": runner.now() 换成带时区的 UTC ISO 时间, \"node_name\": config.node.name, \"program_version\": exitnode.__version__, \"state\": status.state.value, \"reason\": redact(status.reason), \"public_ipv4\": status.public_ipv4, \"layers\": [只取 layer、name、result、reason 四个键,字符串值经 redact], \"local_devices\": [...]}。local_devices 取 device.registry(config, runner).all() 中 account_id == \"local\" 的设备,每项只含 name、platform、created_at、revoked_at;读登记表出 ValueError、OSError、TypeError 时为 []。记录里不许出现 uuid、hy2_password、任何密钥。\n3. write(config, runner, value):目录 = path 的上一级;runner.mkdir(目录, 0o755) 后再 runner.chmod(目录, 0o755);内容 json.dumps(value, ensure_ascii=False) 写到 path + \".tmp\"(runner.write_file),runner.chmod(tmp, 0o644),再 runner.replace(tmp, path)。显式 chmod 是因为定时单元可能带 UMask=0077,不 chmod 文件会变成只有 root 能读,网页的动态账户读不到。\n4. load(file_path, now) -> dict:now 是秒数。直接用 pathlib 读文件(这是网页进程用的,不经 Runner)。文件不存在、不是合法 JSON、不是对象、version 不是 1、缺 generated_at/state/reason/layers/local_devices 任一键、generated_at 解析失败 → {\"available\": False}。否则返回 {\"available\": True, \"age_seconds\": int(now - generated_at 秒数), \"stale\": age > 180 或 age < -60, 以及记录里的 generated_at、node_name、program_version、state、reason、public_ipv4、layers、local_devices}。\nD. server.py(HTTP 服务)\n1. 常量:NOT_FOUND_PAGE 与 authserver/authserver/app.py 里的 NOT_FOUND_PAGE 一字不差(复制字符串,不 import authserver);PASSWORD_NAME = \"console-password\";ADMIN_KEY_NAME = \"authserver-admin-key\";COOKIE = \"yc_console\";LAN_SOURCES = (\"127.0.0.0/8\", \"10.0.0.0/8\", \"172.16.0.0/12\", \"192.168.0.0/16\", \"169.254.0.0/16\");LOCAL_SOURCES = (\"127.0.0.0/8\",)。\n2. create_server(config, *, credentials, static_dir=None, snapshot_path=None, client=None, clock=time.time, sources=None, bind=None, port=None) -> 服务器对象(已开始监听,调用方 serve_forever):\n   - credentials 是 {\"password\": 哈希字符串或 None, \"admin_key\": 字符串或 None}。\n   - static_dir 默认本包旁边的 static 目录(Path(__file__).parent / \"static\");snapshot_path 默认 snapshot.path(config)。\n   - client:None 时按配置自建——config.authsync.enabled 为假 → 无客户端(接口回 invite_mode_off);admin_key 为空 → 无客户端(回 admin_key_missing);否则 AuthClient(config.authsync.url, config.authsync.spki_sha256, admin_key)。测试可直接传入假客户端对象。\n   - bind 默认:config.console.lan 为真 \"0.0.0.0\",否则 \"127.0.0.1\";port 默认 config.console.port;sources 默认:lan 为真 LAN_SOURCES,否则 LOCAL_SOURCES。\n   - 服务器类照 node/exitnode/admin/server.py 的 PackageServer 写法自己写一份(不改 admin/server.py):ThreadingHTTPServer、daemon_threads、request_queue_size=64、最多 32 个并发连接(超了直接关连接、不写字节)、每连接套接字超时 15 秒;handle_error 只记一句经 redact 的「管理网页请求处理失败」。\n3. 每个请求的处理顺序:\n   (1) 来源 IP 不在 sources 任一网段 → 通用 404。\n   (2) Host 头缺失,或不全匹配「IPv4 地址或 localhost,后面可带 :端口」(IPv4 要能被 ipaddress.IPv4Address 解析)→ 通用 404。这挡掉换绑域名的攻击。\n   (3) 方法不是 GET、POST → 通用 404(HEAD、PUT、DELETE、OPTIONS 都算)。\n   (4) 只按路径部分路由(问号后的查询串忽略);路径不在【接口约定】的表里,或方法与该路径不符 → 通用 404。账号与设备路径里的 id 必须全匹配 [A-Za-z0-9_-]{1,64},否则通用 404。\n   (5) 静态文件:只读 static_dir 下固定的三个文件名(不拿请求里的任何字符拼路径),读不到 → 通用 404。\n   (6) 读 Cookie 头里的 yc_console(http.cookies.SimpleCookie,解析出错当没带)。3~9 号接口要求 Sessions.get 命中,否则 401 login_required。\n   (7) 所有 POST(含 /api/login):有 Origin 头且不等于 \"http://\" + Host 头 → 403 csrf。除 /api/login 外还要 X-Console-CSRF 与会话 csrf 用 hmac.compare_digest 相等,否则 403 csrf。\n   (8) POST 请求体:Content-Length 缺失按 0;非整数、负数或大于 16384 → 422 bad_request「请求格式不对」并在响应后关连接(不读超长请求体);长度 > 0 时 Content-Type 必须以 application/json 开头;内容必须是 JSON 对象;各接口不许有约定之外的键;disable、enable、revoke、logout 的请求体只能为空或 {}。\n   (9) 数值校验:days、max_uses 必须是 int 且不是 bool(type(x) is int),范围照约定;note 可省略(默认 \"\")、必须是字符串、去首尾空白后最多 200 字、不含任何控制字符(unicodedata.category == \"Cc\")。错误文字照约定。\n   (10) 登录:先看 LoginThrottle.blocked(来源 IP) → 429 throttled(此时不验密码);credentials 没有密码哈希 → 409 password_missing;password 必须是字符串;verify_password 失败 → throttle.fail + 401 wrong_password;成功 → throttle.succeed、Sessions.create、Set-Cookie 照约定、返回已登录形状。\n   (11) 5~9 号接口:无客户端时按原因回 409(invite_mode_off 优先于 admin_key_missing);调用客户端抛 AuthError 时按 e.status、e.code、e.detail 回 JSON;directory 依次调 invites、accounts、devices 三次,任一失败整次按该错误回。\n   (12) 处理中出现任何其他异常:/api/ 开头的路径回 500 internal,其余回通用 404;记一句经 redact 的固定中文日志,不记异常原文。\n4. 响应头:\n   - 一律不发 Server 头(重写 send_response:只调 send_response_only 并发 Date 头)。log_message 为空(不记访问日志)。\n   - 通用 404:状态 404,正文 NOT_FOUND_PAGE 的 UTF-8,Content-Type: text/html; charset=utf-8,Content-Length,Cache-Control: no-store;不加别的头。\n   - 其余响应(静态文件与接口)都带:Cache-Control: no-store;X-Content-Type-Options: nosniff;Referrer-Policy: no-referrer;X-Frame-Options: DENY;Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; font-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'。JSON 用 json.dumps(…, ensure_ascii=False, separators=(\",\", \":\"))。\n5. load_credentials(environ=None) -> dict:环境变量 CREDENTIALS_DIRECTORY 存在时从该目录读 PASSWORD_NAME、ADMIN_KEY_NAME 两个文件,否则从 service.SECRETS 目录读同名两个文件;读不到为 None;去掉末尾 \"\\r\\n\" 和首尾空白;admin_key 空、超过 512 字符、含控制字符时为 None;password 不以 \"scrypt$\" 开头时为 None。\n6. serve(config):load_credentials() → create_server(config, credentials=…) → 照 admin/server.py 的 serve 写法处理 SIGTERM、serve_forever;启动日志只写经 redact 的「管理网页已启动」。\n7. check(config) -> {\"layer\": \"console\", \"name\": \"管理网页\", \"result\": \"通过\"|\"失败\", \"reason\": \"管理网页可以打开\"|\"管理网页打不开\"}:对 127.0.0.1:config.console.port 发 GET /api/session(Host 头 \"127.0.0.1:<端口>\",超时 3 秒),状态 200 且 JSON 里有 logged_in 键才算通过;任何异常算失败。\n8. 日志、打印、异常文本、响应里绝不出现:密码原文、密码哈希、管理密钥、Cookie 值、csrf 值、请求体原文。\n\n五、命令行(node/exitnode/cli.py)新增 `exitnode console <动作>`,帮助文字中文:\n1. serve:config.console.enabled 为假 → 标准错误打印「管理网页未启用(配置 console.enabled 为 false)」返回 2;否则照 admin serve 的写法先 configure 日志,再 console.server.serve(config);OSError → 标准错误打印「管理网页启动失败,请检查监听配置。」返回 1。\n2. snapshot:snapshot.write(config, runner, snapshot.collect(config, runner)),成功不打印、返回 0;OSError、RunnerError、ValueError → 标准错误打印「检查记录写入失败」返回 1。\n3. password:generate_password() → hash_password → 经 runner 写 service.SECRETS + \"/console-password\"(先写 .tmp、0o600,再 replace)→ runner.run([\"systemctl\", \"try-restart\", \"exitnode-console.service\"], check=False)(RunnerError 忽略)→ 标准输出打印两行:「管理网页新密码:<密码>」与「只显示这一次;旧密码已失效,已登录的网页要重新登录。」返回 0。密码不进日志。\n4. admin-key:从 sys.stdin.readline() 读一行,去掉末尾换行与首尾空白;为空、超过 512 字符或含控制字符 → 标准错误打印「管理密钥无效:不能为空、不能超过 512 个字符、不能含控制字符」返回 1;否则同上写 service.SECRETS + \"/authserver-admin-key\"(.tmp、0o600、replace)、try-restart 同一个单元、打印「鉴权服务管理密钥已保存。」返回 0。不回显密钥。\n5. check 命令改用 report.check_result 后,console.enabled 为真时多出「管理网页」一层(在最后)。\n\n六、测试(用例名固定,可以再加;测试只写 tmp_path,不往仓库目录写任何文件;起服务只绑 127.0.0.1 的 0 端口,不联外网;节点假件用 test_cli.py 的 fake 与 CONFIG,或照它的写法自建)\n- node/tests/test_console_auth.py:test_generated_password_shape(正则 ^[A-HJ-NP-Z2-9]{5}(-[A-HJ-NP-Z2-9]{5}){3}$,两次结果不同);test_hash_and_verify_with_normalization(去横线、加空格、小写都能验过,错密码不过,存储串以 scrypt$16384$8$1$ 开头);test_verify_rejects_malformed_stored_value;test_sessions_expire_idle_and_absolute;test_sessions_limit_evicts_oldest;test_sessions_store_only_hashes(内部数据里找不到 token 原文);test_throttle_per_ip_and_global。\n- node/tests/test_console_authclient.py:test_maps_success_and_whitelists_fields;test_decoy_404_means_key_rejected;test_json_error_passes_detail_through;test_unreachable_and_bad_response(含超过 4 MiB);test_admin_key_never_in_errors;test_https_pin_accepts_match_and_rejects_mismatch_before_sending(用 cryptography 在 tmp_path 生成自签证书,在 127.0.0.1 起一个 ssl 包装的小服务端线程;指纹对时能拿到 200 JSON;指纹不对时抛 authserver_pin_mismatch,且服务端在握手后收到的应用层字节数为 0);test_against_real_authserver_app(transport 包一层 fastapi.testclient.TestClient,对真实 authserver.app.create_app 跑:建码、列码、列账号、列设备、延期、停用、恢复、吊销;配置照 authserver/tests/conftest.py 的 settings 写法,证书与混淆密码文件写 tmp_path)。\n- node/tests/test_console_server.py(每个用例起真实服务,client 传假对象记录调用,clock 用可推进的假时钟):test_static_files_and_security_headers(static_dir 用 tmp_path 里放三个文件);test_unknown_paths_methods_and_missing_static_get_decoy(正文与 authserver.app.NOT_FOUND_PAGE 的 UTF-8 逐字节相同,Content-Type 为 text/html; charset=utf-8;覆盖未知路径、PUT/DELETE/HEAD/OPTIONS、对接口用错方法、static 目录缺文件);test_no_server_header_anywhere;test_disallowed_source_gets_decoy(sources 传 (\"10.0.0.0/8\",));test_bad_host_header_gets_decoy(evil.example、缺 Host 头回 404;192.168.1.52:8444 与 localhost 正常);test_login_success_sets_cookie_and_session(Set-Cookie 含 HttpOnly、SameSite=Strict、Path=/、Max-Age=43200);test_login_wrong_password_and_throttle(同一 IP 错 5 次后第 6 次就算密码对也 429;时钟推进 901 秒后能登录);test_password_missing_returns_409;test_api_requires_session;test_post_requires_csrf_and_same_origin;test_logout_clears_session;test_status_available_stale_and_missing;test_directory_and_actions_forwarded(调用参数与返回的键白名单);test_invite_and_extend_validation(days 为 0、3651、\"7\"、true、7.0 与 note 201 字、含换行、多余键都 422);test_invite_mode_off_and_admin_key_missing_codes(client 为 None 时按配置自建的两种情况);test_ids_in_path_are_validated;test_oversized_body_rejected;test_check_layer(服务在听时「通过」,端口没人听时「失败」);test_load_credentials_from_env_and_secrets(用 environ 参数指到 tmp_path,不读真实 /var/lib);test_secrets_never_logged(caplog 与 capsys 里找不到密码、哈希、管理密钥、Cookie 值)。\n- node/tests/test_console_snapshot.py:test_collect_matches_cli_check_and_status(同一假件下 layers 与 report.check_result 的四键一致、state 与 report.status_result 一致);test_collect_probes_network_once(假件里 (\"ip\", \"-j\", \"route\") 只被调一次);test_local_devices_only_and_no_credentials(登记表里一台 local、一台别的账号,记录里只有 local 那台,且整份 JSON 里没有 uuid、hy2_password 的值);test_write_sets_modes_and_is_atomic(FakeRunner 记录:目录 chmod 0o755、.tmp chmod 0o644、replace 到 status.json);test_load_states(不存在、坏 JSON、version 不对、过期、在未来、新鲜)。\n- node/tests/test_cli.py 新增:test_console_subcommands_dispatch(serve 在未启用时返回 2;snapshot 写出记录;password 打印两行并写哈希、跑 try-restart;admin-key 从 monkeypatch 的 sys.stdin 读,写文件且输出里没有密钥原文;空密钥返回 1);test_check_includes_console_layer_only_when_enabled(配置文本里追加 [console] enabled = true 段时最后一层是 console,不追加时没有)。\n- node/tests/test_config.py 新增:test_console_section_defaults_and_validation(缺段时 False/8444/True;端口 80、70000、与 admin.port 相同都报对应中文错误)。\n- authserver/tests/test_invites.py 新增:test_admin_lists_invites_newest_first(生成两张码,列表顺序、每项恰好六个键、不含 created_by)。\n- authserver/tests/test_decoy.py 新增:test_console_paths_are_not_found_on_authserver(GET /console.js、/console.css、/api/session、/api/status、/api/directory 与 POST /api/login、/api/invites、/api/logout 都过文件里现成的 assert_not_found);test_admin_invites_list_requires_key(GET /admin/invites 不带密钥、错密钥都过 assert_not_found,带对密钥 200 JSON)。\n",
+  "background": "项目:外包「澳洲出口节点 + Windows 一键客户端」。节点端 Python 3.11(node/exitnode,测试在 node/tests;运行时只用标准库和已有的 cryptography),Debian 12 + systemd。鉴权服务 authserver/ 是 FastAPI + SQLite(测试在 authserver/tests,本机已有 fastapi、httpx、uvicorn、cryptography、pytest)。根目录 pyproject.toml 的 pytest pythonpath 同时含 node 与 authserver,所以 node 的测试可以 import authserver(只许测试 import,产品代码不许)。\n\n先读(全文):node/exitnode/cli.py、config.py、status.py、netinfo.py、log.py(redact)、runner.py(Runner 协议与 FakeRunner)、device.py(registry、list_devices)、proxy/registry.py(Device)、service.py(SECRETS 常量)、admin/server.py(照它的服务器类、超时、SIGTERM 写法)、authsync.py(节点密钥的校验写法);node/tests/test_cli.py 的 fake 与 CONFIG、node/tests/test_admin_server.py(起真实服务的测试写法)、node/tests/test_config.py;authserver/authserver/app.py、service.py、config.py、models.py;authserver/tests/conftest.py、test_decoy.py、test_invites.py;docs/authserver/接口说明.md。\n\n已定的取舍(不要改):管理网页是节点上的独立进程,不并进 admin/server.py 的客户端包托管服务;网页不跑检查命令,只读 root 定时任务写的检查记录;发码与管账号只经鉴权服务 /admin/* 接口;登录只要一个管理密码(没有用户名),密码由命令生成、只存 scrypt 哈希;会话在内存里,服务重启全部失效;不做 HTTPS(局域网与隧道内使用,隧道本身加密);通用 404 与鉴权服务逐字节相同;本单不建 static 目录下任何文件。\n\n硬规矩(本仓红线,任何一条做不到就停下交 blocked + forks,不猜):①只改允许清单里的文件;不碰 systemd 模板、manifest.py、nft、proxy/、service.py、示例配置。②凭据不落代码库、不落示例、不落日志;测试里的密码、密钥用明显的测试值(如 test-admin-only),不写真实格式的长密钥。③主机副作用:命令行与检查记录的写入只经 Runner;网页进程(server.py)只许直接读文件(静态文件、检查记录、凭据)和收发 HTTP,不许起子进程(不 import subprocess,不用 os.system)。④测试只用内存假件、tmp_path 和 127.0.0.1 本机端口,不联外网,不往仓库目录写文件;起的服务与线程在用例结束时关掉。⑤只用 Python 3.11 能跑的写法。⑥工人不许 git 写操作,不许自己跑 pytest / ruff / python(按验收编号走派单器自测通道,命令单独一条执行,不写 cd &&、管道、2>&1);不许装依赖,缺依赖交 blocked。⑦既有测试断言不删、不跳过、不放宽;因 Config 多一个 console 段而变的精确比对可以同步改,改了在交活说明里逐条列出。⑧新增文案、注释用中文大白话;每次 Edit / Write 的新内容不超过 150 行,大文件分几次写。⑨本单的 HTTP 服务对外文字(detail、日志)一律照【接口约定】原文,不自己发明新文案;约定里没写到、又必须有文字的地方,停下交 forks 问。",
+  "nonGoals": [
+    "不建、不改 node/exitnode/console/static/ 下任何文件(页面单做)",
+    "不写 systemd 单元、不改 manifest.py、不改 init、不改隧道路由规则与示例配置(安装单做)",
+    "不写 docs/node/ 下的说明文档(安装单做)",
+    "不改 admin/server.py 的客户端包托管服务",
+    "不改 Windows 客户端",
+    "不做 HTTPS、多管理员账号、邀请码作废接口"
+  ],
+  "allowedPaths": [
+    "authserver/authserver/app.py",
+    "authserver/authserver/service.py",
+    "authserver/tests/test_invites.py",
+    "authserver/tests/test_decoy.py",
+    "docs/authserver/接口说明.md",
+    "node/exitnode/config.py",
+    "node/exitnode/report.py",
+    "node/exitnode/cli.py",
+    "node/exitnode/console/__init__.py",
+    "node/exitnode/console/auth.py",
+    "node/exitnode/console/authclient.py",
+    "node/exitnode/console/snapshot.py",
+    "node/exitnode/console/server.py",
+    "node/tests/test_console_auth.py",
+    "node/tests/test_console_authclient.py",
+    "node/tests/test_console_server.py",
+    "node/tests/test_console_snapshot.py",
+    "node/tests/test_cli.py",
+    "node/tests/test_config.py"
+  ],
+  "forbiddenPaths": [
+    ".codex/**",
+    ".github/**",
+    ".gitignore",
+    "pyproject.toml",
+    "requirements-dev.txt",
+    "winclient/**",
+    "scripts/**",
+    "node/exitnode/console/static/**",
+    "node/tests/test_console_page.py",
+    "node/exitnode/templates/**",
+    "node/exitnode/manifest.py",
+    "node/exitnode/proxy/**",
+    "node/exitnode/service.py",
+    "node/exitnode/nft.py",
+    "node/exitnode/runner.py",
+    "node/exitnode/admin/**",
+    "node/exitnode/updater/**",
+    "node/exitnode/rescue/**",
+    "node/exitnode/watchdog/**",
+    "node/exitnode/device.py",
+    "node/exitnode/authsync.py",
+    "node/exitnode/publisher.py",
+    "node/exitnode/status.py",
+    "node/exitnode/netinfo.py",
+    "node/examples/**",
+    "node/tests/golden/**",
+    "authserver/authserver/config.py",
+    "authserver/authserver/db.py",
+    "authserver/authserver/models.py",
+    "authserver/authserver/security.py",
+    "authserver/authserver/admin_cli.py",
+    "authserver/examples/**",
+    "docs/design/**",
+    "docs/plans/**",
+    "docs/acceptance/**",
+    "docs/交接/**",
+    "docs/winclient/**",
+    "docs/node/**",
+    "docs/口径速查表.md",
+    "docs/开工须知.md",
+    "docs/授权页.md"
+  ],
+  "expectArtifacts": [
+    "node/exitnode/report.py",
+    "node/exitnode/console/server.py",
+    "node/exitnode/console/auth.py",
+    "node/exitnode/console/authclient.py",
+    "node/exitnode/console/snapshot.py",
+    "node/tests/test_console_server.py"
+  ],
+  "acceptance": [
+    {
+      "id": "T-AUTHSERVER",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "pytest",
+        "-q",
+        "authserver/tests/test_invites.py",
+        "authserver/tests/test_decoy.py"
+      ],
+      "required": true,
+      "timeoutSec": 300,
+      "failsOnBase": true
+    },
+    {
+      "id": "T-CONSOLE-AUTH",
+      "kind": "test:targeted",
+      "target": "node/tests/test_console_auth.py",
+      "required": true,
+      "failsOnBase": true
+    },
+    {
+      "id": "T-CONSOLE-CLIENT",
+      "kind": "test:targeted",
+      "target": "node/tests/test_console_authclient.py",
+      "required": true,
+      "failsOnBase": true
+    },
+    {
+      "id": "T-CONSOLE-SERVER",
+      "kind": "test:targeted",
+      "target": "node/tests/test_console_server.py",
+      "required": true,
+      "failsOnBase": true
+    },
+    {
+      "id": "T-CONSOLE-SNAPSHOT",
+      "kind": "test:targeted",
+      "target": "node/tests/test_console_snapshot.py",
+      "required": true,
+      "failsOnBase": true
+    },
+    {
+      "id": "T-CLI",
+      "kind": "test:targeted",
+      "target": "node/tests/test_cli.py",
+      "required": true,
+      "failsOnBase": true
+    },
+    {
+      "id": "T-CONFIG",
+      "kind": "test:targeted",
+      "target": "node/tests/test_config.py",
+      "required": true,
+      "failsOnBase": true
+    },
+    {
+      "id": "PYTEST",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "pytest",
+        "-q"
+      ],
+      "required": true,
+      "timeoutSec": 1500
+    },
+    {
+      "id": "RUFF",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "ruff",
+        "check",
+        "node",
+        "authserver"
+      ],
+      "required": true,
+      "timeoutSec": 300
+    },
+    {
+      "id": "SHAPE-API",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import sys;sys.path[:0]=['node','authserver'];from exitnode.console import auth,authclient,snapshot,server;from exitnode import report;w=((auth,'generate_password normalize hash_password verify_password Sessions LoginThrottle'),(authclient,'AuthClient AuthError'),(snapshot,'path collect write load'),(server,'create_server serve check load_credentials NOT_FOUND_PAGE PASSWORD_NAME ADMIN_KEY_NAME LAN_SOURCES'),(report,'check_result status_result'));bad=[m.__name__+'.'+n for m,ns in w for n in ns.split() if not hasattr(m,n)];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "SHAPE-VALUES",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import sys,pathlib;sys.path[:0]=['node','authserver'];from exitnode.console import server,auth;from exitnode.config import Console;import authserver.app as a;c=Console();src=''.join(pathlib.Path('node/exitnode/console/'+f).read_text(encoding='utf-8') for f in ('server.py','auth.py','authclient.py','snapshot.py'));bad=[k for k,ok in (('decoy',server.NOT_FOUND_PAGE==a.NOT_FOUND_PAGE),('defaults',(c.enabled,c.port,c.lan)==(False,8444,True)),('names',(server.PASSWORD_NAME,server.ADMIN_KEY_NAME,server.COOKIE)==('console-password','authserver-admin-key','yc_console')),('alphabet',auth.ALPHABET=='ABCDEFGHJKLMNPQRSTUVWXYZ23456789'),('raw',not any(x in src for x in ('import subprocess','os.system','shell=True','import authserver','from authserver'))),('static',not pathlib.Path('node/exitnode/console/static').exists())) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "TESTS-AUTH",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;w=(('node/tests/test_console_auth.py', ('test_generated_password_shape', 'test_hash_and_verify_with_normalization', 'test_verify_rejects_malformed_stored_value', 'test_sessions_expire_idle_and_absolute', 'test_sessions_limit_evicts_oldest', 'test_sessions_store_only_hashes', 'test_throttle_per_ip_and_global')),);bad=[f+':'+n for f,ns in w for n in ns if 'def '+n+'(' not in pathlib.Path(f).read_text(encoding='utf-8')];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "TESTS-AUTHCLIENT",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;w=(('node/tests/test_console_authclient.py', ('test_maps_success_and_whitelists_fields', 'test_decoy_404_means_key_rejected', 'test_json_error_passes_detail_through', 'test_unreachable_and_bad_response', 'test_admin_key_never_in_errors', 'test_https_pin_accepts_match_and_rejects_mismatch_before_sending', 'test_against_real_authserver_app')),);bad=[f+':'+n for f,ns in w for n in ns if 'def '+n+'(' not in pathlib.Path(f).read_text(encoding='utf-8')];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "TESTS-SNAPSHOT",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;w=(('node/tests/test_console_snapshot.py', ('test_collect_matches_cli_check_and_status', 'test_collect_probes_network_once', 'test_local_devices_only_and_no_credentials', 'test_write_sets_modes_and_is_atomic', 'test_load_states')),);bad=[f+':'+n for f,ns in w for n in ns if 'def '+n+'(' not in pathlib.Path(f).read_text(encoding='utf-8')];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "TESTS-SERVER",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;w=(('node/tests/test_console_server.py', ('test_static_files_and_security_headers', 'test_unknown_paths_methods_and_missing_static_get_decoy', 'test_no_server_header_anywhere', 'test_disallowed_source_gets_decoy', 'test_bad_host_header_gets_decoy', 'test_login_success_sets_cookie_and_session', 'test_login_wrong_password_and_throttle', 'test_password_missing_returns_409', 'test_api_requires_session', 'test_post_requires_csrf_and_same_origin', 'test_logout_clears_session', 'test_status_available_stale_and_missing', 'test_directory_and_actions_forwarded', 'test_invite_and_extend_validation', 'test_invite_mode_off_and_admin_key_missing_codes', 'test_ids_in_path_are_validated', 'test_oversized_body_rejected', 'test_check_layer', 'test_load_credentials_from_env_and_secrets', 'test_secrets_never_logged')),);bad=[f+':'+n for f,ns in w for n in ns if 'def '+n+'(' not in pathlib.Path(f).read_text(encoding='utf-8')];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "TESTS-OTHER",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;w=(('node/tests/test_cli.py', ('test_console_subcommands_dispatch', 'test_check_includes_console_layer_only_when_enabled')), ('node/tests/test_config.py', ('test_console_section_defaults_and_validation',)), ('authserver/tests/test_invites.py', ('test_admin_lists_invites_newest_first',)), ('authserver/tests/test_decoy.py', ('test_console_paths_are_not_found_on_authserver', 'test_admin_invites_list_requires_key')));bad=[f+':'+n for f,ns in w for n in ns if 'def '+n+'(' not in pathlib.Path(f).read_text(encoding='utf-8')];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import pathlib,sys;d=pathlib.Path('docs/authserver/接口说明.md').read_text(encoding='utf-8');bad=[k for k,ok in (('row','| GET `/admin/invites`' in d),('post','| POST `/admin/invites`' in d)) if not ok];print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "SCOPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-c",
+        "import subprocess as sp,sys;g=lambda *a:sp.check_output(['git','-c','core.quotepath=false']+list(a)).decode('utf-8').split(chr(10));mb=g('merge-base','origin/main','HEAD')[0].strip();ch={p.strip() for p in g('diff','--name-only',mb)+g('ls-files','--others','--exclude-standard') if p.strip()};ok={'authserver/authserver/'+x for x in 'app.py service.py'.split()}|{'authserver/tests/'+x for x in 'test_invites.py test_decoy.py'.split()}|{'docs/authserver/'+x for x in '接口说明.md'.split()}|{'node/exitnode/'+x for x in 'config.py report.py cli.py'.split()}|{'node/exitnode/console/'+x for x in '__init__.py auth.py authclient.py snapshot.py server.py'.split()}|{'node/tests/'+x for x in 'test_console_auth.py test_console_authclient.py test_console_server.py test_console_snapshot.py test_cli.py test_config.py'.split()};bad=sorted(p for p in ch if p not in ok);print(bad);sys.exit(1 if bad else 0)"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "workbuddyTier": "hard",
+  "timeoutSec": 14400,
+  "repoRoot": "E:/yuanc",
+  "steps": [
+    "读 BACKGROUND 列出的文件。先做鉴权服务的邀请码列表:补 authserver 两个测试文件(申请 T-AUTHSERVER 证红),再改 service.py、app.py,T-AUTHSERVER 绿;改接口说明,DOCS 绿。",
+    "config.py 的 console 段与 test_config.py 新用例,T-CONFIG 绿。",
+    "report.py 抽出 check_result / status_result,cli.py 的 check、status 改用它们,T-CLI 现有用例保持全绿。",
+    "console/auth.py 与 test_console_auth.py(先证红),T-CONSOLE-AUTH 绿;console/authclient.py 与 test_console_authclient.py,T-CONSOLE-CLIENT 绿。",
+    "console/snapshot.py 与 test_console_snapshot.py,T-CONSOLE-SNAPSHOT 绿;console/server.py 与 test_console_server.py,T-CONSOLE-SERVER 绿。",
+    "cli.py 的 console 四个子命令、check 的管理网页层与 test_cli.py 新用例,T-CLI 绿;最后 PYTEST、RUFF、SHAPE-API、SHAPE-VALUES、TESTS-AUTH、TESTS-AUTHCLIENT、TESTS-SNAPSHOT、TESTS-SERVER、TESTS-OTHER、SCOPE 全绿。"
+  ]
+}
