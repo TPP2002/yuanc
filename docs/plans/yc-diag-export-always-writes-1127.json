@@ -1,0 +1,179 @@
+{
+  "schemaVersion": 1,
+  "taskId": "WINCLIENT-DIAG-EXPORT-NO-FILE-1127",
+  "slug": "yc-diag-export-always-writes-1127",
+  "title": "导出诊断任何情况下都写出文件,结果显示在更新页;新增脱敏、日志尾部、防火墙现状只读探测与诊断采集库",
+  "workbuddyTier": "hard",
+  "goal": "以派单时 origin/main 头为基点。看板卡 WINCLIENT-DIAG-EXPORT-NO-FILE-1127。\n\n【问题】负责人在真机上点「导出诊断…」、选了保存位置,结果没有任何文件。病根在 winclient/WinClient.App/MainViewModel.cs 的 ExportAuditAsync:只有「防火墙审计」或「环境自检」至少有一份时才写文件,而这两份都要成功连上过一次才会产生;从没连上时走「尚无可导出的诊断记录」直接返回,不写文件。成功、失败的提示还都写进连接页的消息里,「更新与诊断」页上看不到,下一次后台推送又把它盖掉。另外导出内容只有那两份,排查连接失败用不上。\n\n【目标】点了导出、选了位置,任何情况下都写出一个文件(后台服务没连上、不认识新指令、没有任何记录都一样);结果写在「更新与诊断」页导出按钮下方;导出内容加上后台服务这边的现状与各份日志尾部,全部脱敏。本单只做采集库、管道应答字段、界面导出;把采集库接进后台服务的指令(read_diagnostics)由后一张单做,本单一行都不接。\n\n下面①~⑧是要做的事。类型名、成员名、提示语、JSON 键名照原文写,一字不差(含全角标点)。\n\n① 新文件 winclient/WinClient.Core/Diagnostics/DiagnosticsRedactor.cs,命名空间 WinClient.Core.Diagnostics:\n\npublic static class DiagnosticsRedactor\n  public const string PublicAddressMark = \"[公网地址]\";\n  public const string UserMark = \"[用户]\";\n  public const string TimedOutMark = \"[脱敏超时，内容已隐藏]\";\n  public static string RedactStructured(string? text)\n  public static string Redact(string? text)\n\nRedactStructured(给 JSON 原文用,替换后仍是合法 JSON):null 或空串返回 \"\"。依次做三步,三个正则都带 2 秒超时,任一步抛 RegexMatchTimeoutException 就整体返回 TimedOutMark。三个正则在源码里一律用逐字字符串 @\"…\" 写(检查脚本按下面的原样找前两个):\n  a. IPv4:正则 (?<![0-9.])(?:[0-9]{1,3}\\.){3}[0-9]{1,3}(?![0-9.]) 。每个命中用 IPAddress.TryParse 解析,解析成功且 WinClient.Core.Network.PublicAddress.IsPublic 为真才换成 PublicAddressMark,否则原样留下(内网、回环、198.18.0.0/15 这类地址排查要用)。\n  b. IPv6:正则 (?<![0-9A-Fa-f:])(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}(?![0-9A-Fa-f:]) 。每个命中解析成功、AddressFamily 是 InterNetworkV6、且 PublicAddress.IsPublic 为真才换成 PublicAddressMark;时间 01:02:03、链路本地地址、文档网段都原样留下。\n  c. 用户目录:正则 (?i)([A-Z]:\\\\{1,2}Users\\\\{1,2})[^\\\\/\\s\"'<>|:*?]+ 换成 $1[用户](一个或两个反斜杠都认,所以 JSON 里转义过的路径也能处理)。\nRedact(给日志行和零散文字用):null 或空串返回 \"\"。先把文字交给一个 WinClient.Core.Logging.RedactingLog(目的地是本类里一个只记住最后一条消息的私有 ILog 实现),取它写出的结果(令牌、口令、Bearer 都已换成 [已隐藏]);再对结果调 RedactStructured。\n\n② 新文件 winclient/WinClient.Core/Diagnostics/LogTail.cs:\n\npublic sealed record LogTailResult(string Name, bool Missing, long Bytes, bool Truncated, IReadOnlyList<string> Lines, string? Error = null);\npublic static class LogTail\n  public const int MaxLineChars = 2000;\n  public const int MaxReadBytes = 512 * 1024;\n  public static LogTailResult Read(string directory, string name, int maxLines)\n\n- 当前文件是 <directory>/<name>,轮转文件是 <directory>/<name>.1(RollingFileLog 的命名)。两个都不存在:返回 new(name, true, 0, false, [])。\n- 读一个文件的尾部:用 FileMode.Open、FileAccess.Read、FileShare.ReadWrite | FileShare.Delete 打开(后台服务可能正在往里追加);长度超过 MaxReadBytes 时只读最后 MaxReadBytes 字节,并丢掉读到的第一行(它是被截断的半行),记「丢过头部」;按 UTF-8 解码(开头有 BOM 要去掉),按 \\n 切行,去掉行尾 \\r,丢掉空行。\n- 先取当前文件的行;不足 maxLines 且轮转文件存在时,把轮转文件尾部的行接在前面。\n- 总行数超过 maxLines 时只留最后 maxLines 行。Truncated 为真的条件:有行被丢掉,或任一文件丢过头部。maxLines 小于等于 0 时 Lines 为空,文件里有过行就算 Truncated。\n- 每一行先过 DiagnosticsRedactor.Redact,再看长度:超过 MaxLineChars 就留前 MaxLineChars 个字符加一个 …。\n- Bytes 是当前文件的长度(不存在记 0)。\n- 读的过程抛 IOException 或 UnauthorizedAccessException:返回 new(name, false, 0, false, [], \"读取失败\")。\n\n③ 新文件 winclient/WinClient.Core/Diagnostics/FirewallStateProbe.cs(只读查系统防火墙现状):\n\npublic sealed record FirewallStateResult(string? Json, string? Error);\npublic static class FirewallStateProbe\n  public static readonly TimeSpan DefaultTimeout = TimeSpan.FromSeconds(20);\n  public const string TimedOut = \"系统防火墙现状没有读到：超过时限没有返回。\";\n  public const string Failed = \"系统防火墙现状没有读到：查询命令没有成功。\";\n  public const string Script = (下面八行,行与行之间用 \\n 连,原样照抄,建议用 C# 原始字符串字面量)\n  public static async Task<FirewallStateResult> RunAsync(ICommandRunner runner, TimeSpan? timeout = null, CancellationToken token = default)\n\nScript 的八行(已在开发机用系统自带 PowerShell 5.1 只读跑通,1.8 秒,输出一行 JSON):\n$ErrorActionPreference = 'Stop'\n$ProgressPreference = 'SilentlyContinue'\nfunction Read-Profiles($store) { try { @(Get-NetFirewallProfile -PolicyStore $store | ForEach-Object { [ordered]@{ name = [string]$_.Name; enabled = [string]$_.Enabled; default_outbound = [string]$_.DefaultOutboundAction; default_inbound = [string]$_.DefaultInboundAction } }) } catch { @() } }\n$service = try { [string](Get-Service -Name MpsSvc).Status } catch { 'unknown' }\n$own = try { @(Get-NetFirewallRule -PolicyStore PersistentStore -Name 'YuanC-KS-*' -ErrorAction SilentlyContinue | ForEach-Object { [ordered]@{ name = [string]$_.Name; enabled = [string]$_.Enabled; action = [string]$_.Action; direction = [string]$_.Direction } }) } catch { @() }\n$outbound = try { @(Get-NetFirewallRule -PolicyStore PersistentStore -Direction Outbound -ErrorAction SilentlyContinue) } catch { @() }\n$result = [ordered]@{ service = $service; profiles_local = @(Read-Profiles 'PersistentStore'); profiles_effective = @(Read-Profiles 'ActiveStore'); own_rules = @($own); outbound_rules_total = $outbound.Count; outbound_rules_enabled = @($outbound | Where-Object { [string]$_.Enabled -eq 'True' }).Count; outbound_allow_enabled = @($outbound | Where-Object { [string]$_.Enabled -eq 'True' -and [string]$_.Action -eq 'Allow' }).Count }\nConvertTo-Json -InputObject $result -Depth 5 -Compress\n\n(脚本只读,不许出现任何会改系统的命令。)\n\nRunAsync:\n- 建一个与 token 相连的取消源,CancelAfter(timeout ?? DefaultTimeout);用 KillSwitchApplier.CreateStartInfo(Script) 得到启动参数(它已经是隐藏窗口),交给 runner.RunAsync。\n- 抛 OperationCanceledException:token 本身已取消就原样抛出;否则返回 new(null, TimedOut)。\n- 抛 Win32Exception、IOException、InvalidOperationException:返回 new(null, Failed)。\n- 退出码不是 0:返回 new(null, Failed)。\n- 取标准输出最后一个非空白行;它能解析成 JSON 且根是对象:返回 new(那一行去掉首尾空白, null);否则 new(null, Failed)。\n\n④ 新文件 winclient/WinClient.Core/Diagnostics/DiagnosticsCollector.cs:\n\npublic sealed class DiagnosticsSources\n  public required string RunDirectory { get; init; }\n  public required Func<ClientSnapshot> Snapshot { get; init; }\n  public string Version { get; init; } = \"\";\n  public bool TestBuild { get; init; }\n  public Func<bool?>? Desired { get; init; }\n  public Func<IReadOnlyList<string>>? WfpFilterNames { get; init; }\n  public Func<IReadOnlyList<AdapterInfo>?>? Adapters { get; init; }\n  public Func<CancellationToken, Task<FirewallStateResult>>? Firewall { get; init; }\n  public Func<string?>? Audit { get; init; }\n  public Func<string?>? SelfCheck { get; init; }\n  public Func<DateTimeOffset> Now { get; init; } = () => DateTimeOffset.UtcNow;\n\npublic static class DiagnosticsCollector\n  public const int MaxEncodedBytes = 900 * 1024;\n  public static readonly IReadOnlyList<string> LogNames = [\"service.log\", \"connect.log\", \"sing-box.log\", \"update.log\", \"killswitch-recovery.log\"];\n  internal static readonly int[] LineBudgets = [400, 200, 100, 40, 10, 0];\n  public static async Task<string> CollectAsync(DiagnosticsSources sources, CancellationToken token = default)\n  internal static int EncodedBytes(string diagnostics) => ControlProtocol.Utf8.GetByteCount(ControlProtocol.Encode(new ControlResponse(0, true, Diagnostics: diagnostics)));\n\nCollectAsync 返回一段紧凑(不缩进)的 JSON 文字,根是对象,用 System.Text.Json.Nodes 组装,序列化时 Encoder 用 JavaScriptEncoder.UnsafeRelaxedJsonEscaping(中文不转义)。键按下面的次序与名字:\n\n  schema            数字 1\n  collected_at      sources.Now() 的 \"O\" 格式\n  version           sources.Version\n  test_build        sources.TestBuild\n  system            对象:os(RuntimeInformation.OSDescription)、arch(RuntimeInformation.OSArchitecture.ToString())、culture(CultureInfo.CurrentUICulture.Name)、time_zone(TimeZoneInfo.Local.Id)、utc_offset_minutes(本地时区此刻相对 UTC 的分钟数,整数)、uptime_minutes(Environment.TickCount64 / 60000)\n  snapshot          对象:state(State.ToString())、status、message、protection_active、mode、exit_status、guard_status、environment_enabled、environment_status、self_check_status、routing_mode、routing_apps(数组,每项只留文件名 Path.GetFileName)。字符串值都过 DiagnosticsRedactor.Redact。不许出现出口地址(ExitIp 不写)。\n  desired           true / false / null\n  killswitch        对象:state(对象:exists、bytes、modified_at(UTC 的 \"O\" 格式,文件不存在为 null)、summary)、audit_file(对象:exists、bytes、modified_at)、wfp_off(RunDirectory 下名为 wfp-off 的文件是否存在)、route_off(名为 route-off 的文件是否存在)。state 指 RunDirectory 下的 killswitch-state.json,audit_file 指 firewall-audit.json。\n                    summary:文件不存在为 null;存在就用 File.ReadAllText 读出并解析,根必须是对象,逐个属性:值是数组 → 写 <属性名>_count = 元素个数;是对象 → 写 <属性名>_keys = 它的属性名数组;是字符串 → 写 <属性名> = Redact 过的值;是数字、布尔、null → 原样写 <属性名>。只做摘要,不把数组内容抄进来。解析不了:summary 为 null,errors 里记 killswitch_state = \"不是有效的 JSON\"。\n  wfp_filters       sources.WfpFilterNames 为 null 时是 null;否则对象:count、names(数组)\n  adapters          sources.Adapters 为 null 或返回 null 时是 null;否则数组,每项:name、description(都过 Redact)、ipv4(数组,每项 \"<地址>/<前缀长度>\",地址先过 Redact)、ipv6(同上)\n  firewall          sources.Firewall 为 null 时是 null;否则把结果的 Json 解析成节点放进来(Json 为 null 就是 null)\n  firewall_error    结果的 Error(没有为 null)\n  logs              对象,键是 LogNames 里的每个名字,值是对象:missing、bytes、truncated、error、lines(数组)。用 LogTail.Read(RunDirectory, 名字, 行数上限) 读。\n  firewall_audit    sources.Audit 返回的文字先过 DiagnosticsRedactor.RedactStructured 再解析成节点;null 或没有委托就是 null;解析不了是 null,errors 里记 firewall_audit = \"不是有效的 JSON\"\n  self_check        sources.SelfCheck,做法同上,errors 的键是 self_check\n  omitted           数组:因为太大被省掉的段名\n  errors            对象:段名 → 出了什么错\n\n出错不许中断:Snapshot、Desired、WfpFilterNames、Adapters、Firewall、Audit、SelfCheck 这些委托,每个调用都单独包起来;抛任何异常(OperationCanceledException 除外,它照常抛出)时,那一段写 null,errors 里记 <段名> = 异常类型的短名(ex.GetType().Name)。段名依次是 snapshot、desired、wfp_filters、adapters、firewall、firewall_audit、self_check。\n\n大小控制(管道一行最多 1 MiB,而且管道编码会把中文和引号写成 6 个字节的转义):先按 LineBudgets[0] 行组装,EncodedBytes(结果) 大于 MaxEncodedBytes 就换下一档行数再量(日志可以只读一次、在内存里裁到最后 N 行并把 truncated 记成 true);行数降到 0 还超:firewall_audit 置 null、omitted 加 \"firewall_audit\";还超:self_check 置 null、omitted 加 \"self_check\";还超:adapters 置 null、omitted 加 \"adapters\"。然后返回。返回的永远是合法 JSON。\n\n⑤ winclient/WinClient.Core/Ipc/ControlProtocol.cs 只改一处:ControlResponse 末尾加一个可选参数\npublic sealed record ControlResponse(long? Id, bool Ok, string? Error = null, ControlSnapshot? Snapshot = null, string? Audit = null, string? SelfCheck = null, string? Diagnostics = null);\n别的一个字不动(ControlRequest、ControlSnapshot、编码选项、MaxLineBytes 都不动)。\n\n⑥ 新文件 winclient/WinClient.App/Presentation/DiagnosticsExport.cs,命名空间 WinClient.App.Presentation:\n\npublic sealed record UiDiagnostics(string UiVersion, string ServiceVersion, string Availability, ClientSnapshot Snapshot, string UpdateStage, string UpdateMessage);\npublic sealed record DiagnosticsExportResult(bool Written, bool ServiceIncluded, string Message);\npublic static class DiagnosticsExport\n  public const string ServiceUnreachable = \"后台服务没有连上。\";\n  public const string ServiceTimedOut = \"后台服务超过时限没有返回诊断。\";\n  public const string ServiceEmpty = \"后台服务没有返回诊断。\";\n  public const string ServiceInvalid = \"后台服务返回的诊断不是有效的 JSON。\";\n  public const string WriteFailed = \"导出失败：文件没能写到所选位置，请换一个位置再试。\";\n  public const string ExportedPrefix = \"已导出：\";\n  public const string UiOnlyNote = \"（后台服务的记录没有取到，文件里只有界面这边的信息）\";\n  public static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(45);\n  public static string DefaultFileName(DateTimeOffset localNow) => $\"澳洲出口客户端-诊断-{localNow:yyyyMMdd-HHmmss}.json\";\n  public static string Compose(UiDiagnostics ui, DateTimeOffset now, string? service, string? serviceError, string? audit, string? selfCheck)\n  public static async Task<DiagnosticsExportResult> RunAsync(Func<string, CancellationToken, Task<ControlResponse>>? send, UiDiagnostics ui, DateTimeOffset now, string path, CancellationToken token, Func<string, string, CancellationToken, Task>? write = null, TimeSpan? requestTimeout = null)\n  public static bool RevealInExplorer(string path)\n\nCompose 返回缩进的 JSON 文字(WriteIndented = true,Encoder 用 JavaScriptEncoder.UnsafeRelaxedJsonEscaping),根对象的键按这个次序:\n  schema         数字 1\n  exported_at    now 的 \"O\" 格式\n  ui             对象:version(ui.UiVersion)、service_version、service_availability(ui.Availability)、state、status、message、protection_active、mode、exit_status、guard_status、environment_enabled、environment_status、self_check_status、routing_mode、routing_apps(只留文件名)、update_stage、update_message。字符串值都过 DiagnosticsRedactor.Redact。不许出现出口地址。\n  service        service 能解析成 JSON 对象就原样放进来,否则 null\n  service_error  serviceError(没有为 null);service 不是 null 却解析不了时写 ServiceInvalid\n  firewall_audit audit 先过 DiagnosticsRedactor.RedactStructured 再解析;null 或解析不了都是 null\n  self_check     selfCheck,做法同上\n\nRunAsync(除了 token 被取消时的 OperationCanceledException,任何情况都不抛异常,都要走到写文件那一步):\n- send 为 null:serviceError = ServiceUnreachable,直接去写文件。\n- 否则发 \"read_diagnostics\"。每次发指令都用一个与 token 相连、CancelAfter(requestTimeout ?? RequestTimeout) 的取消源。\n  · 应答 Ok 为真且 Diagnostics 不是 null:service = Diagnostics。它解析不了时 serviceError = ServiceInvalid、service 作废,并继续走下面的「旧指令补取」。\n  · 应答 Ok 为假:serviceError = 应答的 Error(为 null 就用 ServiceEmpty),走「旧指令补取」。Ok 为真但 Diagnostics 是 null:serviceError = ServiceEmpty,走「旧指令补取」。\n  · 旧指令补取:依次发 \"read_audit\"、\"read_selfcheck\",应答 Ok 为真就分别取 Audit、SelfCheck(老版本的后台服务不认识 read_diagnostics,回「不支持的指令」,这时至少把原来那两份带上)。\n  · 发指令抛 IOException、InvalidOperationException、JsonException、UnauthorizedAccessException、InvalidDataException:serviceError = ServiceUnreachable,已经取到的留着,不再发后面的指令。\n  · 超时(抛 OperationCanceledException 而 token 没有取消):serviceError = ServiceTimedOut,不再发后面的指令。\n- 写文件:write 为 null 时用 File.WriteAllTextAsync(path, 文字, new UTF8Encoding(false), token)。抛 IOException、UnauthorizedAccessException、NotSupportedException、ArgumentException、System.Security.SecurityException:返回 new(false, false, WriteFailed)。\n- 写成功:service 被采用(ServiceIncluded 为真)时 Message = ExportedPrefix + path;否则 Message = ExportedPrefix + path + UiOnlyNote。\n\nRevealInExplorer:起 Windows 目录下的 explorer.exe,Arguments 为 /select,\"<path>\"(引号只包住路径),UseShellExecute = false,CreateNoWindow = true;进程类写全名 System.Diagnostics.Process。成功返回 true;抛 Win32Exception、InvalidOperationException、IOException 返回 false。这个方法不写单元测试(会真的打开资源管理器),测试里一律不许调用它。\n\n⑦ 界面三处:\nwinclient/WinClient.App/MainViewModel.cs\n- 删掉 ExportAuditAsync 整个方法(连同「尚无可导出的诊断记录,请完成一次连接后重试。」「已导出诊断(防火墙审计 + 环境自检)。」两句提示)。\n- 新增:\n  public string DiagnosticsMessage { get; private set; } = \"\";\n  internal Func<string, bool> RevealFile { get; set; } = DiagnosticsExport.RevealInExplorer;\n  internal Func<string, string, CancellationToken, Task>? WriteDiagnosticsFile { get; set; }\n  public string SuggestedDiagnosticsFileName => DiagnosticsExport.DefaultFileName(NowProvider().ToLocalTime());\n  public Task ExportDiagnosticsAsync(string path)\n- ExportDiagnosticsAsync 经现有的 RunAsync 执行(这样导出期间 IsBusy 为真):取当前的 client(可以是 null);组一个 UiDiagnostics(CurrentVersion, serviceVersion, availability.ToString(), snapshot, updateStatus.Stage, updateMessage);调 DiagnosticsExport.RunAsync(client 为 null 传 null,否则传 (op, token) => 那个 client.SendAsync(op, cancellationToken: token), 上面那个 UiDiagnostics, NowProvider(), path, lifetime.Token, WriteDiagnosticsFile);把结果的 Message 赋给 DiagnosticsMessage 并 Notify(nameof(DiagnosticsMessage));Written 为真才调 RevealFile(path)。\n- 导出不许改连接页的消息(不许为导出调 Update(snapshot with { Message = ... }))。其余成员一律不动。\nwinclient/WinClient.App/MainWindow.xaml.cs\n- Export_Click 里:SaveFileDialog 的 FileName 改成 model.SuggestedDiagnosticsFileName,加 InitialDirectory = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);确认后调 model.ExportDiagnosticsAsync(dialog.FileName)。CanExecute 仍是 !model.IsBusy(后台服务没就绪也能导出)。别的不动。\nwinclient/WinClient.App/Views/UpdatePage.xaml\n- 只加一行,紧跟在「正在处理,请稍候再导出诊断。」那个 TextBlock 后面:\n  <TextBlock Text=\"{Binding DiagnosticsMessage}\" Style=\"{DynamicResource Yc.Hint}\" AutomationProperties.LiveSetting=\"Polite\" Visibility=\"{Binding DiagnosticsMessage, Converter={x:Static t:VisibilityConverter.Instance}}\"/>\n- 别的一个字符都不动:DiagnosticsMessage 为空时这一行不占位,所以四张 page-update 截图基线不变;基线图片不许改。\n\n⑧ 文档与测试\ndocs/winclient/环境一致性说明.md:把「「导出诊断」依次读取 read_audit 与只读指令 read_selfcheck，保存为 诊断报告.json …」那一段改写成现在的做法,要写到:先发 read_diagnostics,老版本后台不认识时退回 read_audit 与 read_selfcheck;默认文件名 澳洲出口客户端-诊断-<年月日-时分秒>.json,默认存到桌面;任何情况下都会写出文件,后台服务的记录没取到时文件里有 service_error;结果显示在「更新与诊断」页导出按钮下方;脱敏规则(公网地址换成 [公网地址]、用户目录名换成 [用户]、令牌与口令换成 [已隐藏]、不含出口 IP);文件的顶层键 schema、exported_at、ui、service、service_error、firewall_audit、self_check;后台这一段(service)由后一张单接通,接通前导出的文件里 service 为 null。该文件「环境自检真机待验证」清单里「点击导出诊断，文件包含 firewall_audit 与 self_check 两段」那一条的开头「点击导出诊断，文件包含 firewall_audit 与 self_check 两段；」改成「点击导出诊断，在文件里找到 firewall_audit 与 self_check(后台支持 read_diagnostics 时在 service 段里，否则在顶层)；」,其余字不动;清单末尾加一条:「导出诊断(真机待验证):从没连上过时点导出,桌面上出现文件、资源管理器里选中它、页面上显示「已导出：」加路径。」\ndocs/winclient/界面说明.md:表格里「更新与诊断」那一行的说明改成:「后台服务与界面版本、上次检查时间、更新消息、检查更新，以及导出诊断。导出结果显示在本页导出按钮下方；任何情况下都会写出文件，内容已脱敏，不含出口 IP。」;表格下面那句里的「诊断导出的行为保持原有语义」删掉「、诊断导出」这几个字,使它只说配对文件和程序选择对话框。\n两份文档别的段落不动。\n\n测试(全部新文件;既有测试文件一个都不许改):\nwinclient/WinClient.Tests/DiagnosticsRedactorTests.cs\n- [Theory] PublicIpv4IsMaskedAndPrivateKept:\"8.8.8.8\"、\"1.1.1.1\" 所在的句子里地址变成 [公网地址];\"192.168.1.52\"、\"10.0.0.2\"、\"198.18.255.1\"、\"127.0.0.1\" 原样。\n- [Theory] PublicIpv6IsMaskedAndLocalKept:\"2404:6800:4006:80a::200e\" 变成 [公网地址];\"fe80::1c2d:3e4f:5a6b:7c8d\"、\"2001:db8::1\" 原样。\n- TimestampsAndVersionsAreNotTouched:\"2026-11-28T01:02:03.1234567+00:00 版本 0.1.2 系统 10.0.19045\" 原样返回。\n- UserDirectoryIsMaskedInPlainAndJsonEscapedPaths:C:\\Users\\alice\\AppData\\x.exe → C:\\Users\\[用户]\\AppData\\x.exe;JSON 里转义过的 C:\\\\Users\\\\alice\\\\AppData → C:\\\\Users\\\\[用户]\\\\AppData;结果里不含 alice。\n- LabelledSecretsAndBearerAreHidden:Redact(\"token=abc123 Authorization: Bearer xyz789\") 含 [已隐藏],不含 abc123、xyz789。\n- NullAndEmptyBecomeEmpty。\n- RedactStructuredKeepsJsonValid:一段含公网地址和用户目录的 JSON 文字,处理后仍能被 JsonDocument.Parse 解析。\nwinclient/WinClient.Tests/LogTailTests.cs(都在测试自己建的临时目录里)\n- MissingFileIsReportedWithoutThrowing\n- ReturnsLastLinesAndMarksTruncated:写 10 行、要 3 行 → 恰好最后 3 行,Truncated 为真。\n- PrependsRotatedFileWhenCurrentIsShort:x.log.1 有 5 行、x.log 有 2 行、要 4 行 → 轮转文件最后 2 行在前、当前 2 行在后。\n- LinesAreRedactedAndOverlongLinesCut:含 8.8.8.8 的行被换;3000 个字符的行变成 2000 个字符加 …。\n- ReadsWhileAnotherHandleIsAppending:测试先用 FileShare.ReadWrite 以写方式把文件开着不关,Read 仍读得到。\n- OversizeFileDropsPartialFirstLine:文件超过 MaxReadBytes → Truncated 为真,第一行是完整的一行。\nwinclient/WinClient.Tests/FirewallStateProbeTests.cs(执行器用测试里的假实现,不许起真进程)\n- ScriptIsReadOnly:Script 不含 \"Set-\"、\"Enable-\"、\"Disable-\"、\"New-\"、\"Remove-\"、\"Stop-\"、\"Start-\"、\"Restart-\"、\"netsh\";含 \"Get-NetFirewallProfile\"、\"MpsSvc\"、\"YuanC-KS-*\"、\"ConvertTo-Json\"。\n- RunUsesHiddenWindowStartInfo:假执行器收到的启动参数 CreateNoWindow 为真、UseShellExecute 为假。\n- ReturnsLastJsonLine:输出 \"警告\\n{\\\"service\\\":\\\"Running\\\"}\\n\"、退出码 0 → Json 等于 {\"service\":\"Running\"},Error 为 null。\n- [Theory] NonZeroExitOrBadJsonReportsFailed:退出码 1;退出码 0 但最后一行不是 JSON;最后一行是 JSON 数组 → Json 为 null,Error 等于 FirewallStateProbe.Failed。\n- TimeoutReportsTimedOut:假执行器一直等到令牌取消;timeout 传 50 毫秒 → Error 等于 FirewallStateProbe.TimedOut。\n- ExternalCancelStillThrows:外面的令牌先取消 → 抛 OperationCanceledException。\nwinclient/WinClient.Tests/DiagnosticsCollectorTests.cs(RunDirectory 用临时目录;委托都用测试里的假数据)\n- CollectsAllSectionsAsValidJson:十七个顶层键都在,次序与④一致。\n- SnapshotOmitsExitIpAndKeepsOnlyAppFileNames:快照 ExitIp 设 \"8.8.8.8\"、RoutingApps 设 C:\\Users\\alice\\App\\chrome.exe → 结果全文不含 8.8.8.8、不含 alice,routing_apps 是 [\"chrome.exe\"]。\n- FailingSourceIsRecordedAndOthersSurvive:WfpFilterNames 抛 InvalidOperationException → wfp_filters 为 null,errors.wfp_filters 等于 \"InvalidOperationException\",logs、snapshot 仍在。\n- FirewallResultIsEmbeddedOrErrorCarried:Firewall 返回 new(\"{\\\"service\\\":\\\"Running\\\"}\", null) → firewall.service 等于 Running、firewall_error 为 null;返回 new(null, \"x\") → firewall 为 null、firewall_error 等于 x。\n- StateFileIsSummarizedNotCopied:killswitch-state.json 写 {\"mode\":\"apps\",\"applied\":true,\"disabledRules\":[\"a1\",\"b2\",\"c3\"],\"profiles\":[{\"Name\":\"Domain\"}],\"auth\":{\"ip\":\"x\",\"port\":1}}(带 BOM 写一次、不带 BOM 写一次都要过)→ summary.mode 等于 apps、summary.applied 为 true、summary.disabledRules_count 等于 3、summary.profiles_count 等于 1、summary.auth_keys 等于 [\"ip\",\"port\"];summary 里没有名为 disabledRules 的属性。\n- BrokenStateFileIsReported:文件内容不是 JSON → summary 为 null,errors.killswitch_state 等于 \"不是有效的 JSON\"。\n- MarkersReflectFiles:建 wfp-off 文件 → killswitch.wfp_off 为 true、route_off 为 false。\n- LogsAreTrimmedToFitBudget:五份日志各写 2000 行、每行 200 个汉字 → EncodedBytes(结果) 不超过 MaxEncodedBytes,结果是合法 JSON,每份日志 truncated 为 true。\n- OversizeAuditIsOmittedAndNamed:Audit 返回一段约 2 MB 的合法 JSON → firewall_audit 为 null,omitted 含 \"firewall_audit\",EncodedBytes 不超过 MaxEncodedBytes。\n- AuditAndSelfCheckAreRedactedBeforeEmbedding:Audit 含 8.8.8.8 与转义路径 C:\\\\Users\\\\alice\\\\app.exe → 结果含 [公网地址]、[用户],不含 8.8.8.8、alice。\n- InvalidAuditJsonIsDroppedWithError:errors.firewall_audit 等于 \"不是有效的 JSON\"。\n- AdapterAddressesAreRedacted:网卡 IPv4 有 8.8.4.4/24 和 192.168.1.5/24 → ipv4 等于 [\"[公网地址]/24\",\"192.168.1.5/24\"]。\n- CancellationPropagates:Firewall 委托抛 OperationCanceledException → CollectAsync 抛 OperationCanceledException。\nwinclient/WinClient.Tests/DiagnosticsProtocolTests.cs\n- ResponseCarriesDiagnosticsField:编码 new ControlResponse(1, true, Diagnostics: \"{\\\"a\\\":1}\") 的结果含 \"diagnostics\",DecodeResponse 解回来 Diagnostics 相等。\n- OldResponseWithoutFieldDecodesToNull:{\"id\":1,\"ok\":true} 解出来 Diagnostics 为 null。\nwinclient/WinClient.UiTests/DiagnosticsExportTests.cs(纯函数与 RunAsync;send、write 都用测试里的假委托,写到内存或临时目录;不许调用 RevealInExplorer)\n- DefaultFileNameCarriesTimestamp:new DateTimeOffset(2026, 11, 28, 9, 5, 7, TimeSpan.FromHours(8)) → \"澳洲出口客户端-诊断-20261128-090507.json\"。\n- WritesFileEvenWithoutService:send 为 null → Written 为真、ServiceIncluded 为假;写出的文字是合法 JSON,service 为 null,service_error 等于 \"后台服务没有连上。\",ui.version 等于传入值;Message 等于 \"已导出：\" + path + UiOnlyNote。\n- UsesServiceDiagnosticsWhenAvailable:read_diagnostics 回 Ok 与 Diagnostics \"{\\\"schema\\\":1}\" → 只发了这一条指令;文件里 service.schema 等于 1;Message 等于 \"已导出：\" + path。\n- FallsBackToAuditAndSelfCheckWhenUnsupported:read_diagnostics 回 new(id, false, \"不支持的指令\"),read_audit 回 Audit \"{\\\"a\\\":1}\",read_selfcheck 回 SelfCheck \"{\\\"b\\\":2}\" → 发指令的次序是 read_diagnostics、read_audit、read_selfcheck;文件里 service 为 null、service_error 等于 \"不支持的指令\"、firewall_audit.a 等于 1、self_check.b 等于 2;Written 为真。\n- WritesFileWhenNothingWasEverRecorded:同上但 Audit、SelfCheck 都是 null(这就是负责人遇到的情形)→ Written 为真,文件里 firewall_audit、self_check 为 null。\n- PipeFailureStillWritesFile:send 抛 IOException → Written 为真,service_error 等于 \"后台服务没有连上。\",只发过一条指令。\n- SlowServiceTimesOutAndStillWritesFile:send 一直等到令牌取消,requestTimeout 传 50 毫秒 → Written 为真,service_error 等于 \"后台服务超过时限没有返回诊断。\"。\n- InvalidServiceJsonIsDroppedWithError:Diagnostics 是 \"不是 JSON\" → service 为 null,service_error 等于 \"后台服务返回的诊断不是有效的 JSON。\",并且补发了 read_audit、read_selfcheck。\n- WriteFailureIsReportedNotThrown:write 抛 UnauthorizedAccessException → Written 为假,Message 等于 \"导出失败：文件没能写到所选位置，请换一个位置再试。\"。\n- UiSectionOmitsExitIpAndRedactsMessage:快照 ExitIp \"8.8.8.8\"、Message 含 C:\\Users\\alice\\x、RoutingApps 含完整路径 → 文件全文不含 8.8.8.8、alice,routing_apps 只有文件名。\n- ComposeKeepsKeyOrder:顶层键依次是 schema、exported_at、ui、service、service_error、firewall_audit、self_check。\nwinclient/WinClient.UiTests/ViewModelDiagnosticsTests.cs(照 ViewModelTests.cs 的写法:[Collection(\"界面线程\")]、构造参数 UiThreadFixture ui、用例体包在 ui.Invoke 里;WriteDiagnosticsFile 与 RevealFile 都换成同步完成的假委托,这样 ExportDiagnosticsAsync(...).GetAwaiter().GetResult() 不会卡住界面线程)\n- ExportWritesFileAndShowsResultOnUpdatePageProperty:没有后台连接的模型 → 假写入收到了路径与文字;DiagnosticsMessage 以 \"已导出：\" 开头并含路径;model.Message 与导出前相同;RevealFile 恰好被调一次、参数是那个路径;PropertyChanged 里出现过 nameof(MainViewModel.DiagnosticsMessage)。\n- ExportFailureShowsReasonAndDoesNotReveal:假写入抛 IOException → DiagnosticsMessage 等于 \"导出失败：文件没能写到所选位置，请换一个位置再试。\",RevealFile 没被调。\n- SuggestedFileNameHasPrefixAndJsonExtension:以 \"澳洲出口客户端-诊断-\" 开头、以 \".json\" 结尾。\n- DiagnosticsMessageStartsEmpty:新建模型的 DiagnosticsMessage 是空串(截图基线靠它不变)。\n\n【验收】BUILD、TEST 全绿;SHAPE、TESTS-NEW、DOCS、SCOPE 四项由检查脚本 docs/plans/checks/yc_diag_export_1127.py 判(照它的字样写)。四张 page-update 截图基线与全部既有用例不许动。",
+  "background": "项目:外包「澳洲出口节点 + Windows 一键客户端」。客户端 .NET 9(winclient/WinClient.sln:Core + App + Tests + UiTests)。界面(WinClient.App,WPF)经命名管道向后台服务发指令:界面侧 ControlClient.SendAsync(op, …) 发一行 JSON,后台回一行 ControlResponse;一行最多 1 MiB(ControlProtocol.MaxLineBytes),管道编码会把非 ASCII 字符和引号写成 \\uXXXX。后台服务的数据目录在 ClientSettings.DataDirectory 下的 run 子目录:service.log、connect.log、sing-box.log、update.log(都是 RollingFileLog,1 MB 轮转,轮转文件名 <名字>.1)、killswitch-recovery.log、killswitch-state.json(断网保护的恢复记录,PowerShell 写的 UTF-8 带 BOM)、firewall-audit.json、selfcheck.json、wfp-off、route-off。\n\n先读(都读全文):winclient/WinClient.App/MainViewModel.cs(重点 RunAsync、ExportAuditAsync、ApplyPreview、构造函数)、winclient/WinClient.App/MainWindow.xaml.cs、winclient/WinClient.App/Views/UpdatePage.xaml、winclient/WinClient.App/Themes/PresentationBindings.cs 里的 VisibilityConverter、winclient/WinClient.Core/Ipc/ControlProtocol.cs、ControlClient.cs、winclient/WinClient.Core/Logging/ILog.cs 与 RollingFileLog.cs、winclient/WinClient.Core/Network/PublicAddress.cs、winclient/WinClient.Core/Environment/AdapterProbe.cs(AdapterInfo、AdapterAddress,命名空间 WinClient.Core.EnvironmentSupport)、winclient/WinClient.Core/Firewall/CommandRunner.cs(ICommandRunner、CommandResult)、KillSwitchApplier.cs 里的 CreateStartInfo、winclient/WinClient.Core/Client/ClientController.cs 开头的 ClientSnapshot、winclient/WinClient.UiTests/ViewModelTests.cs 与 UiThreadFixture.cs(界面测试的写法)、docs/winclient/环境一致性说明.md 里讲「导出诊断」的两处、docs/winclient/界面说明.md、检查脚本 docs/plans/checks/yc_diag_export_1127.py(它就是 SHAPE、TESTS-NEW、DOCS、SCOPE 四项验收,照它的字样写)。\n\n与本单同时在施工的另一张单(yc-connect-abandon-testbuild-1127)改 ClientController.cs、ClientRuntime.cs、ControlServer.cs、ControlService.cs、StatusPresentation.cs、WinClient.App.csproj、IpcTests.cs、ControllerTests.cs、StateTests.cs、UiTests/StatusPresentationTests.cs 等,本单一个都不许碰,也不许依赖它新增的任何成员。后台服务端的 read_diagnostics 指令、IClientFacade、ClientRuntime 接线都由后一张单做,本单不做。\n\n注意两个容易踩的名字:Core 里有命名空间 WinClient.Core.Process 和 WinClient.Core.Diagnostics,所以进程类一律写全名 System.Diagnostics.Process;新文件放在 WinClient.Core.Diagnostics 命名空间里时,用到 ProcessStartInfo 要 using System.Diagnostics。\n\n硬规矩:①只改允许清单里的文件;②既有测试文件一个都不许改,既有用例不删不改,只加新文件;③不许 git 写操作,不许自己跑 dotnet(build / test / restore 一律按验收编号申请),命令单独一条执行(不用 cd &&、管道、2>&1);④每次 Edit / Write 的新内容控制在 150 行以内;⑤goal 里的类型名、成员名、提示语、JSON 键名、正则、脚本照原文一字不差(含全角标点),新增注释用中文;⑥新增的子进程一律隐藏窗口(CreateNoWindow = true、UseShellExecute = false);⑦测试不许起真进程、不许读写真的数据目录、不许查或改真防火墙,文件只写在测试自己建的临时目录里并在结束时清掉;⑧不许读写 secrets/,工位里不许装依赖(缺依赖停下交 blocked);⑨截图基线图片(winclient/WinClient.UiTests/Baselines/**)不许改,UpdatePage.xaml 只许加那一行;⑩拿不准停下交 blocked 并写 forks,不猜。\n\n项目红线:只管本项目自己建的服务、路由、防火墙规则(本单对系统只读);凭据不落库不落日志(诊断里不写出口地址、节点公网地址、令牌、配对内容、用户目录名);隧道断了不许悄悄退回直连(本单不碰连接逻辑);安装更新幂等可回退;真机没测的不标通过;Windows 子进程一律隐藏窗口。",
+  "nonGoals": [
+    "不接后台服务端:ControlServer 的 read_diagnostics 分支、IClientFacade、ClientRuntime 接线都不做(后一张单做)",
+    "不扩充连接过程的记录,不改 ClientController、ControlService、断网保护与连接逻辑",
+    "不改管道编码选项、ControlRequest、ControlSnapshot",
+    "不改更新页现有文字与布局,不改截图基线",
+    "不做真机实测,不打包"
+  ],
+  "allowedPaths": [
+    "winclient/WinClient.Core/Diagnostics/DiagnosticsRedactor.cs",
+    "winclient/WinClient.Core/Diagnostics/LogTail.cs",
+    "winclient/WinClient.Core/Diagnostics/FirewallStateProbe.cs",
+    "winclient/WinClient.Core/Diagnostics/DiagnosticsCollector.cs",
+    "winclient/WinClient.Core/Ipc/ControlProtocol.cs",
+    "winclient/WinClient.App/Presentation/DiagnosticsExport.cs",
+    "winclient/WinClient.App/MainViewModel.cs",
+    "winclient/WinClient.App/MainWindow.xaml.cs",
+    "winclient/WinClient.App/Views/UpdatePage.xaml",
+    "winclient/WinClient.Tests/DiagnosticsRedactorTests.cs",
+    "winclient/WinClient.Tests/LogTailTests.cs",
+    "winclient/WinClient.Tests/FirewallStateProbeTests.cs",
+    "winclient/WinClient.Tests/DiagnosticsCollectorTests.cs",
+    "winclient/WinClient.Tests/DiagnosticsProtocolTests.cs",
+    "winclient/WinClient.UiTests/DiagnosticsExportTests.cs",
+    "winclient/WinClient.UiTests/ViewModelDiagnosticsTests.cs",
+    "docs/winclient/环境一致性说明.md",
+    "docs/winclient/界面说明.md"
+  ],
+  "forbiddenPaths": [
+    ".codex/**",
+    ".github/**",
+    ".gitignore",
+    "pyproject.toml",
+    "authserver/**",
+    "node/**",
+    "scripts/**",
+    "docs/plans/**",
+    "docs/design/**",
+    "docs/node/**",
+    "winclient/*.sln",
+    "winclient/Directory.Build.props",
+    "winclient/third_party/**",
+    "winclient/WinClient.Core/Client/**",
+    "winclient/WinClient.Core/Firewall/**",
+    "winclient/WinClient.Core/Network/**",
+    "winclient/WinClient.Core/State/**",
+    "winclient/WinClient.Core/Update/**",
+    "winclient/WinClient.Core/Logging/**",
+    "winclient/WinClient.Core/Ipc/ControlServer.cs",
+    "winclient/WinClient.Core/Ipc/ControlClient.cs",
+    "winclient/WinClient.Core/WinClient.Core.csproj",
+    "winclient/WinClient.App/Hosting/**",
+    "winclient/WinClient.App/Themes/**",
+    "winclient/WinClient.App/WinClient.App.csproj",
+    "winclient/WinClient.App/Presentation/StatusPresentation.cs",
+    "winclient/WinClient.App/Views/MainShell.xaml",
+    "winclient/WinClient.App/Views/MainShell.xaml.cs",
+    "winclient/WinClient.Tests/WinClient.Tests.csproj",
+    "winclient/WinClient.Tests/IpcTests.cs",
+    "winclient/WinClient.Tests/ControllerTests.cs",
+    "winclient/WinClient.UiTests/WinClient.UiTests.csproj",
+    "winclient/WinClient.UiTests/Baselines/**",
+    "winclient/WinClient.UiTests/ViewModelTests.cs",
+    "winclient/WinClient.UiTests/RenderTests.cs",
+    "winclient/WinClient.UiTests/ScreenshotBaselineTests.cs",
+    "winclient/WinClient.UiTests/StatusPresentationTests.cs",
+    "docs/winclient/断网保护加固说明.md",
+    "docs/winclient/打包与发布说明.md",
+    "docs/口径速查表.md"
+  ],
+  "expectArtifacts": [
+    "winclient/WinClient.Core/Diagnostics/DiagnosticsRedactor.cs",
+    "winclient/WinClient.Core/Diagnostics/LogTail.cs",
+    "winclient/WinClient.Core/Diagnostics/FirewallStateProbe.cs",
+    "winclient/WinClient.Core/Diagnostics/DiagnosticsCollector.cs",
+    "winclient/WinClient.App/Presentation/DiagnosticsExport.cs",
+    "winclient/WinClient.Tests/DiagnosticsCollectorTests.cs",
+    "winclient/WinClient.UiTests/DiagnosticsExportTests.cs",
+    "winclient/WinClient.UiTests/ViewModelDiagnosticsTests.cs"
+  ],
+  "acceptance": [
+    {
+      "id": "BUILD",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "build",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1200
+    },
+    {
+      "id": "TEST",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "test",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--no-build",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1500
+    },
+    {
+      "id": "SHAPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_diag_export_1127.py",
+        "shape"
+      ],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "TESTS-NEW",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_diag_export_1127.py",
+        "tests"
+      ],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_diag_export_1127.py",
+        "docs"
+      ],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "SCOPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_diag_export_1127.py",
+        "scope"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "timeoutSec": 10800,
+  "repoRoot": "E:/yuanc",
+  "steps": [
+    "读 background 列出的文件与检查脚本。",
+    "先写测试:七个新测试文件;申请 BUILD 以编译失败证红,之后固定 BUILD→TEST。",
+    "按 goal 第①~⑤条写 Core:脱敏、日志尾部、防火墙现状探测、采集器、管道应答字段。",
+    "按 goal 第⑥~⑦条写界面:DiagnosticsExport、MainViewModel、MainWindow.xaml.cs、UpdatePage.xaml。",
+    "按 goal 第⑧条改两份文档;BUILD、TEST、SHAPE、TESTS-NEW、DOCS、SCOPE 绿后交活。",
+    "交活说明逐条对照 goal 第①~⑧条写做到了没有,并单列哪些只有真机能验。"
+  ]
+}
