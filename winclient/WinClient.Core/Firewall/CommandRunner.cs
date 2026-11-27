@@ -2,7 +2,7 @@ using System.Diagnostics;
 
 namespace WinClient.Core.Firewall;
 
-public sealed record CommandResult(int ExitCode, string Output);
+public sealed record CommandResult(int ExitCode, string Output, string Error = "");
 public interface ICommandRunner
 {
     Task<CommandResult> RunAsync(ProcessStartInfo startInfo, CancellationToken cancellationToken = default);
@@ -24,9 +24,9 @@ public sealed class CommandRunner : ICommandRunner
         {
             await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
             var standardOutput = await output.ConfigureAwait(false);
-            // Error text can contain private paths; never send raw text to logs or UI.
-            await error.ConfigureAwait(false);
-            return new(process.ExitCode, standardOutput);
+            var standardError = await error.ConfigureAwait(false);
+            // 标准错误原文只留在内存里；要进日志必须先经 KillSwitchApplier.SanitizeError 脱敏。
+            return new(process.ExitCode, standardOutput, standardError);
         }
         catch (OperationCanceledException)
         {
