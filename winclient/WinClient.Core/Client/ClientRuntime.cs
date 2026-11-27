@@ -79,6 +79,7 @@ public sealed class ClientRuntime : IClientFacade, IDisposable
                 browserProbe: new SystemBrowserProcessProbe(),
                 nicGuard: new NicGuard(Path.Combine(ClientSettings.DataDirectory, "run"), new SystemAdapterProbe()),
                 reaper: new ConnectionReaper(new SystemTcpTable()),
+                proxyProbe: new RegistryProxySettingsProbe(),
                 scopeResolver: path => AppScopeResolver.Resolve(path, AppScopeResolver.SystemFolders(), new SystemAppScopeFileSystem()));
             return new(controller, firewall, http, pairingStore, log, storeRoot, scope);
         }
