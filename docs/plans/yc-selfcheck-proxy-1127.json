@@ -1,0 +1,125 @@
+{
+  "schemaVersion": 1,
+  "taskId": "WIN-SELFCHECK-SYSTEM-PROXY-1127",
+  "slug": "yc-selfcheck-proxy-1127",
+  "title": "环境自检加第十二项「未设系统代理」:系统代理、自动代理脚本、命令行代理环境变量开着就标未通过",
+  "goal": "以派单时 origin/main 头为基点。看板卡 WIN-SELFCHECK-SYSTEM-PROXY-1127。\n\n【问题】电脑的系统代理、自动代理脚本或命令行代理环境变量开着时,浏览器和命令行程序会先把流量交给那个代理(本机别的代理软件,或公司、家里局域网的代理设备)。回环与局域网在断网保护里是放行的,所以这条路走得通,对方网站看到的是那个代理的出口。客户端的出口核验只测后台服务这一个进程(SYSTEM 账户,不吃用户的代理设置),十一项自检照样全部通过。本单只做「查出来并告诉用户」,不改用户的任何设置。\n\n【做完后】\n① 新文件 winclient/WinClient.Core/Environment/ProxySettingsProbe.cs,命名空间 `WinClient.Core.EnvironmentSupport`(与 EnvironmentSelfCheck 相同),内容:\n- `public sealed record ProxyUserValues(int? ProxyEnable, string? ProxyServer, string? AutoConfigUrl, IReadOnlyDictionary<string, string?> Environment);`\n- `public sealed record ProxySnapshot(IReadOnlyList<ProxyUserValues> Users, IReadOnlyDictionary<string, string?> MachineEnvironment, bool MachineWide, ProxyUserValues? Machine);`\n- `public static class ProxySettings`,纯函数 `public static IReadOnlyList<string> Findings(ProxySnapshot snapshot)`,返回值只从下面五个固定词里取,按这个先后次序、去重:`系统代理`、`自动代理脚本`、`环境变量 HTTP_PROXY`、`环境变量 HTTPS_PROXY`、`环境变量 ALL_PROXY`。判法:\n  · 某个用户(或 MachineWide 为 true 时的 Machine)ProxyEnable 等于 1 且 ProxyServer 去空白后非空 → `系统代理`;\n  · 某个用户(或 MachineWide 为 true 时的 Machine)AutoConfigUrl 去空白后非空 → `自动代理脚本`;\n  · 任一用户的 Environment 或 MachineEnvironment 里,名字不分大小写等于 HTTP_PROXY / HTTPS_PROXY / ALL_PROXY 且值去空白后非空 → 对应的 `环境变量 …`(输出一律大写名)。\n  · MachineWide 为 false 时 Machine 里的代理值不算。返回的字符串里绝不出现任何设置的值(地址、端口、账号)。\n- `public interface IProxySettingsProbe { IReadOnlyList<string>? Snapshot(); }`:取不到返回 null。\n- `public sealed class RegistryProxySettingsProbe : IProxySettingsProbe`:只读注册表,组出 ProxySnapshot 后调 `ProxySettings.Findings`:\n  · 用户:`Registry.Users` 下名字匹配 `^S-1-5-21-[0-9-]+$` 的每个子键(不含 `_Classes` 结尾的),读 `Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings` 的 ProxyEnable、ProxyServer、AutoConfigURL,和 `Environment` 子键下的全部值名与值;\n  · 本机环境变量:`HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment`;\n  · MachineWide:`HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\CurrentVersion\\Internet Settings` 的 ProxySettingsPerUser 等于 0 时为 true,此时 Machine 取 `HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Internet Settings` 的同三个值;\n  · 全部用只读方式打开;任何异常(无权限、键不存在、类型不对)都不抛:单个键读不到按没有处理,整体出错返回 null。不起子进程,不写注册表,不写日志。\n\n② EnvironmentSelfCheck.cs:\n- SelfCheckInput 加 `public IReadOnlyList<string>? ProxyFindings { get; init; }`。\n- Evaluate 在「网卡无公网地址」之后追加第十二项,两种代理范围都评估,不受环境一致性总开关影响:标识 `system_proxy`,名称 `未设系统代理`。\n  · ProxyFindings 为 null → 结果 `无法核验`,明细 `未取得代理设置`;\n  · 为空 → `通过`,明细 `没有发现系统代理、自动代理脚本或命令行代理环境变量`;\n  · 非空 → `未通过`,明细为 `发现:` 加各项用 `、` 连接,再加 `;` 与这一句原文:`这些设置会让浏览器或命令行程序先把流量交给那个代理,查到的地址可能不是节点地址;连接期间请关掉系统代理并退出其他代理软件`。\n- `new List<CheckItem>(11)` 的容量改 12。其余十一项的判定与文字不变。\n\n③ ClientController.cs:两个公开构造器的参数表末尾各加可选参数 `IProxySettingsProbe? proxyProbe = null`(第一个构造器原样转给第二个;既有调用都不用改)。CheckEnvironmentAsync 在读网卡清单之后读一次:`proxyProbe?.Snapshot()`,异常按既有 `IsOperational` 写法吞掉当作 null;把结果放进 SelfCheckInput 的 ProxyFindings。没注入探测器时该项是「无法核验」。\n\n④ ClientRuntime.cs:构造 ClientController 处加 `proxyProbe: new RegistryProxySettingsProbe()`。\n\n⑤ 测试。\n既有断言只许因「多了一项」改数字,别的不动:EnvironmentSelfCheckTests.cs 里共用的 `Good` 输入补上 `ProxyFindings = []`;凡是汇总文字 `N 项通过`、`Items.Count`、`GetArrayLength()`、`Passed` 的期望值,因多了一项而变的,把数字加一(例如 `11 项通过` 改 `12 项通过`,`10 项通过,1 项未能检查` 改 `11 项通过,1 项未能检查`)。ControllerTests.cs 里三处 `Assert.Equal(11, report.Items.Count)` 改 12;若该文件里有断言自检汇总文字的,因没注入探测器多出一项「未能检查」而变的,同样只改数字。\n新文件 ProxySettingsProbeTests.cs:\n- `NoSettingsGivesEmptyFindings`:空快照 → 空表。\n- `EnabledProxyWithServerIsReported`:ProxyEnable 1 且有 ProxyServer → 只有 `系统代理`;ProxyEnable 1 但 ProxyServer 为空白 → 空;ProxyEnable 0 但有 ProxyServer → 空。\n- `AutoConfigUrlIsReported`。\n- `ProxyEnvironmentVariablesAreReportedCaseInsensitively`:用户环境里 `https_proxy`、本机环境里 `All_Proxy` → `环境变量 HTTPS_PROXY`、`环境变量 ALL_PROXY`;值为空白的不算;名字只是包含这些词的(如 `NO_PROXY`、`MY_HTTP_PROXY_X`)不算。\n- `MachineWideProxyCountsOnlyWhenPolicyDisablesPerUser`:Machine 有代理值,MachineWide 为 false → 空;为 true → `系统代理`。\n- `FindingsNeverContainValues`:各处填 `user:secret@10.1.2.3:8080`、`http://10.1.2.3/proxy.pac`,返回的每个字符串都不含 `10.1.2.3`、`secret`、`8080`、`pac`。\n- `FindingsAreDeduplicatedAndOrdered`:两个用户都开了系统代理,其中一个另有脚本,本机环境三个变量都有 → 恰好五项且次序如①所列。\n- `ReadSystemDoesNotThrow`:`new RegistryProxySettingsProbe().Snapshot()` 不抛异常(返回 null 或列表都算过)。\nEnvironmentSelfCheckTests.cs 新增:\n- `ProxyItemPassesWhenNoFindings`:第十二项标识 system_proxy、名称、通过、明细原文。\n- `ProxyItemFailsAndNamesSettingsWithoutValues`:ProxyFindings 为 [`系统代理`, `环境变量 HTTPS_PROXY`] → 未通过,明细以 `发现:系统代理、环境变量 HTTPS_PROXY;` 开头并含②的原句;汇总以 `1 项未通过:未设系统代理` 开头。\n- `ProxyItemUnverifiableWhenSnapshotMissing`:null → 无法核验,明细 `未取得代理设置`。\n- `ProxyItemEvaluatedInAppsMode`:仅指定程序模式下该项照常给出通过或未通过,不是跳过。\nControllerTests.cs 新增:\n- `SelfCheckIncludesProxyFindingsFromProbe`:注入一个返回 [`系统代理`] 的假探测器,连上并等自检报告,报告最后一项标识是 system_proxy、结果未通过。写法照同文件里已有的取自检报告的用例(reportSink)。\n测试只许写临时目录,不得往受测目录写产物。\n\n⑥ 文档(写给人读的中文;只写产品行为,不写施工过程):\n- docs/winclient/环境一致性说明.md「## 环境自检」:总条数改十二项;表格加第 12 行(system_proxy,未设系统代理,判定写清查哪三类设置、各看注册表哪里、明细不写任何地址、两种代理范围都评估且不受总开关影响、只报告不修改用户设置);「全好时显示」改成 12 项通过;其余因多一项而变的数字同步(如「其他十项均通过时汇总为」那句)。在表格之后加一小段说明这项的边界:只查 Windows 系统代理、自动代理脚本和三个环境变量;「自动检测设置」开关、各软件自己的代理设置(如 git、npm、浏览器扩展)查不到;出口核验只测后台服务自己,这一项是用来提醒「别的程序可能没走节点」。「## 真机待验证清单」加两条:开着系统代理连接后一分钟内该项显示未通过并点名;关掉后下一轮自检恢复通过。\n- docs/winclient/架构说明.md 第 107 行附近那句「只读评估十一项」同步成十二项,并点到第 12 项「未设系统代理」。",
+  "background": "项目:外包「澳洲出口节点 + Windows 一键客户端」。客户端 .NET 9 WPF(winclient/WinClient.sln:Core + App + Tests + UiTests)。后台服务以 SYSTEM 身份运行,界面只显示结果;自检报告写到 run/selfcheck.json,界面按条目逐行展示,条数不写死。客户的硬要求:连上节点后,电脑上任何程序看到的出口都是节点。\n\n先读:winclient/WinClient.Core/Environment/EnvironmentSelfCheck.cs(全文)、Core/Client/ClientController.cs 的两个构造器与 CheckEnvironmentAsync、Core/Client/ClientRuntime.cs 构造控制器处、Core/Network 下 AdapterProbe 相关文件(同类「探测器接口 + 系统实现 + 取不到返回 null」的写法)、Tests/EnvironmentSelfCheckTests.cs(共用输入 Good)、Tests/ControllerTests.cs 里断言 `report.Items.Count` 的三个用例、docs/winclient/环境一致性说明.md「环境自检」一节、检查脚本 docs/plans/checks/yc_selfcheck_proxy_1127.py(它就是 SHAPE、TESTS-NEW、DOCS、SCOPE 四项验收)。\n\n硬规矩:①只改允许清单里的九个文件;②既有测试断言只许按 goal 第⑤条改数字,别的不动,只做编译适配;③代理设置的值(地址、端口、账号、脚本网址)不进自检明细、日志、异常与报告;④不许 git 写操作,不许自己跑 dotnet(build / test / restore / publish 一律按验收编号申请);⑤每次 Edit / Write 的新内容控制在 150 行以内;⑥新增文案与注释用中文;⑦只读注册表,不写注册表,不起子进程;⑧不许读写 secrets/,工位里不许装依赖(缺依赖停下交 blocked);⑨拿不准停下交 blocked 并写 forks,不猜。\n\n项目红线:只管本项目自己建的服务、路由、防火墙规则(所以本单不替用户关代理,只报告);凭据不落库不落日志;真机没测的不标通过。",
+  "nonGoals": [
+    "不修改、不关闭用户的任何代理设置",
+    "不查「自动检测设置」开关与各软件自己的代理配置",
+    "不改界面代码与界面测试(界面按条目展示,不写死条数)",
+    "不改其余十一项自检的判定与文字",
+    "不改口径速查表与设计正本(派单方自己改)"
+  ],
+  "allowedPaths": [
+    "winclient/WinClient.Core/Environment/ProxySettingsProbe.cs",
+    "winclient/WinClient.Core/Environment/EnvironmentSelfCheck.cs",
+    "winclient/WinClient.Core/Client/ClientController.cs",
+    "winclient/WinClient.Core/Client/ClientRuntime.cs",
+    "winclient/WinClient.Tests/ProxySettingsProbeTests.cs",
+    "winclient/WinClient.Tests/EnvironmentSelfCheckTests.cs",
+    "winclient/WinClient.Tests/ControllerTests.cs",
+    "docs/winclient/环境一致性说明.md",
+    "docs/winclient/架构说明.md"
+  ],
+  "forbiddenPaths": [
+    ".codex/**",
+    ".github/**",
+    ".gitignore",
+    "pyproject.toml",
+    "authserver/**",
+    "node/**",
+    "scripts/**",
+    "docs/design/**",
+    "docs/plans/**",
+    "docs/acceptance/**",
+    "docs/交接/**",
+    "docs/node/**",
+    "docs/口径速查表.md",
+    "docs/开工须知.md",
+    "docs/授权页.md",
+    "docs/winclient/断网保护加固说明.md",
+    "docs/winclient/泄漏检测说明.md",
+    "winclient/*.sln",
+    "winclient/Directory.Build.props",
+    "winclient/third_party/**",
+    "winclient/WinClient.UiTests/**",
+    "winclient/WinClient.App/**",
+    "winclient/WinClient.Core/Firewall/**",
+    "winclient/WinClient.Core/Diagnostics/**",
+    "winclient/WinClient.Core/Network/**",
+    "winclient/WinClient.Core/Pairing/**",
+    "winclient/WinClient.Core/Update/**",
+    "winclient/WinClient.Core/Auth/**",
+    "winclient/WinClient.Core/Environment/EnvironmentPlanner.cs",
+    "winclient/WinClient.Core/Environment/EnvironmentApplier.cs",
+    "winclient/WinClient.Core/WinClient.Core.csproj",
+    "winclient/WinClient.Tests/WinClient.Tests.csproj",
+    "winclient/WinClient.Tests/Wfp*.cs",
+    "winclient/WinClient.Tests/KillSwitch*.cs",
+    "winclient/WinClient.Tests/LeakCaptureTests.cs"
+  ],
+  "expectArtifacts": [
+    "winclient/WinClient.Core/Environment/ProxySettingsProbe.cs",
+    "winclient/WinClient.Tests/ProxySettingsProbeTests.cs"
+  ],
+  "acceptance": [
+    {
+      "id": "BUILD",
+      "kind": "command",
+      "argv": ["dotnet", "build", "winclient/WinClient.sln", "-c", "Release", "--nologo"],
+      "required": true,
+      "timeoutSec": 1200
+    },
+    {
+      "id": "TEST",
+      "kind": "command",
+      "argv": ["dotnet", "test", "winclient/WinClient.sln", "-c", "Release", "--no-build", "--nologo"],
+      "required": true,
+      "timeoutSec": 1500
+    },
+    {
+      "id": "SHAPE",
+      "kind": "command",
+      "argv": ["python", "docs/plans/checks/yc_selfcheck_proxy_1127.py", "shape"],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "TESTS-NEW",
+      "kind": "command",
+      "argv": ["python", "docs/plans/checks/yc_selfcheck_proxy_1127.py", "tests"],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "argv": ["python", "docs/plans/checks/yc_selfcheck_proxy_1127.py", "docs"],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "SCOPE",
+      "kind": "command",
+      "argv": ["python", "docs/plans/checks/yc_selfcheck_proxy_1127.py", "scope"],
+      "required": true,
+      "timeoutSec": 120
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "timeoutSec": 7200,
+  "repoRoot": "E:/yuanc",
+  "steps": [
+    "读 BACKGROUND 列出的文件与检查脚本。",
+    "先写测试:新建 ProxySettingsProbeTests,加 EnvironmentSelfCheckTests 与 ControllerTests 的新用例并按第⑤条改数字;申请 BUILD 以编译失败证红,之后固定 BUILD→TEST。",
+    "写 ProxySettingsProbe.cs,改 EnvironmentSelfCheck、ClientController、ClientRuntime;BUILD、TEST、SHAPE、TESTS-NEW 绿。",
+    "改两份文档;DOCS、SCOPE 绿后交活。交活说明逐条对照 goal 第①~⑥条写做到了没有。"
+  ]
+}

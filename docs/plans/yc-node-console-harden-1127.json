@@ -1,0 +1,132 @@
+{
+  "schemaVersion": 1,
+  "taskId": "NODE-WEB-CONSOLE-1127",
+  "slug": "yc-node-console-harden-1127",
+  "title": "节点管理网页加固:登录限流原子占位且隧道来源不受全体上限、验密码限并发、自带错误页改通用 404、自己解析 Cookie",
+  "goal": "以派单时 origin/main 头为基点。看板卡 NODE-WEB-CONSOLE-1127。\n\n背景:节点管理网页的后台(node/exitnode/console/ 包)已合并进主干。安全会审挑出四处要补:①登录限流的「查是否被封」和「记一次失败」分两步,并发请求能一次越过上限;全体失败上限对经隧道进来的管理员(来源都是 127.0.0.1)同样生效,局域网里任何一台设备每 15 分钟发 30 个错密码就能让隧道里的管理员一直登不上。②每次验密码的 scrypt 要 16 MiB 内存,32 个并发登录能撑过单元的 MemoryMax=256M,进程被杀、连续几次后单元停在失败状态。③http.server 自己报错的几种情况(自造方法名、坏请求行、超长请求行、请求头太多)要确认都回通用 404 并断开;现有代码已重写 send_error,但没有用例钉住,也没断开连接。④用 http.cookies.SimpleCookie 解析 Cookie,它有过平方级耗时的漏洞。本单只改 console/auth.py、console/server.py 和它们的两份测试。\n\n一、auth.py 的 LoginThrottle(构造参数不变:clock, per_ip=5, global_limit=30, window=900)\n1. 内部只存一个列表,每项是 (时刻, 来源 IP 字符串);每个公开方法进锁后先删掉 window 秒以前的项。\n2. 判断「回环」:ipaddress.ip_address(ip).is_loopback;解析失败按非回环。\n3. blocked(ip) -> bool:该 IP 的项数 ≥ per_ip;或者 ip 不是回环、且所有非回环来源的项数合计 ≥ global_limit。回环来源不受全体上限限制,也不计入全体合计(经隧道进来的只有本机自用设备,来源都是 127.0.0.1;Linux 丢弃从外部网卡进来、源地址是 127/8 的包,局域网设备冒充不了)。\n4. attempt(ip) -> bool:在同一次加锁里先按 blocked 的规则判断,被封返回 False 且不追加;没被封就追加 (现在, ip) 并返回 True。这一项就是「这次尝试先按失败记」,验密码之前占好名额,并发请求越不过上限。\n5. succeed(ip):删掉该 IP 的全部项。\n6. 删除 fail 方法;调用方一律改用 attempt。\n\n二、auth.py 的 verify_password:raw 不是字符串、长度超过 200、或 normalize(raw) 不全匹配 ^[A-HJ-NP-Z2-9]{20}$(generate_password 的字母表、20 位)时直接返回 False,不调用 scrypt。stored 的格式检查照旧。hash_password 不改。\n\n三、server.py 的登录(替换原第 (10) 步的顺序,其余步骤不变):\n1. throttle.attempt(来源 IP) 为假 → 429 throttled(不验密码)。\n2. credentials 没有密码哈希 → 409 password_missing;password 不是字符串 → 422 bad_request「请求格式不对」。\n3. 验密码的并发闸:服务器对象上一个 threading.BoundedSemaphore(2);acquire(blocking=False) 拿不到 → 429 throttled。拿到后在 try/finally 里调用 auth.verify_password(按模块属性调用,写成 auth.verify_password(...),测试要能 monkeypatch exitnode.console.auth.verify_password),结束必释放。\n4. 验不过 → 401 wrong_password(失败已在第 1 步记下,不另记)。验过 → throttle.succeed(来源 IP)、建会话、Set-Cookie、返回已登录形状,与原来相同。\n\n四、server.py 现有的 send_error 重写(调 _decoy)保留;_decoy 里加 self.close_connection = True,所有通用 404 回完都断开连接。send_error 不使用 message、explain,不回显请求内容。这样 http.server 自己报的 400/414/431/501 也都是通用 404。\n\n五、server.py 的 Cookie 解析不再用 http.cookies:\n1. Cookie 头缺失或长度超过 4096 个字符 → 当没带。\n2. 按 \";\" 切开,每段去首尾空白,取第一个以 \"yc_console=\" 开头的段;等号后的值必须全匹配 [A-Za-z0-9_-]{1,128},否则当没带。\n3. 删掉 http.cookies 的 import。\n\n六、测试(用例名固定,可再加;只用假时钟、tmp_path 与 127.0.0.1 本机端口,不联网):\n- node/tests/test_console_auth.py:\n  - test_throttle_attempt_counts_before_verify_and_is_atomic:同一 IP 连续 attempt 5 次都为真、第 6 次为假;succeed 后又能 attempt;50 个线程同时对同一个新 IP 调 attempt,恰好 5 个为真。\n  - test_throttle_loopback_exempt_from_global_limit:30 个不同的局域网地址(如 192.168.1.1~30)各 attempt 一次后,第 31 个局域网地址为假,127.0.0.1 仍为真;127.0.0.1 自己 attempt 满 5 次后第 6 次为假;时钟推进 901 秒后全部恢复。\n  - test_verify_password_rejects_bad_format_without_scrypt:monkeypatch exitnode.console.auth 里用到的 hashlib.scrypt 为调用即抛异常的替身,对一个合法哈希验 \"short\"、21 位、含字母 O 或数字 1 的串都返回 False 且替身没被调用;格式对但密码错时会调用 scrypt(恢复真实函数后验证返回 False)。\n- node/tests/test_console_server.py:\n  - test_login_concurrency_gate_returns_429:monkeypatch exitnode.console.auth.verify_password 为一个等待 threading.Event 的替身;两个线程各发一次登录卡在替身里时,第三次登录立即得到 429 throttled;放行后前两次正常返回。\n  - test_malformed_requests_get_decoy:用原始套接字分别发 PATCH / 请求、FOO / 请求、坏请求行「GARBAGE」、长度超过 65536 字节的请求行、带 101 个请求头的 GET;每次读到连接关闭为止,响应里都含 NOT_FOUND_PAGE 的 UTF-8 字节,不含「Error response」「Python」「BaseHTTP」「Server:」。\n  - test_cookie_header_parsing:登录后,Cookie 头写成「a=1; yc_console=<值>; b=2」时 /api/session 为已登录;Cookie 头超过 4096 个字符(把同一个值放在末尾)、值里含非法字符(如引号、逗号)、只有「yc_console=」时都为未登录。\n- 既有用例:凡是用「不符合 20 位字母表格式」的测试密码登录或验证的,改用 auth.generate_password() 生成的密码或一个格式正确的固定测试值;用到 fail 的改用 attempt。断言的原意不改,改动在交活说明里逐条列出。\n",
+  "background": "项目:外包「澳洲出口节点 + Windows 一键客户端」。节点端 Python 3.11(node/exitnode,测试 node/tests)。\n\n先读(全文):node/exitnode/console/auth.py、server.py、authclient.py、snapshot.py;node/tests/test_console_auth.py、test_console_server.py;node/exitnode/admin/server.py(它的 send_error 重写可参考);检查脚本 docs/plans/checks/yc_node_console_harden_1127.py(SHAPE、TESTS-NEW、SCOPE 三项验收)。\n\n已定的取舍(不要改):管理密码 20 位、只存 scrypt 哈希(n=16384, r=8, p=1);同一来源 15 分钟错 5 次封 15 分钟;全体上限 30 次只管非回环来源;验密码同时最多 2 个;通用 404 正文与鉴权服务逐字节相同;接口路径、请求与响应格式、错误码和文字一律不变。\n\n硬规矩(做不到就停下交 blocked + forks,不猜):①只改允许清单里的四个文件。②测试里的密码用明显的测试值或现场生成,不写真实凭据。③既有测试断言不删、不跳过、不放宽;因密码格式检查要换测试密码的,在交活说明逐条列出。④工人不许 git 写操作,不许自己跑 pytest / ruff / python(按验收编号走派单器自测通道,命令单独一条执行,不写 cd &&、管道、2>&1);不许装依赖。⑤新增注释用中文大白话;每次 Edit / Write 的新内容不超过 150 行。",
+  "nonGoals": [
+    "不改接口路径、请求与响应格式、错误码与错误文字",
+    "不改 authclient.py、snapshot.py、static/ 页面与 cli.py",
+    "不改 systemd 单元、安装流程与隧道配置(并行的安装单在做)",
+    "不写 docs/ 下任何文档"
+  ],
+  "allowedPaths": [
+    "node/exitnode/console/auth.py",
+    "node/exitnode/console/server.py",
+    "node/tests/test_console_auth.py",
+    "node/tests/test_console_server.py"
+  ],
+  "forbiddenPaths": [
+    ".codex/**",
+    ".github/**",
+    ".gitignore",
+    "pyproject.toml",
+    "requirements-dev.txt",
+    "winclient/**",
+    "scripts/**",
+    "authserver/**",
+    "docs/**",
+    "node/exitnode/cli.py",
+    "node/exitnode/console/authclient.py",
+    "node/exitnode/console/snapshot.py",
+    "node/exitnode/console/install.py",
+    "node/exitnode/console/static/**",
+    "node/exitnode/templates/**",
+    "node/examples/**",
+    "node/tests/golden/**"
+  ],
+  "expectArtifacts": [
+    "node/exitnode/console/auth.py",
+    "node/exitnode/console/server.py",
+    "node/tests/test_console_auth.py",
+    "node/tests/test_console_server.py"
+  ],
+  "acceptance": [
+    {
+      "id": "T-AUTH",
+      "kind": "test:targeted",
+      "target": "node/tests/test_console_auth.py",
+      "required": true,
+      "failsOnBase": true
+    },
+    {
+      "id": "T-SERVER",
+      "kind": "test:targeted",
+      "target": "node/tests/test_console_server.py",
+      "required": true,
+      "failsOnBase": true
+    },
+    {
+      "id": "PYTEST",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "pytest",
+        "-q"
+      ],
+      "required": true,
+      "timeoutSec": 1500
+    },
+    {
+      "id": "RUFF",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "ruff",
+        "check",
+        "node",
+        "authserver"
+      ],
+      "required": true,
+      "timeoutSec": 300
+    },
+    {
+      "id": "SHAPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_node_console_harden_1127.py",
+        "shape"
+      ],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "TESTS-NEW",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_node_console_harden_1127.py",
+        "tests"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "SCOPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_node_console_harden_1127.py",
+        "scope"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "timeoutSec": 7200,
+  "repoRoot": "E:/yuanc",
+  "steps": [
+    "读 BACKGROUND 列出的文件与检查脚本。",
+    "auth.py 的 LoginThrottle 与 verify_password,test_console_auth 新用例与既有用例的替换,T-AUTH 绿。",
+    "server.py 的登录顺序与并发闸、通用 404 断开连接、Cookie 解析,test_console_server 新用例与既有用例的替换,T-SERVER 绿。",
+    "PYTEST、RUFF、SHAPE、TESTS-NEW、SCOPE 全绿后交活;交活说明逐条列出既有测试改了什么、为什么。"
+  ]
+}

@@ -164,6 +164,10 @@ def tick(runner):
             kept = [at for at in value[key] if not at > cutoff]
             dropped += len(value[key]) - len(kept)
             value[key] = kept
+        # 上次计数时刻停在未来时拨回会让下一轮差值为负，须一并剔除；计数不清零。
+        if value["counted_at"] is not None and value["counted_at"] > cutoff:
+            value["counted_at"] = None
+            dropped += 1
         if dropped:
             s.history(runner, "clock_adjusted", "ok")  # 随本轮 save 一起落盘。
         result = p.probe(runner)

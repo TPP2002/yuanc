@@ -1,0 +1,129 @@
+{
+  "schemaVersion": 1,
+  "taskId": "SEC-WIN-LAN-DNS-LEAK-1127",
+  "slug": "yc-wfp-dns-guard-1127",
+  "title": "全部流量模式过滤层加「远端 53 端口阻断」压在局域网放行之上;泄漏检测把发往局域网 53 端口的包判为可疑",
+  "goal": "以派单时 origin/main 头为基点。看板卡 SEC-WIN-LAN-DNS-LEAK-1127。\n\n【问题(派单方 2026-11-27 读代码与内核源码核实,不用复核)】\n全部流量模式的断网保护放行整个局域网:防火墙规则 YuanC-KS-Lan,过滤层 Lan-* 四条(权重 10,不限协议端口)。电脑的域名服务器通常就是路由器(局域网地址,或路由器的 fe80 地址),所以发往路由器 53 端口的域名查询在保护层是放行的。隧道内核在跑时,内核自己的严格路由另挂了一条「远端 53 端口阻断」,但那是动态会话,内核进程一退就没了。内核没在跑而保护还在的时段(重连退避、需人工处理、服务重启或升级、开机后隧道就绪前),查询会经路由器交给所在地运营商的解析器。设计正本 §6 写的是「DNS 不单独放行,全走隧道」。泄漏检测 `--leak-check` 把局域网对端一律算放行,查不出这种包。\n\n【做完后】\n只改过滤层全部流量计划与泄漏检测归类。防火墙脚本(KillSwitchPlanner)、KillSwitchApplier、仅指定程序计划(WfpPlanner.PlanApps)一个字不动。\n\n① WfpPlanner 常量:保留 `PermitWeight = 10`、`BlockWeight = 0`;新增 `public const byte ExactPermitWeight = 12;`、`public const byte DnsBlockWeight = 11;`、`public const int DnsPort = 53;`。\n\n② WfpPlanner.PlanGlobal 产出的过滤器:\n- Loopback-* 四条、Tun-* 四条、Node-Tcp、Node-Udp、Auth(有鉴权时):权重改为 ExactPermitWeight,其余字段不变。\n- Lan-* 四条、Dhcp-* 两条:权重仍是 PermitWeight,字段不变。\n- Block-* 四条:不变。\n- 在列表末尾(Block-* 之后)追加两条,layer 依次为 ConnectV4、ConnectV6:`new(Prefix + \"Dns53-\" + layer, layer, WfpAction.Block, DnsBlockWeight, RemotePort: DnsPort)`。不写协议、不写地址、不写程序路径,TCP 与 UDP 都算;AcceptV4 / AcceptV6 层不加。\n- 既有过滤器的名字与先后次序不变。无鉴权共 22 条,有鉴权共 23 条。\n效果:回环、隧道网卡地址、节点、鉴权的放行先于 53 阻断,53 阻断先于局域网放行。输入校验与报错文字不变。KillSwitchApplier 按名字集合巡检,缺了自动整套重装,不用改。\n\n③ LeakClassifier:新增一条只在全部流量模式(`context.AppsMode` 为 false)生效的规则:包的目的端不是本机地址、不是节点地址、不是公网地址,协议是 UDP 或 TCP,目的端口是 53 → 记为可疑,对端取目的地址与 53。只看目的端这一个方向,源端口是 53 的回包不因这条规则记可疑。隧道网段的跳过仍在最前。公网对端的既有判定(节点、鉴权放行)不变;仅指定程序模式的结果与现在完全一样。SuspiciousFlow、LeakVerdict、LeakContext 的字段不变。\n\n④ LeakReportFormatter.WriteSummary:全部流量模式下,只要可疑流里有一条对端不是公网地址(用 `PublicAddress.IsPublic` 判)且对端端口是 53,就在列完可疑流(含「另有 N 条」那一行)之后、「结论:」行之前多输出一行,行首两个空格,原文一字不差:`  其中发往局域网 53 端口的是域名查询:路由器会把它转给所在地运营商的解析器。`。没有这种流、或仅指定程序模式时不输出。`Json` 与 `Conclusion` 的字段和文字不变。\n\n⑤ 测试。既有断言只许改下面点名的三处,其余一律不动(只做编译适配)。\nWfpPlannerTests.cs 改三处:\n- `GlobalHasExactlyTwentyInContractOrder` 改名 `GlobalHasExactlyTwentyTwoInContractOrder`,期望名字列表末尾追加 Dns53-ConnectV4、Dns53-ConnectV6。\n- `AuthIsNarrowAndBetweenNodesAndBlocks`:条数 21 改 23;期望的 Auth 过滤器权重 10 改 12;其余下标断言不变。\n- `BlocksAreUnconditionalAndPermitsHaveHigherWeight`:动作为 Block 的共 6 条;名字以 `YuanC-WFP-Block-` 开头的 4 条仍等于 `new WfpFilterSpec(名, 层, WfpAction.Block, 0)`;动作为 Permit 的,名字含 Lan- 或 Dhcp- 的权重是 10,其余是 12;该用例后三行断言不变。\nWfpPlannerTests.cs 新增:\n- `DnsPortBlockSitsBetweenLanAndExactPermits`:无鉴权与有鉴权两种计划都断言:末两条分别等于 `new WfpFilterSpec(\"YuanC-WFP-Dns53-ConnectV4\", WfpLayer.ConnectV4, WfpAction.Block, 11, RemotePort: 53)` 与 ConnectV6 那条;名字含 Dns53 的恰两条;`ExactPermitWeight > DnsBlockWeight`、`DnsBlockWeight > PermitWeight`、`PermitWeight > BlockWeight`;名字含 Lan- 或 Dhcp- 的权重都小于 DnsBlockWeight;动作为 Permit 且名字不含 Lan-、Dhcp- 的权重都大于 DnsBlockWeight。\n- `AppsPlanHasNoDnsBlock`:PlanApps 两个程序的结果里没有名字含 Dns53 的,权重只出现 10 与 0。\nWfpApplierTests.cs 新增(沿用文件里现成的 Fixture 与假引擎):\n- `GlobalPolicyKeepsDnsBlockAcrossNodeUpdateAndAppsDropIt`:ApplyAsync(全部流量)后假引擎 Policy 含两条 Dns53;UpdateNodeAsync 后仍含两条;ApplyAppsAsync 后一条都没有。\nWfpLiveTests.cs 新增一个真机门控用例(用现成的 `[WfpLiveFact]`、测试专用提供者与子层、`InstallGuarded`、`WithCleanEngine`;`Guard` 与既有五个用例一个字不改;不许出现无门控的 `[Fact]`):\n- `DnsPortBlockBeatsLanPermitButNotExactPermit`:安装四条,名字用文件里的 Prefix 加后缀,层都是 ConnectV4,都不写协议:\n  · Lan:Permit,权重 `WfpPlanner.PermitWeight`,RemoteAddresses [\"192.0.2.0/24\"];\n  · Dns53:Block,权重 `WfpPlanner.DnsBlockWeight`,RemoteAddresses [\"192.0.2.0/24\"],RemotePort 53;\n  · Exact:Permit,权重 `WfpPlanner.ExactPermitWeight`,RemoteAddresses [\"192.0.2.1/32\"];\n  · Rest:Block,权重 `WfpPlanner.BlockWeight`,RemoteAddresses [\"192.0.2.0/24\"]。\n  断言四条:TCP 连 192.0.2.2 的 53 端口,三秒内得到 AccessDenied;UDP(`new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp)`)向 192.0.2.2 的 53 端口 SendTo 一个字节,抛 SocketException 且 SocketErrorCode 为 AccessDenied;TCP 连 192.0.2.2 的 9 端口,结果不是 AccessDenied;TCP 连 192.0.2.1 的 53 端口,结果不是 AccessDenied。\n  现有 `Connect(string address)` 写死端口 9:加一个带端口参数的重载,原签名保留、行为不变。\nLeakCaptureTests.cs 新增(用文件里现成的 Local、Tcp、Udp、Context):\n- `LanDnsQueryIsSuspiciousInGlobalMode`:包依次为 UDP 192.168.1.5:50000→192.168.1.1:53 两个、TCP 192.168.1.5:50001→192.168.1.1:53 一个、UDP fe80::5 的 50002→fe80::1 的 53 一个、UDP 192.168.1.1:53→192.168.1.5:50000 一个(回包)、UDP 192.168.1.5:50003→192.168.1.1:5353 一个、TCP 192.168.1.5:50004→192.168.1.1:445 一个。期望:Suspicious 恰 3 条,分别是 (UDP, 192.168.1.1, 53, 计数 2)、(TCP, 192.168.1.1, 53, 计数 1)、(UDP, fe80::1, 53, 计数 1);Allowed 等于 3;`LeakClassifier.ExitCode(verdict, false)` 等于 1。再造一个节点地址为 192.168.1.52 的上下文:UDP 192.168.1.5:50005→192.168.1.52:53 不可疑。\n- `LanDnsQueryIsNotFlaggedInAppsMode`:同一批七个包,仅指定程序模式(名单任填一个绝对路径)下 Suspicious 为空。\n- `SummaryExplainsLanDnsFlow`:用 StringWriter 调 WriteSummary 三次:全部流量且含一条 (UDP, 192.168.1.1, 53) 可疑流时,输出含第④条的提示句,且提示句在「结论:」之前;全部流量但只有公网可疑流时不含;仅指定程序模式且含同样一条时不含。LeakCheckOptions、LeakCheckResult 的构造照文件里既有用例。\n测试只许写临时目录,不得往受测目录写产物。\n\n⑥ 文档(写给人读的中文;只写产品行为,不写施工过程):\n- docs/winclient/断网保护加固说明.md:在「## 局域网放行」一节之后新增一节,标题原文 `## 域名查询端口不随局域网放行`,依次写:缺口(哪些时段、内核自己的阻断为什么不够);做法(三档权重 12 / 11 / 10 与兜底 0 各管哪些过滤器;两条过滤器的全名 YuanC-WFP-Dns53-ConnectV4、YuanC-WFP-Dns53-ConnectV6,层与条件;全部流量计划共 22 条,有鉴权 23 条);没改的地方与原因(防火墙规则没加同样的阻断:过滤层装不上时首次连接本来就拒绝连接,已持有保护又装不上时界面有告警;仅指定程序模式不加:名单外程序按定义直连,要用系统域名解析);管不到的三种情况(虚拟机或 WSL 里手工把域名服务器指到路由器:流量经系统 NAT 转发,不经过本机连接授权层;维护开关 wfp-off 存在时;发往局域网设备 853 或 443 端口的加密域名查询);真机待验证四条(连接后结束内核进程,抓物理网卡不应出现发往路由器 53 端口的包,TCP 与 UDP 都算;保护期间向路由器地址做 nslookup 应立即失败;内核恢复后域名解析恢复正常;仅指定程序模式下名单外程序的域名解析不受影响)。同文件「## 系统过滤层第二道闸(WFP)」一节里列过滤器清单、条数与权重的地方,同步成新清单。\n- docs/winclient/泄漏检测说明.md:「判定规则」加一条(全部流量模式下,发往局域网对端 53 端口的 TCP / UDP 包记为可疑,这是域名查询;节点在局域网时发往节点的不算;仅指定程序模式不适用);「建议的真机检测步骤」加第 5 步(全部流量模式检测中途结束内核进程并等 30 秒,报告里不应出现发往路由器 53 端口的包);「局限」加一条(发往局域网设备的加密域名查询和局域网里的代理设备,检测只看得到包去了局域网,判断不了它之后去哪)。",
+  "background": "项目:外包「澳洲出口节点 + Windows 一键客户端」。客户端 .NET 9 WPF(winclient/WinClient.sln:Core + App + Tests + UiTests)。客户的硬要求:连上节点后,电脑上任何程序、任何查询方式看到的出口都是节点;交付前靠 `--leak-check` 抓物理网卡验证。\n\n先读:winclient/WinClient.Core/Firewall/WfpPlanner.cs(全文 90 行)、Firewall/WfpEngine.cs(条件怎么拼:协议可空,远端端口可单独用,权重是 0~15 的 FWP_UINT8)、Firewall/KillSwitchApplier.cs 的 PatrolAsync(按名字集合比对)、Diagnostics/LeakClassifier.cs、Diagnostics/LeakReportFormatter.cs、Network/PublicAddress.cs、Tests/WfpPlannerTests.cs、Tests/WfpApplierTests.cs(Fixture 与假引擎)、Tests/WfpLiveTests.cs(门控、安全闸、Connect 写法)、Tests/LeakCaptureTests.cs、docs/winclient/断网保护加固说明.md 的「系统过滤层第二道闸(WFP)」「局域网放行」两节、docs/winclient/泄漏检测说明.md、检查脚本 docs/plans/checks/yc_wfp_dns_guard_1127.py(它就是 SHAPE、TESTS-NEW、DOCS、SCOPE 四项验收)。\n\n硬规矩:①只改允许清单里的九个文件;②既有测试断言除 goal 第⑤条点名的三处外不改,只做编译适配;③任何本机地址、网卡名不进日志、异常与报告;④不许 git 写操作,不许自己跑 dotnet(build / test / restore / publish 一律按验收编号申请);⑤每次 Edit / Write 的新内容控制在 150 行以内;⑥新增文案与注释用中文;⑦本单不新增子进程;若新增,一律隐藏窗口;⑧真机门控用例在没设环境变量时必须是 Skip,普通测试里不许安装真过滤器;真机用例的过滤器远端地址只许落在 192.0.2.0/24;⑨不许读写 secrets/,工位里不许装依赖(缺依赖停下交 blocked);⑩拿不准停下交 blocked 并写 forks,不猜。\n\n项目红线:只管本项目自己建的服务、路由、防火墙规则;凭据不落库不落日志;隧道断了不许悄悄退回直连;真机没测的不标通过。",
+  "nonGoals": [
+    "不改防火墙脚本(KillSwitchPlanner)与 KillSwitchApplier",
+    "不改仅指定程序模式的过滤层计划与泄漏判定",
+    "不改内核配置渲染、路由、网卡收紧",
+    "不改泄漏报告 JSON 的字段与既有结论文字",
+    "不改口径速查表与设计正本(派单方自己改)"
+  ],
+  "allowedPaths": [
+    "winclient/WinClient.Core/Firewall/WfpPlanner.cs",
+    "winclient/WinClient.Core/Diagnostics/LeakClassifier.cs",
+    "winclient/WinClient.Core/Diagnostics/LeakReportFormatter.cs",
+    "winclient/WinClient.Tests/WfpPlannerTests.cs",
+    "winclient/WinClient.Tests/WfpApplierTests.cs",
+    "winclient/WinClient.Tests/WfpLiveTests.cs",
+    "winclient/WinClient.Tests/LeakCaptureTests.cs",
+    "docs/winclient/断网保护加固说明.md",
+    "docs/winclient/泄漏检测说明.md"
+  ],
+  "forbiddenPaths": [
+    ".codex/**",
+    ".github/**",
+    ".gitignore",
+    "pyproject.toml",
+    "authserver/**",
+    "node/**",
+    "scripts/**",
+    "docs/design/**",
+    "docs/plans/**",
+    "docs/acceptance/**",
+    "docs/交接/**",
+    "docs/node/**",
+    "docs/口径速查表.md",
+    "docs/开工须知.md",
+    "docs/授权页.md",
+    "winclient/*.sln",
+    "winclient/Directory.Build.props",
+    "winclient/third_party/**",
+    "winclient/WinClient.UiTests/**",
+    "winclient/WinClient.App/**",
+    "winclient/WinClient.Core/Client/**",
+    "winclient/WinClient.Core/Network/**",
+    "winclient/WinClient.Core/Environment/**",
+    "winclient/WinClient.Core/Pairing/**",
+    "winclient/WinClient.Core/Update/**",
+    "winclient/WinClient.Core/Auth/**",
+    "winclient/WinClient.Core/Firewall/KillSwitch*.cs",
+    "winclient/WinClient.Core/Firewall/WfpEngine.cs",
+    "winclient/WinClient.Core/Firewall/WfpNative.cs",
+    "winclient/WinClient.Core/Firewall/RouteGuard.cs",
+    "winclient/WinClient.Core/Firewall/CommandRunner.cs",
+    "winclient/WinClient.Core/Diagnostics/LeakCapture.cs",
+    "winclient/WinClient.Core/Diagnostics/PcapNgReader.cs",
+    "winclient/WinClient.Core/WinClient.Core.csproj",
+    "winclient/WinClient.Tests/WinClient.Tests.csproj",
+    "winclient/WinClient.Tests/KillSwitch*.cs",
+    "winclient/WinClient.Tests/FirewallTests.cs",
+    "winclient/WinClient.Tests/RouteGuardTests.cs",
+    "winclient/WinClient.Tests/ControllerTests.cs"
+  ],
+  "expectArtifacts": [
+    "winclient/WinClient.Core/Firewall/WfpPlanner.cs",
+    "winclient/WinClient.Tests/WfpLiveTests.cs"
+  ],
+  "acceptance": [
+    {
+      "id": "BUILD",
+      "kind": "command",
+      "argv": ["dotnet", "build", "winclient/WinClient.sln", "-c", "Release", "--nologo"],
+      "required": true,
+      "timeoutSec": 1200
+    },
+    {
+      "id": "TEST",
+      "kind": "command",
+      "argv": ["dotnet", "test", "winclient/WinClient.sln", "-c", "Release", "--no-build", "--nologo"],
+      "required": true,
+      "timeoutSec": 1500
+    },
+    {
+      "id": "SHAPE",
+      "kind": "command",
+      "argv": ["python", "docs/plans/checks/yc_wfp_dns_guard_1127.py", "shape"],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "TESTS-NEW",
+      "kind": "command",
+      "argv": ["python", "docs/plans/checks/yc_wfp_dns_guard_1127.py", "tests"],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "argv": ["python", "docs/plans/checks/yc_wfp_dns_guard_1127.py", "docs"],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "SCOPE",
+      "kind": "command",
+      "argv": ["python", "docs/plans/checks/yc_wfp_dns_guard_1127.py", "scope"],
+      "required": true,
+      "timeoutSec": 120
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "timeoutSec": 7200,
+  "repoRoot": "E:/yuanc",
+  "steps": [
+    "读 BACKGROUND 列出的文件与检查脚本。",
+    "先写测试:改 WfpPlannerTests 点名的三处并加新用例,加 WfpApplierTests、LeakCaptureTests、WfpLiveTests 的新用例;申请 BUILD 以编译失败证红,之后固定 BUILD→TEST。",
+    "改 WfpPlanner.PlanGlobal、LeakClassifier、LeakReportFormatter;BUILD、TEST、SHAPE、TESTS-NEW 绿。",
+    "改两份文档;DOCS、SCOPE 绿后交活。交活说明逐条对照 goal 第①~⑥条写做到了没有。"
+  ]
+}

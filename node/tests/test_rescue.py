@@ -617,3 +617,28 @@ def test_rescue_package_only_imports_stdlib_and_itself():
             else:
                 continue
             assert all(name.split(".")[0] in sys.stdlib_module_names for name in names)
+
+
+def test_future_counted_at_is_dropped_and_rounds_resume():
+    runner = ready()
+    damage(runner, "P1")
+    value = s.fresh()
+    value["counted_at"] = runner.clock + 86400
+    s.save(runner, value)
+    assert actions.tick(runner) == 1
+    assert s.read(runner)["counts"]["P1"] == 1
+    assert s.read(runner)["counted_at"] == runner.clock
+    assert history_actions(runner) == ["clock_adjusted"]
+    runner.clock += 300
+    assert actions.tick(runner) == 0
+    assert runner.links[p.CURRENT] == p.RELEASES + "/0.1.0"
+
+
+def test_counted_at_small_skew_is_kept():
+    runner = ready()
+    value = s.fresh()
+    value["counted_at"] = runner.clock + 200
+    s.save(runner, value)
+    actions.tick(runner)
+    assert s.read(runner)["counted_at"] == runner.clock + 200
+    assert s.HISTORY not in runner.files or "clock_adjusted" not in history_actions(runner)
