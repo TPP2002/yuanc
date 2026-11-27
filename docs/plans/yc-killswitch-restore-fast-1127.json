@@ -1,0 +1,135 @@
+{
+  "schemaVersion": 1,
+  "taskId": "WINCLIENT-KILLSWITCH-SLOW-RESTORE-1127",
+  "slug": "yc-killswitch-restore-fast-1127",
+  "title": "撤销断网保护时先改回默认出站再批量启用规则;套用时批量停用;脚本超时有固定说法并进记录",
+  "workbuddyTier": "hard",
+  "goal": "以派单时 origin/main 头为基点。看板卡 WINCLIENT-KILLSWITCH-SLOW-RESTORE-1127。\n\n【问题】断网保护的防火墙脚本逐条处理规则:套用时对每条外来的出站放行规则单独调一次 Disable-NetFirewallRule;撤销(用户点「断开」)和启动恢复时,对恢复记录里每个名字先按名字查一次(`Get-NetFirewallRule -PolicyStore PersistentStore -Name $name`,开发机实测每次约 0.3 秒)再启用,全部做完才把三个配置档的默认出站改回原值。开发机上这类规则有 264 条,只按名字查就要约 80 秒,加上逐条启用,贴着或超过 180 秒的超时;超时后脚本被杀,默认出站还是「阻止」,电脑继续上不了网,恢复记录也留着。2026-11-27 晚国内测试电脑点「断开」后没恢复上网,与此相符。另外脚本的标准错误被整段丢弃,出错原因不进任何日志,超时也没有单独的说法。\n\n【修法】只改生成的脚本文字和执行器的收尾,不改断网保护的范围:\n- 撤销与恢复:先把三个配置档的默认出站改回原值(这一步做完电脑就能上网),再一次枚举、一次管道批量启用规则;\n- 套用:外来规则一次管道批量停用;\n- 脚本超时有固定说法;启动恢复的第一阶段超时时照样进入降级恢复;\n- 每次脚本运行的阶段、退出码、用时、脱敏后的错误摘要交给一个可选的记录口。\n\n【做完后】\n\n① winclient/WinClient.Core/Firewall/KillSwitchPlanner.cs 的 ToPowerShellScript,只改下面三处生成的脚本文字;`Plan`、`PlanApps`、`UpdateNode` 的动作清单与次序不动,其余 case 不动。脚本文字照下面逐行生成(行首缩进照抄,一行一个 AppendLine):\n\n(a) `case RestoreProfileDefault:` 改成:\n```\nif (Test-Path -LiteralPath $statePath) {\n  $state = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json\n  if (@($state.profiles).Count -ne 3) { throw '防火墙恢复记录不完整，需人工处理。' }\n  foreach ($p in $state.profiles) { if ($p.Name -notin @('Domain','Private','Public') -or $p.DefaultOutboundAction -notin @('Allow','Block','NotConfigured') -or ($null -ne $p.PSObject.Properties['Enabled'] -and $p.Enabled -notin @('True','False'))) { throw '防火墙恢复记录无效。' } }\n  foreach ($p in $state.profiles) { if ($null -ne $p.PSObject.Properties['Enabled']) { Set-NetFirewallProfile -Profile $p.Name -Enabled $p.Enabled -DefaultOutboundAction $p.DefaultOutboundAction } else { Set-NetFirewallProfile -Profile $p.Name -DefaultOutboundAction $p.DefaultOutboundAction } }\n  $restoreFailed = @()\n  if ($null -ne $state.disabledRules) {\n    $lookup = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)\n    foreach ($name in @($state.disabledRules)) { if ($null -ne $name) { [void]$lookup.Add([string]$name) } }\n    $targets = @(Get-NetFirewallRule -PolicyStore PersistentStore -ErrorAction SilentlyContinue | Where-Object { $lookup.Contains([string]$_.Name) -and [string]$_.Enabled -ne 'True' })\n    if ($targets.Count -gt 0) {\n      $enableError = @()\n      try { $targets | Enable-NetFirewallRule -ErrorAction SilentlyContinue -ErrorVariable enableError } catch { $enableError = @($_) }\n      if ($enableError) { $restoreFailed = @(Get-NetFirewallRule -PolicyStore PersistentStore -ErrorAction SilentlyContinue | Where-Object { $lookup.Contains([string]$_.Name) -and [string]$_.Enabled -ne 'True' } | ForEach-Object { [string]$_.Name }) }\n    }\n  }\n  if ($restoreFailed.Count -gt 0) { throw '部分防火墙规则恢复失败，恢复记录已保留，请联系管理员。' }\n  Remove-Item -LiteralPath $statePath\n} else { Set-NetFirewallProfile -Profile Domain,Private,Public -DefaultOutboundAction Allow }\n```\n两句校验、三句 throw 的文字、最后一行的 else 分支与原来一字不差;变的只有:改默认出站那一行提到启用规则之前,启用规则改成一次枚举加一次管道。名单里已不存在的规则照旧跳过、不算失败。\n\n(b) `case DisableForeignAllowRules:` 里,从 `$disableFailed = @($state.disableFailed)` 到第二个 `Write-State $state` 这一段改成(这一段之前的七行不动):\n```\n$disableFailed = @($state.disableFailed)\nif ($foreignRules.Count -gt 0) {\n  $disableError = @()\n  try { $foreignRules | Disable-NetFirewallRule -ErrorAction SilentlyContinue -ErrorVariable disableError } catch { $disableError = @($_) }\n  if ($disableError) { $disableFailed += @(Get-NetFirewallRule -PolicyStore PersistentStore -Enabled True -Direction Outbound -Action Allow -ErrorAction SilentlyContinue | Where-Object { $_.Name -notlike 'YuanC-KS-*' } | ForEach-Object { [string]$_.Name }) }\n}\n$state.disableFailed = @($disableFailed | Where-Object { $null -ne $_ } | Sort-Object -Unique)\nWrite-State $state\n```\n巡检(`case Patrol patrol:`)里那段逐条停用的循环不动:巡检时新冒出来的规则通常是零条。\n\n(c) `case RecoverFallback:` 里,从 `$notEnabled = @()` 起到删除本项目规则那一行(`Get-NetFirewallRule -Name 'YuanC-KS-*' …| Remove-NetFirewallRule`)之前的那一段改成:\n```\n$notEnabled = @()\nif ($null -ne $state.disabledRules) {\n  $lookup = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)\n  foreach ($name in @($state.disabledRules)) { if ($null -ne $name) { [void]$lookup.Add([string]$name) } }\n  $targets = @(Get-NetFirewallRule -PolicyStore PersistentStore -ErrorAction SilentlyContinue | Where-Object { $lookup.Contains([string]$_.Name) -and $_.Direction -eq 'Outbound' -and [string]$_.Enabled -ne 'True' })\n  if ($targets.Count -gt 0) {\n    $enableError = @()\n    try { $targets | Enable-NetFirewallRule -ErrorAction SilentlyContinue -ErrorVariable enableError } catch { $enableError = @($_) }\n    if ($enableError) { $notEnabled = @(Get-NetFirewallRule -PolicyStore PersistentStore -ErrorAction SilentlyContinue | Where-Object { $lookup.Contains([string]$_.Name) -and $_.Direction -eq 'Outbound' -and [string]$_.Enabled -ne 'True' } | ForEach-Object { [string]$_.Name }) }\n  }\n}\n```\n该 case 其余行(归档、校验、改配置档、删本项目规则、写 killswitch-recovery.json、删记录、exit 0)一字不动。\n\n做完后全文件不再出现 `-PolicyStore PersistentStore -Name $name`;`foreach ($rule in $foreignRules)` 只剩巡检里那一处。\n\n② winclient/WinClient.Core/Firewall/CommandRunner.cs:\n- `public sealed record CommandResult(int ExitCode, string Output, string Error = \"\");`(第三个参数带默认值,既有的两参数构造照常编译)。\n- `CommandRunner.RunAsync` 把读到的标准错误原文放进 `Error` 返回。那行注释改成中文说明:原文只留在内存里,要进日志必须先经 `KillSwitchApplier.SanitizeError`。隐藏窗口的四行设置不动。\n\n③ winclient/WinClient.Core/Firewall/KillSwitchApplier.cs:\n- 构造函数末尾加一个可选参数:`public KillSwitchApplier(string runDirectory, ICommandRunner? runner = null, IWfpEngine? wfp = null, IRouteGuard? routes = null, Action<string>? log = null)`。不传时行为与现在完全一样。调用 log 时接住它抛出的任何异常(记录失败不能影响断网保护)。\n- `internal TimeSpan ScriptTimeout { get; init; } = TimeSpan.FromSeconds(180);`,三处写死的 180 秒(RunActionsAsync、RunRecoveryStageAsync、PatrolAsync)都改用它。\n- `public const string ScriptTimedOut = \"系统防火墙设置超过时限没有完成，已中止。\";`\n- 超时(本类自己的计时器到点,不是外部令牌取消):\n  · RunActionsAsync 抛 `new TimeoutException(ScriptTimedOut)`;撤销时 finally 里移除过滤层、移除兜底路由照旧执行。\n  · RunRecoveryStageAsync 不抛,返回 -1,并按现有写法往 killswitch-recovery.log 追加一行 `<时间> <stage> timeout`;于是「启动恢复」超时后照样进入「降级恢复」。\n  · PatrolAsync:外部传进来的令牌被取消时照旧让 OperationCanceledException 透出;只有本类计时器到点时抛 `new TimeoutException(ScriptTimedOut)`。\n- 每次脚本跑完(成功、失败、超时都算)往 log 写一行,文字固定:\n  · 正常结束:`防火墙脚本[<阶段>] 退出码 <n>，用时 <毫秒数> 毫秒`;退出码不为 0 且错误摘要不为空时再接 `，错误摘要：<SanitizeError 的结果>`。\n  · 超时:`防火墙脚本[<阶段>] 超时，用时 <毫秒数> 毫秒`。\n  · <阶段> 七选一:`套用`(ApplyAsync)、`套用指定程序`(ApplyAppsAsync)、`换节点`(UpdateNodeAsync)、`撤销`(RemoveAsync)、`巡检`(PatrolAsync)、`启动恢复`(RunRecoveryStageAsync 的 restore)、`降级恢复`(fallback)。\n  · 巡检每 60 秒一次,只在退出码不为 0、超时、或用时不少于 30000 毫秒时才写。\n- 过滤层:InstallWfp 真调了 `wfp.Install` 之后写 `过滤层安装：成功` 或 `过滤层安装：失败`;RemoveWfp 在 wfp 不为 null 时写 `过滤层移除：成功` 或 `过滤层移除：失败`。\n- `public static string SanitizeError(string? text)`:null 或全空白返回空串;把连续的回车换行换成 ` | `;IPv4 点分地址(四段数字)一律换成 `[地址]`;`<盘符>:\\Users\\<名字>` 里的名字换成 `[用户]`(不分大小写,例:`C:\\Users\\alice\\x` → `C:\\Users\\[用户]\\x`);去首尾空白;超过 600 个字符时截到 600 再加 `…`。\n- 退出码判定、三句既有的异常文字、移除过滤层与兜底路由的次序都不动。\n\n④ 测试(先写,BUILD 以编译失败证红)。\n既有用例只许改 winclient/WinClient.Tests/KillSwitchHardenTests.cs 里的两个,改法逐条写死,别的既有用例的名字、数据行、断言一个不改:\n- `ApplyRecordsUnionBeforeDisablingOnlyLocalEnabledOutboundAllows`:`Assert.Contains(\"foreach ($rule in $foreignRules)\", script);` 改成 `Assert.DoesNotContain(\"foreach ($rule in $foreignRules)\", script);`;`Assert.Contains(\"$rule | Disable-NetFirewallRule -ErrorAction SilentlyContinue -ErrorVariable disableError\", script);` 改成 `Assert.Contains(\"$foreignRules | Disable-NetFirewallRule -ErrorAction SilentlyContinue -ErrorVariable disableError\", script);`。其余行不动。\n- `RemoveRestoresRulesBeforeProfilesAndDeletingSnapshotWithLegacyGuard` 改名为 `RemoveRestoresProfilesBeforeRulesAndDeletingSnapshotWithLegacyGuard`;`Assert.Contains(\"Get-NetFirewallRule -PolicyStore PersistentStore -Name $name -ErrorAction SilentlyContinue\", script);` 改成 `Assert.DoesNotContain(\"-PolicyStore PersistentStore -Name $name\", script);`;`Assert.Contains(\"Where-Object { $_.Name -eq $name } | Enable-NetFirewallRule\", script);` 改成 `Assert.Contains(\"$targets | Enable-NetFirewallRule\", script);`;`Before(script, \"Enable-NetFirewallRule\", \"Set-NetFirewallProfile -Profile $p.Name\");` 改成 `Before(script, \"Set-NetFirewallProfile -Profile $p.Name\", \"Enable-NetFirewallRule\");`,并在它后面加一行 `Before(script, \"Enable-NetFirewallRule\", \"Remove-Item -LiteralPath $statePath\");`;原来那行 `Before(script, \"Set-NetFirewallProfile -Profile $p.Name\", \"Remove-Item -LiteralPath $statePath\");` 保留。其余行不动。\n还有别的既有用例因为本单变红:不许改它,停下交 blocked,写清是哪个用例、哪句断言。\n\n新文件 winclient/WinClient.Tests/KillSwitchRestoreFastTests.cs(命名空间 WinClient.Tests;替身命令执行器自己在本文件里写;临时目录用完删):\n- `RestoreScriptPutsProfilesBeforeRulesAndEnablesInOneBatch`:`[new RestoreProfileDefault()]` 的脚本里,`Set-NetFirewallProfile -Profile $p.Name` 在 `Enable-NetFirewallRule` 之前、`Enable-NetFirewallRule` 在 `Remove-Item -LiteralPath $statePath` 之前;含 `$targets | Enable-NetFirewallRule`;`Enable-NetFirewallRule` 在全文恰好出现一次;不含 `-Name $name`。\n- `ApplyScriptDisablesForeignRulesInOneBatch`:全部流量的套用脚本含 `$foreignRules | Disable-NetFirewallRule`,不含 `foreach ($rule in $foreignRules)`;`Write-State $state` 在 `Disable-NetFirewallRule` 之前和之后各至少出现一次。\n- `FallbackScriptEnablesInOneBatchAndStillRestoresProfilesFirst`:`[new RecoverFallback()]` 的脚本含 `$targets | Enable-NetFirewallRule`、含 `$_.Direction -eq 'Outbound'`,不含 `-Name $name`;第一处 `Set-NetFirewallProfile` 在 `Enable-NetFirewallRule` 之前。\n- `GeneratedScriptsParseInWindowsPowerShell`:把八份脚本(全部流量套用带鉴权窄规则、指定程序套用、换节点、撤销、降级恢复、全部流量巡检、指定程序巡检、审计)各写成临时目录里一个 .ps1(UTF-8 带 BOM),启动一次系统自带的 powershell.exe(路径取法照 KillSwitchApplier.CreateStartInfo;`-NoProfile -NonInteractive -Command`;CreateNoWindow = true、UseShellExecute = false、重定向输出),对每个文件调 `[System.Management.Automation.Language.Parser]::ParseFile` 只做语法解析、不执行,有语法错误就打印并以非 0 退出;断言退出码为 0。不是 Windows 时直接返回。\n- `ApplyTimeoutThrowsTimeoutExceptionWithFixedMessage`:`ScriptTimeout` 设 50 毫秒,执行器挂起到令牌取消;`ApplyAsync` 抛 TimeoutException,Message 等于 `KillSwitchApplier.ScriptTimedOut`;log 里有一行以 `防火墙脚本[套用] 超时，用时 ` 开头。\n- `RestoreStageTimeoutFallsBackToDegradedRecovery`:先写一个恢复记录文件;执行器第一次挂起到取消,第二次删掉记录文件并返回退出码 0;`RecoverAsync` 返回的降级提示不为空;执行器被调恰好 2 次;killswitch-recovery.log 里有一行以 ` restore timeout` 结尾;log 里先后有 `防火墙脚本[启动恢复] 超时` 与 `防火墙脚本[降级恢复] 退出码 0`。\n- `PatrolKeepsExternalCancelAndTurnsOwnTimeoutIntoTimeoutException`:外部令牌先取消 → OperationCanceledException(不是 TimeoutException);只有计时器到点 → TimeoutException。\n- `LogRecordsPhaseExitCodeDurationAndSanitizedError`:执行器返回 `new CommandResult(1, \"\", \"失败 203.0.113.9 C:\\\\Users\\\\alice\\\\x\")`;`RemoveAsync` 照旧抛 InvalidOperationException;log 里有一行以 `防火墙脚本[撤销] 退出码 1，用时 ` 开头,含 `，错误摘要：`、`[地址]`、`[用户]`,不含 `203.0.113.9` 与 `alice`。\n- `SuccessfulRunLogsWithoutErrorSummaryAndPatrolStaysQuiet`:退出码 0 的套用写一行不含 `错误摘要` 的记录;退出码 0、很快结束的巡检不写任何 `防火墙脚本[巡检]` 行。\n- `LogCallbackFailureDoesNotBreakRemove`:log 回调抛 InvalidOperationException 时,`RemoveAsync` 仍正常完成。\n- `SanitizeErrorMasksAddressesUserFoldersAndTruncates`:null、空白 → 空串;多行 → 用 ` | ` 连成一行;`10.0.0.8`、`203.0.113.9` → `[地址]`;`D:\\Users\\Bob\\AppData` → `D:\\Users\\[用户]\\AppData`;700 个字符 → 长度 601 且以 `…` 结尾。\n- `CommandRunnerReturnsStandardErrorText`:用 CommandRunner 跑系统自带的 cmd.exe(`/c echo oops 1>&2 & exit 3`,参数用 ArgumentList 逐个加),ExitCode 为 3,Error 含 `oops`。不是 Windows 时直接返回。\n- `WfpInstallAndRemoveAreLogged`:带替身过滤层引擎的执行器,套用后 log 含 `过滤层安装：成功`,撤销后含 `过滤层移除：成功`。\n\n交活说明逐条对照①~④写做到了没有,并单列:真机上批量停用、批量启用的实际用时和结果没有验证(开发机与检查机都不许动真防火墙规则)。",
+  "background": "项目:外包「澳洲出口节点 + Windows 一键客户端」。客户端 .NET 9(winclient/WinClient.sln:Core + App + Tests + UiTests)。断网保护两层:系统防火墙(三个配置档默认出站改「阻止」+ 停用外来的出站放行规则 + 本项目六七条放行规则,由 KillSwitchPlanner 生成 PowerShell 脚本、KillSwitchApplier 经隐藏窗口的 powershell.exe 执行)和系统过滤层(WfpEngine)。恢复记录在 run/killswitch-state.json,里面的 disabledRules 是套用时被停用的规则名单。\n\n先读:winclient/WinClient.Core/Firewall/KillSwitchPlanner.cs(全文 414 行)、KillSwitchApplier.cs(全文 321 行)、CommandRunner.cs、winclient/WinClient.Tests/KillSwitchHardenTests.cs、KillSwitchRecoveryTests.cs、WfpApplierTests.cs(替身执行器与替身引擎的写法)、FirewallTests.cs 末尾的 TempDirectory、检查脚本 docs/plans/checks/yc_killswitch_restore_fast_1127.py(它就是 SHAPE、TESTS-NEW、SCOPE 三项验收,照它的字样写)。\n\n硬规矩:①只改允许清单里的五个文件;②既有测试只许按 goal 第④条写死的改法改 KillSwitchHardenTests.cs 里那两个用例,其余既有用例的名字、数据行、断言不改,只加;③不许 git 写操作,不许自己跑 dotnet(build / test / restore 一律按验收编号申请),命令单独一条执行(不用 cd &&、管道、2>&1);④每次 Edit / Write 的新内容控制在 150 行以内;⑤goal 里的脚本文字、提示语、记录文字照原文一字不差(含全角逗号、冒号、方括号),新增注释用中文;⑥新增的子进程一律隐藏窗口(CreateNoWindow = true、UseShellExecute = false);⑦测试不许启用、停用、新建、删除任何真防火墙规则,不许改防火墙配置档,不许装过滤器;语法解析那个用例只调 ParseFile,不执行脚本;⑧不许读写 secrets/,工位里不许装依赖(缺依赖停下交 blocked);⑨拿不准停下交 blocked 并写 forks,不猜。\n\n项目红线:只管本项目自己建的服务、路由、防火墙规则(删规则只许删 YuanC-KS- 前缀的);凭据不落库不落日志;隧道断了不许悄悄退回直连;安装更新幂等可回退;真机没测的不标通过;Windows 子进程一律隐藏窗口。",
+  "nonGoals": [
+    "不改断网保护的范围:Plan / PlanApps / UpdateNode 的动作清单与次序、过滤层策略、兜底路由一律不动",
+    "不改 ClientController、ClientRuntime、ControlService(把记录口接到运行时由后一张单做)",
+    "不改巡检脚本里逐条停用的那段循环",
+    "不做真机实测,不在任何机器上启用、停用真防火墙规则",
+    "不改文档、口径速查表、设计正本(由后一张单一并写)"
+  ],
+  "allowedPaths": [
+    "winclient/WinClient.Core/Firewall/KillSwitchPlanner.cs",
+    "winclient/WinClient.Core/Firewall/KillSwitchApplier.cs",
+    "winclient/WinClient.Core/Firewall/CommandRunner.cs",
+    "winclient/WinClient.Tests/KillSwitchHardenTests.cs",
+    "winclient/WinClient.Tests/KillSwitchRestoreFastTests.cs"
+  ],
+  "forbiddenPaths": [
+    ".codex/**",
+    ".github/**",
+    ".gitignore",
+    "pyproject.toml",
+    "authserver/**",
+    "node/**",
+    "scripts/**",
+    "docs/**",
+    "winclient/*.sln",
+    "winclient/Directory.Build.props",
+    "winclient/third_party/**",
+    "winclient/WinClient.App/**",
+    "winclient/WinClient.UiTests/**",
+    "winclient/WinClient.Core/Client/**",
+    "winclient/WinClient.Core/Ipc/**",
+    "winclient/WinClient.Core/Network/**",
+    "winclient/WinClient.Core/State/**",
+    "winclient/WinClient.Core/Update/**",
+    "winclient/WinClient.Core/Hosting/**",
+    "winclient/WinClient.Core/Firewall/WfpEngine.cs",
+    "winclient/WinClient.Core/Firewall/WfpPlanner.cs",
+    "winclient/WinClient.Core/Firewall/RouteGuard.cs",
+    "winclient/WinClient.Core/WinClient.Core.csproj",
+    "winclient/WinClient.Tests/WinClient.Tests.csproj",
+    "winclient/WinClient.Tests/ControllerTests.cs",
+    "winclient/WinClient.Tests/KillSwitchRecoveryTests.cs",
+    "winclient/WinClient.Tests/WfpApplierTests.cs",
+    "winclient/WinClient.Tests/FirewallTests.cs",
+    "winclient/WinClient.Tests/KillSwitchPatrolTests.cs",
+    "winclient/WinClient.Tests/KillSwitchProfileTests.cs"
+  ],
+  "expectArtifacts": [
+    "winclient/WinClient.Tests/KillSwitchRestoreFastTests.cs"
+  ],
+  "acceptance": [
+    {
+      "id": "BUILD",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "build",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1200
+    },
+    {
+      "id": "TEST",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "test",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--no-build",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1500
+    },
+    {
+      "id": "SHAPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_killswitch_restore_fast_1127.py",
+        "shape"
+      ],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "TESTS-NEW",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_killswitch_restore_fast_1127.py",
+        "tests"
+      ],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "SCOPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_killswitch_restore_fast_1127.py",
+        "scope"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "timeoutSec": 7200,
+  "repoRoot": "E:/yuanc",
+  "steps": [
+    "读 background 列出的文件与检查脚本。",
+    "先写测试:新建 KillSwitchRestoreFastTests,按 goal 第④条改 KillSwitchHardenTests 里那两个用例;申请 BUILD 以编译失败证红,之后固定 BUILD→TEST。",
+    "按 goal 第①~③条改三份代码;BUILD、TEST、SHAPE、TESTS-NEW、SCOPE 绿后交活。",
+    "交活说明逐条对照 goal 第①~④条写做到了没有,并单列哪些只有真机能验。"
+  ]
+}
