@@ -1,0 +1,175 @@
+{
+  "schemaVersion": 1,
+  "taskId": "WINCLIENT-CONNECTED-NO-EXIT-SLOW-HINT-1128",
+  "slug": "yc-exit-hint-ks-norecord-1128",
+  "title": "出口不通第一轮就提示并每分钟复核;没有恢复记录时断开只在有证据时改回允许并提示",
+  "workbuddyTier": "hard",
+  "goal": "以派单时 origin/main 头为基点。看板卡 WINCLIENT-CONNECTED-NO-EXIT-SLOW-HINT-1128(同一单合做 WINCLIENT-KS-REMOVE-NO-RECORD-ALLOWS-1128)。下面的提示语、记录文字、脚本行照原文一字不差(全角标点照抄)。\n\n【问题一】界面显示「已连接」但其实通不到澳洲出口时,要连续 3 轮出口核验都失败才出提示,每轮间隔 5 分钟,用户要干等十来分钟才知道该点「断开」。\n【问题二】断网保护的恢复记录 killswitch-state.json 不见了时点「断开」,撤销脚本无条件把系统防火墙三个配置档的默认出站改成「允许」,哪怕本产品根本没改过它们(用户自己本来设成阻止、只用过指定程序模式、本来就没套保护),界面还照样说「已断开，原网络设置已恢复。」。\n\n一、出口提示(winclient/WinClient.Core/Client/ClientController.cs)\n① 常量改成(删掉原来带 {UnverifiableHintRounds} 插值的两句):\n `internal const int UnverifiableHintRounds = 1;`\n `internal static readonly TimeSpan UnverifiableRecheckInterval = TimeSpan.FromMinutes(1);`\n `internal const string PairingUnverifiableHint = \"连不到澳洲出口，现在可能上不了网。可以点「断开」恢复原来的网络；小主机换过地址的话，在小主机上重新导出配对文件再导入。\";`\n `internal const string AuthUnverifiableHint = \"连不到澳洲出口，现在可能上不了网。可以点「断开」恢复原来的网络，或联系管理员。\";`\n② RecheckInterval 改为:测试包照旧用 TestBuildRecheckInterval;否则 unverifiableRounds > 0 用 UnverifiableRecheckInterval,否则 ExitRecheckInterval。核验成功时现有代码已把 unverifiableRounds 清零,间隔自然回到 5 分钟。\n③ CheckExitAsync 别的逻辑一字不动:出提示的条件、核验成功换回原消息、测试包一轮无法核验就自动断开、记录行「出口核验：无法核验，已连续 N 轮」都照旧。\n\n二、没有恢复记录时点断开\n④ winclient/WinClient.Core/Firewall/KillSwitchPlanner.cs 的 ToPowerShellScript:actions 里有 RestoreProfileDefault 时,在 `foreach (var action in actions)` 之前先输出这一行(所以它在删规则那行之前执行):\n $hadGlobalRules = @(Get-NetFirewallRule -Name 'YuanC-KS-*' -ErrorAction SilentlyContinue | Where-Object { $_.Name -notlike 'YuanC-KS-App-*' }).Count -gt 0\n case RestoreProfileDefault 里最后一行 `} else { Set-NetFirewallProfile -Profile Domain,Private,Public -DefaultOutboundAction Allow }` 换成下面六行(有记录的分支一字不改,case RecoverFallback 一字不改):\n} else {\n  if ($hadGlobalRules) {\n    $blocked = @(Get-NetFirewallProfile | Where-Object { [string]$_.DefaultOutboundAction -eq 'Block' } | ForEach-Object { [string]$_.Name })\n    if ($blocked.Count -gt 0) { Set-NetFirewallProfile -Profile $blocked -DefaultOutboundAction Allow; Write-Output 'YUANC-NO-RECORD=windows_default' } else { Write-Output 'YUANC-NO-RECORD=untouched' }\n  } else { Write-Output 'YUANC-NO-RECORD=untouched' }\n}\n 道理:只有本项目全局模式的规则(YuanC-KS-* 去掉 YuanC-KS-App-*)还在,才说明默认出站是本产品设成阻止的,这时只把当前为阻止的配置档改回 Windows 默认的允许;只剩指定程序模式的规则或一条都没有,本产品没改过默认出站,一个配置档都不碰。\n⑤ winclient/WinClient.Core/Firewall/KillSwitchApplier.cs:\n - IKillSwitch 加默认成员 `string? LastRemoveWarning => null;`(现有各实现与测试替身因此不用改)。\n - KillSwitchApplier 加 `public const string NoRecordRemoveWarning = \"断网保护的恢复记录不见了，系统防火墙的默认出站已按 Windows 默认改回「允许」；原来设成「阻止」的，请到 Windows 安全中心改回。\";` 与 `public string? LastRemoveWarning { get; private set; }`。\n - RunActionsAsync 改成返回 `Task<string>`(返回 result.Output,各个抛异常的分支不变);ExecuteAsync 改成返回 `Task<string>`,里面用 `var output = \"\";` 接住 RunActionsAsync 的返回值;别的调用方忽略返回值,RemoveAsync 的签名与写法不变。\n - ExecuteAsync 拿到 gate 之后,remove 为真时先把 LastRemoveWarning 置 null。紧跟在「跑脚本的 try / 撤过滤层与兜底路由的 finally」之后、`if (!removed) throw` 之前:remove 为真,且输出里有一行去掉首尾空白后正好是 `YUANC-NO-RECORD=windows_default`,就把 LastRemoveWarning 设为 NoRecordRemoveWarning,并 `await AppendRecoveryLineAsync($\"{DateTime.UtcNow:O} remove no_record windows_default\").ConfigureAwait(false);`。输出是 untouched、没有标记行、或脚本抛了异常,LastRemoveWarning 都保持 null。RecoverAsync 不解析输出,不变。\n⑥ winclient/WinClient.Core/Firewall/DisabledKillSwitch.cs:加 `public string? LastRemoveWarning { get; private set; }`;RemoveAsync 改成 async:先置 null;inner.HasPendingState 为假直接返回(照旧不碰系统防火墙);否则 await inner.RemoveAsync(),再 `LastRemoveWarning = inner.LastRemoveWarning;`。\n⑦ ClientController.cs:\n - 加私有字段 `private string? removeWarning;`。\n - EffectKind.RemoveKillSwitch 分支:`await firewall.RemoveAsync();` 之后紧接 `removeWarning = firewall.LastRemoveWarning;`,不为 null 时 `WriteJournal(\"撤销断网保护：没有恢复记录，默认出站已按 Windows 默认改回允许\");`,该分支其余照旧。\n - DisconnectAsync:在 `nicRestoreWarning = null;` 下一行加 `removeWarning = null;`。拼消息改为:removeWarning 不为 null 时 `message = \"已断开。\" + removeWarning + (environmentRestored ? \"\" : \" 时区或浏览器设置未能恢复，请联系管理员。\");`;为 null 时保持现有那两句原文与三元写法不变。之后照旧追加 nicRestoreWarning、写「断开完成」记录。\n - RemoveProtectionAsync:`await firewall.RemoveAsync();` 成功后取 `var removeText = firewall.LastRemoveWarning;`,不为 null 时写同一句记录;返回的 Warning 改为 removeText 与网卡警告用一个空格拼起来(都为 null 返回 null,只有一个就返回那一个)。AbandonAsync 与 MaybeAbandonAfterLoginFailureAsync 不改,它们已把 Warning 拼进消息。\n⑧ winclient/WinClient.App/Hosting/InstallerRunner.cs(卸载):服务可达那条路,disconnect 检查通过后,`response.Snapshot?.Message` 含 KillSwitchApplier.NoRecordRemoveWarning 时 `Console.Error.WriteLine(KillSwitchApplier.NoRecordRemoveWarning);`;服务不可达那条路,把 `new KillSwitchApplier(...)` 先存进变量再 RemoveAsync,成功后 LastRemoveWarning 不为 null 就 `Console.Error.WriteLine(它)`。其余一字不动。\n\n三、测试\n⑨ winclient/WinClient.Tests/ControllerTests.cs:\n - Firewall 替身加 `public string? LastRemoveWarning { get; set; }`。\n - 行为按负责人要求变了,下面两个既有用例与一个辅助方法允许改,别的既有用例一个字不动:\n   · UnverifiableExitShowsHintAfterThreeRoundsWithoutDisconnecting 改名为 UnverifiableExitShowsHintAfterFirstRoundWithoutDisconnecting(仍是 pairing true / false 两行):第一轮无法核验之后消息就等于对应提示,后面几轮一直是提示,状态仍是已连接、保护仍在、order 里没有 stop 与 remove;最后在 1 分钟的复核上核验成功,ExitStatus 为「已核验」,消息回到「虚拟网卡已就绪。」。\n   · UnverifiableCounterResetsWhenExitRecovers 名字不改,数据与断言改成新行为:一轮无法核验 → 提示;1 分钟后的复核核验成功 → 消息回到「虚拟网卡已就绪。」、接着排的复核是 5 分钟;再一轮无法核验 → 提示又出现。\n   · 辅助方法 CompleteUnverifiableRound 的 `bool first` 换成 `TimeSpan firstWait`(第一轮 3 秒,无法核验之后 1 分钟,核验成功之后 5 分钟)。\n - 新用例(名字照抄):\n   · UnverifiableExitRechecksEveryMinuteUntilVerified:正式包,连续两轮无法核验,每轮之后 timers.For(\"出口核验\") 的最后一项都是 1 分钟;核验成功之后最后一项是 5 分钟。\n   · DisconnectWithoutRecordShowsWindowsDefaultWarning:替身 LastRemoveWarning = KillSwitchApplier.NoRecordRemoveWarning,连上后断开,消息等于 \"已断开。\" + KillSwitchApplier.NoRecordRemoveWarning;用控制器的 Journal 收记录,含「撤销断网保护：没有恢复记录，默认出站已按 Windows 默认改回允许」。\n   · DisconnectWithRecordKeepsRestoredMessage:LastRemoveWarning 为 null,断开后消息等于「已断开，原网络设置已恢复。」,记录里没有上面那句。\n   · AbandonWithoutRecordAppendsWindowsDefaultWarning:TestBuild = true 的控制器(写法照 ConnectAbandonTests 里 TestBuild = true 的那两处),替身 LastRemoveWarning = NoRecordRemoveWarning,跑一轮无法核验触发自动断开:消息以「测试包：出口核验不了，已自动断开并恢复原来的网络。」开头,且含 NoRecordRemoveWarning。\n⑩ FirewallTests.RemoveUsesSavedDefaultsAndExplicitNoSnapshotFallback 与 KillSwitchHardenTests.RemoveRestoresProfilesBeforeRulesAndDeletingSnapshotWithLegacyGuard:各自把 `Assert.Contains(\"-Profile Domain,Private,Public -DefaultOutboundAction Allow\", script);` 这一行换成 `Assert.Contains(\"YUANC-NO-RECORD=windows_default\", script);`,别的不动。KillSwitchProfileTests、KillSwitchRecoveryTests 查的是降级恢复脚本,不受影响,不许改。\n⑪ 新文件 winclient/WinClient.Tests/KillSwitchNoRecordTests.cs,六个用例,名字照抄:\n - RemoveScriptReadsEvidenceBeforeDeletingRules:`KillSwitchPlanner.Plan([], \"\", \"\", 0, KillSwitchMode.Remove)` 生成的脚本里有上面那行证据原文,且在 `Get-NetFirewallRule -Name 'YuanC-KS-*' -ErrorAction SilentlyContinue | Remove-NetFirewallRule` 之前;套用与换节点脚本里没有 $hadGlobalRules。\n - NoRecordBranchOnlyTouchesBlockedProfilesWithGlobalEvidence(只在 Windows 上跑,别的系统直接 return):真跑撤销脚本,但防火墙命令全换成桩函数。状态文件路径指向临时目录里不存在的文件;把场景变量和五个桩函数 Get-NetFirewallRule、Remove-NetFirewallRule、Enable-NetFirewallRule、Get-NetFirewallProfile、Set-NetFirewallProfile(写成 `function 名字 { … }`,PowerShell 里函数优先于同名系统命令)拼在生成脚本前面成一个字符串,用 `KillSwitchApplier.CreateStartInfo(拼好的字符串)` 起 powershell(它已隐藏窗口、重定向输出),读标准输出,10 秒内没退出就结束它并判失败。桩函数:Get-NetFirewallRule 返回场景给的规则(有 Name 的对象);Get-NetFirewallProfile 返回三档 Name 与 DefaultOutboundAction;Set-NetFirewallProfile 只输出一行「SET:<配置档用逗号连起来>:<DefaultOutboundAction>」;Remove-NetFirewallRule、Enable-NetFirewallRule 只输出一行标记。起进程前先断言:用正则 `[A-Za-z]+-NetFirewall[A-Za-z]+` 从生成脚本里找出的每个命令名,桩函数里都有定义(漏一个就失败,防止碰到真防火墙)。四个场景:(a)有 YuanC-KS-Tun 与 YuanC-KS-App-1,Domain=Block、Private=Allow、Public=Block → 输出有 `YUANC-NO-RECORD=windows_default` 与 `SET:Domain,Public:Allow`,SET 行里没有 Private;(b)只有 YuanC-KS-App-1,三档全 Block → 输出有 `YUANC-NO-RECORD=untouched`,没有 SET 行;(c)一条规则都没有,三档全 Block → untouched,没有 SET 行;(d)有 YuanC-KS-Tun,三档全 Allow → untouched,没有 SET 行。\n - NoRecordScriptParsesInWindowsPowerShell:写法照 KillSwitchRestoreFastTests.GeneratedScriptsParseInWindowsPowerShell,只用 ParseFile 解析撤销脚本,不执行。\n - ApplierSetsWarningAndRecoveryLineOnWindowsDefault:假 ICommandRunner 返回 `new CommandResult(0, \"YUANC-NO-RECORD=windows_default\\r\\n\")`,临时目录作 runDirectory,`new KillSwitchApplier(目录, 假执行器)` 调 RemoveAsync:LastRemoveWarning 等于 NoRecordRemoveWarning;目录下 killswitch-recovery.log 有一行以「 remove no_record windows_default」结尾。\n - ApplierClearsWarningWhenUntouchedOrRecordPresent:同一个执行器依次让脚本输出 windows_default、untouched、空字符串 → 第二、三次之后 LastRemoveWarning 为 null;再来一次退出码 1 → RemoveAsync 抛异常且 LastRemoveWarning 为 null。\n - DisabledKillSwitchForwardsRemoveWarning:本文件里自写假 inner(HasPendingState、LastRemoveWarning 可设,RemoveAsync 计次):HasPendingState 为假 → 不调 inner、值为 null;为真 → 调一次、值等于 inner 的值。\n\n四、文档\n⑫ docs/winclient/架构说明.md 第 97 行那段里「连续 3 轮无法核验（约 10 分钟）时主消息槽显示提示（…），连接与断网保护保持；重新核验成功后提示自动撤回。」改成:一轮核验 5 次都没有回应(不到 1 分钟)就在主消息槽显示提示,自用版「连不到澳洲出口，现在可能上不了网。可以点「断开」恢复原来的网络；小主机换过地址的话，在小主机上重新导出配对文件再导入。」,分发版「连不到澳洲出口，现在可能上不了网。可以点「断开」恢复原来的网络，或联系管理员。」;连接与断网保护保持,不自动断开;无法核验期间每 1 分钟复核一次,核验成功后提示撤回、复核间隔回到 5 分钟。本文件别的行一字不动(另一张单正在改第 95、119 行)。\n⑬ docs/winclient/断网保护加固说明.md:「## 断开与崩溃恢复」一节里「状态文件不存在时，断开恢复操作仍按既有行为把三个配置的默认出站设为允许；」改成指向新小节的说法,下一段「如果恢复记录丢失，在默认出站已恢复为允许的前提下……」按新行为改准(有证据时才改回允许,没证据时默认出站保持原样)。在这一节末尾、「## 启动恢复失败的降级处理」之前加小节「### 没有恢复记录时点断开」,写清:在删本项目规则之前先查证据(YuanC-KS-* 里去掉 YuanC-KS-App-*);有证据时只把当前为阻止的配置档改回允许,脚本输出 windows_default,界面消息为「已断开。」后接警告原文「断网保护的恢复记录不见了，系统防火墙的默认出站已按 Windows 默认改回「允许」；原来设成「阻止」的，请到 Windows 安全中心改回。」,killswitch-recovery.log 追加一行 remove no_record windows_default;没证据(只剩 YuanC-KS-App- 开头的指定程序模式规则或一条都没有)一个配置档都不碰,输出 untouched,消息照旧;首次连接失败自动恢复等放弃路径同样把警告拼进消息;卸载时警告打到标准错误;测试包没有恢复记录时照旧不调撤销;单列「真机待验证（本单未执行）」:删掉恢复记录后断开,核对三档默认出站与警告;指定程序模式删掉记录后断开,三档不变。本文件别处一字不动(另一张单正在改讲 killswitch-recovery.log 的那一条与「## 防火墙配置档被关闭或被策略覆盖」一节)。",
+  "background": "项目:外包「澳洲出口节点 + Windows 一键客户端」。客户端 .NET 9(winclient/WinClient.sln:Core + App + Tests + UiTests)。后台服务里 ClientController 管连接状态与出口核验;断网保护由 IKillSwitch(真实现 KillSwitchApplier,测试包外壳 DisabledKillSwitch)执行,KillSwitchPlanner 生成 PowerShell 脚本,经 ICommandRunner 跑;恢复记录在 %ProgramData%\\YuanC\\run\\killswitch-state.json。\n\n先读(都读全文):winclient/WinClient.Core/Client/ClientController.cs(重点:常量区、DisconnectAsync、ExecuteAsync 里的 RemoveKillSwitch 分支、RecheckInterval、CheckExitAsync、AbandonAsync、RemoveProtectionAsync、MaybeAbandonAfterLoginFailureAsync)、winclient/WinClient.Core/Firewall/KillSwitchPlanner.cs、KillSwitchApplier.cs、DisabledKillSwitch.cs、CommandRunner.cs、winclient/WinClient.App/Hosting/InstallerRunner.cs 的卸载撤防段、winclient/WinClient.Tests/ControllerTests.cs(Firewall 替身、Timers、CompleteUnverifiableRound 与两个出口提示用例)、ConnectAbandonTests.cs 里 TestBuild = true 的写法、KillSwitchRestoreFastTests.cs 的 GeneratedScriptsParseInWindowsPowerShell、FirewallTests.cs 末尾的 TempDirectory、KillSwitchHardenTests.cs、docs/winclient/架构说明.md 与 断网保护加固说明.md、检查脚本 docs/plans/checks/yc_exit_hint_ks_norecord_1128.py(它就是 SHAPE、TESTS-NEW、DOCS、SCOPE 四项验收,照它的字样写)。\n\n与本单同时在施工的另一张单 yc-diag-service-wiring-1128 改 ClientRuntime.cs、TunnelTransport.cs、IClientFacade.cs、Ipc/ControlServer.cs、Diagnostics 目录,以及这两份文档的别的段落;本单不许碰它的文件,也不许依赖它新增的任何成员。\n\n硬规矩:①只改允许清单里的文件;②除 goal ⑨⑩ 点名的,既有测试的名字、数据行、断言不改,只加;③不许 git 写操作,不许自己跑 dotnet(build / test / restore 一律按验收编号申请),命令单独一条执行(不用 cd &&、管道、2>&1);④每次 Edit / Write 的新内容控制在 150 行以内;⑤goal 里的提示语、记录文字、脚本行照原文一字不差(含全角标点),新增注释用中文;⑥起的子进程一律隐藏窗口(CreateNoWindow = true、UseShellExecute = false);⑦测试不许碰真防火墙、过滤层、路由、网卡;真执行 PowerShell 脚本的只有 goal ⑪ 的 NoRecordBranchOnlyTouchesBlockedProfilesWithGlobalEvidence(ParseFile 只解析不算),而且里面的防火墙命令必须全部是桩函数;⑧不许读写 secrets/,工位里不许装依赖(缺依赖停下交 blocked);⑨测试只许写临时目录,不许往仓库里写产物;⑩遇到契约没写到、要自己拍板的地方,停下交 blocked 并写清楚岔路,不许自行换做法或放宽断言。",
+  "nonGoals": [
+    "不改出口探测本身(每轮 5 次、每次最多 5 秒、间隔 5 秒)与「无法核验」的判定",
+    "不改测试包一轮无法核验就自动断开的行为",
+    "不改有恢复记录时的撤销脚本、启动恢复与降级恢复脚本",
+    "不改连接记录说明、口径速查表、服务化与自启说明(收官时另改)",
+    "不碰 ClientRuntime、TunnelTransport、IClientFacade、Ipc、Diagnostics(另一张单正在改)",
+    "不做真机实测,不打发布包,不改版本号"
+  ],
+  "allowedPaths": [
+    "docs/winclient/断网保护加固说明.md",
+    "docs/winclient/架构说明.md",
+    "winclient/WinClient.App/Hosting/InstallerRunner.cs",
+    "winclient/WinClient.Core/Client/ClientController.cs",
+    "winclient/WinClient.Core/Firewall/DisabledKillSwitch.cs",
+    "winclient/WinClient.Core/Firewall/KillSwitchApplier.cs",
+    "winclient/WinClient.Core/Firewall/KillSwitchPlanner.cs",
+    "winclient/WinClient.Tests/ControllerTests.cs",
+    "winclient/WinClient.Tests/FirewallTests.cs",
+    "winclient/WinClient.Tests/KillSwitchHardenTests.cs",
+    "winclient/WinClient.Tests/KillSwitchNoRecordTests.cs"
+  ],
+  "forbiddenPaths": [
+    ".codex/**",
+    ".github/**",
+    ".gitignore",
+    "pyproject.toml",
+    "authserver/**",
+    "node/**",
+    "scripts/**",
+    "docs/plans/**",
+    "docs/design/**",
+    "docs/node/**",
+    "docs/口径速查表.md",
+    "docs/winclient/连接记录说明.md",
+    "docs/winclient/服务化与自启说明.md",
+    "docs/winclient/诊断导出说明.md",
+    "winclient/*.sln",
+    "winclient/Directory.Build.props",
+    "winclient/third_party/**",
+    "winclient/WinClient.App/Presentation/**",
+    "winclient/WinClient.App/Views/**",
+    "winclient/WinClient.App/Controls/**",
+    "winclient/WinClient.App/WinClient.App.csproj",
+    "winclient/WinClient.App/Hosting/ControlService.cs",
+    "winclient/WinClient.UiTests/**",
+    "winclient/WinClient.Core/Client/ClientRuntime.cs",
+    "winclient/WinClient.Core/Client/TunnelTransport.cs",
+    "winclient/WinClient.Core/Client/IClientFacade.cs",
+    "winclient/WinClient.Core/Client/ConnectJournal.cs",
+    "winclient/WinClient.Core/Client/ExitProbe.cs",
+    "winclient/WinClient.Core/Ipc/**",
+    "winclient/WinClient.Core/Diagnostics/**",
+    "winclient/WinClient.Core/Process/**",
+    "winclient/WinClient.Core/Network/**",
+    "winclient/WinClient.Core/State/**",
+    "winclient/WinClient.Core/Update/**",
+    "winclient/WinClient.Core/Kernel/**",
+    "winclient/WinClient.Core/WinClient.Core.csproj",
+    "winclient/WinClient.Core/Firewall/WfpEngine.cs",
+    "winclient/WinClient.Core/Firewall/WfpNative.cs",
+    "winclient/WinClient.Core/Firewall/WfpPlanner.cs",
+    "winclient/WinClient.Core/Firewall/RouteGuard.cs",
+    "winclient/WinClient.Core/Firewall/CommandRunner.cs",
+    "winclient/WinClient.Tests/WinClient.Tests.csproj",
+    "winclient/WinClient.Tests/ConnectJournalFlowTests.cs",
+    "winclient/WinClient.Tests/ConnectAbandonTests.cs",
+    "winclient/WinClient.Tests/KillSwitchProfileTests.cs",
+    "winclient/WinClient.Tests/KillSwitchRecoveryTests.cs",
+    "winclient/WinClient.Tests/KillSwitchRestoreFastTests.cs",
+    "winclient/WinClient.Tests/PairingTests.cs",
+    "winclient/WinClient.Tests/DisabledGuardTests.cs",
+    "winclient/WinClient.Tests/DiagnosticsWiringTests.cs"
+  ],
+  "expectArtifacts": [
+    "winclient/WinClient.Tests/KillSwitchNoRecordTests.cs"
+  ],
+  "acceptance": [
+    {
+      "id": "BUILD",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "build",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1200
+    },
+    {
+      "id": "TEST",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "test",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--no-build",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1500
+    },
+    {
+      "id": "SHAPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_exit_hint_ks_norecord_1128.py",
+        "shape"
+      ],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "TESTS-NEW",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_exit_hint_ks_norecord_1128.py",
+        "tests"
+      ],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_exit_hint_ks_norecord_1128.py",
+        "docs"
+      ],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "SCOPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_exit_hint_ks_norecord_1128.py",
+        "scope"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "timeoutSec": 10800,
+  "repoRoot": "E:/yuanc",
+  "steps": [
+    "读 background 列出的文件与检查脚本。",
+    "先写测试:KillSwitchNoRecordTests.cs 与 ControllerTests 的新用例和改名;申请 BUILD 以编译失败证红,之后固定 BUILD→TEST。",
+    "按 goal ①~⑧ 改代码:先 Planner 与 Applier、DisabledKillSwitch,再 ClientController,最后 InstallerRunner;再按 ⑨⑩ 调既有断言。",
+    "按 goal ⑫⑬ 改文档;BUILD、TEST、SHAPE、TESTS-NEW、DOCS、SCOPE 全绿后交活。",
+    "交活说明逐条对照 goal ①~⑬ 写做到了没有,并单列哪些只有真机能验。"
+  ]
+}
