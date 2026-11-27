@@ -1,6 +1,8 @@
 import hashlib
 import re
+import threading
 
+from exitnode.console import auth
 from exitnode.console.auth import (
     ALPHABET,
     LoginThrottle,
@@ -10,6 +12,9 @@ from exitnode.console.auth import (
     normalize,
     verify_password,
 )
+
+# 格式正确的固定测试密码：20 位、只用 generate_password 那套字母表。
+VALID_PASSWORD = "ABCDE-FGHJK-LMNPQ-RSTUV"
 
 
 class Clock:
@@ -46,10 +51,10 @@ def test_hash_and_verify_with_normalization():
 
 
 def test_verify_rejects_malformed_stored_value():
-    good = hash_password("ABCDE-FGHJK")
+    good = hash_password(VALID_PASSWORD)
     for value in ("", "scrypt$1$2$3", "scrypt$16384$8$1$bad$bad",
                   "scrypt$16384$8$2$c2FsdA==$aGFzaA==", None, 123, b"bytes"):
-        assert verify_password("ABCDE-FGHJK", value) is False
+        assert verify_password(VALID_PASSWORD, value) is False
     assert verify_password(None, good) is False
     assert verify_password(123, good) is False
     assert verify_password("A" * 201, good) is False
@@ -101,15 +106,86 @@ def test_sessions_store_only_hashes():
 def test_throttle_per_ip_and_global():
     clock = Clock()
     throttle = LoginThrottle(clock, per_ip=2, global_limit=4, window=100)
-    throttle.fail("a")
-    throttle.fail("a")
+    assert throttle.attempt("a") is True
+    assert throttle.attempt("a") is True
     assert throttle.blocked("a") is True
     assert throttle.blocked("b") is False
     # succeed 只清该 IP，不清全体计数。
     throttle.succeed("a")
     assert throttle.blocked("a") is False
     for ip in ("b", "c", "d", "e"):
-        throttle.fail(ip)
+        throttle.attempt(ip)
     assert throttle.blocked("other") is True
     clock.tick(101)
     assert throttle.blocked("other") is False
+
+
+def test_throttle_attempt_counts_before_verify_and_is_atomic():
+    clock = Clock()
+    throttle = LoginThrottle(clock)
+    # 同一个 IP 连占 5 个名额，第 6 次就不让了；succeed 之后又放行。
+    assert all(throttle.attempt("192.168.1.7") for _ in range(5))
+    assert throttle.attempt("192.168.1.7") is False
+    throttle.succeed("192.168.1.7")
+    assert throttle.attempt("192.168.1.7") is True
+
+    # 50 个线程同时抢同一个新 IP，正好 5 个成功：判断和登记在同一把锁里。
+    crowd = LoginThrottle(clock)
+    results = []
+    results_lock = threading.Lock()
+    barrier = threading.Barrier(50)
+
+    def hit():
+        barrier.wait()
+        allowed = crowd.attempt("10.1.2.3")
+        with results_lock:
+            results.append(allowed)
+
+    threads = [threading.Thread(target=hit) for _ in range(50)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+    assert len(results) == 50
+    assert sum(1 for allowed in results if allowed) == 5
+
+
+def test_throttle_loopback_exempt_from_global_limit():
+    clock = Clock()
+    throttle = LoginThrottle(clock)
+    for index in range(1, 31):
+        assert throttle.attempt(f"192.168.1.{index}") is True
+    # 全体上限只数非回环来源：第 31 个局域网地址被挡，回环照旧放行。
+    assert throttle.attempt("192.168.1.31") is False
+    assert throttle.blocked("192.168.1.31") is True
+    assert throttle.blocked("127.0.0.1") is False
+    for _ in range(5):
+        assert throttle.attempt("127.0.0.1") is True
+    # 回环自己也有 5 次的上限。
+    assert throttle.attempt("127.0.0.1") is False
+    assert throttle.blocked("127.0.0.1") is True
+    # 窗口过去后全部恢复。
+    clock.tick(901)
+    assert throttle.blocked("192.168.1.31") is False
+    assert throttle.blocked("127.0.0.1") is False
+    assert throttle.attempt("192.168.1.31") is True
+    assert throttle.attempt("127.0.0.1") is True
+
+
+def test_verify_password_rejects_bad_format_without_scrypt(monkeypatch):
+    stored = hash_password(VALID_PASSWORD)
+    calls = []
+
+    def boom(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("格式不对时不该调用 scrypt")
+
+    monkeypatch.setattr(auth.hashlib, "scrypt", boom)
+    # 太短、21 位、含字母 O、含数字 1：都在进 scrypt 之前就被挡掉。
+    for bad in ("short", "A" * 21, "ABCDE-FGHJK-LMNPQ-RSTUO", "ABCDE-FGHJK-LMNPQ-RSTU1"):
+        assert auth.verify_password(bad, stored) is False
+    assert calls == []
+
+    # 格式对但密码错：确实会走 scrypt，算出来不一样就是 False。
+    monkeypatch.undo()
+    assert auth.verify_password("ABCDE-FGHJK-LMNPQ-RSTUW", stored) is False
