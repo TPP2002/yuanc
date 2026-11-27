@@ -19,6 +19,7 @@ public sealed class DiagnosticsSources
     public Func<IReadOnlyList<string>>? WfpFilterNames { get; init; }
     public Func<IReadOnlyList<AdapterInfo>?>? Adapters { get; init; }
     public Func<CancellationToken, Task<FirewallStateResult>>? Firewall { get; init; }
+    public Func<CancellationToken, Task<NetworkStateResult>>? Network { get; init; }
     public Func<string?>? Audit { get; init; }
     public Func<string?>? SelfCheck { get; init; }
     public Func<DateTimeOffset> Now { get; init; } = () => DateTimeOffset.UtcNow;
@@ -49,6 +50,13 @@ public static class DiagnosticsCollector
             catch (OperationCanceledException) { throw; }
             catch (Exception ex) { errors["firewall"] = ex.GetType().Name; }
         }
+        NetworkStateResult? network = null;
+        if (sources.Network is not null)
+        {
+            try { network = await sources.Network(token).ConfigureAwait(false); }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex) { errors["network"] = ex.GetType().Name; }
+        }
         var audit = sources.Audit is null ? null : Call(sources.Audit, "firewall_audit", errors);
         var selfCheck = sources.SelfCheck is null ? null : Call(sources.SelfCheck, "self_check", errors);
         var auditNode = ParseRedacted(audit, "firewall_audit", errors);
@@ -58,6 +66,12 @@ public static class DiagnosticsCollector
         {
             try { firewallNode = JsonNode.Parse(firewallJson); }
             catch (JsonException) { firewallNode = null; }
+        }
+        JsonNode? networkNode = null;
+        if (network?.Json is { } networkJson)
+        {
+            try { networkNode = RedactNetwork(JsonNode.Parse(networkJson)); }
+            catch (JsonException) { errors["network"] = "不是有效的 JSON"; }
         }
 
         var logReads = new List<LogTailResult>();
@@ -72,19 +86,38 @@ public static class DiagnosticsCollector
         JsonObject? stateSummary = null;
         if (stateExists)
         {
-            stateBytes = new FileInfo(statePath).Length;
-            stateModified = File.GetLastWriteTimeUtc(statePath).ToString("O");
+            try
+            {
+                stateBytes = new FileInfo(statePath).Length;
+                stateModified = File.GetLastWriteTimeUtc(statePath).ToString("O");
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                stateBytes = 0;
+                stateModified = null;
+                errors["killswitch_state_file"] = ex.GetType().Name;
+            }
             try { stateSummary = Summarize(File.ReadAllText(statePath), errors); }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
         }
         if (auditExists)
         {
-            auditBytes = new FileInfo(auditPath).Length;
-            auditModified = File.GetLastWriteTimeUtc(auditPath).ToString("O");
+            try
+            {
+                auditBytes = new FileInfo(auditPath).Length;
+                auditModified = File.GetLastWriteTimeUtc(auditPath).ToString("O");
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                auditBytes = 0;
+                auditModified = null;
+                errors["firewall_audit_file"] = ex.GetType().Name;
+            }
         }
 
         var omitted = new List<string>();
-        var input = new BuildInput(sources, snapshot, desired, wfp, adapters, firewallNode, firewall?.Error, logReads,
+        var input = new BuildInput(sources, snapshot, desired, wfp, adapters, firewallNode, firewall?.Error,
+            networkNode, network?.Error, logReads,
             auditNode, selfCheckNode, omitted, errors, stateExists, stateBytes, stateModified, stateSummary,
             auditExists, auditBytes, auditModified);
         foreach (var maxLines in LineBudgets)
@@ -110,6 +143,7 @@ public static class DiagnosticsCollector
 
     private sealed record BuildInput(DiagnosticsSources Sources, ClientSnapshot? Snapshot, bool? Desired,
         IReadOnlyList<string>? Wfp, IReadOnlyList<AdapterInfo>? Adapters, JsonNode? Firewall, string? FirewallError,
+        JsonNode? Network, string? NetworkError,
         IReadOnlyList<LogTailResult> Logs, JsonNode? Audit, JsonNode? SelfCheck, IReadOnlyList<string> Omitted,
         IReadOnlyDictionary<string, string> Errors, bool StateExists, long StateBytes, string? StateModified,
         JsonObject? StateSummary, bool AuditExists, long AuditBytes, string? AuditModified);
@@ -129,7 +163,7 @@ public static class DiagnosticsCollector
             ["utc_offset_minutes"] = (int)TimeZoneInfo.Local.GetUtcOffset(now).TotalMinutes,
             ["uptime_minutes"] = Environment.TickCount64 / 60000
         };
-        return new JsonObject
+        var result = new JsonObject
         {
             ["schema"] = 1,
             ["collected_at"] = now.ToString("O"),
@@ -160,12 +194,21 @@ public static class DiagnosticsCollector
             ["adapters"] = withAdapters ? BuildAdapters(input.Adapters) : null,
             ["firewall"] = input.Firewall?.DeepClone(),
             ["firewall_error"] = input.FirewallError,
+            ["network"] = input.Network?.DeepClone(),
+            ["network_error"] = input.NetworkError,
             ["logs"] = BuildLogs(input.Logs, maxLines),
             ["firewall_audit"] = withAudit ? input.Audit?.DeepClone() : null,
             ["self_check"] = withSelfCheck ? input.SelfCheck?.DeepClone() : null,
             ["omitted"] = BuildOmitted(input.Omitted),
             ["errors"] = errors
         };
+        // 采集来源没接路由与 DNS 探测时（只在单元测试里出现）不带这两个键，根键清单与次序保持原样。
+        if (sources.Network is null)
+        {
+            result.Remove("network");
+            result.Remove("network_error");
+        }
+        return result;
     }
 
     private static JsonObject? BuildSnapshot(ClientSnapshot? snapshot)
@@ -241,7 +284,8 @@ public static class DiagnosticsCollector
                 truncated = true;
             }
             var array = new JsonArray();
-            foreach (var line in lines) array.Add(line);
+            foreach (var line in lines)
+                array.Add(log.Name == "sing-box.log" ? DiagnosticsRedactor.MaskDomains(line) : line);
             result[log.Name] = new JsonObject
             {
                 ["missing"] = log.Missing,
@@ -281,6 +325,8 @@ public static class DiagnosticsCollector
                         break;
                     case JsonArray array:
                         summary[name + "_count"] = array.Count;
+                        // 恢复记录里的 profiles 另给数组，导出里看得到套用前保存的三档默认出站。
+                        if (name == "profiles") summary[name] = SummarizeProfiles(array);
                         break;
                     case JsonObject child:
                         var keys = new JsonArray();
@@ -301,6 +347,54 @@ public static class DiagnosticsCollector
         {
             errors["killswitch_state"] = "不是有效的 JSON";
             return null;
+        }
+    }
+
+    private static JsonArray SummarizeProfiles(JsonArray profiles)
+    {
+        var result = new JsonArray();
+        foreach (var item in profiles)
+        {
+            if (item is not JsonObject profile) continue;
+            var copy = new JsonObject();
+            foreach (var property in profile)
+            {
+                if (property.Key is not ("Name" or "DefaultOutboundAction" or "Enabled")) continue;
+                copy[property.Key] = property.Value is JsonValue scalar && scalar.TryGetValue<string>(out var text)
+                    ? JsonValue.Create(DiagnosticsRedactor.Redact(text))
+                    : JsonNode.Parse(property.Value?.ToJsonString() ?? "null");
+            }
+            result.Add(copy);
+        }
+        return result;
+    }
+
+    /// <summary>路由与 DNS 现状里的字符串值都脱敏；路由前缀只有 /0、/1、/2 三种长度，原样保留。</summary>
+    private static JsonNode? RedactNetwork(JsonNode? node)
+    {
+        switch (node)
+        {
+            case JsonObject obj:
+                var copy = new JsonObject();
+                foreach (var pair in obj)
+                {
+                    if (pair.Value is null)
+                        copy[pair.Key] = null;
+                    else if (pair.Key == "prefix" && pair.Value is JsonValue prefix && prefix.TryGetValue<string>(out var kept))
+                        copy[pair.Key] = kept;
+                    else
+                        copy[pair.Key] = RedactNetwork(pair.Value);
+                }
+                return copy;
+            case JsonArray array:
+                var items = new JsonArray();
+                foreach (var item in array) items.Add(RedactNetwork(item));
+                return items;
+            case JsonValue value when value.TryGetValue<string>(out var text):
+                return DiagnosticsRedactor.Redact(text);
+            default:
+                // 数字与布尔值原样复制一份脱离父节点，避免重新挂载。
+                return node?.DeepClone();
         }
     }
 

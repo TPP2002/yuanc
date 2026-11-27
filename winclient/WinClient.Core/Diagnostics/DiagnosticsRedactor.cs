@@ -10,6 +10,7 @@ public static class DiagnosticsRedactor
 {
     public const string PublicAddressMark = "[公网地址]";
     public const string UserMark = "[用户]";
+    public const string DomainMark = "[域名]";
     public const string TimedOutMark = "[脱敏超时，内容已隐藏]";
 
     private static readonly Regex Ipv4 = new(
@@ -21,6 +22,17 @@ public static class DiagnosticsRedactor
     private static readonly Regex UserDirectory = new(
         @"(?i)([A-Z]:\\{1,2}Users\\{1,2})[^\\/\s""'<>|:*?]+",
         RegexOptions.CultureInvariant, TimeSpan.FromSeconds(2));
+    private static readonly Regex Domain = new(
+        @"(?i)\b(?:[a-z0-9-]+\.)+[a-z]{2,}\b",
+        RegexOptions.CultureInvariant, TimeSpan.FromSeconds(2));
+
+    /// <summary>把主机名换成固定记号；纯数字与内网地址不含字母域名后缀，原样保留。</summary>
+    public static string MaskDomains(string? text)
+    {
+        if (string.IsNullOrEmpty(text)) return "";
+        try { return Domain.Replace(text, DomainMark); }
+        catch (RegexMatchTimeoutException) { return TimedOutMark; }
+    }
 
     /// <summary>给 JSON 原文脱敏，替换后仍是合法 JSON。</summary>
     public static string RedactStructured(string? text)
