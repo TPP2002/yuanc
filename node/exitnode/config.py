@@ -242,8 +242,9 @@ def load(path: str, runner: Runner | None = None) -> Config:
             invalid(key, "端口须在 1 至 65535 之间")
     if not 1024 <= config.console.port <= 65535:
         invalid("console.port", "须在 1024 至 65535 之间(管理网页以无特权账户运行)")
-    if config.console.port in {config.admin.port, config.proxy.reality_port,
-                              config.proxy.hy2_port}:
+    # 管理网页没开时不占端口，不拿它去挡已有节点的端口配置。
+    if config.console.enabled and config.console.port in {
+            config.admin.port, config.proxy.reality_port, config.proxy.hy2_port}:
         invalid("console.port", "不能与 admin.port、proxy.reality_port、proxy.hy2_port 相同")
     try:
         ipaddress.ip_address(config.admin.bind)
