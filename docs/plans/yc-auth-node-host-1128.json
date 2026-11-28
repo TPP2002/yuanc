@@ -1,0 +1,130 @@
+{
+  "schemaVersion": 1,
+  "taskId": "AUTH-NODE-HOST-STATIC-1117",
+  "slug": "yc-auth-node-host-1128",
+  "title": "发给客户端的节点地址跟着节点心跳的来源走:澳洲宽带换了公网地址后,邀请码用户重新连接就拿到新地址",
+  "goal": "一、要解决什么\n\n卡 AUTH-NODE-HOST-STATIC-1117。邀请码模式下,客户端连节点用的地址由鉴权服务(authserver)在取会话时下发。现在下发的是配置文件里写死的 node.host。澳洲家里的宽带一换公网地址,下发的还是旧地址,邀请码用户全部连不上,要管理员登录服务器改配置、重启服务才恢复。\n\n节点每 60 秒向鉴权服务发一次心跳(POST /node/heartbeat,带节点密钥),服务已经把心跳的来源地址存进 node_heartbeat 表,只是没拿来用。鉴权服务和节点不在同一台机器、也不在同一个内网时,这个来源地址就是节点当前的公网地址。\n\n做法:取会话时,如果最近一次心跳的来源是公网 IPv4 地址,就把它当节点地址发给客户端;看不出公网地址(没有心跳、来源是本机或内网地址、不是 IPv4)就照旧发配置里的地址。配置里加一个开关 node.host_from_heartbeat,默认开;节点前面有中继时可以关。\n\n只动四个文件:authserver/authserver/service.py、authserver/authserver/config.py、authserver/examples/config.example.toml、authserver/tests/test_node_host.py(新文件)。\n\n二、改完以后对外是什么样(判据就是测试文件,见四)\n\n- 取会话(POST /client/session)返回的 node.host:开关开着、且最近一次心跳的来源是公网 IPv4 地址时,等于那个来源地址;否则等于配置里的 node.host。node 里别的字段、字段个数都不变,开关本身不发给客户端。\n- 「公网 IPv4 地址」的判法写死成一张网段表,不用解释器自带的 is_global、is_private(各版本判法不一样):来源是字符串,能解析成 IPv4 地址(或者是 IPv6 里包着 IPv4 的 ::ffff:a.b.c.d 写法,取里面的 IPv4),并且不在这些网段里:0.0.0.0/8、10.0.0.0/8、100.64.0.0/10、127.0.0.0/8、169.254.0.0/16、172.16.0.0/12、192.168.0.0/16、224.0.0.0/3。\n- 以最近一次心跳为准,不管它过了多久;最近一次心跳的来源看不出公网地址时,回到配置里的地址。\n- 心跳的来源仍然只取连接对端的地址,请求头里自称的地址不算;没带对节点密钥的心跳不改任何东西(现状如此,不动)。\n- 心跳表、审计的写法不变;配置对象不被改写。\n- 开关 node.host_from_heartbeat:布尔值,默认 true;填 false 时一律发配置里的地址。\n\n三、怎么改\n\n下面的写法已在派单方的机器上配四里的测试文件跑过:新测试 125 条全过,全量测试和规范检查也过。名字、写法照这个来;跑不通就交 blocked,不许动测试。\n\n(1) authserver/authserver/service.py 顶部:在「from datetime import datetime, timedelta」前面加一行「import ipaddress」;在「from .security import …」那一行之后、「class Problem(Exception):」之前加(前后各空两行):\n\n# 心跳从这些网段来，说明节点和本服务在同一台机器或同一个内网，看不出节点的公网地址。\nNOT_PUBLIC = tuple(ipaddress.ip_network(value) for value in (\n    \"0.0.0.0/8\", \"10.0.0.0/8\", \"100.64.0.0/10\", \"127.0.0.0/8\", \"169.254.0.0/16\",\n    \"172.16.0.0/12\", \"192.168.0.0/16\", \"224.0.0.0/3\"))\n\n\ndef public_ipv4(value):\n    \"\"\"心跳来源是公网 IPv4 地址时返回它的标准写法，否则返回 None。\"\"\"\n    if not isinstance(value, str):\n        return None\n    try:\n        address = ipaddress.ip_address(value)\n    except ValueError:\n        return None\n    if address.version == 6:\n        address = address.ipv4_mapped\n        if address is None:\n            return None\n    if any(address in network for network in NOT_PUBLIC):\n        return None\n    return str(address)\n\n(2) authserver/authserver/service.py 的 Service.session 里,在「node = self.settings.node.model_dump()」这一行后面加(缩进照抄):\n\n            if self.settings.node.host_from_heartbeat:\n                # 节点的公网地址会变：以最近一次心跳的来源为准，看不出公网地址时用配置里的。\n                beat = conn.execute(\"SELECT ip FROM node_heartbeat WHERE id = 1\").fetchone()\n                reported = None if beat is None else public_ipv4(beat[\"ip\"])\n                if reported is not None:\n                    node[\"host\"] = reported\n\n   这个函数别的行不动;service.py 里别的函数一个字不动,也不新增别的函数。\n\n(3) authserver/authserver/config.py:在 Node 类里「hy2_obfs_password_path: str = Field(default=\"\", exclude=True, repr=False)」这一行后面加两行(缩进照抄),别的不动:\n\n    # 发给客户端的节点地址跟不跟节点心跳的来源地址走；节点前面有中继时填 false。\n    host_from_heartbeat: bool = Field(default=True, exclude=True)\n\n(4) authserver/examples/config.example.toml:在「host = \"<节点地址>\"」这一行后面加两行,别的不动:\n\n# 节点的公网地址变了以后，发给客户端的地址跟着节点心跳的来源走；节点前面有中继、心跳来源不是客户端该连的地址时填 false。\nhost_from_heartbeat = true\n\n四、authserver/tests/test_node_host.py:用命令写出,不许手改\n\n测试文件的正本在 docs/plans/checks/yc_auth_node_host_1128_tests.txt。单独执行这一条命令,把它原样写成测试文件:\n\npython docs/plans/checks/yc_auth_node_host_1128.py write-tests\n\n这份测试在改动前的代码上整份收集失败(从 authserver.service 导入不到 public_ipv4),这就是证红。\n\n五、检查脚本逐条核对的写法(脚本:docs/plans/checks/yc_auth_node_host_1128.py,只读)\n\nSHAPE 核 authserver/authserver/service.py:能解析;下面每一条都要原样出现:\n      import ipaddress\n      NOT_PUBLIC = tuple(ipaddress.ip_network(value) for value in (\n      \"0.0.0.0/8\", \"10.0.0.0/8\", \"100.64.0.0/10\", \"127.0.0.0/8\", \"169.254.0.0/16\",\n      \"172.16.0.0/12\", \"192.168.0.0/16\", \"224.0.0.0/3\"))\n      def public_ipv4(value):\n      if not isinstance(value, str):\n      address = ipaddress.ip_address(value)\n      address = address.ipv4_mapped\n      if any(address in network for network in NOT_PUBLIC):\n    Service.session 这个函数里,下面每一条都要原样出现:\n      node = self.settings.node.model_dump()\n      if self.settings.node.host_from_heartbeat:\n      conn.execute(\"SELECT ip FROM node_heartbeat WHERE id = 1\").fetchone()\n      reported = None if beat is None else public_ipv4(beat[\"ip\"])\n      node[\"host\"] = reported\n      node.update(uuid=device[\"uuid\"], hy2_password=hy2_password(device[\"uuid\"], self.salt))\n    不许出现:\n      is_global\n      is_private\n      print(\n      time.sleep(\n      self.settings.node.host =\n      datetime.now(\n    只许新增 public_ipv4 一个函数;下面这些函数和改动前逐字一样(只忽略行尾空格):\n      Problem.__init__\n      required\n      add_days\n      extend_from\n      Service.__init__\n      Service.time\n      Service.create_invite\n      Service.accounts\n      Service.invites\n      Service._devices\n      Service.devices\n      Service.audits\n      Service.change_account\n      Service.revoke\n      Service._by_refresh\n      Service._check\n      Service.redeem\n      Service.authenticate_session\n      Service._session_device\n      Service.logout\n      Service.allowed\n      Service.heartbeat\n\nSHAPE 核 authserver/authserver/config.py:相对改动前只许在「hy2_obfs_password_path: str = Field(default=\"\", exclude=True, repr=False)」这一行后面多出这两行,别的行不动:\n      # 发给客户端的节点地址跟不跟节点心跳的来源地址走；节点前面有中继时填 false。\n      host_from_heartbeat: bool = Field(default=True, exclude=True)\n\nSHAPE 核 authserver/examples/config.example.toml:相对改动前只许在「host = \"<节点地址>\"」这一行后面多出这两行,别的行不动:\n      # 节点的公网地址变了以后，发给客户端的地址跟着节点心跳的来源走；节点前面有中继、心跳来源不是客户端该连的地址时填 false。\n      host_from_heartbeat = true\n\nTESTS 核 authserver/tests/test_node_host.py:和 docs/plans/checks/yc_auth_node_host_1128_tests.txt 逐行一样(只忽略行尾空格和文件末尾的空行)。\n\nSCOPE 核这些:相对主干只许改动下面这些文件,别的一个都不许动:\n  - authserver/authserver/config.py\n  - authserver/authserver/service.py\n  - authserver/examples/config.example.toml\n  - authserver/tests/test_node_host.py\n\n六、做的时候守这几条\n\n- 只动 allowedPaths 里的四个文件。发现非改别的文件不可,交 blocked 写清是哪一个、为什么。\n- 测试文件只用四里的命令写出,不手改一个字;某条测试你认为写错了,交 blocked 写成结构化岔路(哪条、现象、你的判断),不改测试。\n- 不放宽、不删、不跳过任何断言;不改别的测试文件。\n- 不改 app.py、models.py、db.py:接口、表结构、心跳和审计的写法都不变。\n- 不新增日志,不打印;不改写配置对象。\n- 不改文档(合并后派单方补文档)。\n- 验收命令单独一条执行,不要拼 cd &&、管道或重定向。\n- 次序:先执行四里的命令写出测试文件,申请 T 看到收集失败作为证红;再照三改三个文件;之后按 T → PYTEST → RUFF → SHAPE → TESTS → SCOPE 跑。\n- 工位里不许装依赖,缺依赖停下交 blocked;不许读写 secrets/。\n\n七、交活说明要写\n\n- 四个文件各改了什么(一两句一处)。\n- 和三里的参考写法不一样的地方、为什么(没有就写没有)。\n- 没做、没验的:真机上没测;节点和鉴权服务在同一台机器或同一个内网时看不出公网地址,这种部署本单不解决;客户端什么时候重新取会话不在本单里。",
+  "background": "项目:澳洲出口节点配套的邀请码鉴权服务(authserver,Python 3.11+,FastAPI、pydantic、SQLite)。客户端取会话(POST /client/session)时,服务把节点连接参数(node 一节)发给客户端;节点每 60 秒拉一次放行名单并发一次心跳(POST /node/heartbeat,请求头带节点密钥)。\n\n开工先读:\n- authserver/authserver/service.py(292 行,整份读;session 和 heartbeat 两个函数是重点)\n- authserver/authserver/config.py(134 行,整份读;Node 类)\n- authserver/authserver/app.py(只读;看 ip(request) 和 /node/heartbeat 怎么把来源地址交给 service.heartbeat)\n- authserver/tests/conftest.py、authserver/tests/test_node_sync.py、authserver/tests/test_sessions.py(只读;现有夹具和相关测试)\n- authserver/examples/config.example.toml\n- docs/plans/checks/yc_auth_node_host_1128_tests.txt(新测试的正本,只读)\n- docs/plans/checks/yc_auth_node_host_1128.py(验收脚本,只读)\n\n现状(主干 84c6fec):\n- Service.session 里 node = self.settings.node.model_dump(),host 取自配置。\n- Service.heartbeat(ip) 把来源地址和时间写进 node_heartbeat 表唯一的一行;来源变了才记一条审计。\n- app.py 的 ip(request) 只取连接对端的地址(request.client.host),不看转发请求头。\n- Node 配置类里带 exclude=True 的字段不会出现在发给客户端的 node 里。\n- 测试客户端默认的对端是主机名 testclient,不是地址;现有测试里的会话因此仍拿到配置里的地址。\n\n项目红线(任何任务都生效):只动本项目自己的服务、路由、防火墙规则;凭据不入库、不入日志;隧道断了不静默回落;安装更新幂等可回退;真机没测的不标通过;Windows 上拉起的子进程一律隐藏窗口(本单不新增子进程)。\n\n本仓跑法:没有 package.json,按 Python 仓跑;pytest 配置在根目录 pyproject.toml。验收命令由派单器在工位里跑。",
+  "nonGoals": [
+    "不解决节点和鉴权服务在同一台机器或同一个内网的部署(那时鉴权服务自己的地址也变了,客户端连不上鉴权服务)",
+    "不改节点(node/)一侧:心跳照旧不带请求体",
+    "不改客户端什么时候重新取会话",
+    "不改接口、表结构、心跳和审计的写法",
+    "不改文档(合并后派单方补文档),不做真机实测"
+  ],
+  "allowedPaths": [
+    "authserver/authserver/config.py",
+    "authserver/authserver/service.py",
+    "authserver/examples/config.example.toml",
+    "authserver/tests/test_node_host.py"
+  ],
+  "forbiddenPaths": [
+    ".codex/**",
+    ".github/**",
+    ".gitignore",
+    ".gitattributes",
+    "pyproject.toml",
+    "requirements-dev.txt",
+    "winclient/**",
+    "scripts/**",
+    "node/**",
+    "docs/**",
+    "authserver/pyproject.toml",
+    "authserver/authserver/app.py",
+    "authserver/authserver/models.py",
+    "authserver/authserver/db.py",
+    "authserver/authserver/security.py",
+    "authserver/authserver/admin_cli.py",
+    "authserver/authserver/__init__.py",
+    "authserver/tests/conftest.py",
+    "authserver/tests/test_audit_limit.py",
+    "authserver/tests/test_certificate.py",
+    "authserver/tests/test_decoy.py",
+    "authserver/tests/test_devices.py",
+    "authserver/tests/test_invites.py",
+    "authserver/tests/test_node_sync.py",
+    "authserver/tests/test_security.py",
+    "authserver/tests/test_sessions.py"
+  ],
+  "expectArtifacts": [],
+  "acceptance": [
+    {
+      "id": "T",
+      "kind": "test:targeted",
+      "target": "authserver/tests/test_node_host.py",
+      "required": true,
+      "failsOnBase": true
+    },
+    {
+      "id": "PYTEST",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "pytest",
+        "-q"
+      ],
+      "required": true,
+      "timeoutSec": 1500
+    },
+    {
+      "id": "RUFF",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "ruff",
+        "check",
+        "node",
+        "authserver"
+      ],
+      "required": true,
+      "timeoutSec": 300
+    },
+    {
+      "id": "SHAPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_auth_node_host_1128.py",
+        "shape"
+      ],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "TESTS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_auth_node_host_1128.py",
+        "tests"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "SCOPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_auth_node_host_1128.py",
+        "scope"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "timeoutSec": 5400,
+  "repoRoot": "E:/yuanc",
+  "steps": [
+    "读 background 列出的文件与检查脚本。",
+    "执行 goal 四里的命令写出测试文件;申请 T,看到收集失败作为证红。",
+    "照 goal 三改 service.py、config.py、config.example.toml。",
+    "T、PYTEST、RUFF、SHAPE、TESTS、SCOPE 全绿后交活;交活说明照 goal 七的要求写。"
+  ]
+}

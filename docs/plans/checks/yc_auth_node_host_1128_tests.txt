@@ -1,0 +1,205 @@
+"""发给客户端的节点地址跟着节点心跳的来源地址走(AUTH-NODE-HOST-STATIC-1117)。"""
+
+import json
+import tomllib
+from pathlib import Path
+
+import pytest
+from authserver.config import Settings, load_config
+from authserver.service import public_ipv4
+from fastapi.testclient import TestClient
+
+CONFIGURED = "192.0.2.23"
+NODE_KEYS = {"time_zone", "country", "host", "reality_port", "hy2_port", "reality_public_key",
+             "short_id", "sni", "hy2_server_name", "hy2_certificate", "hy2_obfs_password",
+             "uuid", "hy2_password"}
+# 公网地址,含各个内网段两头紧挨着的地址。
+PUBLIC = ["203.0.113.9", "198.51.100.7", "1.1.1.1", "9.255.255.255", "11.0.0.1",
+          "100.63.255.255", "100.128.0.1", "126.255.255.255", "128.0.0.1",
+          "169.253.255.255", "169.255.0.1", "172.15.255.255", "172.32.0.1",
+          "192.167.255.255", "192.169.0.1", "223.255.255.255"]
+# 本机、内网、运营商共享地址、链路本地、组播、保留:看不出节点的公网地址。
+NOT_PUBLIC = ["127.0.0.1", "127.255.255.254", "10.0.0.1", "10.255.255.254", "172.16.0.1",
+              "172.31.255.254", "192.168.0.1", "192.168.1.52", "192.168.255.254",
+              "100.64.0.1", "100.127.255.254", "169.254.0.1", "169.254.255.254",
+              "0.0.0.0", "0.255.255.255", "224.0.0.1", "239.255.255.255", "240.0.0.1",
+              "255.255.255.255"]
+# 不是 IPv4 地址的来源:测试客户端的主机名、占位词、写坏的地址、IPv6。
+NOT_ADDRESS = ["testclient", "unknown", "local", "", " ", "203.0.113", "203.0.113.9.1",
+               "203.0.113.256", "203.0.113.09", " 203.0.113.9", "203.0.113.9 ",
+               "203.0.113.9:443", "::1", "2001:db8::1", "fe80::1", "::ffff:192.168.1.52",
+               "::ffff:127.0.0.1", "::ffff:10.0.0.1"]
+MAPPED = [("::ffff:203.0.113.9", "203.0.113.9"), ("::ffff:1.1.1.1", "1.1.1.1"),
+          ("::FFFF:CB00:7109", "203.0.113.9")]
+
+
+def session(client, enrolled):
+    response = client.post("/client/session", json={"refresh_token": enrolled["refresh_token"]})
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def host(client, enrolled):
+    return session(client, enrolled)["node"]["host"]
+
+
+def values(settings, **changes):
+    node = settings.node.model_dump(exclude={"hy2_certificate", "hy2_obfs_password"})
+    node["hy2_certificate_path"] = settings.node.hy2_certificate_path
+    node["hy2_obfs_password_path"] = settings.node.hy2_obfs_password_path
+    node.update(changes)
+    return {
+        "security": {name: getattr(settings.security, name).get_secret_value()
+                     for name in ("admin_key", "node_key", "token_salt")},
+        "node": node,
+    }
+
+
+def test_switch_defaults_on_and_is_not_sent_to_clients(settings):
+    assert settings.node.host_from_heartbeat is True
+    assert "host_from_heartbeat" not in settings.node.model_dump()
+
+
+def test_without_heartbeat_host_is_the_configured_one(client, enrolled):
+    assert host(client, enrolled) == CONFIGURED
+
+
+@pytest.mark.parametrize("source", PUBLIC)
+def test_public_heartbeat_source_becomes_host(client, enrolled, app, source):
+    app.state.service.heartbeat(ip=source)
+    assert host(client, enrolled) == source
+
+
+@pytest.mark.parametrize("source", NOT_PUBLIC + NOT_ADDRESS)
+def test_other_heartbeat_source_keeps_configured_host(client, enrolled, app, source):
+    app.state.service.heartbeat(ip=source)
+    assert host(client, enrolled) == CONFIGURED
+
+
+@pytest.mark.parametrize("source,expected", MAPPED)
+def test_ipv4_mapped_source_is_unwrapped(client, enrolled, app, source, expected):
+    app.state.service.heartbeat(ip=source)
+    assert host(client, enrolled) == expected
+
+
+def test_latest_heartbeat_wins_however_old(client, enrolled, app, clock):
+    service = app.state.service
+    service.heartbeat(ip="203.0.113.9")
+    assert host(client, enrolled) == "203.0.113.9"
+    clock.advance(seconds=60)
+    service.heartbeat(ip="198.51.100.7")
+    assert host(client, enrolled) == "198.51.100.7"
+    clock.advance(seconds=60)
+    # 最近一次心跳从本机来:看不出公网地址,回到配置里的地址。
+    service.heartbeat(ip="127.0.0.1")
+    assert host(client, enrolled) == CONFIGURED
+    clock.advance(seconds=60)
+    service.heartbeat(ip="203.0.113.9")
+    # 心跳停了很久,最近一次的来源照样算数:没有新的消息时它仍是最可能对的地址。
+    clock.advance(days=20)
+    assert host(client, enrolled) == "203.0.113.9"
+
+
+def test_heartbeat_over_http_uses_peer_address(app, client, enrolled, node_key):
+    # 经接口发心跳,来源取连接对端的地址;测试客户端默认的对端是主机名 testclient。
+    assert client.post("/node/heartbeat", headers=node_key).status_code == 200
+    assert host(client, enrolled) == CONFIGURED
+    node = TestClient(app, client=("203.0.113.9", 50000))
+    assert node.post("/node/heartbeat", headers=node_key).status_code == 200
+    assert host(client, enrolled) == "203.0.113.9"
+    # 请求头里自称的地址不算数。
+    assert node.post("/node/heartbeat", headers={**node_key, "X-Forwarded-For": "198.51.100.7"}
+                     ).status_code == 200
+    assert host(client, enrolled) == "203.0.113.9"
+
+
+def test_heartbeat_without_node_key_changes_nothing(app, client, enrolled, node_key, admin):
+    node = TestClient(app, client=("203.0.113.9", 50000))
+    assert node.post("/node/heartbeat", headers=node_key).status_code == 200
+    other = TestClient(app, client=("198.51.100.7", 50000))
+    assert other.post("/node/heartbeat").status_code == 404
+    assert other.post("/node/heartbeat", headers={"X-Node-Key": "wrong"}).status_code == 404
+    assert other.post("/node/heartbeat", headers=admin).status_code == 404
+    assert host(client, enrolled) == "203.0.113.9"
+
+
+def test_switch_off_keeps_configured_host(client, enrolled, app, settings):
+    service = app.state.service
+    service.heartbeat(ip="203.0.113.9")
+    service.settings = Settings.model_validate(values(settings, host_from_heartbeat=False))
+    assert service.settings.node.host_from_heartbeat is False
+    assert host(client, enrolled) == CONFIGURED
+    service.settings = Settings.model_validate(values(settings, host_from_heartbeat=True))
+    assert host(client, enrolled) == "203.0.113.9"
+
+
+def test_only_host_changes_and_settings_stay_untouched(client, enrolled, app, settings):
+    app.state.service.heartbeat(ip="203.0.113.9")
+    node = session(client, enrolled)["node"]
+    assert set(node) == NODE_KEYS
+    for field, value in settings.node.model_dump().items():
+        if field != "host":
+            assert node[field] == value
+    assert node["host"] == "203.0.113.9"
+    assert app.state.service.settings.node.host == CONFIGURED
+    assert settings.node.host == CONFIGURED
+
+
+def test_heartbeat_row_and_audit_are_as_before(app, client, enrolled):
+    service = app.state.service
+    service.heartbeat(ip="203.0.113.9")
+    host(client, enrolled)
+    with service.db.transaction() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM node_heartbeat").fetchone()[0] == 1
+        assert conn.execute("SELECT ip FROM node_heartbeat").fetchone()["ip"] == "203.0.113.9"
+        rows = conn.execute("SELECT what, ip FROM audit WHERE who = 'node'").fetchall()
+    assert [(row["what"], row["ip"]) for row in rows] == [("node.heartbeat", "203.0.113.9")]
+
+
+def test_switch_is_read_from_config_file(tmp_path, settings):
+    def load(*extra):
+        lines = [
+            "[security]",
+            'admin_key = "test-admin-only"',
+            'node_key = "test-node-only"',
+            'token_salt = "test-salt-only"',
+            "[node]",
+            'host = "192.0.2.23"',
+            "reality_port = 443",
+            "hy2_port = 24443",
+            'reality_public_key = "test-public-key"',
+            'short_id = "abcd1234"',
+            'sni = "example.test"',
+            "hy2_certificate_path = " + json.dumps(settings.node.hy2_certificate_path),
+            *extra,
+        ]
+        path = tmp_path / "config.toml"
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return load_config(path)
+
+    assert load().node.host_from_heartbeat is True
+    assert load("host_from_heartbeat = false").node.host_from_heartbeat is False
+    assert load("host_from_heartbeat = true").node.host_from_heartbeat is True
+    with pytest.raises(ValueError, match="配置无效"):
+        load('host_from_heartbeat = "<填 true 或 false>"')
+
+
+def test_example_config_shows_the_switch():
+    path = Path(__file__).parents[1] / "examples" / "config.example.toml"
+    data = tomllib.loads(path.read_text(encoding="utf-8"))
+    assert data["node"]["host_from_heartbeat"] is True
+
+
+@pytest.mark.parametrize("value", PUBLIC)
+def test_public_ipv4_accepts_public_addresses(value):
+    assert public_ipv4(value) == value
+
+
+@pytest.mark.parametrize("value,expected", MAPPED)
+def test_public_ipv4_unwraps_mapped_addresses(value, expected):
+    assert public_ipv4(value) == expected
+
+
+@pytest.mark.parametrize("value", NOT_PUBLIC + NOT_ADDRESS + [None, 16843009, b"203.0.113.9"])
+def test_public_ipv4_rejects_everything_else(value):
+    assert public_ipv4(value) is None
