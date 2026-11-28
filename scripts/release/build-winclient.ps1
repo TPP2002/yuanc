@@ -1,4 +1,4 @@
-﻿param([string]$Version, [switch]$TestBuild)
+﻿param([string]$Version, [switch]$TestBuild, [switch]$UiSmoke)
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
@@ -42,6 +42,12 @@ try {
     if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) { throw '发布结果缺少客户端程序。' }
     # 与客户端自动更新接收的防呆线(UpdateManifest.MaxPayloadBytes,1 GiB)同数,超过它的包客户端不收。
     if ((Get-Item -LiteralPath $executable).Length -gt 1GB) { throw '客户端超过 1GB，自动更新不会接收，请先查是什么撑大了包。' }
+    if ($UiSmoke) {
+        # 交出去之前先自动点一遍界面;没通过或没法试都不出包。
+        $smokeVersion = ($Version -split '\+')[0]
+        & (Join-Path $PSScriptRoot 'ui-smoke.ps1') -Exe $executable -OutDir (Join-Path $root 'build/ui-smoke') -ExpectVersion $smokeVersion -ExpectTestBuild:$TestBuild
+        if ($LASTEXITCODE -ne 0) { throw "界面试跑没有通过（退出码 $LASTEXITCODE），没有出包。" }
+    }
     [IO.Directory]::CreateDirectory($release) | Out-Null
     $name = 'YuanC-Client-' + $Version + $(if ($TestBuild) { '-test' } else { '' }) + '.exe'
     $destination = Join-Path $release $name
