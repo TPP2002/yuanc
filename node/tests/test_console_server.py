@@ -2,6 +2,7 @@ import http.client
 import json
 import socket
 import threading
+import time
 from datetime import UTC, datetime
 
 import pytest
@@ -779,3 +780,207 @@ def test_stalled_body_closes_without_reply(tmp_path, caplog, monkeypatch):
         logging.getLogger("exitnode").removeHandler(handler)
     text = caplog.text + "\n".join(records)
     assert "管理网页请求处理失败" not in text
+
+# 以下用例验证慢连接与慢来源占不住并发名额。
+def wait_closed(sock, feed, interval, limit):
+    # 反复「送一点字节、再短读一次」，直到判定这条连接已断开或过了 limit 秒：
+    # 发不出去、读到空、读到重置都算断开；读超时说明还连着，继续下一轮。
+    start = time.monotonic()
+    received = b""
+    while time.monotonic() - start < limit:
+        if feed:
+            try:
+                sock.sendall(feed)
+            except OSError:
+                return True, time.monotonic() - start, received
+        sock.settimeout(interval)
+        try:
+            chunk = sock.recv(4096)
+        except TimeoutError:
+            continue
+        except OSError:
+            return True, time.monotonic() - start, received
+        if not chunk:
+            return True, time.monotonic() - start, received
+        received += chunk
+    return False, time.monotonic() - start, received
+
+
+def test_slow_header_is_cut_at_total_deadline(tmp_path, caplog, monkeypatch):
+    # 请求头一个字节一个字节地送：单次读超时永远等不到，只能靠整条连接的总时限断开。
+    import logging
+
+    records = []
+
+    class Capture(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    handler = Capture()
+    logging.getLogger("exitnode").addHandler(handler)
+    try:
+        with caplog.at_level("ERROR"), Running(make(tmp_path)) as server:
+            with monkeypatch.context() as patch:
+                patch.setattr(console_server.ConsoleHandler, "total_timeout", 1.0)
+                sock = socket.create_connection(server.server_address, timeout=5)
+                try:
+                    # 请求头没有结束的空行，之后只一个字一个字地喂。
+                    sock.sendall(b"GET /api/session HTTP/1.0\r\n"
+                                 b"Host: 127.0.0.1\r\nX-Pad: ")
+                    closed, elapsed, received = wait_closed(sock, b"a", 0.2, 6)
+                finally:
+                    sock.close()
+            assert closed is True
+            assert 0.7 <= elapsed <= 4
+            assert received == b""
+            # 总时限只掐慢连接，普通请求照常能进来。
+            assert call(server, "/api/session")[0] == 200
+    finally:
+        logging.getLogger("exitnode").removeHandler(handler)
+    assert "管理网页请求处理失败" not in caplog.text + "\n".join(records)
+
+
+def test_slow_body_is_cut_at_total_deadline(tmp_path, caplog, monkeypatch):
+    # 请求体一个字节都不来：读请求体这一处也受总时限约束，到点断开且一个字都不回。
+    import logging
+
+    records = []
+
+    class Capture(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    handler = Capture()
+    logging.getLogger("exitnode").addHandler(handler)
+    try:
+        with caplog.at_level("ERROR"), Running(make(tmp_path)) as server:
+            port = server.server_address[1]
+            with monkeypatch.context() as patch:
+                patch.setattr(console_server.ConsoleHandler, "total_timeout", 1.0)
+                head = (f"POST /api/invites HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Content-Length: 200\r\n\r\n").encode("ascii")
+                sock = socket.create_connection(server.server_address, timeout=5)
+                try:
+                    sock.sendall(head)
+                    closed, elapsed, received = wait_closed(sock, b"a", 0.2, 6)
+                finally:
+                    sock.close()
+            assert closed is True
+            assert 0.7 <= elapsed <= 4
+            assert received == b""
+    finally:
+        logging.getLogger("exitnode").removeHandler(handler)
+    assert "管理网页请求处理失败" not in caplog.text + "\n".join(records)
+
+
+def test_decoy_drain_is_bounded(tmp_path):
+    # 通用 404 之后读掉后到字节也有上限：对方一直慢吞吞送，连接不能被吊在这里。
+    with Running(make(tmp_path)) as server:
+        port = server.server_address[1]
+        request = f"GET /nope HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n\r\n".encode("ascii")
+        sock = socket.create_connection(server.server_address, timeout=5)
+        try:
+            sock.sendall(request)
+            raw = b""
+            while b"\r\n\r\n" not in raw:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                raw += chunk
+            header, body = raw.split(b"\r\n\r\n", 1)
+            length = None
+            for line in header.split(b"\r\n"):
+                name, _, value = line.partition(b":")
+                if name.strip().lower() == b"content-length":
+                    length = int(value.strip())
+            while length is not None and len(body) < length:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                body += chunk
+            assert header.startswith(b"HTTP/1.0 404")
+            assert length is not None and len(body) == length
+            closed, elapsed, _ = wait_closed(sock, b"a", 0.05, 5)
+        finally:
+            sock.close()
+        assert closed is True
+        assert elapsed <= 4
+
+
+def test_source_quota_refuses_extra_connection(tmp_path):
+    # 同一个来源地址最多 per_source 条：占满之后新连接一个字节都不回，直接关掉。
+    server = make(tmp_path)
+    server.per_source = 2
+    with Running(server):
+        first = socket.create_connection(server.server_address, timeout=5)
+        second = socket.create_connection(server.server_address, timeout=5)
+        try:
+            first.sendall(b"GET ")
+            second.sendall(b"GET ")
+            time.sleep(0.3)
+            third = socket.create_connection(server.server_address, timeout=5)
+            try:
+                closed, _, received = wait_closed(third, b"", 0.2, 3)
+            finally:
+                third.close()
+            assert closed is True
+            assert received == b""
+            # 放掉一条之后名额空出来，新请求又能进来。
+            first.close()
+            time.sleep(0.5)
+            assert call(server, "/api/session")[0] == 200
+        finally:
+            first.close()
+            second.close()
+
+
+def test_other_source_is_not_blocked_by_full_quota(tmp_path):
+    # 来源上限按地址算：127.0.0.1 占满不该挡住 127.0.0.2 的正常请求。
+    server = make(tmp_path)
+    server.per_source = 2
+    with Running(server):
+        first = socket.create_connection(server.server_address, timeout=5)
+        second = socket.create_connection(server.server_address, timeout=5)
+        try:
+            first.sendall(b"GET ")
+            second.sendall(b"GET ")
+            time.sleep(0.3)
+            other = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                other.bind(("127.0.0.2", 0))
+                other.settimeout(5)
+                other.connect(server.server_address)
+                port = server.server_address[1]
+                other.sendall((f"GET /api/session HTTP/1.0\r\n"
+                               f"Host: 127.0.0.1:{port}\r\n\r\n").encode("ascii"))
+                raw = b""
+                while True:
+                    chunk = other.recv(4096)
+                    if not chunk:
+                        break
+                    raw += chunk
+                assert raw.startswith(b"HTTP/1.0 200")
+            finally:
+                other.close()
+        finally:
+            first.close()
+            second.close()
+
+
+def test_idle_connections_release_quota_at_deadline(tmp_path, monkeypatch):
+    # 闲着的连接在总时限到点被断，占用的来源名额跟着还回来。
+    server = make(tmp_path)
+    server.per_source = 2
+    with Running(server), monkeypatch.context() as patch:
+        patch.setattr(console_server.ConsoleHandler, "total_timeout", 1.0)
+        first = socket.create_connection(server.server_address, timeout=5)
+        second = socket.create_connection(server.server_address, timeout=5)
+        try:
+            first.sendall(b"GET ")
+            second.sendall(b"GET ")
+            time.sleep(2.5)
+            assert call(server, "/api/session")[0] == 200
+        finally:
+            first.close()
+            second.close()

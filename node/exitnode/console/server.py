@@ -2,6 +2,7 @@
 
 import hmac
 import http.client
+import io
 import ipaddress
 import json
 import logging
@@ -67,10 +68,15 @@ DEVICE_ROUTE = re.compile(r"^/api/devices/([A-Za-z0-9_-]{1,64})/revoke$")
 class ConsoleServer(ThreadingHTTPServer):
     daemon_threads = True
     request_queue_size = 64
+    # 每个来源地址同时最多处理这么多条连接：一台设备挂一堆慢连接，也挤不掉别的设备。
+    per_source = 8
 
     def __init__(self, *args, max_connections=32, **kwargs):
         # 先建好槽位再监听：父类构造会开始监听，但不会处理连接。
         self._slots = threading.BoundedSemaphore(max_connections)
+        # 每个来源地址正在处理的连接数：进出都拿这把锁，免得两个线程算同一份账。
+        self._source_counts = {}
+        self._source_lock = threading.Lock()
         super().__init__(*args, **kwargs)
 
     def process_request(self, request, client_address):
@@ -78,25 +84,97 @@ class ConsoleServer(ThreadingHTTPServer):
             # 超过并发上限：直接关连接，不写任何字节。
             self.shutdown_request(request)
             return
+        # 每次接受连接都现读 self.per_source，测试和运行期改它都当场生效。
+        source = client_address[0]
+        with self._source_lock:
+            count = self._source_counts.get(source, 0)
+            over = count >= self.per_source
+            if not over:
+                self._source_counts[source] = count + 1
+        if over:
+            # 这个来源地址自己的名额也满了：把刚拿到的总名额还回去，照样直接关连接。
+            self._slots.release()
+            self.shutdown_request(request)
+            return
         try:
             super().process_request(request, client_address)
         except BaseException:
+            # 线程没起来：总名额与来源计数都还回去，不然两个名额都会越漏越少。
             self._slots.release()
+            self._release_source(source)
             raise
+
+    def _release_source(self, source):
+        with self._source_lock:
+            count = self._source_counts.get(source, 0) - 1
+            if count > 0:
+                self._source_counts[source] = count
+            else:
+                # 减到 0 就把键删掉，地址换了不会在字典里越积越多。
+                self._source_counts.pop(source, None)
 
     def process_request_thread(self, request, client_address):
         try:
             super().process_request_thread(request, client_address)
         finally:
             self._slots.release()
+            self._release_source(client_address[0])
 
     def handle_error(self, request, client_address):
         logging.getLogger("exitnode").error(redact("管理网页请求处理失败"))
 
 
+class _DeadlineReader(io.RawIOBase):
+    """按整条连接的总时限读套接字的原始读取器。
+
+    为什么要有总时限：对方隔几秒送一个字节，单次读超时永远等不到，一条连接就能
+    一直占着并发名额；一条连接上等服务端等对方字节的时间加起来要有上限，名额才转得开。
+    为什么不用另一条线程去关套接字：Windows 上关套接字唤不醒卡在读上的线程，
+    外部掐断既不准，又可能把半截请求当成完整请求处理，所以在读的这条线程里自己算剩余时间。
+    """
+
+    def __init__(self, handler):
+        super().__init__()
+        self._handler = handler
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        handler = self._handler
+        remaining = handler.deadline - time.monotonic()
+        if remaining <= 0:
+            # 到总时限了：让这次读以超时的样子失败，上面按原有路径断开。
+            raise TimeoutError("这条连接等请求字节的总时限到了")
+        # 这次读最多等「剩余时间」；平时单次读的超时更小，就按它来。
+        handler.connection.settimeout(min(handler.read_timeout, remaining))
+        try:
+            return handler.connection.recv_into(buffer)
+        finally:
+            # 读完把套接字超时调回每次读该用的值，后面写应答仍按 15 秒算。
+            handler.connection.settimeout(handler.timeout)
+
+
 class ConsoleHandler(BaseHTTPRequestHandler):
     # 每连接套接字超时（秒）：读头或写响应卡住超过它就断开。
     timeout = 15
+    # 一条连接上「等对方字节」（请求行、请求头、请求体、通用 404 之后读掉的字节）
+    # 加起来最多等这么久，从 setup() 起算；处理请求和写应答的时间不算在内。
+    total_timeout = 30
+    # 通用 404 之后读掉后到字节的上限：最多读这么久、这么多字节，哪个先到就停。
+    drain_seconds = 1.0
+    drain_bytes = 65536
+
+    def setup(self):
+        super().setup()
+        # 总时限从连接建好的那一刻起算；读取器每次读都只等到这个时刻。
+        self.deadline = time.monotonic() + self.total_timeout
+        # 「这次读的超时」平时就是 timeout；_drain_input 期间临时改成 0.2 秒。
+        self.read_timeout = self.timeout
+        previous = self.rfile
+        self.rfile = io.BufferedReader(_DeadlineReader(self), io.DEFAULT_BUFFER_SIZE)
+        # 原来那个读文件对象没用了，关掉它只是少一层缓冲，套接字本身不受影响。
+        previous.close()
 
     def log_message(self, format, *args):
         pass
@@ -222,13 +300,23 @@ class ConsoleHandler(BaseHTTPRequestHandler):
     def _drain_input(self):
         # 断开前把对方已经到了的请求字节读掉：连接里留着没读的字节，
         # 系统会直接给对端回 RST，把刚写好的 404 一起冲掉。
+        # 但读掉也不能由着对方：它一直慢吞吞送字节，这条连接就一直占着名额，
+        # 所以一次最多等 0.2 秒，累计读满 drain_bytes 或累计过了 drain_seconds 就停。
+        start = time.monotonic()
+        total = 0
         try:
             self.wfile.flush()
-            self.connection.settimeout(0.2)
-            while self.rfile.read1(65536):
-                pass
+            self.read_timeout = 0.2
+            while total < self.drain_bytes and time.monotonic() - start < self.drain_seconds:
+                chunk = self.rfile.read1(min(65536, self.drain_bytes - total))
+                if not chunk:
+                    break
+                total += len(chunk)
         except OSError:
+            # 读到空、超时或对方重置：都是安静结束。
             pass
+        finally:
+            self.read_timeout = self.timeout
 
     def _static(self, target):
         name, content_type = target
