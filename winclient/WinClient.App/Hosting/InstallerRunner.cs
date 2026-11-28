@@ -114,33 +114,40 @@ public sealed class InstallerRunner
             if (!string.Equals(key.GetValue(ServiceInstaller.RunValueName) as string, value, StringComparison.Ordinal))
                 key.SetValue(ServiceInstaller.RunValueName, value, RegistryValueKind.String);
         }
-        if (ServiceInstaller.SwitchesExecutable(previous, destination)) await StartSwitchedAsync(previous);
+        if (ServiceInstaller.SwitchesExecutable(previous, destination)) await StartSwitchedAsync(previous, ServiceInstaller.ReleaseVersion(version));
         else await StartAsync();
         // 图标与卸载入口建不成只提示，不让安装失败（有的安全软件会拦桌面图标）。
         Report(EntryPoints.ForMachine().Apply(destination, ServiceInstaller.ReleaseVersion(version)), EntryPoints.ApplyFailedSuffix);
     }
 
-    /// <summary>服务原来登记的是另一份程序：先停服务，再启动新版并确认稳定；失败时改回旧版。</summary>
-    private async Task StartSwitchedAsync(string? previous)
+    /// <summary>服务原来登记的是另一份程序：先停服务，再启动新版并确认它真的起来了；没起来就改回旧版，并如实说明结果。</summary>
+    private async Task StartSwitchedAsync(string? previous, string version)
     {
         await StopServiceAsync();
         try
         {
             await StartAsync();
-            await Task.Delay(TimeSpan.FromSeconds(3));
-            if (ServiceStatus() == ServiceControllerStatus.Running) return;
-            throw SafeError("新版本的后台服务未能启动，已改回原来的版本。");
+            var host = new UpdateWindowsHost();
+            // 读到新版本的状态应答才算起来了：后台要过了数据目录核验、内核文件校验、运行时创建才会开管道。
+            if (await SwitchedStart.WaitHealthyAsync(host.ReadStatusAsync, version, () => host.Now, host.DelayAsync)) return;
+            throw new TimeoutException();
         }
         catch (Exception ex) when (ex is InvalidOperationException or IOException or UnauthorizedAccessException or
             Win32Exception or TimeoutException or OperationCanceledException)
         {
-            if (previous is null || !File.Exists(previous)) throw;
-            await RunCommandAsync(ServiceInstaller.Configure(previous, true), "改回原来的后台服务失败。");
-            using (var key = Registry.LocalMachine.CreateSubKey(ServiceInstaller.RunKey, writable: true))
-                key.SetValue(ServiceInstaller.RunValueName, ServiceInstaller.RunValue(previous), RegistryValueKind.String);
-            try { await StartAsync(); }
-            catch (Exception) { /* 改回旧版的启动失败只吞掉，仍报原来的失败。 */ }
-            throw SafeError("新版本的后台服务未能启动，已改回原来的版本。");
+            var available = previous is not null && File.Exists(previous);
+            var running = false;
+            if (available)
+            {
+                // 新版可能还在运行（进程在、管道不通），先停掉再改回，否则旧版起不来。
+                await StopServiceAsync();
+                await RunCommandAsync(ServiceInstaller.Configure(previous!, true), "改回原来的后台服务失败。");
+                using (var key = Registry.LocalMachine.CreateSubKey(ServiceInstaller.RunKey, writable: true))
+                    key.SetValue(ServiceInstaller.RunValueName, ServiceInstaller.RunValue(previous!), RegistryValueKind.String);
+                try { await StartAsync(); running = true; }
+                catch (Exception) { /* 旧版没起来：下面如实报，不说成已经好了。 */ }
+            }
+            throw SafeError(SwitchedStart.FailureMessage(available, running));
         }
     }
 
