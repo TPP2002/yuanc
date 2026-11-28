@@ -10,7 +10,7 @@ using WinClient.Core.Ipc;
 
 namespace WinClient.App.Presentation;
 
-public sealed record UiDiagnostics(string UiVersion, string ServiceVersion, string Availability, ClientSnapshot Snapshot, string UpdateStage, string UpdateMessage);
+public sealed record UiDiagnostics(string UiVersion, string ServiceVersion, string Availability, ClientSnapshot Snapshot, string UpdateStage, string UpdateMessage, string? LeakCheck = null);
 public sealed record DiagnosticsExportResult(bool Written, bool ServiceIncluded, string Message);
 
 /// <summary>导出诊断：任何情况下都写出一个脱敏文件，结果显示在「更新与诊断」页。</summary>
@@ -72,7 +72,8 @@ public static class DiagnosticsExport
             ["routing_mode"] = DiagnosticsRedactor.Redact(snapshot.RoutingMode),
             ["routing_apps"] = apps,
             ["update_stage"] = DiagnosticsRedactor.Redact(ui.UpdateStage),
-            ["update_message"] = DiagnosticsRedactor.Redact(ui.UpdateMessage)
+            ["update_message"] = DiagnosticsRedactor.Redact(ui.UpdateMessage),
+            ["leak_check"] = ui.LeakCheck is null ? null : DiagnosticsRedactor.Redact(ui.LeakCheck)
         };
     }
 

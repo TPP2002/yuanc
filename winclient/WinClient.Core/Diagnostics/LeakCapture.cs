@@ -23,7 +23,7 @@ public sealed record LeakCheckResult(int ExitCode, string? Reason, LeakVerdict? 
 public sealed class LeakCapture(ICommandRunner runner, ITcpTable tcp, IUdpTable udp,
     Func<IReadOnlySet<IPAddress>?>? localAddresses = null, Func<TimeSpan, CancellationToken, Task>? delay = null)
 {
-    private const string NodeMissing = "未找到隧道内核的连接，请先连接，或用 --node 指定节点地址";
+    public const string NodeMissing = "未找到隧道内核的连接，请先连接，或用 --node 指定节点地址";
     private readonly Func<TimeSpan, CancellationToken, Task> wait = delay ?? ((span, cancel) => Task.Delay(span, cancel));
     private readonly Func<IReadOnlySet<IPAddress>?> locals = localAddresses ?? SystemLocalAddresses;
 
