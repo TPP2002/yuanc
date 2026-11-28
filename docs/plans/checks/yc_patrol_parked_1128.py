@@ -229,7 +229,7 @@ def tests_problems(new, old):
         was, now = member(old, f"public {kind} {name}("), member(new, f"public {kind} {name}(")
         if not now:
             bad.append(f"既有用例 {name} 不见了(不许改名、不许删)")
-        elif [l.strip() for l in was.splitlines() if "Assert." in l] != [l.strip() for l in now.splitlines() if "Assert." in l]:
+        elif [line.strip() for line in was.splitlines() if "Assert." in line] != [line.strip() for line in now.splitlines() if "Assert." in line]:
             bad.append(f"既有用例 {name} 里带 Assert. 的行被改了")
     known = {name for _, name in old_tests}
     for name, tokens in NEW_TESTS.items():
