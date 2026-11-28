@@ -1,0 +1,121 @@
+{
+  "schemaVersion": 1,
+  "taskId": "NODE-INIT-RESCUE-FACTORY-1127",
+  "slug": "yc-init-rescue-factory-1128",
+  "title": "节点重跑安装不再卡在救援那步:出厂包完整就不动、半截就重建,救援代码不一致时给出管用的提示",
+  "goal": "以派单时 origin/main 头为基点。看板卡 NODE-INIT-RESCUE-FACTORY-1127。\n\n【问题】\n节点的 exitnode init 在「安装救援单元」一步(node/exitnode/cli.py 里 _install 的内嵌函数 install_rescue)把当前程序与两处已有内容逐文件比哈希:独立救援代码 /opt/exitnode-rescue/exitnode_rescue、出厂包 /opt/exitnode-rescue/factory。任一处不同就报「已有救援包内容不同，请维护人员确认；更新代码请用 rescue refresh」。两个毛病:\n\n1. 出厂包本来就不该和当前程序一样。升级后它还是旧版本,要等新版本稳定运行满二十四小时,由救援自己「提升」(rescue/actions.py 的 promote)。升级后先 rollback 或 uninstall 再重跑 init,必然卡在这里:这两条命令保留 /opt/exitnode-rescue,但会撤掉安装清单里「安装救援单元」这一步,重跑时这一步要重新执行。提示让人运行 rescue refresh,而它只更新独立救援代码、不碰出厂包,照做后仍然失败。\n2. 首次安装复制出厂包到一半中断(断电、被打断),留下半个目录,重跑 init 同样永远卡在这里。\n\n升级后不撤回、直接重跑 init 不会卡:那一步在安装清单里已完成,会被跳过。这条现状要保住。\n\n【要的行为】\n只改 install_rescue 里「建目录之后、写救援服务文件之前」那一段,即现在 `runner.mkdir(rescue_probes.RESCUE, 0o755)` 这一行之后、`for unit in sorted(rescue_units):` 这一行之前的那个 for 循环(共 7 行)。这两行本身和 cli.py 其余部分一个字不动。\n\n① 独立救援代码(/opt/exitnode-rescue/exitnode_rescue):不存在就从当前程序的 exitnode/rescue 复制;存在且与当前程序自带的逐文件哈希不同,抛 ValueError,文字一字不差:「独立救援代码与当前程序自带的不一致，请先运行 exitnode rescue refresh，再重跑安装」。安装不替维护人员换这份代码,不调用 refresh。\n② 出厂包(/opt/exitnode-rescue/factory):\n   - 不存在:从当前版本目录复制。\n   - 存在且 layout.valid_release(runner, 出厂包路径) 为真(清单与文件哈希对得上):不管版本和当前程序是否相同都不动、不比较、不提示。\n   - 存在但校验不过(半截或损坏):先 runner.remove_tree 删掉,再从当前版本目录复制,并 successful.append(\"出厂包不完整，已按当前程序重建\")(文字一字不差;successful 是 _install 里已有的列表)。\n③ 旧提示「已有救援包内容不同，请维护人员确认；更新代码请用 rescue refresh」从代码里删掉。\n④ 照抄下面这段代码,替换那个 for 循环(每行前面的缩进照原样,最少 12 个空格):\n\n```python\n            runner.mkdir(rescue_probes.RESCUE, 0o755)\n            code = rescue_probes.RESCUE + \"/exitnode_rescue\"\n            if not runner.exists(code):\n                runner.copy_tree(source, code)\n            elif layout.hashes(runner, source) != layout.hashes(runner, code):\n                # 独立救援代码只由 rescue refresh 更新，安装不替维护人员换。\n                raise ValueError(\"独立救援代码与当前程序自带的不一致，请先运行 exitnode rescue refresh，再重跑安装\")\n            factory = rescue_probes.FACTORY\n            if not runner.exists(factory):\n                runner.copy_tree(current, factory)\n            elif not layout.valid_release(runner, factory):\n                # 上次复制到一半就停了，或文件坏了：救援用不了这一份，按当前程序重建。\n                runner.remove_tree(factory)\n                runner.copy_tree(current, factory)\n                successful.append(\"出厂包不完整，已按当前程序重建\")\n            # 出厂包完整时不管版本和当前程序是否相同都不动：换成新版本是救援「提升」的事。\n```\n\n【测试】\n在 node/tests/test_cli.py 的末尾照抄加入下面两个辅助函数和四个用例。名字、参数、断言一字不差;文件里原有的内容一个字不动(新内容只许加在末尾,与原有最后一个函数之间空两行)。\n\n```python\ndef simulate_upgrade(runner, version):\n    \"\"\"模拟更新器换版本：复制当前版本目录、改一个文件、重写清单、切 current。\"\"\"\n    from exitnode.updater import layout\n\n    old = runner.readlink(\"/opt/exitnode/current\")\n    new = \"/opt/exitnode/releases/\" + version\n    runner.copy_tree(old, new)\n    runner.write_file(new + \"/exitnode/__init__.py\", f'__version__ = \"{version}\"\\n', 0o644)\n    files = layout.hashes(runner, new)\n    files.pop(\"manifest.json\")\n    manifest = json.loads(runner.read_file(new + \"/manifest.json\"))\n    manifest.update(version=version, files=files)\n    runner.write_file(new + \"/manifest.json\", json.dumps(manifest), 0o644)\n    runner.links[\"/opt/exitnode/current\"] = new\n    assert layout.valid_release(runner, new)\n\n\ndef rescue_tree(runner, name):\n    prefix = \"/opt/exitnode-rescue/\" + name + \"/\"\n    return {p: v for p, v in runner.files.items() if p.startswith(prefix)}\n\n\n@pytest.mark.parametrize(\"command\", [\"rollback\", \"uninstall\"])\ndef test_reinit_after_upgrade_and_removal_keeps_older_factory(command, capsys):\n    from exitnode.updater import layout\n\n    runner = fake(pairing=True)\n    assert main([\"init\"], runner) == 0\n    simulate_upgrade(runner, \"0.2.0\")\n    factory = rescue_tree(runner, \"factory\")\n    assert main([command], runner) == 0\n    capsys.readouterr()\n    assert main([\"init\"], runner) == 0\n    out = capsys.readouterr().out\n    assert \"安装救援单元：已完成；\" in out\n    assert \"出厂包不完整\" not in out\n    # 出厂包还是升级前那一版，一个字节不动；换成新版本是救援「提升」的事。\n    assert rescue_tree(runner, \"factory\") == factory\n    assert json.loads(runner.read_file(\"/opt/exitnode-rescue/factory/manifest.json\"))[\"version\"] == \"0.1.0\"\n    assert layout.valid_release(runner, \"/opt/exitnode-rescue/factory\")\n    assert runner.readlink(\"/opt/exitnode/current\") == \"/opt/exitnode/releases/0.2.0\"\n\n\ndef test_init_rebuilds_incomplete_factory(capsys):\n    from exitnode.updater import layout\n\n    runner = fake(pairing=True)\n    runner.write_file(\"/opt/exitnode-rescue/factory/exitnode/__init__.py\", \"半截\", 0o644)\n    assert main([\"init\"], runner) == 0\n    assert \"出厂包不完整，已按当前程序重建\" in capsys.readouterr().out\n    current = runner.readlink(\"/opt/exitnode/current\")\n    assert layout.valid_release(runner, \"/opt/exitnode-rescue/factory\")\n    assert layout.hashes(runner, \"/opt/exitnode-rescue/factory\") == layout.hashes(runner, current)\n    # 完整的出厂包再跑一遍安装不会被重建。\n    factory = rescue_tree(runner, \"factory\")\n    assert main([\"rollback\"], runner) == 0\n    capsys.readouterr()\n    assert main([\"init\"], runner) == 0\n    assert \"出厂包不完整\" not in capsys.readouterr().out\n    assert rescue_tree(runner, \"factory\") == factory\n\n\ndef test_init_points_to_refresh_when_rescue_code_differs(capsys):\n    runner = fake(pairing=True)\n    assert main([\"init\"], runner) == 0\n    assert main([\"rollback\"], runner) == 0\n    path = \"/opt/exitnode-rescue/exitnode_rescue/actions.py\"\n    original = runner.files[path]\n    runner.files[path] = \"# older rescue code\\n\"\n    factory = rescue_tree(runner, \"factory\")\n    capsys.readouterr()\n    assert main([\"init\"], runner) == 1\n    out = capsys.readouterr().out\n    assert \"独立救援代码与当前程序自带的不一致，请先运行 exitnode rescue refresh，再重跑安装\" in out\n    assert \"已有救援包内容不同\" not in out\n    # 安装不替维护人员换救援代码，出厂包也不动。\n    assert runner.files[path] == \"# older rescue code\\n\"\n    assert rescue_tree(runner, \"factory\") == factory\n    # 刷新之后（这里直接放回一致的内容）重跑安装能走完。\n    runner.files[path] = original\n    assert main([\"init\"], runner) == 0\n\n\ndef test_reinit_after_upgrade_skips_finished_rescue_step(capsys):\n    runner = fake(pairing=True)\n    assert main([\"init\"], runner) == 0\n    simulate_upgrade(runner, \"0.2.0\")\n    factory = rescue_tree(runner, \"factory\")\n    capsys.readouterr()\n    assert main([\"init\"], runner) == 0\n    assert \"安装救援单元：已完成，跳过\" in capsys.readouterr().out\n    assert rescue_tree(runner, \"factory\") == factory\n```\n\n【验收怎么对上】\n- T-CLI(node/tests/test_cli.py 整份)标了「旧代码上必须红」:把新用例放到改动前的代码上,test_reinit_after_upgrade_and_removal_keeps_older_factory 的两个参数、test_init_rebuilds_incomplete_factory、test_init_points_to_refresh_when_rescue_code_differs 共四条是红的;test_reinit_after_upgrade_skips_finished_rescue_step 是回归护栏,旧代码上也过。\n- SHAPE 逐字核对:cli.py 在那一段之外没有改动;那一段里有两句新文字、有校验、有删除再复制、有写成功项;旧提示不在了;没有调用 refresh。\n- TESTS 核对:原有函数一个没少、一个字没改;两个辅助函数和四个用例都在,关键断言都在;没有新增跳过或预期失败。\n- SCOPE:只许改 node/exitnode/cli.py、node/tests/test_cli.py。\n\n【交活说明要写】\n逐条对照 ①~④ 和四个用例写做到了没有;单列只有真机能验的一条:在真节点上升级后 rollback 再 init 能走完,出厂包仍是旧版本。",
+  "background": "先读(全文或点到的函数):\n- node/exitnode/cli.py:_install 整个函数,重点是内嵌的 apply、install_rescue,以及模块级的 refresh(本单不改它)。\n- node/exitnode/manifest.py:Manifest.apply。已完成的步骤再次 init 时跳过;rollback、uninstall 会把步骤从清单里撤掉。\n- node/exitnode/updater/layout.py:hashes、valid_release、current_target、bootstrap。\n- node/exitnode/rescue/probes.py(RESCUE、FACTORY 两个路径)、node/exitnode/rescue/actions.py(promote、promotable、_reinstall:出厂包由谁在什么时候换)。\n- node/tests/test_cli.py:fake()、test_repeated_init_does_not_repeat_commands_and_uninstall_keeps_secrets、test_all_removal_paths_preserve_rescue。\n- docs/plans/checks/yc_init_rescue_factory_1128.py:验收检查脚本,只读,不许改。\n\n派单方已经做过的核对:\n- 在测试替身上复现了四种情形:升级后直接重跑 init(过,救援那步被跳过);升级后 rollback 或 uninstall 再重跑(卡在旧提示,照提示刷新后仍卡);出厂包只有半个目录(卡);没升级时 rollback 再重跑(过)。\n- 把 goal 里的代码和用例照抄进一份草稿副本后,四个新用例和既有的 test_repeated_init…、test_init_failure_can_resume… 都通过;改动前的代码上前三个新用例是红的。\n\n环境与规矩:\n- 本机是 Windows。node/tests 全部走 FakeRunner,不需要 Linux,也不要去碰真实的 /opt 目录。\n- 命令单独一条执行:不要写 cd &&、管道、2>&1。\n- 规范检查的规则集见仓根 pyproject.toml(没有启用行宽规则,goal 里那行较长的提示语照抄即可)。\n- 说明文档(docs/node/救援单元说明.md、口径速查表)由派单方在合并后另改,本单不碰 docs/。",
+  "nonGoals": [
+    "不改 node/exitnode/rescue/ 下任何文件(提升、重装、刷新、探针的逻辑都不动)",
+    "不改 cli.py 里的 refresh(),不让 init 自动刷新独立救援代码",
+    "不改安装清单 manifest.py 和 updater/ 下的文件",
+    "同版本换代码时出厂包不跟着换(开发期场景,删掉出厂包目录再重跑安装即可)",
+    "不写 docs/ 下任何文档",
+    "不做真机实测"
+  ],
+  "allowedPaths": [
+    "node/exitnode/cli.py",
+    "node/tests/test_cli.py"
+  ],
+  "forbiddenPaths": [
+    ".codex/**",
+    ".github/**",
+    ".gitignore",
+    "pyproject.toml",
+    "requirements-dev.txt",
+    "winclient/**",
+    "scripts/**",
+    "authserver/**",
+    "docs/**",
+    "node/examples/**",
+    "node/exitnode/templates/**",
+    "node/exitnode/rescue/**",
+    "node/exitnode/updater/**",
+    "node/exitnode/watchdog/**",
+    "node/exitnode/console/**",
+    "node/exitnode/manifest.py",
+    "node/exitnode/runner.py"
+  ],
+  "expectArtifacts": [],
+  "acceptance": [
+    {
+      "id": "T-CLI",
+      "kind": "test:targeted",
+      "target": "node/tests/test_cli.py",
+      "required": true,
+      "failsOnBase": true
+    },
+    {
+      "id": "PYTEST",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "pytest",
+        "-q"
+      ],
+      "required": true,
+      "timeoutSec": 1500
+    },
+    {
+      "id": "RUFF",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "ruff",
+        "check",
+        "node",
+        "authserver"
+      ],
+      "required": true,
+      "timeoutSec": 300
+    },
+    {
+      "id": "SHAPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_init_rescue_factory_1128.py",
+        "shape"
+      ],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "TESTS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_init_rescue_factory_1128.py",
+        "tests"
+      ],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "SCOPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_init_rescue_factory_1128.py",
+        "scope"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "timeoutSec": 5400,
+  "repoRoot": "E:/yuanc",
+  "steps": [
+    "读 background 列出的文件与检查脚本。",
+    "先写测试:在 node/tests/test_cli.py 末尾照抄 goal 里的两个辅助函数和四个用例;申请 T-CLI 证红(前三个新用例共四条红)。",
+    "按 goal ①~④ 改 cli.py 的 install_rescue 那一段,T-CLI 转绿。",
+    "PYTEST、RUFF、SHAPE、TESTS、SCOPE 全绿后交活;交活说明照 goal 末尾的要求写。"
+  ]
+}
