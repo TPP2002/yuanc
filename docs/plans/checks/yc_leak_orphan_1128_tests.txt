@@ -1,0 +1,223 @@
+using System.ComponentModel;
+using System.Diagnostics;
+using System.Net;
+using WinClient.Core.Diagnostics;
+using WinClient.Core.Firewall;
+using WinClient.Core.Network;
+using Xunit;
+
+namespace WinClient.Tests;
+
+/// <summary>泄漏检测做到一半进程被结束,系统抓包没人停:靠输出目录里的记号认出来,后台服务启动时清掉。</summary>
+public sealed class LeakOrphanCaptureTests
+{
+    private static readonly IPAddress Local = IPAddress.Parse("192.168.1.5");
+    private static readonly DateTime Started = new(2026, 11, 28, 21, 3, 5);
+
+    [Fact]
+    public async Task MarkerExistsOnlyWhileCapturing()
+    {
+        using var dir = new TempDirectory();
+        var marker = Path.Combine(dir.Path, LeakCapture.RunningMarker);
+        var seen = new List<string>();
+        var runner = new Runner { OnCall = info => seen.Add($"{info.ArgumentList[0]}:{File.Exists(marker)}") };
+        var result = await Capture(runner).RunAsync(Options(dir.Path), CancellationToken.None);
+        Assert.NotNull(result.Verdict);
+        Assert.Equal("capture.running", LeakCapture.RunningMarker);
+        Assert.Equal(["filter:False", "start:True", "stop:True", "etl2pcap:True"], seen);
+        Assert.Empty(Directory.GetFiles(dir.Path));
+    }
+
+    [Theory]
+    [InlineData("filter")]
+    [InlineData("start")]
+    [InlineData("stop")]
+    [InlineData("etl2pcap")]
+    public async Task MarkerIsRemovedWhenStepFails(string verb)
+    {
+        using var dir = new TempDirectory();
+        var result = await Capture(new Runner { FailOn = verb }).RunAsync(Options(dir.Path), CancellationToken.None);
+        Assert.Equal(2, result.ExitCode);
+        Assert.Empty(Directory.GetFiles(dir.Path));
+    }
+
+    [Fact]
+    public async Task MarkerIsRemovedWhenKeepingCapture()
+    {
+        using var dir = new TempDirectory();
+        var result = await Capture(new Runner()).RunAsync(Options(dir.Path) with { KeepCapture = true }, CancellationToken.None);
+        Assert.NotNull(result.Verdict);
+        Assert.Equal(["capture.etl", "capture.pcapng"], Names(dir.Path));
+    }
+
+    [Fact]
+    public async Task MarkerIsRemovedWhenCancelled()
+    {
+        using var dir = new TempDirectory();
+        var runner = new Runner();
+        var capture = Capture(runner, (_, _) => Task.FromCanceled(new CancellationToken(true)));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => capture.RunAsync(Options(dir.Path), CancellationToken.None));
+        Assert.Equal(["filter", "start", "stop"], runner.Verbs);
+        Assert.Empty(Directory.GetFiles(dir.Path));
+    }
+
+    [Fact]
+    public async Task CleanupStopsOnceAndRemovesOnlyMarkedCaptures()
+    {
+        using var root = new TempDirectory();
+        var first = Seed(root.Path, "20261128-210305", true);
+        var second = Seed(root.Path, "20261128-221500", true);
+        var kept = Seed(root.Path, "20261127-090000", false);
+        var runner = new Runner();
+        Assert.Equal(2, await Capture(runner).CleanupOrphansAsync(root.Path, CancellationToken.None));
+        var call = Assert.Single(runner.Calls);
+        Assert.Equal(["stop"], call.ArgumentList);
+        Assert.True(call.CreateNoWindow);
+        Assert.False(call.UseShellExecute);
+        Assert.Equal(ProcessWindowStyle.Hidden, call.WindowStyle);
+        Assert.EndsWith("pktmon.exe", call.FileName, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(["leak-report.json"], Names(first));
+        Assert.Equal(["leak-report.json"], Names(second));
+        Assert.Equal(["capture.etl", "capture.pcapng", "leak-report.json"], Names(kept));
+        // 清过一次就没有记号了,再清什么都不做。
+        Assert.Equal(0, await Capture(runner).CleanupOrphansAsync(root.Path, CancellationToken.None));
+        Assert.Single(runner.Calls);
+    }
+
+    [Fact]
+    public async Task CleanupWithoutMarkerDoesNothing()
+    {
+        using var root = new TempDirectory();
+        var kept = Seed(root.Path, "20261127-090000", false);
+        var runner = new Runner();
+        Assert.Equal(0, await Capture(runner).CleanupOrphansAsync(root.Path, CancellationToken.None));
+        Assert.Equal(0, await Capture(runner).CleanupOrphansAsync(Path.Combine(root.Path, "missing"), CancellationToken.None));
+        Assert.Empty(runner.Calls);
+        Assert.Equal(["capture.etl", "capture.pcapng", "leak-report.json"], Names(kept));
+    }
+
+    [Fact]
+    public async Task CleanupRemovesFilesEvenWhenStopFails()
+    {
+        using var root = new TempDirectory();
+        // 重启过电脑以后抓包早就没了,这时停抓包会报错,文件照样要清。
+        var notRunning = Seed(root.Path, "20261128-210305", true);
+        Assert.Equal(1, await Capture(new Runner { FailOn = "stop" }).CleanupOrphansAsync(root.Path, CancellationToken.None));
+        Assert.Equal(["leak-report.json"], Names(notRunning));
+
+        var noPktmon = Seed(root.Path, "20261128-221500", true);
+        var runner = new Runner { OnCall = _ => throw new Win32Exception(2) };
+        Assert.Equal(1, await Capture(runner).CleanupOrphansAsync(root.Path, CancellationToken.None));
+        Assert.Equal(["leak-report.json"], Names(noPktmon));
+    }
+
+    [Fact]
+    public async Task CleanupCancelledLeavesMarkerForNextTime()
+    {
+        using var root = new TempDirectory();
+        var directory = Seed(root.Path, "20261128-210305", true);
+        var runner = new Runner { OnCall = _ => throw new OperationCanceledException() };
+        Assert.Equal(0, await Capture(runner).CleanupOrphansAsync(root.Path, CancellationToken.None));
+        Assert.Equal(["capture.etl", "capture.pcapng", "capture.running", "leak-report.json"], Names(directory));
+    }
+
+    [Fact]
+    public async Task ServiceCheckerCleansOnceAtCreationAndDetectionWaitsForIt()
+    {
+        using var temp = new TempDirectory();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var cleanups = 0;
+        var captures = 0;
+        var checker = Checker(temp.Path, () => { Interlocked.Increment(ref cleanups); entered.SetResult(); return gate.Task; },
+            () => Interlocked.Increment(ref captures));
+        // 没人点检测也清:建出来就开始。
+        await entered.Task.WaitAsync(TimeSpan.FromSeconds(30));
+        var first = checker.RunAsync(CancellationToken.None);
+        Assert.False(first.IsCompleted);
+        Assert.Equal(0, Volatile.Read(ref captures));
+        gate.SetResult();
+        Assert.StartsWith("未发现可疑流量。", await first);
+        await checker.RunAsync(CancellationToken.None);
+        Assert.Equal(2, Volatile.Read(ref captures));
+        Assert.Equal(1, Volatile.Read(ref cleanups));
+    }
+
+    [Fact]
+    public async Task ServiceCheckerStillDetectsWhenCleanupFails()
+    {
+        using var temp = new TempDirectory();
+        var thrown = Checker(temp.Path, () => throw new IOException("清不掉"));
+        Assert.StartsWith("未发现可疑流量。", await thrown.RunAsync(CancellationToken.None));
+        var faulted = Checker(temp.Path, () => Task.FromException(new InvalidOperationException("清不掉")));
+        Assert.StartsWith("未发现可疑流量。", await faulted.RunAsync(CancellationToken.None));
+        var cancelled = Checker(temp.Path, () => Task.FromCanceled(new CancellationToken(true)));
+        Assert.StartsWith("未发现可疑流量。", await cancelled.RunAsync(CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task ServiceCheckerWithoutCleanupDetectsAsBefore()
+    {
+        using var temp = new TempDirectory();
+        var captures = 0;
+        var checker = Checker(temp.Path, null, () => captures++);
+        Assert.StartsWith("未发现可疑流量。", await checker.RunAsync(CancellationToken.None));
+        Assert.Equal(1, captures);
+    }
+
+    private static Task NoDelay(TimeSpan span, CancellationToken token) => Task.CompletedTask;
+    private static LeakCheckOptions Options(string dir) => new(1, "13.237.1.2", dir, false, false, [], null);
+    private static LeakCapture Capture(Runner runner, Func<TimeSpan, CancellationToken, Task>? delay = null) =>
+        new(runner, new NoTcp(), new NoUdp(), () => new HashSet<IPAddress> { Local }, delay ?? NoDelay);
+
+    private static ServiceLeakChecker Checker(string root, Func<Task>? cleanup, Action? onCapture = null) => new(
+        (_, _) => { onCapture?.Invoke(); return Task.FromResult(new LeakCheckResult(0, null, new LeakVerdict(10, 8, 2, 0, []))); },
+        (seconds, node, directory, keep) => new LeakCheckOptions(seconds, node, directory, keep, false, [], null),
+        () => null, () => Started, root, (_, _) => { }, cleanup);
+
+    // 一次检测留下的目录:抓包文件两个、报告一个;marked 表示上次没收尾,记号还在。
+    private static string Seed(string root, string name, bool marked)
+    {
+        var directory = Directory.CreateDirectory(Path.Combine(root, name)).FullName;
+        foreach (var file in new[] { "capture.etl", "capture.pcapng", "leak-report.json" })
+            File.WriteAllText(Path.Combine(directory, file), "x");
+        if (marked) File.WriteAllText(Path.Combine(directory, LeakCapture.RunningMarker), "");
+        return directory;
+    }
+
+    private static List<string> Names(string directory) =>
+        Directory.GetFiles(directory).Select(path => new FileInfo(path).Name).OrderBy(name => name, StringComparer.Ordinal).ToList();
+
+    private sealed class NoTcp : ITcpTable
+    {
+        public IReadOnlyList<TcpEntry> Snapshot() => [];
+        public bool Reset(TcpEntry entry) => false;
+    }
+
+    private sealed class NoUdp : IUdpTable
+    {
+        public IReadOnlyList<UdpEntry> Snapshot() => [];
+    }
+
+    private sealed class Runner : ICommandRunner
+    {
+        public string? FailOn { get; init; }
+        public Action<ProcessStartInfo>? OnCall { get; init; }
+        public List<ProcessStartInfo> Calls { get; } = [];
+        public List<string> Verbs => Calls.Select(call => call.ArgumentList[0]).ToList();
+
+        public Task<CommandResult> RunAsync(ProcessStartInfo startInfo, CancellationToken cancellationToken = default)
+        {
+            Calls.Add(startInfo);
+            OnCall?.Invoke(startInfo);
+            var verb = startInfo.ArgumentList[0];
+            if (verb == FailOn) return Task.FromResult(new CommandResult(1, ""));
+            if (verb == "start")
+                File.WriteAllText(startInfo.ArgumentList[startInfo.ArgumentList.IndexOf("--file-name") + 1], "etl");
+            if (verb == "etl2pcap")
+                File.WriteAllBytes(startInfo.ArgumentList[startInfo.ArgumentList.IndexOf("--out") + 1],
+                    PcapBuilder.File(PcapBuilder.Shb(), PcapBuilder.Idb(1)));
+            return Task.FromResult(new CommandResult(0, ""));
+        }
+    }
+}

@@ -1,0 +1,159 @@
+{
+  "schemaVersion": 1,
+  "taskId": "WINCLIENT-LEAKCHECK-ORPHAN-CAPTURE-1128",
+  "slug": "yc-leak-orphan-1128",
+  "title": "泄漏检测做到一半进程被结束:留下的系统抓包和抓包文件,后台服务下次启动时清掉",
+  "goal": "一、要解决什么\n\n卡:WINCLIENT-LEAKCHECK-ORPHAN-CAPTURE-1128。\n\n泄漏检测(LeakCapture.RunAsync)用系统自带的 pktmon 抓包:pktmon start → 等 120 秒 → pktmon stop → 转格式 → 分析,停抓包和删抓包文件都在 finally 里。检测做到一半进程被结束时(后台服务自动更新换版、崩溃、被手动结束;命令行检测的窗口被关掉)finally 没机会跑:系统抓包没人停,一直抓到重启电脑;抓包文件 capture.etl 留在数据目录里。\n\n做法(三件事):\n1. 开始抓包之前,在这次检测的输出目录里写一个空的记号文件 capture.running;检测收尾时(成功、失败、被取消都算)删掉。进程中途被结束,记号就留下了。\n2. LeakCapture 加一个方法 CleanupOrphansAsync(root, token),清上次没收尾的抓包:在 root 下面各次检测的目录里找记号。一个记号都没有,什么都不做(不调 pktmon)。有记号:调一次 pktmon stop,不看它成不成(重启过电脑以后抓包早就没了,这时 stop 会报错);再把带记号的目录里的 capture.etl、capture.pcapng 和记号删掉。报告 leak-report.json 不动;没有记号的目录一个文件都不动。\n3. 后台服务用的检测器 ServiceLeakChecker 建出来的时候就在后台清一次(不等人点检测);每次检测开始前先等这次清理结束,清理出了错不拦检测。生产接线 CreateProduction() 传入清理动作,最多等 15 秒。\n\n改两个产品文件,新增一个测试文件(用命令写出,不手写)。别的文件一个不动:ControlService.cs 调的 ServiceLeakChecker.CreateProduction() 签名没变,不用改。\n\n二、两个产品文件怎么改\n\n下面每一处的代码照抄:一句一行,不拆行、不合并、不改名字、不加别的代码。缩进随意;注释随意加,但要单独占一行、以 // 开头(不要写在代码行的末尾)。「这一行」指改动前文件里去掉缩进后正好是这句话的那一行,每句在文件里只出现一次。\n\n(1) winclient/WinClient.Core/Diagnostics/LeakCapture.cs(只加行,原来的行一个字不动)\n\na) 记号文件的名字。找到这一行:\n      public const string NodeMissing = \"未找到隧道内核的连接，请先连接，或用 --node 指定节点地址\";\n   在它后面加 1 行:\n      public const string RunningMarker = \"capture.running\";\n\nb) 这次检测的记号路径。找到这一行:\n      var pcap = Path.Combine(options.OutputDirectory, \"capture.pcapng\");\n   在它后面加 1 行:\n      var marker = Path.Combine(options.OutputDirectory, RunningMarker);\n\nc) 开始抓包之前写记号。找到这一行:\n      if (await Step([\"filter\", \"remove\"], token) is { } filterFailed) return Unable(filterFailed);\n   在它后面加 1 行:\n      TryWrite(marker);\n\nd) 收尾的最后删记号。找到这一行:\n      if (!options.KeepCapture) { TryDelete(etl); TryDelete(pcap); }\n   在它后面加 1 行:\n      TryDelete(marker);\n\ne) 清上次没收尾的抓包的方法。找到这一行:\n      private static LeakCheckResult Analyze(LeakCheckOptions options, string pcap, IReadOnlySet<IPAddress> local,\n   在它前面加 21 行:\n      public async Task<int> CleanupOrphansAsync(string root, CancellationToken token)\n      {\n          string[] markers;\n          try\n          {\n              if (!Directory.Exists(root)) return 0;\n              markers = Directory.GetDirectories(root).Select(directory => Path.Combine(directory, RunningMarker)).Where(File.Exists).ToArray();\n          }\n          catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return 0; }\n          if (markers.Length == 0) return 0;\n          try { await Step([\"stop\"], token).ConfigureAwait(false); }\n          catch (OperationCanceledException) { return 0; }\n          foreach (var marker in markers)\n          {\n              var directory = Path.GetDirectoryName(marker)!;\n              TryDelete(Path.Combine(directory, \"capture.etl\"));\n              TryDelete(Path.Combine(directory, \"capture.pcapng\"));\n              TryDelete(marker);\n          }\n          return markers.Length;\n      }\n\nf) 写记号的小函数(写不成不拦检测)。找到这一行:\n      private static IReadOnlySet<IPAddress>? SystemLocalAddresses()\n   在它前面加 5 行:\n      private static void TryWrite(string path)\n      {\n          try { File.WriteAllText(path, \"\"); }\n          catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }\n      }\n\n(2) winclient/WinClient.Core/Diagnostics/LeakCheckService.cs(除下面写明换掉的两行以外,原来的行一个字不动)\n\na) 主构造函数多一个可选参数 cleanup。找到这一行:\n      Func<string?> node, Func<DateTime> now, string root, Action<string, string>? write = null) : ILeakChecker\n   把它换成这 2 行:\n      Func<string?> node, Func<DateTime> now, string root, Action<string, string>? write = null,\n      Func<Task>? cleanup = null) : ILeakChecker\n\nb) 建出来就在后台清一次。找到这一行:\n      private readonly Action<string, string> writeReport = write ?? WriteReport;\n   在它后面加 1 行:\n      private readonly Task startup = cleanup is null ? Task.CompletedTask : Task.Run(cleanup);\n\nc) 每次检测先等清理结束,不看成败。找到这一行:\n      var started = now();\n   在它前面加 1 行:\n      await Task.WhenAny(startup).ConfigureAwait(false);\n\nd) 生产接线传入清理动作。找到这一行:\n      () => LeakCheckPlan.NodeFromKernelConfig(LeakCheckPlan.KernelConfigPath), () => DateTime.Now, LeakCheckPlan.OutputRoot);\n   把它换成这 2 行:\n      () => LeakCheckPlan.NodeFromKernelConfig(LeakCheckPlan.KernelConfigPath), () => DateTime.Now, LeakCheckPlan.OutputRoot,\n      cleanup: () => CleanupAsync(capture, LeakCheckPlan.OutputRoot));\n\ne) 清理动作:最多等 15 秒。找到这一行:\n      private static void WriteReport(string path, string text)\n   在它前面加 5 行:\n      private static async Task CleanupAsync(LeakCapture capture, string root)\n      {\n          using var limit = new CancellationTokenSource(TimeSpan.FromSeconds(15));\n          await capture.CleanupOrphansAsync(root, limit.Token).ConfigureAwait(false);\n      }\n\n三、帮你看懂\n\n- 记号为什么在 pktmon filter remove 之后、pktmon start 之前写:start 一成功抓包就在跑了,记号要先于它落盘;start 没成功时 finally 会把记号删掉,不会留下假记号。\n- TryDelete(marker) 放在 finally 的最后:记号从开始抓包前一直留到整个检测收完尾,转格式期间也在。\n- CleanupOrphansAsync 为什么不看 pktmon stop 的结果:Step 在命令退出码不是 0、或 pktmon 根本起不来(Win32Exception、InvalidOperationException)时返回一句原因,不抛异常;这两种情况文件照样要清。Step 不接「被取消」(OperationCanceledException),取消会原样抛出来:这时抓包可能还在跑、文件还被占着,所以直接返回 0,记号留着下次再清。\n- 停抓包必须走现有的 Step:它已经把窗口藏好了(CreateNoWindow、UseShellExecute=false、WindowStyle.Hidden)。不许另写启动进程的代码。\n- startup 为什么用 Task.Run(cleanup):检测器是在后台服务启动的路上建出来的,停抓包最长要等 15 秒,不能拖住服务启动。\n- RunAsync 里为什么写 await Task.WhenAny(startup) 而不是 await startup:只等它结束,不把清理里的异常抛给检测;清理失败了检测照常做。\n- 测试里的 Runner 是假的命令执行器,不会真的调 pktmon;整套测试不碰系统抓包、不弹窗口、不真的等时间。\n\n四、测试文件:用命令写出,不许手改\n\n测试文件的正本在 docs/plans/checks/yc_leak_orphan_1128_tests.txt。单独执行这一条命令,把它原样写成 winclient/WinClient.Tests/LeakOrphanCaptureTests.cs:\n\npython docs/plans/checks/yc_leak_orphan_1128.py write-tests\n\n这份测试在改动前的代码上编译不过(LeakCapture.RunningMarker、CleanupOrphansAsync、ServiceLeakChecker 的 cleanup 参数都还不存在),这就是证红。\n\n五、检查脚本核什么(脚本:docs/plans/checks/yc_leak_orphan_1128.py,只读)\n\nSHAPE:两个产品文件各自去掉每行首尾空白、去掉空行和以 // 开头的注释行以后,必须正好等于「改动前的文件照二里的改法改完」的样子。多一句、少一句、改一个字、把一句拆成两行都不通过。不通过时它会写出第几个代码行应为什么、现在是什么,照着改。\n\nTESTS:winclient/WinClient.Tests/LeakOrphanCaptureTests.cs 和正本逐行一样(行尾空白、换行符不算)。\n\nSCOPE:相对主干只许改动或新增下面这些文件,别的一个都不许动:\n  - winclient/WinClient.Core/Diagnostics/LeakCapture.cs\n  - winclient/WinClient.Core/Diagnostics/LeakCheckService.cs\n  - winclient/WinClient.Tests/LeakOrphanCaptureTests.cs\n\n六、做的时候守这几条\n\n- 只动 allowedPaths 里的三个文件。发现非改别的文件不可,交 blocked 写清是哪一个、为什么。\n- 测试文件只用四里的命令写出,不手改一个字;某条测试你认为写错了,交 blocked 写成结构化岔路(哪条、现象、你的判断),不改测试。\n- 不放宽、不删、不跳过任何现有断言;不改别的测试文件(LeakCaptureTests.cs、LeakCheckServiceTests.cs 原样)。\n- 不新增启动进程的代码,不弹任何窗口;停抓包只走 Step。不加日志行,不加重试,不加等待。\n- 不改 ControlService.cs、LeakCheckRunner.cs、LeakCheckPlan.cs。\n- 不改文档(合并后派单方补文档)。\n- 工位里不要真的运行 pktmon,不要做系统抓包实验。\n- 验收命令单独一条执行,不要拼 cd &&、管道或重定向。\n- 次序:先执行四里的命令写出测试文件,申请 BUILD 看到编译失败作为证红;再照二改两个产品文件;之后按 BUILD → TEST → T-ORPHAN → SHAPE → TESTS → SCOPE 跑。\n- SHAPE 报「第 N 个代码行应为…现在是…」时照它改。照契约写编译不过,或 SHAPE 说「改动前的样子和契约对不上」时,交 blocked 写成结构化岔路,不自己改契约里定稿的代码。\n\n七、交活说明要写\n\n- 三个文件各改了什么(一两句一处)。\n- 和二里的写法不一样的地方、为什么(没有就写没有)。\n- 没做、没验的:真机上没试过(检测中途结束后台服务、再启动,看系统抓包停没停、抓包文件清没清);命令行检测被强行关掉留下的记号要等下次后台服务启动才清,用 --out 指到别处的清不到;后台服务启动那一刻正好有命令行检测在跑,会被这次清理停掉;系统已经在抓包时再点检测会怎样没验。",
+  "background": "项目:Windows 客户端(.NET 9、C# 13),核心库 winclient/WinClient.Core,单元测试 winclient/WinClient.Tests(xUnit)。\n\n开工先读:\n- winclient/WinClient.Core/Diagnostics/LeakCapture.cs(RunAsync 的次序、finally、Step、TryDelete)\n- winclient/WinClient.Core/Diagnostics/LeakCheckService.cs(ServiceLeakChecker、CreateProduction)\n- winclient/WinClient.Core/Diagnostics/LeakCheckPlan.cs(OutputRoot:数据目录下的 leakcheck;只读)\n- winclient/WinClient.Tests/LeakCaptureTests.cs、winclient/WinClient.Tests/LeakCheckServiceTests.cs(现有测试的写法;只读)\n- docs/plans/checks/yc_leak_orphan_1128_tests.txt(新测试的正本,只读)\n- docs/plans/checks/yc_leak_orphan_1128.py(验收脚本,只读)\n\n现状(主干 1c8b76a):\n- 后台服务每次检测的输出目录是 <数据目录>\\leakcheck\\<年月日-时分秒>\\,里面先后有 capture.etl、capture.pcapng、leak-report.json;默认检测完删掉前两个。\n- LeakCapture.RunAsync:pktmon filter remove → pktmon start --capture --comp nics --file-name <etl> → 每半秒采一次连接表 → pktmon stop → pktmon etl2pcap → 分析。finally 里:start 成功过而还没 stop 就补一次 stop;不是 KeepCapture 就删 etl 和 pcapng。\n- ServiceLeakChecker.CreateProduction() 只在后台服务启动时调一次(winclient/WinClient.App/Hosting/ControlService.cs),整个服务进程共用这一个检测器。\n- 命令行检测(--leak-check)直接在界面程序进程里用 LeakCapture,默认输出目录也在 <数据目录>\\leakcheck\\ 下面的一个子目录。\n\n项目红线(任何任务都生效):只动本项目自己的服务、路由、防火墙规则;凭据不入库、不入日志;隧道断了不静默回落;安装更新幂等可回退;真机没测的不标通过;Windows 上拉起的子进程一律隐藏窗口(本单不新增启动进程的写法,停抓包走现有的 Step;新测试断言了隐藏窗口的三个标志)。\n\n本仓跑法:dotnet 9.0.102;构建前会自动取两个第三方件(工位的 winclient/third_party/cache/ 里已备好压缩包时不联网)。验收命令由派单器在工位里跑。\n\n卡面:看板 yuanc 项目 WINCLIENT-LEAKCHECK-ORPHAN-CAPTURE-1128。",
+  "nonGoals": [
+    "不改 ControlService.cs 和命令行检测(LeakCheckRunner.cs):命令行检测被强行关掉留下的记号,等下次后台服务启动时清",
+    "不处理「pktmon stop 自己失败」留下的抓包(和现在一样)",
+    "不验「系统已经在抓包时再点检测会怎样」,不在工位里真的运行 pktmon",
+    "不加日志行,不改界面,不改检测结论的文字",
+    "不改文档(合并后派单方补文档),不做真机实测,不打发布包,不改版本号"
+  ],
+  "allowedPaths": [
+    "winclient/WinClient.Core/Diagnostics/LeakCapture.cs",
+    "winclient/WinClient.Core/Diagnostics/LeakCheckService.cs",
+    "winclient/WinClient.Tests/LeakOrphanCaptureTests.cs"
+  ],
+  "forbiddenPaths": [
+    ".codex/**",
+    ".github/**",
+    ".gitignore",
+    "pyproject.toml",
+    "authserver/**",
+    "node/**",
+    "scripts/**",
+    "docs/**",
+    "winclient/*.sln",
+    "winclient/Directory.Build.props",
+    "winclient/third_party/**",
+    "winclient/WinClient.App/**",
+    "winclient/WinClient.UiTests/**",
+    "winclient/WinClient.Core/WinClient.Core.csproj",
+    "winclient/WinClient.Core/Auth/**",
+    "winclient/WinClient.Core/Client/**",
+    "winclient/WinClient.Core/Environment/**",
+    "winclient/WinClient.Core/Firewall/**",
+    "winclient/WinClient.Core/Hosting/**",
+    "winclient/WinClient.Core/Ipc/**",
+    "winclient/WinClient.Core/Kernel/**",
+    "winclient/WinClient.Core/Logging/**",
+    "winclient/WinClient.Core/Network/**",
+    "winclient/WinClient.Core/Pairing/**",
+    "winclient/WinClient.Core/Process/**",
+    "winclient/WinClient.Core/State/**",
+    "winclient/WinClient.Core/Storage/**",
+    "winclient/WinClient.Core/Update/**",
+    "winclient/WinClient.Core/Diagnostics/LeakCheckPlan.cs",
+    "winclient/WinClient.Core/Diagnostics/LeakClassifier.cs",
+    "winclient/WinClient.Core/Diagnostics/LeakReportFormatter.cs",
+    "winclient/WinClient.Core/Diagnostics/ConnectionOwnerSampler.cs",
+    "winclient/WinClient.Core/Diagnostics/PcapNgReader.cs",
+    "winclient/WinClient.Core/Diagnostics/PacketParser.cs",
+    "winclient/WinClient.Tests/WinClient.Tests.csproj",
+    "winclient/WinClient.Tests/LeakCaptureTests.cs",
+    "winclient/WinClient.Tests/LeakCheckServiceTests.cs",
+    "winclient/WinClient.Tests/LeakCheckIpcTests.cs",
+    "winclient/WinClient.Tests/PcapNgReaderTests.cs",
+    "winclient/WinClient.Tests/FirewallTests.cs",
+    "winclient/WinClient.Tests/TestData.cs"
+  ],
+  "expectArtifacts": [],
+  "acceptance": [
+    {
+      "id": "BUILD",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "build",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1200
+    },
+    {
+      "id": "TEST",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "test",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--no-build",
+        "--nologo",
+        "--filter",
+        "FullyQualifiedName!~RenderTests"
+      ],
+      "required": true,
+      "timeoutSec": 1500
+    },
+    {
+      "id": "T-ORPHAN",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "test",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--nologo",
+        "--filter",
+        "FullyQualifiedName~LeakOrphan"
+      ],
+      "required": true,
+      "timeoutSec": 1500
+    },
+    {
+      "id": "SHAPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_leak_orphan_1128.py",
+        "shape"
+      ],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "TESTS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_leak_orphan_1128.py",
+        "tests"
+      ],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "SCOPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_leak_orphan_1128.py",
+        "scope"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "timeoutSec": 10800,
+  "repoRoot": "E:/yuanc",
+  "steps": [
+    "读 background 列出的文件与检查脚本。",
+    "执行 goal 四里的命令写出测试文件;申请 BUILD,看到编译失败作为证红(新符号还不存在)。",
+    "照 goal 二改 LeakCapture.cs、LeakCheckService.cs。",
+    "BUILD、TEST、T-ORPHAN、SHAPE、TESTS、SCOPE 全绿后交活;交活说明照 goal 七的要求写。"
+  ]
+}
