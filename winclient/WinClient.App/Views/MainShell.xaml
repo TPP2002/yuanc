@@ -38,7 +38,11 @@
     </StackPanel>
    </DockPanel>
   </Border>
-  <ContentControl x:Name="PageHost" Grid.Column="1" Margin="32,24" Content="{Binding}" HorizontalContentAlignment="Stretch" VerticalContentAlignment="Stretch">
+  <DockPanel Grid.Column="1" LastChildFill="True">
+   <Border x:Name="PageNotice" DockPanel.Dock="Bottom" BorderBrush="{DynamicResource Yc.Line}" BorderThickness="0,1,0,0" Padding="32,8,32,12" Visibility="{Binding PageNoticeText, Converter={x:Static t:VisibilityConverter.Instance}}">
+    <TextBlock Text="{Binding PageNoticeText}" FontSize="{DynamicResource Yc.FontSize.Sm}" TextWrapping="Wrap" t:SemanticText.NormalKey="Yc.Text2" t:SemanticText.Tone="{Binding Hero.SubtitleTone}" AutomationProperties.LiveSetting="Polite"/>
+   </Border>
+   <ContentControl x:Name="PageHost" Margin="32,24" Content="{Binding}" HorizontalContentAlignment="Stretch" VerticalContentAlignment="Stretch">
    <ContentControl.Style><Style TargetType="ContentControl"><Setter Property="ContentTemplate" Value="{DynamicResource Connect}"/><Style.Triggers>
     <DataTrigger Binding="{Binding CurrentPage}" Value="{x:Static p:PageKind.Routing}"><Setter Property="ContentTemplate" Value="{DynamicResource Routing}"/></DataTrigger>
     <DataTrigger Binding="{Binding CurrentPage}" Value="{x:Static p:PageKind.Environment}"><Setter Property="ContentTemplate" Value="{DynamicResource Environment}"/></DataTrigger>
@@ -46,5 +50,6 @@
     <DataTrigger Binding="{Binding CurrentPage}" Value="{x:Static p:PageKind.Update}"><Setter Property="ContentTemplate" Value="{DynamicResource Update}"/></DataTrigger>
    </Style.Triggers></Style></ContentControl.Style>
   </ContentControl>
+  </DockPanel>
  </Grid>
 </UserControl>
