@@ -75,6 +75,9 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
     public string Message => snapshot.Message + (serviceVersion.Length != 0 && serviceVersion != ControlSnapshot.CurrentVersion
         ? $" 后台已更新到 {serviceVersion}，下次打开界面将使用新版" : "");
 
+    // 「连接」页自己有消息槽;别的页由窗口底部的提示条显示同一句。
+    public string PageNoticeText => CurrentPage == PageKind.Connect ? "" : Message.Trim();
+
     public string UpdateMessage => updateMessage;
     public string DiagnosticsMessage { get; private set; } = "";
     public const string LeakCheckNeedsConnection = "连接后才能检测。";
@@ -120,6 +123,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         {
             if (currentPage == value) return;
             currentPage = value; Notify();
+            Notify(nameof(PageNoticeText));
             if (value == PageKind.Environment) _ = LoadSelfCheckAsync();
         }
     }
@@ -480,6 +484,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         Notify(nameof(BrowserWarningShown));
         Hero = StatusPresentation.Build(snapshot, availability, ShouldDisconnect);
         Notify(nameof(Hero)); Notify(nameof(Status)); Notify(nameof(Message)); Notify(nameof(ConnectLabel)); Notify(nameof(ModeText)); Notify(nameof(IsBusy)); Notify(nameof(CanUseConnection));
+        Notify(nameof(PageNoticeText));
         Notify(nameof(ServiceVersionText)); Notify(nameof(ServiceVersionDisplay)); Notify(nameof(ServiceStateText)); Notify(nameof(ServiceStateTone));
         Notify(nameof(UpdateMessage)); Notify(nameof(UpdateCheckedAtText)); Notify(nameof(IsUpdateInProgress));
         RefreshUpdateIndicator();
