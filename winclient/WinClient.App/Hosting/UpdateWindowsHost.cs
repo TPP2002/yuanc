@@ -118,6 +118,10 @@ public sealed class UpdateWindowsHost : IUpdateHost
         using var key = Registry.LocalMachine.CreateSubKey(ServiceInstaller.RunKey, writable: true);
         key.SetValue(ServiceInstaller.RunValueName, ServiceInstaller.RunValue(executable), RegistryValueKind.String);
     }
+    public void SetEntryPoints(string executable, string version)
+    {
+        if (EntryPoints.Describe(EntryPoints.ForMachine().Apply(executable, version), EntryPoints.ApplyFailedSuffix) is { } text) Log.Write(text);
+    }
     public static Task<int> ApplyAsync()
     {
         var store = new UpdateStore();

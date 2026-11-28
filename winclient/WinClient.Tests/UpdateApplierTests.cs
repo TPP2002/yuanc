@@ -114,6 +114,41 @@ public sealed class UpdateApplierTests
         Assert.Equal(expected == "rolled_back", store.IsBad("1.0.0"));
     }
 
+    [Theory]
+    [InlineData("ok")]
+    [InlineData("silent")]
+    public async Task EntryPointsFollowServiceExecutable(string mode)
+    {
+        using var temp = new TempDirectory();
+        var root = Path.Combine(temp.Path, "app");
+        var store = new UpdateStore(Path.Combine(temp.Path, "updates"));
+        var host = new Host(mode);
+        var pending = Pending(root, host.Now);
+        store.WritePending(pending);
+        var runner = new Runner(pending, false);
+        var applier = new UpdateApplier(store, runner, host, root, Path.GetFullPath("Windows/System32"));
+        await applier.RunAsync();
+        Assert.Equal<(string Exe, string Version)?>(
+            mode == "ok" ? (pending.NewExe, "1.0.0") : (pending.OldExe, "0.1.0"), host.Entries);
+    }
+
+    [Fact]
+    public async Task EntryPointFailureCannotUndoSuccessfulServiceSwitch()
+    {
+        using var temp = new TempDirectory();
+        var host = new Host("ok") { EntriesThrow = true };
+        var root = Path.Combine(temp.Path, "app");
+        var store = new UpdateStore(Path.Combine(temp.Path, "updates"));
+        var pending = Pending(root, host.Now);
+        store.WritePending(pending);
+        var runner = new Runner(pending, false);
+        var applier = new UpdateApplier(store, runner, host, root, temp.Path);
+        Assert.Equal(0, await applier.RunAsync());
+        Assert.Equal(3, runner.Commands.Count);
+        Assert.Equal("ok", store.ReadHistory().Last().Status);
+        Assert.False(store.HasPending);
+    }
+
     private static UpdatePending Pending(string root, DateTimeOffset at)
     {
         var old = UpdatePlanner.Executable(root, "0.1.0"); var next = UpdatePlanner.Executable(root, "1.0.0");
@@ -145,5 +180,8 @@ public sealed class UpdateApplierTests
         // 默认 null：既有数据行仍按「服务进程查不到」处理，行为不变。
         public string? RunningExe { get; set; }
         public string? RunningServiceExecutable() => RunningExe;
+        public (string Exe, string Version)? Entries;
+        public bool EntriesThrow;
+        public void SetEntryPoints(string exe, string version) { if (EntriesThrow) throw new IOException(); Entries = (exe, version); }
     }
 }

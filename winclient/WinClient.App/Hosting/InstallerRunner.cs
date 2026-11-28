@@ -116,6 +116,8 @@ public sealed class InstallerRunner
         }
         if (ServiceInstaller.SwitchesExecutable(previous, destination)) await StartSwitchedAsync(previous);
         else await StartAsync();
+        // 图标与卸载入口建不成只提示，不让安装失败（有的安全软件会拦桌面图标）。
+        Report(EntryPoints.ForMachine().Apply(destination, ServiceInstaller.ReleaseVersion(version)), EntryPoints.ApplyFailedSuffix);
     }
 
     /// <summary>服务原来登记的是另一份程序：先停服务，再启动新版并确认稳定；失败时改回旧版。</summary>
@@ -208,6 +210,7 @@ public sealed class InstallerRunner
         if (ServiceStatus() is not null) await RunCommandAsync(ServiceInstaller.Delete(), "删除后台服务失败。");
         using var key = Registry.LocalMachine.OpenSubKey(ServiceInstaller.RunKey, writable: true);
         key?.DeleteValue(ServiceInstaller.RunValueName, throwOnMissingValue: false);
+        Report(EntryPoints.ForMachine().Remove(), EntryPoints.RemoveFailedSuffix);
     }
     private async Task StopServiceAsync()
     {
@@ -235,6 +238,11 @@ public sealed class InstallerRunner
     private static InvalidOperationException SafeError(string message)
     {
         var error = new InvalidOperationException(message); error.Data["safe"] = true; return error;
+    }
+
+    private static void Report(IReadOnlyList<string> failed, string suffix)
+    {
+        if (EntryPoints.Describe(failed, suffix) is { } text) Console.Error.WriteLine(text);
     }
 
     private static void EnsureDataDirectory()
