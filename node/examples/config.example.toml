@@ -22,7 +22,8 @@ hy2_port = 24443
 sni = "www.abc.net.au"
 handshake_server = "www.abc.net.au"
 hy2_server_name = "exitnode"
-binary = "/usr/bin/sing-box"
+# 内核路径不用填：默认用版本目录里的内核（/opt/exitnode/current/bin/sing-box），跟着更新和回退一起换。
+# 只有要固定用别处的内核时才加一行 binary = "/绝对路径"；加了以后更新器不会更新它。
 
 [admin]
 bind = "127.0.0.1"

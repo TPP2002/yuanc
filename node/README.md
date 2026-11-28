@@ -11,7 +11,7 @@
 1. 装系统工具：`sudo apt-get install python3-cryptography curl nftables miniupnpc qrencode`。系统自带的 nftables 服务保持关闭即可，程序只管自己的 `table inet exitnode`。
 2. 装隧道内核：sing-box 1.13.21 的官方 linux-amd64 包，核对哈希后放到 `/usr/bin/sing-box`。`init` 会把它复制进版本目录，以后由更新器管理。
 3. 把仓库的 `node/` 目录拷到小主机，例如 `/home/ops/yuanc/node`。
-4. 把 `examples/config.example.toml` 复制成 `/etc/exitnode/config.toml` 并填写，方法见 [配置说明](../docs/node/配置说明.md)。示例里 `binary = "/usr/bin/sing-box"` 这一行要删掉，否则隧道服务一直用这个路径的内核，以后更新内核不生效。
+4. 把 `examples/config.example.toml` 复制成 `/etc/exitnode/config.toml` 并填写，方法见 [配置说明](../docs/node/配置说明.md)。
 5. 安装：`cd / && sudo env PYTHONPATH=/home/ops/yuanc/node python3 -P -m exitnode init`。装完会导出第一台电脑的配对文件。
 
 装好以后程序在 `/opt/exitnode/current`，之后的命令都写成 `cd / && sudo env PYTHONPATH=/opt/exitnode/current python3 -P -m exitnode <命令>`，下文简写成 `exitnode <命令>`。`cd /` 和 `-P` 让 Python 不从当前目录加载同名模块。
