@@ -3,9 +3,7 @@ using System.Net;
 using System.Runtime.InteropServices;
 using System.Security.Principal;
 using System.Text;
-using System.Text.Json;
 using Microsoft.Win32.SafeHandles;
-using WinClient.Core.Client;
 using WinClient.Core.Diagnostics;
 using WinClient.Core.Firewall;
 using WinClient.Core.Network;
@@ -46,11 +44,7 @@ public static class LeakCheckRunner
                 Console.Error.WriteLine("请以管理员身份运行");
                 return 2;
             }
-            var routing = new RoutingSettingsStore().Read();
-            var options = new LeakCheckOptions(seconds, node, outDir, keep, routing.Mode == RoutingMode.Apps, routing.Apps, LoadAuth())
-            {
-                AppPatterns = routing.Mode == RoutingMode.Apps ? ScopePatterns(routing.Apps) : null
-            };
+            var options = LeakCheckPlan.Build(seconds, node, outDir, keep);
             var started = DateTime.Now;
             Console.WriteLine($"开始泄漏检测,抓包 {seconds} 秒,请在此期间正常使用电脑……");
             using var cancel = new CancellationTokenSource();
@@ -95,28 +89,6 @@ public static class LeakCheckRunner
             }
         }
         return true;
-    }
-
-    // 与客户端连接时同一算法算出每个名单程序的连带范围匹配式;单个解析失败时退回只认该程序本身。
-    private static string[] ScopePatterns(IReadOnlyList<string> apps)
-    {
-        var folders = AppScopeResolver.SystemFolders();
-        var fileSystem = new SystemAppScopeFileSystem();
-        var patterns = new List<string>();
-        foreach (var path in apps)
-        {
-            try { patterns.Add(AppScopeResolver.Resolve(path, folders, fileSystem).Pattern); }
-            catch (Exception) { patterns.Add(RoutingRenderer.PathPattern(path)); }
-        }
-        return [.. patterns];
-    }
-
-    // 分发版鉴权地址;读不到就不放行任何鉴权地址。
-    private static AuthEndpoint? LoadAuth()
-    {
-        try { return ClientSettings.Load()?.AuthEndpoint; }
-        catch (Exception ex) when (ex is IOException or InvalidDataException or UriFormatException or FormatException
-            or System.Text.Json.JsonException or UnauthorizedAccessException) { return null; }
     }
 
     // 窗口程序没有标准输出句柄;挂上父控制台后,若没有可用句柄就直接打开 CONOUT$。

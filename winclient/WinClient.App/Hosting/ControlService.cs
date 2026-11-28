@@ -6,6 +6,7 @@ using System.Security.Cryptography;
 using System.Security.Principal;
 using System.ServiceProcess;
 using WinClient.Core.Client;
+using WinClient.Core.Diagnostics;
 using WinClient.Core.Hosting;
 using WinClient.Core.Ipc;
 using WinClient.Core.Kernel;
@@ -84,7 +85,7 @@ public sealed class ControlService : ServiceBase
                 updateSource = new HttpUpdateSource();
                 updates = new UpdateCoordinator(updateSource, updateStore, () => runtime.Snapshot, () => DateTimeOffset.UtcNow, version, Log);
                 updates.Start();
-                var server = new ControlServer(runtime, desired, updates, version);
+                var server = new ControlServer(runtime, desired, updates, version, leakCheck: ServiceLeakChecker.CreateProduction());
                 // 首实例独占管道名：若已有别的程序先建了同名管道，创建失败，服务拒绝启动而不是与冒名者共用名字。
                 NamedPipeServerStream first;
                 try { first = CreatePipe(PipeOptions.Asynchronous | PipeOptions.FirstPipeInstance); }
