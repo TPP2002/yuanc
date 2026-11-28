@@ -1,0 +1,161 @@
+{
+  "schemaVersion": 1,
+  "taskId": "WINCLIENT-UPDATE-AUTH-PATH-ROLLBACK-1127",
+  "slug": "yc-auth-permit-refresh-1128",
+  "title": "邀请码模式自动更新后取不到会话:保持保护启动时先把「后台服务到登录服务器」的放行换成当前程序路径",
+  "goal": "一、要解决的问题\n\n邀请码模式(会话来源是 AuthServerSessionSource)下,断网保护里有一条「只放行后台服务这个程序去登录服务器」的规则:系统防火墙里叫 YuanC-KS-Auth,系统过滤层里叫 YuanC-WFP-Auth,两条都绑着后台服务程序的完整路径。自动更新把后台服务换到新目录(每个版本一个目录,见 UpdatePlanner.Executable),新进程带着保护启动(InitializeAsync 的保持保护分路),先取会话;但两条放行还绑着旧版路径,过滤层的过滤器是持久的、默认阻断还在,新进程连不上登录服务器,取不到会话。规则要等取到会话以后才会重新套用,所以永远等不到。更新程序等 120 秒见不到「已连接」就退回旧版。结果:每次自动更新都失败退回,其间断网约 3 分钟。\n\n做法:保持保护启动时,在取会话之前,先把这一条放行换成当前程序的路径。防火墙那条用一段只含这一条规则的脚本重放(脚本会顺手更新恢复记录里的这一条);过滤层没有「只换一条」的接口,就从恢复记录里的两条节点放行读回内核路径、节点地址和端口,整套重装一遍(Install 在一个事务里先删后加,中间没有空窗)。恢复记录里的这条和现在的一样时什么都不做,所以普通重启、开机自启的行为和现在完全一样。\n\n二、逐个文件怎么改(下面的代码是参考写法,没编译过;以能编译、过验收为准,名字和定稿的字照抄)\n\n(1) 新文件 winclient/WinClient.Core/Firewall/KillSwitchRecord.cs:只读恢复记录,不写、不删。\n\nusing System.Net;\nusing System.Net.Sockets;\nusing System.Text.Json;\n\nnamespace WinClient.Core.Firewall;\n\ninternal sealed record RecordedRule(string Name, string? Program, string[] RemoteAddress, string? Protocol, string? RemotePort);\ninternal sealed record RecordedNode(string Program, IReadOnlyList<IPAddress> Ips, int Hy2Port, int RealityPort);\n\n/// <summary>断网保护恢复记录(killswitch-state.json)里换登录放行要读的两样:模式和套用时记下的放行规则。只读不写。</summary>\ninternal sealed record KillSwitchRecord(string Mode, IReadOnlyList<RecordedRule> Rules)\n{\n    /// <summary>文件不在、读不了、不是 JSON 对象时返回 null;没写模式的记录按全部流量(\"global\")算。</summary>\n    public static KillSwitchRecord? Read(string path)\n    {\n        try\n        {\n            if (!File.Exists(path)) return null;\n            using var json = JsonDocument.Parse(File.ReadAllText(path));\n            var root = json.RootElement;\n            if (root.ValueKind != JsonValueKind.Object) return null;\n            var mode = root.TryGetProperty(\"mode\", out var value) && value.ValueKind == JsonValueKind.String ? value.GetString()! : \"global\";\n            var rules = new List<RecordedRule>();\n            if (root.TryGetProperty(\"rules\", out var list))\n                foreach (var item in Items(list))\n                    if (item.ValueKind == JsonValueKind.Object && Text(item, \"Name\") is { Length: > 0 } name)\n                        rules.Add(new(name, Text(item, \"Program\"),\n                            item.TryGetProperty(\"RemoteAddress\", out var remote) ? Items(remote).Select(Scalar).OfType<string>().ToArray() : Array.Empty<string>(),\n                            Text(item, \"Protocol\"), Text(item, \"RemotePort\")));\n            return new(mode, rules.AsReadOnly());\n        }\n        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException or InvalidOperationException) { return null; }\n    }\n\n    // Windows PowerShell 写出的数组有三种样子:数组;带 value 数组的对象;只有一项时的单个值。\n    private static JsonElement[] Items(JsonElement value)\n    {\n        if (value.ValueKind == JsonValueKind.Array) return value.EnumerateArray().ToArray();\n        if (value.ValueKind == JsonValueKind.Object)\n            return value.TryGetProperty(\"value\", out var inner) && inner.ValueKind == JsonValueKind.Array\n                ? inner.EnumerateArray().ToArray() : Array.Empty<JsonElement>();\n        return value.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined ? Array.Empty<JsonElement>() : new[] { value };\n    }\n\n    private static string? Scalar(JsonElement value) => value.ValueKind switch\n    {\n        JsonValueKind.String => value.GetString(),\n        JsonValueKind.Number => value.GetRawText(),\n        _ => null\n    };\n\n    private static string? Text(JsonElement item, string name) => item.TryGetProperty(name, out var value) ? Scalar(value) : null;\n\n    /// <summary>记录里有没有一条和它一样的放行:名字、程序(不分大小写)、远端地址、协议、远端端口都一样。</summary>\n    public bool Has(AddRule rule) => Rules.Any(item => item.Name == rule.Name &&\n        string.Equals(item.Program, rule.Program, StringComparison.OrdinalIgnoreCase) &&\n        item.RemoteAddress.Order(StringComparer.OrdinalIgnoreCase).SequenceEqual(\n            (rule.RemoteAddress ?? Array.Empty<string>()).Order(StringComparer.OrdinalIgnoreCase), StringComparer.OrdinalIgnoreCase) &&\n        string.Equals(item.Protocol, rule.Protocol, StringComparison.OrdinalIgnoreCase) && item.RemotePort == rule.RemotePort);\n\n    /// <summary>从两条节点放行读回内核路径、节点地址和两个端口;缺一样或格式不对返回 null。</summary>\n    public RecordedNode? Node()\n    {\n        var tcp = Rules.FirstOrDefault(item => item.Name == KillSwitchPlanner.NodePrefix + \"Tcp\");\n        var udp = Rules.FirstOrDefault(item => item.Name == KillSwitchPlanner.NodePrefix + \"Udp\");\n        if (tcp?.Program is not { Length: > 0 } program || udp is null || !Path.IsPathFullyQualified(program)) return null;\n        var ips = new List<IPAddress>();\n        foreach (var text in tcp.RemoteAddress)\n        {\n            if (!IPAddress.TryParse(text, out var ip) || ip.AddressFamily != AddressFamily.InterNetwork) return null;\n            ips.Add(ip);\n        }\n        if (ips.Count == 0 || !Port(tcp.RemotePort, out var reality) || !Port(udp.RemotePort, out var hy2)) return null;\n        return new(program, ips.AsReadOnly(), hy2, reality);\n    }\n\n    private static bool Port(string? text, out int port) =>\n        int.TryParse(text, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out port) && port is >= 1 and <= 65535;\n}\n\n(2) winclient/WinClient.Core/Firewall/KillSwitchPlanner.cs:把 Plan 里 if (auth is not null) { … } 那一整块(三句校验加 actions.Add(new AddRule(Prefix + \"Auth\", …)))收进一个私有方法,Plan 里只留一行;再加一个只含这一条规则的方案。Plan 生成的动作序列一条都不能变(既有的 KillSwitchAuthRuleTests 钉着)。别的方法不动。\n\n    Plan 里那一块改成:\n        if (auth is not null) actions.Add(AuthRule(auth));\n\n    新增(放在 Plan 之后):\n    /// <summary>只重放「后台服务到登录服务器」那一条放行:保持保护启动时程序路径变了用。脚本会顺手更新恢复记录里的这一条。</summary>\n    public static IReadOnlyList<FirewallAction> RefreshAuth(AuthEndpoint auth) => [AuthRule(auth)];\n\n    private static AddRule AuthRule(AuthEndpoint auth)\n    {\n        if (auth.Address is null || auth.Address.AddressFamily != AddressFamily.InterNetwork)\n            throw new ArgumentException(\"鉴权服务器必须是 IPv4 数字地址。\", nameof(auth));\n        if (auth.Port is < 1 or > 65535)\n            throw new ArgumentException(\"鉴权服务器端口必须在 1 到 65535 之间。\", nameof(auth));\n        if (string.IsNullOrWhiteSpace(auth.Program) || !Path.IsPathFullyQualified(auth.Program))\n            throw new ArgumentException(\"后台服务程序必须是绝对路径。\", nameof(auth));\n        return new AddRule(Prefix + \"Auth\", \"Outbound\", \"Allow\", Program: auth.Program,\n            RemoteAddress: [auth.Address.ToString()], Protocol: \"TCP\",\n            RemotePort: auth.Port.ToString(System.Globalization.CultureInfo.InvariantCulture));\n    }\n\n(3) winclient/WinClient.Core/Firewall/KillSwitchApplier.cs:只加行,原有的行一行不改。\n\n    接口 IKillSwitch 里加一个带默认实现的成员(别的实现和测试替身不用跟着改):\n    /// <summary>保持保护启动用:恢复记录里「后台服务到登录服务器」的放行和现在的不一样时换成现在的,返回换没换。</summary>\n    Task<bool> RefreshAuthAsync(AuthEndpoint auth) => Task.FromResult(false);\n\n    KillSwitchApplier 里加一个常量和一个方法:\n    public const string WfpAuthRefreshFailed = \"系统过滤层里登录服务器的放行没能换成当前程序。\";\n\n    public async Task<bool> RefreshAuthAsync(AuthEndpoint auth)\n    {\n        var actions = KillSwitchPlanner.RefreshAuth(auth); // 参数不对先抛,不碰系统。\n        await gate.WaitAsync().ConfigureAwait(false);\n        try\n        {\n            var record = KillSwitchRecord.Read(StatePath);\n            if (record is null || record.Mode != \"global\" || record.Has((AddRule)actions[0])) return false;\n            var wfpFailed = false;\n            if (wfp is not null && !File.Exists(wfpOffPath) && record.Node() is { } node)\n            {\n                try\n                {\n                    // 过滤层里本来有本项目的过滤器才重装;内核路径、节点地址和端口照记录里的两条节点放行。\n                    if (wfp.ListFilterNames().Count > 0)\n                    {\n                        var policy = WfpPlanner.PlanGlobal(node.Ips, node.Program, node.Hy2Port, node.RealityPort, auth);\n                        wfp.Install(policy);\n                        wfpPolicy = policy;\n                        lastAuth = auth;\n                        WriteLog(\"过滤层换登录放行：成功\");\n                    }\n                }\n                catch (WfpException) { WriteLog(\"过滤层换登录放行：失败\"); wfpFailed = true; }\n            }\n            await RunActionsAsync(actions, \"换登录放行\").ConfigureAwait(false);\n            if (wfpFailed) throw new WfpUnavailableException(WfpAuthRefreshFailed);\n            return true;\n        }\n        finally { gate.Release(); }\n    }\n\n    要点:先过滤层、后防火墙脚本(和 ApplyAsync 的次序一样);过滤层没换成也要把脚本跑完,再抛 WfpUnavailableException;脚本失败抛 RunActionsAsync 原来那句。不删过滤器、不撤销、不恢复默认出站。\n\n(4) winclient/WinClient.Core/Client/ClientController.cs:只加行。InitializeAsync 的 if (keptUsable) 那一块里,在 WriteJournal(\"启动：接回断网保护，随后自动连接\"); 之后、SyncPatrol(); 之前加一行 await RefreshAuthPermitAsync(); 再加这个私有方法(放在 InitializeAsync 之后):\n\n    /// <summary>\n    /// 自动更新后后台服务的程序路径变了,恢复记录里那条「后台服务到登录服务器」的放行还绑着旧路径,新进程取不到会话。\n    /// 取会话之前先换成现在的路径;没换成只记一行,连接照常往下走。\n    /// </summary>\n    private async Task RefreshAuthPermitAsync()\n    {\n        if (sessionSource is not AuthServerSessionSource || authEndpoint is null) return;\n        try\n        {\n            var changed = await firewall.RefreshAuthAsync(authEndpoint);\n            WriteJournal(changed ? \"启动：登录服务器的放行已换成当前程序\" : \"启动：登录服务器的放行不用换\");\n        }\n        catch (Exception ex) when (IsOperational(ex))\n        { WriteJournal(\"启动：登录服务器的放行没换成：\" + ConnectJournal.Describe(ex)); }\n    }\n\n    别的分路(找不到凭据停在需人工处理、没有保持保护的启动、用户点连接、巡检、续期)都不调它。不改 ConnectAsync、FetchSessionAsync、ExecuteEffectsAsync、PatrolAsync。\n\n三、测试(两个新文件,用例名照抄;测试替身写在各自文件里,不改现有测试文件)\n\n(1) winclient/WinClient.Tests/AuthPermitRefreshTests.cs(类名 AuthPermitRefreshTests)。夹具照 WfpApplierTests 的写法自己写一份:临时目录(TempDirectory)、记调用次序的过滤层替身(Install 记 \"install\" 并把 Policy、Names 换成新的;ListFilterNames 记 \"list\";Remove 记 \"remove\";可注入 InstallError;Names 默认放一份旧方案的名字,比如 WfpPlanner.PlanGlobal(…) 的名字)、记 \"script\" 并留下脚本文字的命令替身(ExitCode 可设,Output 默认 {\"reenforced\":[],\"newly_disabled\":[],\"missing_rules\":[]})。恢复记录用 JsonSerializer 序列化一个对象写进 applier.StatePath,样子照真记录:\n    { \"applied\": true, \"profiles\": [三个 { Name, DefaultOutboundAction, Enabled }], \"rules\": [\n      { \"Name\": \"YuanC-KS-Node-Tcp\", \"Program\": 内核路径, \"Service\": null, \"LocalAddress\": null, \"RemoteAddress\": [\"192.0.2.5\"], \"Protocol\": \"TCP\", \"LocalPort\": null, \"RemotePort\": \"443\" },\n      { \"Name\": \"YuanC-KS-Node-Udp\", \"Program\": 内核路径, …, \"RemoteAddress\": [\"192.0.2.5\"], \"Protocol\": \"UDP\", \"RemotePort\": \"24443\" },\n      { \"Name\": \"YuanC-KS-Auth\", \"Program\": 旧版后台路径, …, \"RemoteAddress\": [\"192.0.2.1\"], \"Protocol\": \"TCP\", \"RemotePort\": \"8443\" } ] }\n    登录服务器一律用 new AuthEndpoint(IPAddress.Parse(\"192.0.2.1\"), 8443, 新版后台路径);路径用 Path.GetFullPath 造两个不同的绝对路径。地址只用 192.0.2.0/24。\n    - RefreshAuthPlanIsTheAuthRuleFromFullPlan:KillSwitchPlanner.RefreshAuth(auth) 只有一条(Assert.Single),名字 \"YuanC-KS-Auth\",用 JsonSerializer.Serialize 比它和 KillSwitchPlanner.Plan(…, auth: auth) 里那条一样。\n    - RefreshAuthScriptRewritesOnlyAuthRuleAndRecord:KillSwitchPlanner.ToPowerShellScript(KillSwitchPlanner.RefreshAuth(auth), …) 里有 \"New-NetFirewallRule -Name 'YuanC-KS-Auth'\"、\"$_.Name -ne 'YuanC-KS-Auth'\"、\"if ($null -ne $state) { Write-State $state }\";Assert.DoesNotContain(\"Set-NetFirewallProfile\", script)、Assert.DoesNotContain(\"YuanC-KS-Node\", script)。\n    - RefreshAuthRejectsBadEndpointBeforeTouchingSystem:程序写相对路径,Assert.ThrowsAsync<ArgumentException>(…RefreshAuthAsync(…)),调用次序为空(Assert.Empty)。\n    - ChangedProgramRewritesFirewallRuleAndReinstallsFilters:Assert.True(await f.Applier.RefreshAuthAsync(auth));次序等于 new[] { \"list\", \"install\", \"script\" };脚本等于 KillSwitchPlanner.ToPowerShellScript(KillSwitchPlanner.RefreshAuth(auth), 状态路径, 审计路径);新方案里 \"YuanC-WFP-Auth\" 的 AppPath 是新版后台路径,\"YuanC-WFP-Node-Tcp\" 的 AppPath 是内核路径、RemoteAddresses 是 \"192.0.2.5/32\"、RemotePort 443,\"YuanC-WFP-Node-Udp\" 的 RemotePort 是 24443。\n    - SameProgramDoesNothing:记录里那条的程序就是 auth.Program,再试一次把记录里的路径 ToUpperInvariant();两次都 Assert.False(await …),次序为空。\n    - NoRecordAppsModeOrBrokenRecordDoesNothing:[Theory],[InlineData(\"missing\")](没有记录文件)、[InlineData(\"apps\")](记录里 \"mode\": \"apps\")、[InlineData(\"broken\")](文件内容不是 JSON);Assert.False(await …),次序为空。\n    - RecordWithoutNodeRulesOnlyRewritesFirewallRule:记录的 rules 里只有那条旧路径的 Auth;Assert.True(await …),次序等于 new[] { \"script\" }。\n    - EmptyFilterLayerIsNotReinstalled:过滤层替身的 Names 置空;Assert.True(await …),次序等于 new[] { \"list\", \"script\" }。\n    - OffSwitchSkipsFilterLayer:临时目录里写一个 \"wfp-off\" 文件;Assert.True(await …),次序等于 new[] { \"script\" }。\n    - FilterFailureStillRewritesFirewallRuleThenReports:注入 InstallError;Assert.ThrowsAsync<WfpUnavailableException>,消息等于 KillSwitchApplier.WfpAuthRefreshFailed,次序等于 new[] { \"list\", \"install\", \"script\" }。\n    - ScriptFailureKeepsOriginalError:ExitCode = 1;Assert.ThrowsAsync<InvalidOperationException>,消息等于 \"防火墙操作失败，恢复记录已保留，请联系管理员。\"。\n    - RecordReaderAcceptsPowerShellArrayShapes:用 new UTF8Encoding(true)(带 BOM)写一份记录,rules 写成 { \"value\": [ … ], \"Count\": 3 } 的样子,其中一条的 RemoteAddress 写成单个字符串;KillSwitchRecord.Read(…) 不为空(Assert.NotNull),Mode 等于 \"global\",.Node() 读得回地址和两个端口。\n    - PatrolAfterRefreshComparesAgainstReinstalledFilters:先换一次(次序等于 new[] { \"list\", \"install\", \"script\" }),清空次序后 PatrolAsync([]),次序等于 new[] { \"list\", \"script\" }(说明重装后的方案已经记住,巡检不会再重装一遍)。\n\n(2) winclient/WinClient.Tests/ControllerAuthPermitTests.cs(类名 ControllerAuthPermitTests)。自己写三个替身:\n    - 断网保护替身(实现 IKillSwitch):HasPendingState 可设;AllowedProgram(现在放行的后台路径);RefreshError 可设;Refreshed(收到的 AuthEndpoint 列表)。RefreshAuthAsync 记 \"refresh-auth\"、把参数放进 Refreshed,RefreshError 不为空就抛,否则把 AllowedProgram 换成 auth.Program,返回路径变没变。ApplyAsync 记 \"apply\" 并把 AllowedProgram 换成 auth?.Program(为空不换);RemoveAsync 记 \"remove\";RecoverAsync 记 \"recover\" 返回 null;UpdateNodeAsync 记 \"update\"。\n    - 隧道替身:StartAsync 记 \"start\",Stop 记 \"stop\"。\n    - 登录服务器替身:new HttpClient(new AuthTests.Handler(_ => { 记 \"session\";AllowedProgram 不等于现在的后台路径就 throw new HttpRequestException(\"blocked\");否则回 200 和 TestData.Session() 的 JSON(写法照 ControllerTests.SessionHttp:JsonSerializer.Serialize(…, new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower })) })) { BaseAddress = new(\"https://unit.invalid\") }。\n    会话来源用 new AuthServerSessionSource(new AuthApiClient(http), store),store 是存了 \"refresh\" 的 InMemoryCredentialStore。控制器用带 delayAsync 的那个构造函数,delayAsync 传一个永远不完成的任务((_, _) => new TaskCompletionSource().Task),authEndpoint 传 new AuthEndpoint(IPAddress.Parse(\"192.0.2.1\"), 8443, 新版后台路径),Journal 记进一个列表。不许用 Task.Delay、Thread.Sleep。\n    - KeptStartRefreshesAuthPermitBeforeFetchingSession:AllowedProgram 是旧版路径,HasPendingState = true;InitializeAsync(autoConnect: false, keepProtection: true) 后,次序等于 new[] { \"refresh-auth\", \"session\", \"apply\", \"start\" },状态是 ConnectionState.Connected,Refreshed 只有一项(Assert.Single)且等于传进去的 authEndpoint,连接记录里有 \"启动：登录服务器的放行已换成当前程序\"。\n    - KeptStartWithoutRefreshCannotFetchSession:同上但 RefreshError = new InvalidOperationException(\"拒绝\");次序里有 \"session\"、Assert.DoesNotContain(\"apply\", order),Assert.NotEqual(ConnectionState.Connected, …),ProtectionActive 为真,连接记录里有以 \"启动：登录服务器的放行没换成：\" 开头的一行。这条同时证实病根:放行不换,新路径的后台取不到会话。\n    - SameProgramJournalsNoChange:AllowedProgram 就是新版路径;keepProtection: true 启动后是 ConnectionState.Connected,连接记录里有 \"启动：登录服务器的放行不用换\"。\n    - PairingModeOrMissingEndpointDoesNotRefresh:[Theory],[InlineData(true)](会话来源换成 new PairingSessionSource(PairingTests.ValidPairing()))、[InlineData(false)](邀请码模式但不传 authEndpoint,AllowedProgram 设成能通);保持保护启动后 Assert.DoesNotContain(\"refresh-auth\", order),状态是 ConnectionState.Connected。\n    - StartWithoutKeptProtectionDoesNotRefresh:[Theory],[InlineData(false, true)](keepProtection 为假、有恢复记录)、[InlineData(true, false)](keepProtection 为真、没有恢复记录);InitializeAsync(autoConnect: false, …) 后 Assert.DoesNotContain(\"refresh-auth\", order)、Assert.Empty(Refreshed)。\n    - MissingCredentialsParksWithoutRefresh:凭据库是空的;keepProtection: true 启动后 Assert.DoesNotContain(\"refresh-auth\", order),状态是 ConnectionState.NeedsManual,ProtectionActive 为真。\n\n四、检查脚本逐条核对的写法(脚本:docs/plans/checks/yc_auth_permit_refresh_1128.py,只读)\n\nSHAPE 核这些:\n(1) 这两个文件只许加行,改动前的每一行都要按原顺序原样留着:winclient/WinClient.Core/Firewall/KillSwitchApplier.cs ; winclient/WinClient.Core/Client/ClientController.cs\n(2) 下列片段必须原样出现在对应文件里(逐字,含标点和空格):\n  - winclient/WinClient.Core/Firewall/KillSwitchPlanner.cs\n      public static IReadOnlyList<FirewallAction> RefreshAuth(AuthEndpoint auth)\n      private static AddRule AuthRule(AuthEndpoint auth)\n      actions.Add(AuthRule(auth));\n  - winclient/WinClient.Core/Firewall/KillSwitchApplier.cs\n      Task<bool> RefreshAuthAsync(AuthEndpoint auth) => Task.FromResult(false);\n      public async Task<bool> RefreshAuthAsync(AuthEndpoint auth)\n      public const string WfpAuthRefreshFailed = \"系统过滤层里登录服务器的放行没能换成当前程序。\";\n  - winclient/WinClient.Core/Firewall/KillSwitchRecord.cs\n      internal sealed record KillSwitchRecord(\n      public static KillSwitchRecord? Read(string path)\n      public bool Has(AddRule rule)\n      public RecordedNode? Node()\n      \"value\"\n      internal sealed record RecordedRule(\n      internal sealed record RecordedNode(\n  - winclient/WinClient.Core/Client/ClientController.cs\n      private async Task RefreshAuthPermitAsync()\n      await RefreshAuthPermitAsync();\n      \"启动：登录服务器的放行已换成当前程序\"\n      \"启动：登录服务器的放行不用换\"\n      \"启动：登录服务器的放行没换成：\"\n(3) 下列方法的正文里必须有、不许有:\n  - winclient/WinClient.Core/Firewall/KillSwitchApplier.cs 的 public async Task<bool> RefreshAuthAsync(AuthEndpoint auth)\n      必须有:KillSwitchPlanner.RefreshAuth(auth)\n      必须有:gate.WaitAsync()\n      必须有:gate.Release()\n      必须有:KillSwitchRecord.Read(StatePath)\n      必须有:\"global\"\n      必须有:wfpOffPath\n      必须有:wfp.ListFilterNames()\n      必须有:WfpPlanner.PlanGlobal(\n      必须有:wfp.Install(policy)\n      必须有:wfpPolicy = policy\n      必须有:RunActionsAsync(actions, \"换登录放行\")\n      必须有:WfpAuthRefreshFailed\n      不许有:wfp.Remove\n      不许有:RemoveWfp\n      不许有:RecoverFirewallAsync\n      不许有:RestoreProfileDefault\n      不许有:SetProfileDefault\n      不许有:RemoveRulesByPrefix\n  - winclient/WinClient.Core/Client/ClientController.cs 的 private async Task RefreshAuthPermitAsync()\n      必须有:sessionSource is not AuthServerSessionSource\n      必须有:authEndpoint is null\n      必须有:firewall.RefreshAuthAsync(authEndpoint)\n      必须有:IsOperational(ex)\n      必须有:ConnectJournal.Describe(ex)\n      不许有:FailAsync\n      不许有:message =\n      不许有:protection =\n      不许有:machine.Handle\n      不许有:Publish(\n  - winclient/WinClient.Core/Client/ClientController.cs 的 public async Task InitializeAsync(bool autoConnect = true, bool keepProtection = false)\n      必须有:await RefreshAuthPermitAsync();\n  - winclient/WinClient.Core/Firewall/KillSwitchPlanner.cs 的 public static IReadOnlyList<FirewallAction> Plan(\n      必须有:actions.Add(AuthRule(auth));\n      不许有:鉴权服务器\n      不许有:后台服务程序必须\n(4) 下列方法从签名到正文结束一个字不能变:\n  - winclient/WinClient.Core/Firewall/KillSwitchPlanner.cs:public static string ToPowerShellScript( ; public static IReadOnlyList<FirewallAction> PlanApps( ; private static IEnumerable<FirewallAction> NodeRules(\n  - winclient/WinClient.Core/Firewall/KillSwitchApplier.cs:private async Task<string> ExecuteAsync( ; private async Task<string> RunActionsAsync( ; public async Task<string?> RecoverAsync() ; private bool InstallWfp( ; private bool RemoveWfp()\n  - winclient/WinClient.Core/Client/ClientController.cs:internal async Task ConnectAsync(bool fromUser) ; private async Task FetchSessionAsync() ; private async Task ExecuteEffectsAsync(Transition transition) ; private async Task PatrolAsync(object cycle)\n(5) 下列文件里不许出现:\n  - winclient/WinClient.Core/Firewall/KillSwitchRecord.cs:File.Write ; File.Delete ; File.Move ; File.Copy ; ProcessStartInfo\n(6) 另外:KillSwitchPlanner.cs 里这三句报错各正好出现一次:鉴权服务器必须是 IPv4 数字地址。 ; 鉴权服务器端口必须在 1 到 65535 之间。 ; 后台服务程序必须是绝对路径。。InitializeAsync 里 await RefreshAuthPermitAsync(); 在「启动：接回断网保护，随后自动连接」那行之后、else if (keptMissing) 之前;ClientController.cs 里 RefreshAuthPermitAsync( 正好出现两次、firewall.RefreshAuthAsync( 正好出现一次;RefreshAuthAsync 里 wfp.Install(policy) 在 RunActionsAsync(actions, \"换登录放行\") 之前,new WfpUnavailableException(WfpAuthRefreshFailed) 在它之后。\n\nTESTS 核这些:两个测试文件都在;每个用例前是 [Fact] 或 [Theory](后面可跟 [InlineData(…)] 行)、签名是 public void 名字( 或 public async Task 名字(、至少两处 Assert.;文件里不许出现 Skip、Task.Delay(、Thread.Sleep(。每个用例(连同它的 InlineData 行)里必须原样出现:\n  - winclient/WinClient.Tests/AuthPermitRefreshTests.cs\n      RefreshAuthPlanIsTheAuthRuleFromFullPlan:\n          KillSwitchPlanner.RefreshAuth(\n          KillSwitchPlanner.Plan(\n          \"YuanC-KS-Auth\"\n          Assert.Single(\n          JsonSerializer.Serialize(\n      RefreshAuthScriptRewritesOnlyAuthRuleAndRecord:\n          KillSwitchPlanner.ToPowerShellScript(KillSwitchPlanner.RefreshAuth(\n          \"New-NetFirewallRule -Name 'YuanC-KS-Auth'\"\n          \"$_.Name -ne 'YuanC-KS-Auth'\"\n          \"if ($null -ne $state) { Write-State $state }\"\n          DoesNotContain(\"Set-NetFirewallProfile\"\n          DoesNotContain(\"YuanC-KS-Node\"\n      RefreshAuthRejectsBadEndpointBeforeTouchingSystem:\n          ThrowsAsync<ArgumentException>(\n          RefreshAuthAsync(\n          Assert.Empty(\n      ChangedProgramRewritesFirewallRuleAndReinstallsFilters:\n          Assert.True(await\n          RefreshAuthAsync(\n          new[] { \"list\", \"install\", \"script\" }\n          KillSwitchPlanner.ToPowerShellScript(KillSwitchPlanner.RefreshAuth(\n          \"YuanC-WFP-Auth\"\n          \"YuanC-WFP-Node-Tcp\"\n          \"YuanC-WFP-Node-Udp\"\n          \"192.0.2.5/32\"\n          24443\n          AppPath\n      SameProgramDoesNothing:\n          Assert.False(await\n          RefreshAuthAsync(\n          Assert.Empty(\n          ToUpperInvariant()\n      NoRecordAppsModeOrBrokenRecordDoesNothing:\n          [InlineData(\"missing\")]\n          [InlineData(\"apps\")]\n          [InlineData(\"broken\")]\n          Assert.False(await\n          Assert.Empty(\n      RecordWithoutNodeRulesOnlyRewritesFirewallRule:\n          Assert.True(await\n          new[] { \"script\" }\n      EmptyFilterLayerIsNotReinstalled:\n          Assert.True(await\n          new[] { \"list\", \"script\" }\n      OffSwitchSkipsFilterLayer:\n          \"wfp-off\"\n          Assert.True(await\n          new[] { \"script\" }\n      FilterFailureStillRewritesFirewallRuleThenReports:\n          ThrowsAsync<WfpUnavailableException>(\n          KillSwitchApplier.WfpAuthRefreshFailed\n          new[] { \"list\", \"install\", \"script\" }\n      ScriptFailureKeepsOriginalError:\n          ThrowsAsync<InvalidOperationException>(\n          \"防火墙操作失败，恢复记录已保留，请联系管理员。\"\n      RecordReaderAcceptsPowerShellArrayShapes:\n          KillSwitchRecord.Read(\n          new UTF8Encoding(true)\n          value\n          Count\n          .Node()\n          \"global\"\n          Assert.NotNull(\n      PatrolAfterRefreshComparesAgainstReinstalledFilters:\n          RefreshAuthAsync(\n          PatrolAsync(\n          new[] { \"list\", \"script\" }\n          new[] { \"list\", \"install\", \"script\" }\n  - winclient/WinClient.Tests/ControllerAuthPermitTests.cs\n      KeptStartRefreshesAuthPermitBeforeFetchingSession:\n          keepProtection: true\n          new[] { \"refresh-auth\", \"session\", \"apply\", \"start\" }\n          ConnectionState.Connected\n          \"启动：登录服务器的放行已换成当前程序\"\n          Assert.Single(\n      KeptStartWithoutRefreshCannotFetchSession:\n          keepProtection: true\n          RefreshError\n          DoesNotContain(\"apply\"\n          Assert.NotEqual(ConnectionState.Connected\n          ProtectionActive\n          \"启动：登录服务器的放行没换成：\"\n          \"session\"\n      SameProgramJournalsNoChange:\n          keepProtection: true\n          \"启动：登录服务器的放行不用换\"\n          ConnectionState.Connected\n      PairingModeOrMissingEndpointDoesNotRefresh:\n          [InlineData(true)]\n          [InlineData(false)]\n          PairingSessionSource\n          DoesNotContain(\"refresh-auth\"\n          ConnectionState.Connected\n      StartWithoutKeptProtectionDoesNotRefresh:\n          [InlineData(false, true)]\n          [InlineData(true, false)]\n          DoesNotContain(\"refresh-auth\"\n          Assert.Empty(\n      MissingCredentialsParksWithoutRefresh:\n          keepProtection: true\n          DoesNotContain(\"refresh-auth\"\n          ConnectionState.NeedsManual\n          ProtectionActive\n\nSCOPE 核这些:相对主干只许改动或新增下面这些文件,别的一个都不许动:\n  - winclient/WinClient.Core/Client/ClientController.cs\n  - winclient/WinClient.Core/Firewall/KillSwitchApplier.cs\n  - winclient/WinClient.Core/Firewall/KillSwitchPlanner.cs\n  - winclient/WinClient.Core/Firewall/KillSwitchRecord.cs\n  - winclient/WinClient.Tests/AuthPermitRefreshTests.cs\n  - winclient/WinClient.Tests/ControllerAuthPermitTests.cs\n\n五、做的时候守这几条\n\n- 只动 allowedPaths 里的六个文件;现有测试文件一个不改(IKillSwitch 新成员带默认实现,现有替身不用跟着改)。发现非改别的文件不可,交 blocked 写清是哪一个、为什么。\n- 不放宽、不删、不跳过任何现有断言;不加重试;测试里不许 Skip、Task.Delay、Thread.Sleep。\n- 不新增子进程调用(本单没有);防火墙脚本仍经现有的 RunActionsAsync 跑,它用的 CreateStartInfo 已是隐藏窗口。\n- 不往日志、连接记录里写登录服务器地址、节点地址、令牌(ConnectJournal.Describe 已做脱敏,照用)。\n- 验收命令单独一条执行,不要拼 cd &&、管道或重定向。\n- 先写两个测试文件,申请 BUILD 看到编译失败(新符号还不存在)作为证红;之后固定按 BUILD → TEST → T-AUTH → SHAPE → TESTS → SCOPE 的次序跑。\n- 参考代码和验收脚本对不上、或照契约写编译不过且改法不唯一时,交 blocked 写成结构化岔路,不自己改契约里定稿的名字和文字。\n\n六、交活说明要写\n\n- 六个文件各改了什么(一两句)。\n- 参考代码里哪几处为了编译通过做了改动、怎么改的。\n- 没做、没验的:真机上没跑过(真防火墙、真过滤层、真的自动更新一遍)。",
+  "background": "项目:Windows 客户端(.NET 9 / C# 13,Nullable 与 ImplicitUsings 开),后台服务带断网保护。本单只动 winclient 下六个文件。\n\n开工先读(都在本仓):\n- winclient/WinClient.Core/Client/ClientController.cs 的 InitializeAsync(保持保护分路)、ConnectAsync、FetchSessionAsync、IsOperational、WriteJournal。\n- winclient/WinClient.Core/Firewall/KillSwitchPlanner.cs 的 Plan(登录放行那一块)和 ToPowerShellScript 里 AddRule 那一段(只有放行规则、没有默认策略动作时,脚本会读恢复记录、重放规则、把记录里同名那条换掉再写回;UpdateNode 走的就是这条路)。\n- winclient/WinClient.Core/Firewall/KillSwitchApplier.cs 全文(gate、StatePath、wfp、wfpOffPath、wfpPolicy、lastAuth、RunActionsAsync、PatrolAsync 怎么用 wfpPolicy)。\n- winclient/WinClient.Core/Firewall/WfpPlanner.cs 的 PlanGlobal;winclient/WinClient.Core/Firewall/WfpEngine.cs 的 Install(一个事务里先删后加)。\n- winclient/WinClient.Core/Client/ClientSettings.cs 的 AuthEndpoint(程序取当前进程路径)、winclient/WinClient.Core/Update/UpdatePlanner.cs 的 Executable(每个版本一个目录)、winclient/WinClient.App/Hosting/UpdateApplier.cs 的 RunAsync(等 120 秒到已连接,否则退回)。这三个只读,不改。\n- 测试写法参考:winclient/WinClient.Tests/WfpApplierTests.cs(夹具与两个替身)、KillSwitchAuthRuleTests.cs、ControllerTests.cs 里的 Firewall、Tunnel 替身和 SessionHttp;AuthTests.Handler、TestData、TempDirectory、InMemoryCredentialStore 可直接用。\n- 验收脚本 docs/plans/checks/yc_auth_permit_refresh_1128.py(只读)。\n\n恢复记录是 Windows PowerShell 5.1 用 ConvertTo-Json 写的 killswitch-state.json:UTF-8 带 BOM;没有 mode 字段就是全部流量;rules 是套用时记下的放行规则,每条有 Name、Program、Service、LocalAddress、RemoteAddress、Protocol、LocalPort、RemotePort,端口是字符串。\n\n卡面:看板 yuanc 项目 WINCLIENT-UPDATE-AUTH-PATH-ROLLBACK-1127。病根是读代码得出的,真机上没跑过;本单用控制器级测试证实「放行不换就取不到会话」,真机验证不在本单。",
+  "nonGoals": [
+    "不改自动更新的流程、等待时长和退回逻辑(UpdateApplier、UpdateCoordinator、UpdatePlanner)",
+    "不把放行改成不看程序路径,不放宽放行的地址、端口、协议",
+    "不改过滤层引擎(WfpEngine、WfpNative)和过滤层方案(WfpPlanner)",
+    "不改连接、取会话、巡检、续期的既有流程",
+    "不改文档和口径速查表(合并后派单方补)",
+    "不做真机实测,不打发布包,不改版本号"
+  ],
+  "allowedPaths": [
+    "winclient/WinClient.Core/Client/ClientController.cs",
+    "winclient/WinClient.Core/Firewall/KillSwitchApplier.cs",
+    "winclient/WinClient.Core/Firewall/KillSwitchPlanner.cs",
+    "winclient/WinClient.Core/Firewall/KillSwitchRecord.cs",
+    "winclient/WinClient.Tests/AuthPermitRefreshTests.cs",
+    "winclient/WinClient.Tests/ControllerAuthPermitTests.cs"
+  ],
+  "forbiddenPaths": [
+    ".codex/**",
+    ".github/**",
+    ".gitignore",
+    "pyproject.toml",
+    "authserver/**",
+    "node/**",
+    "scripts/**",
+    "docs/**",
+    "winclient/*.sln",
+    "winclient/Directory.Build.props",
+    "winclient/third_party/**",
+    "winclient/WinClient.App/**",
+    "winclient/WinClient.UiTests/**",
+    "winclient/WinClient.Core/Update/**",
+    "winclient/WinClient.Core/Network/**",
+    "winclient/WinClient.Core/State/**",
+    "winclient/WinClient.Core/Diagnostics/**",
+    "winclient/WinClient.Core/Ipc/**",
+    "winclient/WinClient.Core/Hosting/**",
+    "winclient/WinClient.Core/Auth/**",
+    "winclient/WinClient.Core/Kernel/**",
+    "winclient/WinClient.Core/Process/**",
+    "winclient/WinClient.Core/Client/ClientSettings.cs",
+    "winclient/WinClient.Core/Client/ClientRuntime.cs",
+    "winclient/WinClient.Core/Client/ISessionSource.cs",
+    "winclient/WinClient.Core/Client/RoutingRenderer.cs",
+    "winclient/WinClient.Core/Firewall/WfpEngine.cs",
+    "winclient/WinClient.Core/Firewall/WfpNative.cs",
+    "winclient/WinClient.Core/Firewall/WfpPlanner.cs",
+    "winclient/WinClient.Core/Firewall/DisabledKillSwitch.cs",
+    "winclient/WinClient.Core/Firewall/RouteGuard.cs",
+    "winclient/WinClient.Core/WinClient.Core.csproj",
+    "winclient/WinClient.Tests/WinClient.Tests.csproj",
+    "winclient/WinClient.Tests/ControllerTests.cs",
+    "winclient/WinClient.Tests/WfpApplierTests.cs",
+    "winclient/WinClient.Tests/KillSwitchAuthRuleTests.cs",
+    "winclient/WinClient.Tests/FirewallTests.cs",
+    "winclient/WinClient.Tests/TestData.cs",
+    "winclient/WinClient.Tests/AuthTests.cs"
+  ],
+  "expectArtifacts": [],
+  "acceptance": [
+    {
+      "id": "BUILD",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "build",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1200
+    },
+    {
+      "id": "TEST",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "test",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--no-build",
+        "--nologo",
+        "--filter",
+        "FullyQualifiedName!~RenderTests"
+      ],
+      "required": true,
+      "timeoutSec": 1500
+    },
+    {
+      "id": "T-AUTH",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "test",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--nologo",
+        "--filter",
+        "FullyQualifiedName~AuthPermit"
+      ],
+      "required": true,
+      "timeoutSec": 1500
+    },
+    {
+      "id": "SHAPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_auth_permit_refresh_1128.py",
+        "shape"
+      ],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "TESTS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_auth_permit_refresh_1128.py",
+        "tests"
+      ],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "SCOPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_auth_permit_refresh_1128.py",
+        "scope"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "timeoutSec": 10800,
+  "repoRoot": "E:/yuanc",
+  "steps": [
+    "读 background 列出的文件与检查脚本。",
+    "先写两个测试文件;申请 BUILD 以编译失败证红(新符号还不存在),之后固定 BUILD→TEST。",
+    "照 goal 二逐个文件改:恢复记录读取、只含登录放行的方案、换登录放行、保持保护启动时调用。",
+    "BUILD、TEST、T-AUTH、SHAPE、TESTS、SCOPE 全绿后交活;交活说明照 goal 六的要求写。"
+  ]
+}
