@@ -3,13 +3,14 @@ using System.Text;
 using System.Text.Json;
 using System.Threading.Channels;
 using WinClient.Core.Client;
+using WinClient.Core.Diagnostics;
 using WinClient.Core.State;
 using WinClient.Core.Update;
 
 namespace WinClient.Core.Ipc;
 
 public sealed class ControlServer(IClientFacade facade, DesiredStateStore desired, IUpdateCoordinator? updates = null, string? serviceVersion = null,
-    TimeSpan? idleTimeout = null)
+    TimeSpan? idleTimeout = null, ILeakChecker? leakCheck = null)
 {
     public static readonly TimeSpan DefaultIdleTimeout = TimeSpan.FromSeconds(30);
     /// <summary>开机要不要接着连:真有断网保护,或此刻正在连接/已连接/重连中才算要连;首次失败恢复后写不连。</summary>
@@ -17,13 +18,17 @@ public sealed class ControlServer(IClientFacade facade, DesiredStateStore desire
         snapshot.ProtectionActive || snapshot.State is ConnectionState.Connecting or ConnectionState.Connected or ConnectionState.Reconnecting;
     /// <summary>不可信调用者发会改变连接状态的指令时返回的错误文案。</summary>
     public const string UntrustedCallerError = "只有本产品的界面程序可以执行此操作";
-    // 会改变连接状态的指令，以及 check_update（会触发对外网络检查）、read_audit（含本机其他程序的规则名与完整路径）、read_selfcheck（含产品核验到的真实出口地址）、read_diagnostics（含本机防火墙规则名、网卡与日志末尾），只允许程序位于安装目录之下的调用者执行；status 与 subscribe 对任何本机程序开放。
+    // 会改变连接状态的指令，以及 check_update（会触发对外网络检查）、read_audit（含本机其他程序的规则名与完整路径）、read_selfcheck（含产品核验到的真实出口地址）、read_diagnostics（含本机防火墙规则名、网卡与日志末尾）、leak_check（会在本机抓包），只允许程序位于安装目录之下的调用者执行；status 与 subscribe 对任何本机程序开放。
     // restore_environment 会修改系统环境，同样只允许可信调用者。
-    private static readonly HashSet<string> TrustedOnlyOps = ["connect", "disconnect", "redeem", "import_pairing", "clear_pairing", "set_environment", "restore_environment", "set_routing", "check_update", "read_audit", "read_selfcheck", "read_diagnostics"];
+    private static readonly HashSet<string> TrustedOnlyOps = ["connect", "disconnect", "redeem", "import_pairing", "clear_pairing", "set_environment", "restore_environment", "set_routing", "check_update", "read_audit", "read_selfcheck", "read_diagnostics", "leak_check"];
     // One ordering across connections keeps persisted intent consistent with completed commands.
     private readonly SemaphoreSlim commands = new(1, 1);
     // 多条 read_diagnostics 之间排队；它不进指令信号量，连接指令卡住时也能导出。
     private readonly SemaphoreSlim diagnostics = new(1, 1);
+    public const string LeakCheckBusyError = "泄漏检测正在进行，请等它结束。";
+    public const string LeakCheckFailedError = "泄漏检测没有完成，请稍后再试。";
+    // 泄漏检测同一时刻只跑一个;第二条不排队,直接回「正在进行」。
+    private readonly SemaphoreSlim leakChecks = new(1, 1);
     // 未订阅连接的空闲上限；零或负数表示不限。已订阅连接靠推送保活，不受此限。
     private readonly TimeSpan idleLimit = idleTimeout ?? DefaultIdleTimeout;
     private ControlSnapshot Snapshot() => ((ControlSnapshot)facade.Snapshot) with
@@ -137,6 +142,23 @@ public sealed class ControlServer(IClientFacade facade, DesiredStateStore desire
                 return new(request.Id, false, "诊断没有取到，请稍后再试。");
             }
             finally { diagnostics.Release(); }
+        }
+        // leak_check 要跑两分钟:不进指令信号量,期间连接、断开照常。
+        if (request.Op == "leak_check")
+        {
+            if (leakCheck is null) return new(request.Id, false, "不支持的指令");
+            if (!leakChecks.Wait(0)) return new(request.Id, false, LeakCheckBusyError);
+            try
+            {
+                return new ControlResponse(request.Id, true, LeakCheck: await leakCheck.RunAsync(token).ConfigureAwait(false));
+            }
+            catch (Exception ex) when (ex is IOException or InvalidDataException or UnauthorizedAccessException or InvalidOperationException
+                or ArgumentException or JsonException or System.ComponentModel.Win32Exception)
+            {
+                // 不把异常原文发回界面。
+                return new(request.Id, false, LeakCheckFailedError);
+            }
+            finally { leakChecks.Release(); }
         }
         await commands.WaitAsync(token).ConfigureAwait(false);
         try

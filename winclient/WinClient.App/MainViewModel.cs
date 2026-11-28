@@ -77,6 +77,18 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
 
     public string UpdateMessage => updateMessage;
     public string DiagnosticsMessage { get; private set; } = "";
+    public const string LeakCheckNeedsConnection = "连接后才能检测。";
+    public const string LeakCheckFailedMessage = "泄漏检测没有完成，请检查后台服务后再试。";
+    public const string LeakCheckInterruptedMessage = "检测期间连接断开过，这次结果不作数。请连接后重新检测。";
+    public ICommand LeakCheckCommand { get; }
+    public bool IsLeakCheckRunning { get; private set; }
+    public string LeakCheckMessage { get; private set; } = "";
+    // 只记作数的结论,导出诊断时带上。
+    private string? lastLeakCheck;
+    private bool leakCheckInterrupted;
+    internal Func<CancellationToken, Task<ControlResponse>> SendLeakCheck { get; set; } = SendLeakCheckOverPipeAsync;
+    public bool CanLeakCheck => CanUseConnection && ShouldDisconnect && !IsLeakCheckRunning;
+    public string LeakCheckDisabledReason => IsLeakCheckRunning ? "" : ConnectionDisabledReason.Length > 0 ? ConnectionDisabledReason : ShouldDisconnect ? "" : LeakCheckNeedsConnection;
     internal Func<string, bool> RevealFile { get; set; } = DiagnosticsExport.RevealInExplorer;
     internal Func<string, string, CancellationToken, Task>? WriteDiagnosticsFile { get; set; }
     public string SuggestedDiagnosticsFileName => DiagnosticsExport.DefaultFileName(NowProvider().ToLocalTime());
@@ -174,6 +186,7 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         }), CanChangePairing);
         ClearPairingCommand = new AsyncCommand(() => RunAsync(() => SendAsync("clear_pairing")),
             () => CanChangePairing() && snapshot.Mode == "自用模式");
+        LeakCheckCommand = new AsyncCommand(RunLeakCheckAsync, () => CanLeakCheck);
         Refresh();
     }
     private bool CanChangePairing() => CanUseConnection && !ShouldDisconnect;
@@ -481,12 +494,14 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
             observedSelfCheckStatus = SelfCheckStatus;
             if (CurrentPage == PageKind.Environment) _ = LoadSelfCheckAsync();
         }
+        if (IsLeakCheckRunning && !ShouldDisconnect) leakCheckInterrupted = true;
+        Notify(nameof(CanLeakCheck)); Notify(nameof(LeakCheckDisabledReason));
         CommandManager.InvalidateRequerySuggested();
     }
     public Task ExportDiagnosticsAsync(string path) => RunAsync(async () =>
     {
         var source = client;
-        var ui = new UiDiagnostics(CurrentVersion, serviceVersion, availability.ToString(), snapshot, updateStatus.Stage, updateMessage);
+        var ui = new UiDiagnostics(CurrentVersion, serviceVersion, availability.ToString(), snapshot, updateStatus.Stage, updateMessage, lastLeakCheck);
         var result = await DiagnosticsExport.RunAsync(
             source is null ? null : (op, token) => source!.SendAsync(op, cancellationToken: token),
             ui, NowProvider(), path, lifetime.Token, WriteDiagnosticsFile);
@@ -502,6 +517,62 @@ public sealed class MainViewModel : INotifyPropertyChanged, IDisposable
         client.Dispose(); client = null;
     }
     public void Dispose() { disposed = true; updateIndicatorTimer?.Stop(); updateIndicatorTimer = null; lifetime.Cancel(); DropClient(); }
+
+    internal async Task RunLeakCheckAsync()
+    {
+        if (disposed || !CanLeakCheck) return;
+        leakCheckInterrupted = false;
+        ApplyLeakCheck(true, "");
+        string text;
+        var completed = false;
+        try
+        {
+            var response = await SendLeakCheck(lifetime.Token).ConfigureAwait(false);
+            completed = response.Ok && !string.IsNullOrEmpty(response.LeakCheck);
+            text = completed ? response.LeakCheck! : response.Error ?? LeakCheckFailedMessage;
+        }
+        catch (Exception ex) when (ex is IOException or InvalidDataException or UnauthorizedAccessException or InvalidOperationException or
+            JsonException or ArgumentException or OperationCanceledException or TimeoutException)
+        { text = LeakCheckFailedMessage; }
+        await OnUiAsync(() =>
+        {
+            // 检测期间断开过:断开后的流量本来就不走节点,这次结果不作数,也不带进诊断。
+            if (completed && leakCheckInterrupted) { completed = false; text = LeakCheckInterruptedMessage; }
+            if (completed) lastLeakCheck = text;
+            ApplyLeakCheck(false, text);
+        }).ConfigureAwait(false);
+    }
+
+    // 回到界面线程再改界面状态;没有界面线程或已经在界面线程就直接执行。返回的任务完成时状态已经写好。
+    private Task OnUiAsync(Action action)
+    {
+        var dispatcher = Application.Current?.Dispatcher;
+        if (disposed || dispatcher?.HasShutdownStarted == true) return Task.CompletedTask;
+        if (dispatcher is null || dispatcher.CheckAccess()) { action(); return Task.CompletedTask; }
+        return dispatcher.InvokeAsync(action).Task;
+    }
+
+    private void ApplyLeakCheck(bool running, string text)
+    {
+        IsLeakCheckRunning = running; LeakCheckMessage = text;
+        Notify(nameof(IsLeakCheckRunning)); Notify(nameof(LeakCheckMessage));
+        Notify(nameof(CanLeakCheck)); Notify(nameof(LeakCheckDisabledReason));
+        CommandManager.InvalidateRequerySuggested();
+    }
+
+    // 检测要跑两分钟,而每条连接上的指令是一条做完才读下一条:另开一条连接,不占主连接,连接、断开照常。
+    private static async Task<ControlResponse> SendLeakCheckOverPipeAsync(CancellationToken token)
+    {
+        var pipe = new NamedPipeClientStream(".", ControlService.PipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
+        try
+        {
+            await pipe.ConnectAsync(3000, token).ConfigureAwait(false);
+            if (!PipePeer.VerifyServer(pipe, UpdatePlanner.DefaultAppRoot)) throw new IOException("后台服务身份核验失败");
+            using var checker = new ControlClient(pipe);
+            return await checker.SendAsync("leak_check", cancellationToken: token).ConfigureAwait(false);
+        }
+        finally { pipe.Dispose(); }
+    }
 
     private sealed class AsyncCommand(Func<Task> execute, Func<bool> canExecute) : ICommand
     {
