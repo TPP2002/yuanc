@@ -239,6 +239,11 @@ class ConsoleHandler(BaseHTTPRequestHandler):
         self._send(200, data, content_type)
 
     def _api(self, method, name, extra):
+        # POST 第一件事就是把请求体读完，排在登录、来源页、防伪头、限流各道检查之前：
+        # 被拒的请求也得等对端把请求体发完，否则先回话再关连接会把应答冲掉。
+        if method == "POST" and not self._take_body():
+            # 请求体没读完（超时或对方重置）：这条连接不回任何应答，直接结束。
+            return
         token = self._token()
         csrf = None if token is None else self.server.sessions.get(token)
         if name not in {"session", "login"} and csrf is None:
@@ -319,28 +324,50 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             self.server.sessions.drop(token)
         return self._json(200, {"logged_in": False}, CLEAR_COOKIE)
 
-    def _read_body(self, allowed):
+    def _take_body(self):
+        # 走到接口层的 POST 先把请求体读完再做判断：先回话再关连接的话，
+        # 对端还没写完的请求体会落到已关的连接上，系统回 RST，把刚写的应答一起冲掉；
+        # 所以这里宁可多等一会儿请求体，也不靠「回完再等一小会儿」碰运气。
+        self.body = b""
+        self.body_length = 0
         value = self.headers.get("Content-Length")
-        length = 0
-        if value is not None:
-            try:
-                length = int(value)
-            except ValueError:
-                self.close_connection = True
-                self._json(422, BAD_REQUEST)
-                return None
-            if length < 0 or length > 16384:
-                self.close_connection = True
-                self._json(422, BAD_REQUEST)
-                return None
+        if value is None:
+            return True
+        try:
+            length = int(value)
+        except ValueError:
+            # 声明长度读不了：不读套接字，后面按现有规则回 422 并断开。
+            self.body_length = None
+            return True
+        if length < 0 or length > 16384:
+            self.body_length = None
+            return True
         if length == 0:
+            return True
+        self.body_length = length
+        try:
+            # 连接提前结束时读到多少算多少，后面按格式不对处理。
+            self.body = self.rfile.read(length)
+        except OSError:
+            # 套接字超时（含 TimeoutError）或对方重置：这条连接不回任何应答，
+            # 直接断开；不记错误日志，当成对端自己放弃了这条连接。
+            self.close_connection = True
+            return False
+        return True
+
+    def _read_body(self, allowed):
+        # 只判断并解析 _take_body 存下的内容，不再碰套接字。
+        if self.body_length is None:
+            self.close_connection = True
+            self._json(422, BAD_REQUEST)
+            return None
+        if self.body_length == 0:
             return {}
         if not self.headers.get("Content-Type", "").startswith("application/json"):
             self._json(422, BAD_REQUEST)
             return None
-        data = self.rfile.read(length)
         try:
-            body = json.loads(data.decode("utf-8"))
+            body = json.loads(self.body.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
             self._json(422, BAD_REQUEST)
             return None

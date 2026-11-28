@@ -4,6 +4,7 @@ import socket
 import threading
 from datetime import UTC, datetime
 
+import pytest
 from exitnode.config import load
 from exitnode.console import server as console_server
 from exitnode.console.auth import hash_password
@@ -663,3 +664,118 @@ def test_secrets_never_logged(tmp_path, caplog, capsys):
     assert PASSWORD_HASH not in text
     assert data["csrf"] not in text
     assert cookie_value not in text
+
+
+def test_rejected_post_waits_for_body_then_answers(tmp_path):
+    # 会被拒的 POST 也要先等请求体:请求体没到齐之前服务端一个字都不许回,
+    # 到了之后才按原规则给出 401 / 403 / 422 / 429。
+    payload = b'{"days":1,"max_uses":1,"note":""}'
+    with Running(make(tmp_path, client=FakeClient())) as server:
+        data, cookie = login(server)
+        host = f"127.0.0.1:{server.server_address[1]}"
+        csrf = data["csrf"]
+        password_payload = json.dumps({"password": PASSWORD}).encode("utf-8")
+
+        def exchange(request_head, request_body):
+            sock = socket.create_connection(server.server_address, timeout=5)
+            try:
+                # 先只发请求头;请求体没到,服务端此刻必须一个字节都不回。
+                sock.sendall(request_head)
+                sock.settimeout(0.3)
+                with pytest.raises(TimeoutError):
+                    sock.recv(4096)
+                # 再把请求体补上,读到连接关闭为止。
+                sock.sendall(request_body)
+                sock.settimeout(5)
+                raw = b""
+                while True:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    raw += chunk
+                return raw
+            finally:
+                sock.close()
+
+        cases = [
+            # 没带 Cookie:401,要先等请求体到齐。
+            ("/api/invites", {"Content-Type": "application/json"}, payload,
+             401, {"detail": "请先登录", "code": "login_required"}),
+            # 带 Cookie、不带防伪头:403。
+            ("/api/logout", {"Cookie": cookie, "Content-Type": "application/json"}, b"{}",
+             403, {"detail": console_server.CSRF_DETAIL, "code": "csrf"}),
+            # 来源页不对:403。
+            ("/api/invites", {"Cookie": cookie, "X-Console-CSRF": csrf,
+                              "Origin": "http://evil.example",
+                              "Content-Type": "application/json"}, payload,
+             403, {"detail": console_server.CSRF_DETAIL, "code": "csrf"}),
+            # 登录也要先等请求体,来源页不对照样 403。
+            ("/api/login", {"Origin": "http://evil.example",
+                            "Content-Type": "application/json"}, password_payload,
+             403, {"detail": console_server.CSRF_DETAIL, "code": "csrf"}),
+            # 内容类型不对:422。
+            ("/api/invites", {"Cookie": cookie, "X-Console-CSRF": csrf,
+                              "Content-Type": "text/plain"}, payload,
+             422, {"detail": "请求格式不对", "code": "bad_request"}),
+        ]
+        for path, extra, body, status, expected in cases:
+            head = (f"POST {path} HTTP/1.0\r\nHost: {host}\r\n"
+                    + "".join(f"{key}: {value}\r\n" for key, value in extra.items())
+                    + f"Content-Length: {len(body)}\r\n\r\n").encode("ascii")
+            raw = exchange(head, body)
+            assert raw.startswith(b"HTTP/1.0 " + str(status).encode("ascii"))
+            assert json.loads(raw.split(b"\r\n\r\n", 1)[1]) == expected
+
+        # 最后一种:先用常规请求错 5 次,再把正确密码的 POST 拆开发,应得 429。
+        for _ in range(5):
+            status, _, _ = call(server, "/api/login", "POST",
+                                json_body={"password": WRONG_PASSWORD})
+            assert status == 401
+        head = (f"POST /api/login HTTP/1.0\r\nHost: {host}\r\n"
+                "Content-Type: application/json\r\n"
+                f"Content-Length: {len(password_payload)}\r\n\r\n").encode("ascii")
+        raw = exchange(head, password_payload)
+        assert raw.startswith(b"HTTP/1.0 429")
+        assert json.loads(raw.split(b"\r\n\r\n", 1)[1])["code"] == "throttled"
+
+
+def test_stalled_body_closes_without_reply(tmp_path, caplog, monkeypatch):
+    # 请求体没到齐、等到套接字超时:这条连接一个字都不回,直接断开,也不记错误日志。
+    import logging
+
+    records = []
+
+    class Capture(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    handler = Capture()
+    logging.getLogger("exitnode").addHandler(handler)
+    try:
+        with caplog.at_level("ERROR"), Running(make(tmp_path)) as server:
+            port = server.server_address[1]
+            with monkeypatch.context() as patch:
+                # 每条新连接建立时读这个类属性,所以块里建的这条连接只等 0.5 秒。
+                patch.setattr(console_server.ConsoleHandler, "timeout", 0.5)
+                head = (f"POST /api/invites HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Content-Length: 10\r\n\r\n").encode("ascii")
+                sock = socket.create_connection(server.server_address, timeout=5)
+                try:
+                    # 请求头和三个字节一起发,声明的长度是 10,剩下的七个字节永远不来。
+                    sock.sendall(head + b'{"d')
+                    received = b""
+                    while True:
+                        chunk = sock.recv(4096)
+                        if not chunk:
+                            break
+                        received += chunk
+                finally:
+                    sock.close()
+            assert received == b""
+            # 超时已回到原值,再发一条普通请求:服务还在。
+            assert call(server, "/api/session")[0] == 200
+    finally:
+        logging.getLogger("exitnode").removeHandler(handler)
+    text = caplog.text + "\n".join(records)
+    assert "管理网页请求处理失败" not in text
