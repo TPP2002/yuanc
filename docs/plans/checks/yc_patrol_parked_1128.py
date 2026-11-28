@@ -248,7 +248,11 @@ def tests_problems(new, old):
             bad.append(f"ControllerTests.cs 缺 {token}")
     if len(re.findall(declared, new)) < len(old_tests) + len(NEW_TESTS):
         bad.append(f"用例数不对:原有 {len(old_tests)} 个,现在 {len(re.findall(declared, new))} 个")
-    if new.count("Skip") > old.count("Skip"):
+    # 只数真正的跳过写法(特性里的 Skip =、Assert.Skip…、Skip.If…、Skippable…);
+    # 用例名里带 Skips、LINQ 的 .Skip(n) 不算。原先按 "Skip" 全文计数,会被契约自己要求的
+    # 用例名 ParkedPatrolSkipsFirewallWhenRecordModeDiffers 撞红。
+    skips = r"\bSkip\s*=|\bAssert\.Skip\w*\s*\(|\bSkip\.If\w*\s*\(|\bSkippable(?:Fact|Theory)\b"
+    if len(re.findall(skips, new)) > len(re.findall(skips, old)):
         bad.append("ControllerTests.cs 里新增了跳过")
     return bad
 
