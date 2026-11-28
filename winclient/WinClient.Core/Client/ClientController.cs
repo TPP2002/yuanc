@@ -57,6 +57,7 @@ public sealed class ClientController : IDisposable
     // 上次没断开但启动时找不到配对文件或登录凭据:保护保持,停在需人工处理,提示用户点断开。
     internal const string KeptWithoutPairingMessage = "上次的连接没有断开，但现在找不到配对文件。断网保护保持，电脑暂时上不了网。请点「断开」恢复原来的网络，重新导入配对文件后再连接。";
     internal const string KeptWithoutCredentialsMessage = "上次的连接没有断开，但现在找不到登录凭据。断网保护保持，电脑暂时上不了网。请点「断开」恢复原来的网络，重新兑换邀请码后再连接。";
+    internal const string PatrolModeMismatchStatus = "代理范围与断网保护记录不一致，本轮没有检查防火墙规则";
     internal static readonly TimeSpan PatrolInterval = TimeSpan.FromSeconds(60);
     // 测试可同时记录所有用途；未注入时仍使用原有 delayAsync，不改变调度行为。
     internal Func<TimeSpan, CancellationToken, string, Task>? DelayWithPurposeAsync { get; set; }
@@ -84,6 +85,9 @@ public sealed class ClientController : IDisposable
     private object? exitCycle;
     private bool patrolScheduled;
     private object? patrolCycle;
+    // 巡检自己的取消源:只跟「断网保护在不在」走,不跟连接的 lifetime 和代数走。
+    // FailAsync 取消 lifetime 之后连接停住,保护还在,巡检要照常跑。
+    private CancellationTokenSource patrolLifetime = new();
     // 会话续期（邀请码模式）：有效期走到八成时续期；网络类失败每五分钟重试，直到到期前一分钟为止。
     internal const double RenewAtFraction = 0.8;
     internal static readonly TimeSpan RenewRetryInterval = TimeSpan.FromMinutes(5);
@@ -213,12 +217,20 @@ public sealed class ClientController : IDisposable
                 keptProtection = true;
                 environmentApplied = environment?.HasPendingState ?? false;
                 WriteJournal("启动：接回断网保护，随后自动连接");
+                SyncPatrol();
             }
             else if (keptMissing)
             {
                 // 上次没断开但现在找不到配对文件或登录凭据:保护保持,停在需人工处理,只等用户点断开。
                 protection = true;
                 environmentApplied = environment?.HasPendingState ?? false;
+                // 这条路不经过 ConnectAsync:巡检要按上次套保护时的代理范围去查,在这里读一次;读不到就留默认,由巡检里的范围核对兜住。
+                try
+                {
+                    activeRouting = routingSettings?.Read() ?? RoutingPolicy.Global;
+                    activeScopes = activeRouting.Mode == RoutingMode.Apps ? activeRouting.Apps.Select(scopeResolver).ToArray() : [];
+                }
+                catch (Exception ex) when (IsOperational(ex)) { WriteJournal("启动：读不到代理范围设置：" + ConnectJournal.Describe(ex)); }
                 await ExecuteAsync(machine.Handle(new(ConnectionEventKind.OperationFailed)));
                 message = sessionSource is AuthServerSessionSource ? KeptWithoutCredentialsMessage : KeptWithoutPairingMessage;
                 WriteJournal("启动：找不到配对文件或登录凭据，断网保护保持，停在需人工处理");
@@ -384,6 +396,8 @@ public sealed class ClientController : IDisposable
         if (ShouldWarnBrowsers("断开", checkApplied: true))
         { WriteJournal("断开未开始：浏览器正在运行，等用户再点一次"); Publish(); return; }
         lifetime.Cancel();
+        // 正在跑的巡检要立刻让路;断开没成功、保护还在时,状态迁移后的 SyncPatrol 会重新排上。
+        patrolLifetime.Cancel();
         Interlocked.Increment(ref generation);
         await gate.WaitAsync();
         try
@@ -808,19 +822,35 @@ public sealed class ClientController : IDisposable
             exitStatus = "核验中";
             ScheduleExitCheck(ExitCheckDelay, exitCycle, 1);
         }
-        if (!ShouldPatrol)
+        SyncPatrol();
+    }
+
+    /// <summary>巡检只看断网保护在不在,和连接状态无关。</summary>
+    private bool ShouldPatrol => protection;
+
+    /// <summary>巡检只在已连接或重连中才改提示语;停住时那句处理指引不能被巡检的话盖掉,巡检结果只写进保护状态。</summary>
+    private bool PatrolMaySpeak => machine.State is ConnectionState.Connected or ConnectionState.Reconnecting;
+
+    /// <summary>保护是按哪种代理范围套上的,以恢复记录为准;和控制器手里的范围对不上时,防火墙巡检会按错的范围去收紧系统设置,整段不做。</summary>
+    private bool PatrolModeMismatch => firewall.HasPendingState && (firewall.PendingMode ?? "global") != ModeName(activeRouting);
+
+    /// <summary>让巡检定时和「保护在不在」对齐:保护没了或巡检被取消过,就丢掉旧定时;保护在而没有定时,就排一个。只在串行锁内调用。</summary>
+    private void SyncPatrol()
+    {
+        if (patrolLifetime.IsCancellationRequested || (!ShouldPatrol && patrolScheduled))
         {
+            // 旧取消源只取消、不释放:迟到的定时任务拿旧令牌等锁时不会撞上已释放的对象。
+            patrolLifetime.Cancel();
+            patrolLifetime = new();
             patrolScheduled = false;
             patrolCycle = null;
         }
-        else if (!patrolScheduled)
+        if (ShouldPatrol && !patrolScheduled && !disposed)
         {
             patrolCycle = new object();
             SchedulePatrol(patrolCycle);
         }
     }
-
-    private bool ShouldPatrol => protection && machine.State is ConnectionState.Connected or ConnectionState.Reconnecting;
 
     private void ScheduleExitCheck(TimeSpan wait, object cycle, int attempt)
         => Schedule(wait, () => CheckExitAsync(cycle, attempt), "出口核验");
@@ -919,19 +949,34 @@ public sealed class ClientController : IDisposable
     private void SchedulePatrol(object cycle)
     {
         patrolScheduled = true;
-        Schedule(PatrolInterval, () => PatrolAsync(cycle), "巡检");
+        _ = RunPatrolAsync(cycle, patrolLifetime.Token);
+    }
+
+    /// <summary>等 60 秒后在串行锁内跑一轮巡检。不走 Schedule:那条路绑着连接的 lifetime 和代数,连接停住后就排不上了。</summary>
+    private async Task RunPatrolAsync(object cycle, CancellationToken token)
+    {
+        try
+        {
+            await DelayForPurposeAsync(PatrolInterval, token, "巡检");
+            await gate.WaitAsync(token);
+            try { if (!disposed) await PatrolAsync(cycle); }
+            finally { Publish(); gate.Release(); }
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested) { }
     }
 
     private async Task PatrolAsync(object cycle)
     {
-        if (!ReferenceEquals(cycle, patrolCycle) || !ShouldPatrol) return;
+        if (!ReferenceEquals(cycle, patrolCycle)) return;
+        if (!ShouldPatrol) { SyncPatrol(); return; }
         try
         {
+            if (PatrolModeMismatch) { guardStatus = PatrolModeMismatchStatus; return; }
             var addedNote = await PatrolNewExecutablesAsync();
             var report = activeRouting.Mode == RoutingMode.Apps
-                ? await firewall.PatrolAsync(KillSwitchPlanner.AppRuleNames(activeRouting.Apps.Count), enforceDefaultBlock: false, lifetime.Token)
-                : await firewall.PatrolAsync(KillSwitchPlanner.ExpectedRuleNames(sessionSource is AuthServerSessionSource), enforceDefaultBlock: true, lifetime.Token);
-            if (lifetime.IsCancellationRequested || disposed) return;
+                ? await firewall.PatrolAsync(KillSwitchPlanner.AppRuleNames(activeRouting.Apps.Count), enforceDefaultBlock: false, patrolLifetime.Token)
+                : await firewall.PatrolAsync(KillSwitchPlanner.ExpectedRuleNames(sessionSource is AuthServerSessionSource), enforceDefaultBlock: true, patrolLifetime.Token);
+            if (patrolLifetime.IsCancellationRequested || disposed) return;
             if (report.MissingRules.Count > 0)
             {
                 if (session is not null)
@@ -949,15 +994,15 @@ public sealed class ClientController : IDisposable
             {
                 firewallWarning = null;
                 protectionVerified = true;
-                message = "断网保护已重新生效。";
+                if (PatrolMaySpeak) message = "断网保护已重新生效。";
             }
         }
         catch (FirewallIneffectiveException ex) when (ex is WfpUnavailableException or RouteGuardUnavailableException)
-        { guardStatus = ex.Message; message = guardStatus; }
+        { guardStatus = ex.Message; if (PatrolMaySpeak) message = guardStatus; }
         catch (FirewallIneffectiveException)
         {
             guardStatus = "系统防火墙已被关闭或被策略覆盖,断网保护可能失效,请立即在 Windows 安全中心开启防火墙或联系管理员";
-            message = guardStatus;
+            if (PatrolMaySpeak) message = guardStatus;
         }
         catch (Exception ex) when (IsOperational(ex)) { guardStatus = "巡检失败,下一轮重试"; }
         finally
@@ -965,7 +1010,7 @@ public sealed class ClientController : IDisposable
             await PatrolNicAsync(); // 防火墙巡检(含规则重建分路)之后再巡检网卡。
             JournalPatrol();
             Publish();
-            if (!disposed && !lifetime.IsCancellationRequested && ShouldPatrol && ReferenceEquals(cycle, patrolCycle)) SchedulePatrol(cycle);
+            if (!disposed && !patrolLifetime.IsCancellationRequested && ShouldPatrol && ReferenceEquals(cycle, patrolCycle)) SchedulePatrol(cycle);
         }
     }
 
@@ -993,18 +1038,18 @@ public sealed class ClientController : IDisposable
     /// <summary>网卡巡检:任何结果都不断开、不撤保护,只更新提示。</summary>
     private async Task PatrolNicAsync()
     {
-        if (nicGuard is null || lifetime.IsCancellationRequested || disposed) return;
+        if (nicGuard is null || patrolLifetime.IsCancellationRequested || disposed) return;
         try
         {
-            var nic = await nicGuard.PatrolAsync(lifetime.Token);
+            var nic = await nicGuard.PatrolAsync(patrolLifetime.Token);
             if (nic.NewlyDisabled.Count > 0) guardStatus += $",已关闭新出现公网 IPv6 的网卡 {nic.NewlyDisabled.Count} 个";
             if (nic.PublicIpv4Adapters.Count > 0)
             {
                 guardStatus = $"网卡「{nic.PublicIpv4Adapters[0]}」出现公网 IPv4 地址,部分软件可能读到它;连接与断网保护保持,请改由路由器拨号或联系管理员";
-                message = guardStatus;
+                if (PatrolMaySpeak) message = guardStatus;
             }
         }
-        catch (NicGuardException ex) { guardStatus = ex.Message; message = guardStatus; }
+        catch (NicGuardException ex) { guardStatus = ex.Message; if (PatrolMaySpeak) message = guardStatus; }
         catch (Exception ex) when (IsOperational(ex)) { }
     }
 
@@ -1206,6 +1251,8 @@ public sealed class ClientController : IDisposable
         protectionVerified = false;
         firewallWarning = null;
         reapWarning = null;
+        // 这条路撤保护不经过状态迁移,要自己把巡检停掉。
+        SyncPatrol();
         string? warning = null;
         if (nicGuard is not null)
         {
@@ -1314,6 +1361,7 @@ public sealed class ClientController : IDisposable
         if (disposed) return;
         disposed = true;
         lifetime.Cancel();
+        patrolLifetime.Cancel();
         Interlocked.Increment(ref generation);
         tunnel.TunnelDown -= OnTunnelDown;
         tunnel.Dispose();

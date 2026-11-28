@@ -1172,6 +1172,29 @@ public sealed class ControllerTests
         await controller.ConnectAsync(); // 串行锁屏障，等待本次回调完成。
     }
 
+    private static async Task FireParkedPatrol(ClientController controller, Timers timers)
+    {
+        var published = Volatile.Read(ref timers.Published);
+        timers.Fire("巡检", d => d == TimeSpan.FromSeconds(60));
+        await Until(() => Volatile.Read(ref timers.Published) > published);
+        await controller.RefreshSessionAsync(); // 串行锁屏障;没连着时它什么都不做。
+    }
+
+    /// <summary>第一次启动抛「找不到内核」,之后成功。</summary>
+    private sealed class FirstStartMissingTunnel(List<string> order) : ITunnelTransport
+    {
+        private int starts;
+        public event EventHandler? TunnelDown { add { } remove { } }
+        public Task StartAsync(JsonElement configuration, CancellationToken token)
+        {
+            order.Add("start");
+            if (Interlocked.Increment(ref starts) == 1) throw new FileNotFoundException("测试:找不到内核");
+            return Task.CompletedTask;
+        }
+        public void Stop() => order.Add("stop");
+        public void Dispose() { }
+    }
+
     [Theory]
     [InlineData(true)]
     [InlineData(false)]
@@ -2366,6 +2389,215 @@ public sealed class ControllerTests
         Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
         Assert.Contains("start", order);
         Assert.Equal("虚拟网卡已就绪。", controller.Snapshot.Message);
+    }
+
+    [Theory]
+    [InlineData("rejection", ConnectionState.NeedsLogin)]
+    [InlineData("failure", ConnectionState.NeedsManual)]
+    public async Task PatrolContinuesWhileParkedWithProtection(string reason, ConnectionState expected)
+    {
+        var order = new List<string>();
+        var timers = new Timers();
+        var firewall = new Firewall(order);
+        var tunnel = new ObservableTunnel(order);
+        var source = new ScriptedSource(); source.Enqueue(Ok(TestData.Session()));
+        using var controller = new ClientController(source, firewall, tunnel, Path.GetFullPath("fake.exe"),
+            TestData.Device, timers.Delay) { DelayWithPurposeAsync = timers.Delay };
+        controller.Changed += _ => Interlocked.Increment(ref timers.Published);
+        await controller.ConnectAsync();
+        source.Enqueue(new AuthResponse<SessionResponse>(AuthResult.InvalidToken));
+        tunnel.FailStop = reason == "failure";
+        await controller.RefreshSessionAsync();
+        Assert.Equal(expected, controller.Snapshot.State);
+        Assert.True(controller.Snapshot.ProtectionActive);
+        var parked = controller.Snapshot.Message;
+        await FireParkedPatrol(controller, timers);
+        Assert.Single(firewall.PatrolCalls);
+        Assert.Equal("正常", controller.Snapshot.GuardStatus);
+        Assert.Equal(expected, controller.Snapshot.State);
+        Assert.Equal(parked, controller.Snapshot.Message);
+        Assert.DoesNotContain("remove", order);
+        await FireParkedPatrol(controller, timers);
+        Assert.Equal(2, firewall.PatrolCalls.Count);
+    }
+
+    [Fact]
+    public async Task PatrolRearmsAfterFailedDisconnect()
+    {
+        var order = new List<string>();
+        var timers = new Timers();
+        var firewall = new Firewall(order);
+        var tunnel = new ObservableTunnel(order);
+        var source = new ScriptedSource(); source.Enqueue(Ok(TestData.Session()));
+        using var controller = new ClientController(source, firewall, tunnel, Path.GetFullPath("fake.exe"),
+            TestData.Device, timers.Delay) { DelayWithPurposeAsync = timers.Delay };
+        controller.Changed += _ => Interlocked.Increment(ref timers.Published);
+        await controller.ConnectAsync();
+        tunnel.FailStop = true;
+        await controller.DisconnectAsync();
+        Assert.Equal(ConnectionState.NeedsManual, controller.Snapshot.State);
+        Assert.True(controller.Snapshot.ProtectionActive);
+        Assert.Equal(2, timers.For("巡检").Length);
+        var parked = controller.Snapshot.Message;
+        firewall.PatrolResults.Enqueue(new PatrolReport([], [], ["YuanC-KS-Tun"]));
+        await FireParkedPatrol(controller, timers);
+        Assert.Equal("已重建 1 条本项目规则", controller.Snapshot.GuardStatus);
+        Assert.Equal(2, order.Count(x => x == "apply"));
+        Assert.Equal(parked, controller.Snapshot.Message);
+        Assert.Equal(ConnectionState.NeedsManual, controller.Snapshot.State);
+        Assert.Equal(3, timers.For("巡检").Length);
+    }
+
+    [Fact]
+    public async Task ParkedPatrolWarningStaysOutOfMessage()
+    {
+        var order = new List<string>();
+        var timers = new Timers();
+        var firewall = new Firewall(order);
+        var tunnel = new ObservableTunnel(order);
+        var source = new ScriptedSource(); source.Enqueue(Ok(TestData.Session()));
+        using var controller = new ClientController(source, firewall, tunnel, Path.GetFullPath("fake.exe"),
+            TestData.Device, timers.Delay) { DelayWithPurposeAsync = timers.Delay };
+        controller.Changed += _ => Interlocked.Increment(ref timers.Published);
+        await controller.ConnectAsync();
+        tunnel.FailStop = true;
+        await controller.DisconnectAsync();
+        Assert.Equal(ConnectionState.NeedsManual, controller.Snapshot.State);
+        var parked = controller.Snapshot.Message;
+        firewall.PatrolResults.Enqueue(new FirewallIneffectiveException("防火墙失效"));
+        await FireParkedPatrol(controller, timers);
+        Assert.Contains("防火墙", controller.Snapshot.GuardStatus);
+        Assert.Equal(parked, controller.Snapshot.Message);
+        Assert.Equal(ConnectionState.NeedsManual, controller.Snapshot.State);
+        Assert.True(controller.Snapshot.ProtectionActive);
+    }
+
+    [Fact]
+    public async Task StartupParkedWithoutSourceStillPatrols()
+    {
+        var order = new List<string>();
+        var timers = new Timers();
+        var firewall = new Firewall(order) { HasPendingState = true };
+        using var controller = new ClientController((ISessionSource?)null, firewall, new Tunnel(order),
+            Path.GetFullPath("fake.exe"), TestData.Device, timers.Delay) { DelayWithPurposeAsync = timers.Delay };
+        controller.Changed += _ => Interlocked.Increment(ref timers.Published);
+        await controller.InitializeAsync(true, true);
+        Assert.Equal(ConnectionState.NeedsManual, controller.Snapshot.State);
+        Assert.Single(timers.For("巡检"));
+        await FireParkedPatrol(controller, timers);
+        Assert.Single(firewall.PatrolCalls);
+        Assert.True(Assert.Single(firewall.EnforceDefaultCalls));
+        Assert.Equal("正常", controller.Snapshot.GuardStatus);
+        Assert.Equal(ClientController.KeptWithoutPairingMessage, controller.Snapshot.Message);
+        firewall.PatrolResults.Enqueue(new PatrolReport([], [], ["YuanC-KS-Tun"]));
+        await FireParkedPatrol(controller, timers);
+        Assert.Equal("巡检失败,下一轮重试", controller.Snapshot.GuardStatus);
+        Assert.DoesNotContain("apply", order);
+        Assert.DoesNotContain("recover", order);
+        Assert.DoesNotContain("remove", order);
+        Assert.Equal(ClientController.KeptWithoutPairingMessage, controller.Snapshot.Message);
+    }
+
+    [Fact]
+    public async Task StartupParkedAppsModePatrolsAppRules()
+    {
+        var order = new List<string>();
+        var timers = new Timers();
+        var firewall = new Firewall(order) { HasPendingState = true, PendingMode = "apps" };
+        var files = new List<string> { ScopeDir + @"\Update.exe" };
+        using var controller = new ClientController((ISessionSource?)null, firewall, new Tunnel(order),
+            Path.GetFullPath("fake.exe"), TestData.Device, timers.Delay,
+            routingSettings: new MemoryRouting { Policy = RoutingPolicy.Create("apps", [ScopeSelected]) },
+            scopeResolver: ScopeOf(files)) { DelayWithPurposeAsync = timers.Delay };
+        controller.Changed += _ => Interlocked.Increment(ref timers.Published);
+        await controller.InitializeAsync(true, true);
+        Assert.Equal(ConnectionState.NeedsManual, controller.Snapshot.State);
+        Assert.Equal("apps", controller.Snapshot.RoutingMode);
+        await FireParkedPatrol(controller, timers);
+        Assert.Equal(KillSwitchPlanner.AppRuleNames(1), Assert.Single(firewall.PatrolCalls));
+        Assert.False(Assert.Single(firewall.EnforceDefaultCalls));
+        Assert.Equal("正常", controller.Snapshot.GuardStatus);
+        Assert.Empty(firewall.AppliedFilters);
+        files.Add(ScopeDir + @"\helper.exe");
+        await FireParkedPatrol(controller, timers);
+        Assert.Single(firewall.AppliedFilters);
+        Assert.Equal("已为新出现的 1 个程序文件补上保护", controller.Snapshot.GuardStatus);
+        Assert.Equal(ClientController.KeptWithoutPairingMessage, controller.Snapshot.Message);
+    }
+
+    [Fact]
+    public async Task ParkedPatrolSkipsFirewallWhenRecordModeDiffers()
+    {
+        var order = new List<string>();
+        var timers = new Timers();
+        var firewall = new Firewall(order) { HasPendingState = true, PendingMode = "apps" };
+        using var controller = new ClientController((ISessionSource?)null, firewall, new Tunnel(order),
+            Path.GetFullPath("fake.exe"), TestData.Device, timers.Delay) { DelayWithPurposeAsync = timers.Delay };
+        controller.Changed += _ => Interlocked.Increment(ref timers.Published);
+        await controller.InitializeAsync(true, true);
+        await FireParkedPatrol(controller, timers);
+        Assert.Empty(firewall.PatrolCalls);
+        Assert.Empty(firewall.EnforceDefaultCalls);
+        Assert.Equal(ClientController.PatrolModeMismatchStatus, controller.Snapshot.GuardStatus);
+        Assert.Equal(ClientController.KeptWithoutPairingMessage, controller.Snapshot.Message);
+        Assert.Equal(2, timers.For("巡检").Length);
+        Assert.DoesNotContain("apply", order);
+        Assert.DoesNotContain("apply-apps", order);
+    }
+
+    [Fact]
+    public async Task PatrolStopsOnceProtectionRemoved()
+    {
+        var order = new List<string>();
+        var timers = new Timers();
+        var firewall = new Firewall(order);
+        var tunnel = new ObservableTunnel(order);
+        var source = new ScriptedSource(); source.Enqueue(Ok(TestData.Session()));
+        using var controller = new ClientController(source, firewall, tunnel, Path.GetFullPath("fake.exe"),
+            TestData.Device, timers.Delay) { DelayWithPurposeAsync = timers.Delay };
+        controller.Changed += _ => Interlocked.Increment(ref timers.Published);
+        await controller.ConnectAsync();
+        source.Enqueue(new AuthResponse<SessionResponse>(AuthResult.InvalidToken));
+        tunnel.FailStop = true;
+        await controller.RefreshSessionAsync();
+        Assert.Equal(ConnectionState.NeedsManual, controller.Snapshot.State);
+        Assert.True(controller.Snapshot.ProtectionActive);
+        tunnel.FailStop = false;
+        await controller.DisconnectAsync();
+        Assert.Equal(ConnectionState.Disconnected, controller.Snapshot.State);
+        Assert.False(controller.Snapshot.ProtectionActive);
+        var count = timers.For("巡检").Length;
+        timers.Advance(TimeSpan.FromMinutes(10));
+        await controller.RefreshSessionAsync();
+        Assert.Empty(firewall.PatrolCalls);
+        Assert.Equal(count, timers.For("巡检").Length);
+        source.Enqueue(Ok(TestData.Session()));
+        await controller.ConnectAsync();
+        Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
+        Assert.Equal(count + 1, timers.For("巡检").Length);
+    }
+
+    [Fact]
+    public async Task AbandonedFirstAttemptLeavesPatrolReadyForNextConnect()
+    {
+        var order = new List<string>();
+        var timers = new Timers();
+        var firewall = new Firewall(order);
+        var source = new ScriptedSource();
+        source.Enqueue(Ok(TestData.Session()));
+        source.Enqueue(Ok(TestData.Session()));
+        using var controller = new ClientController(source, firewall, new FirstStartMissingTunnel(order),
+            Path.GetFullPath("fake.exe"), TestData.Device, timers.Delay) { DelayWithPurposeAsync = timers.Delay };
+        controller.Changed += _ => Interlocked.Increment(ref timers.Published);
+        await controller.ConnectAsync();
+        Assert.Equal(ConnectionState.Disconnected, controller.Snapshot.State);
+        Assert.False(controller.Snapshot.ProtectionActive);
+        Assert.Contains("remove", order);
+        await controller.ConnectAsync();
+        Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
+        await FireAndPublish(controller, timers, "巡检", TimeSpan.FromSeconds(60));
+        Assert.Single(firewall.PatrolCalls);
+        Assert.Equal("正常", controller.Snapshot.GuardStatus);
     }
 
     private sealed class Firewall(List<string> order) : IKillSwitch
