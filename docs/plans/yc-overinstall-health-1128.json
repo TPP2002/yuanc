@@ -1,0 +1,151 @@
+{
+  "schemaVersion": 1,
+  "taskId": "WINCLIENT-OVERINSTALL-HEALTHCHECK-1127",
+  "slug": "yc-overinstall-health-1128",
+  "title": "手动装新版时等新后台应答出新版本号才算成功,没起来就改回旧版并如实说明",
+  "goal": "以派单时 origin/main 头为基点。看板卡 WINCLIENT-OVERINSTALL-HEALTHCHECK-1127。\n\n【问题】\n电脑上已装旧版时,用户双击新包点「安装这个版本」,安装程序(winclient/WinClient.App/Hosting/InstallerRunner.cs 的 StartSwitchedAsync)把后台服务换成新版后,只看「启动 3 秒后服务还在运行」就报成功。两个毛病:\n\n1. 新后台 3 秒后才退出的情况会被当成成功。后台启动时要先核验数据目录、做更新恢复、校验并解出内嵌的连接内核、创建运行时,这些都过了才开本机管道;任何一步失败都是非零退出,由系统隔几秒再拉起。退出发生在第 3 秒之后,安装照样报成功,不会改回旧版。自动更新那条路(UpdateApplier)是等后台经管道应答出新版本号才算成功,手动安装没有这一层。\n2. 失败时的提示语不如实。旧程序文件已经不在、没法改回时,报的仍是「…已改回原来的版本」;改回后旧后台没能启动,报的也是这一句。\n\n【要的行为】\n① 新增 winclient/WinClient.Core/Hosting/SwitchedStart.cs(公开静态类 SwitchedStart,命名空间 WinClient.Core.Hosting),内容照抄下面第一段代码。要点:\n   - 三句提示语常量,文字一字不差;HealthBudget 60 秒,ProbeInterval 2 秒。\n   - WaitHealthyAsync:在 HealthBudget 内每隔 ProbeInterval 读一次后台状态;读到「应答成功、带快照、快照里的 ServiceVersion 等于 expectedVersion」才返回 true;时限到了返回 false。读状态超时或被本轮的取消打断,当成这一轮没读到,接着试。外层取消令牌被取消时抛 OperationCanceledException,不返回 false。时钟和等待都用传进来的 now、delay,类里不许出现 Task.Delay、DateTimeOffset.UtcNow、Stopwatch。\n   - 不看连接状态:后台应答出新版本号就算起来了,不要求隧道已经连上(用户明确选择装这个版本,当时网络不通不该把安装退回去)。\n   - FailureMessage(previousAvailable, previousRunning):旧程序文件不在返回 NoPreviousMessage;改回后旧后台起来了返回 RolledBackMessage;改回了但旧后台没起来返回 RollbackNotRunningMessage。\n② 改 InstallerRunner.cs 两处,其余成员一个字不动:\n   - InstallAsync 里调用那一行改成:`if (ServiceInstaller.SwitchesExecutable(previous, destination)) await StartSwitchedAsync(previous, ServiceInstaller.ReleaseVersion(version));`(InstallAsync 其余各行不动)。\n   - StartSwitchedAsync 连同上面那行 summary 注释,整个换成下面第二段代码。要点:启动新版后用 SwitchedStart.WaitHealthyAsync 判断(读状态用 new UpdateWindowsHost() 的 ReadStatusAsync,它会核验管道对面确实是本产品的后台);没起来时先看旧程序文件还在不在;在,就先停服务(新版可能进程还在、只是管道不通,不先停旧版起不来),再把服务和登录自启值改回旧版并启动旧版;最后按实际结果抛 SafeError(SwitchedStart.FailureMessage(…))。InstallerRunner.cs 里不再出现写死的「已改回原来的版本」,不再出现 Task.Delay 固定等几秒的判断。\n③ 新增 winclient/WinClient.Tests/SwitchedStartTests.cs,照抄下面第三段代码(七个用例,名字不许改)。测试用假时钟,不许真的等时间。\n\n三段代码是派单方写的参考实现,没有在本机编译过。照抄后如果编译不过或用例不过,按上面写的行为意图修到通过;用例名、三句提示语、两个时限、方法签名不许改。改动只限这三个文件。\n\n第一段(SwitchedStart.cs 全文):\n\n```csharp\nusing WinClient.Core.Ipc;\n\nnamespace WinClient.Core.Hosting;\n\n/// <summary>覆盖安装换程序之后，判断新后台是不是真的起来了，以及没起来时该报哪一句。</summary>\npublic static class SwitchedStart\n{\n    public const string RolledBackMessage = \"新版本的后台服务未能启动，已改回原来的版本。\";\n    public const string NoPreviousMessage = \"新版本的后台服务未能启动，原来的版本已经不在，没有改回。请重新安装，或联系管理员。\";\n    public const string RollbackNotRunningMessage = \"新版本的后台服务未能启动，已改回原来的版本，但原来的后台服务也没能启动。请重启电脑，或联系管理员。\";\n    public static readonly TimeSpan HealthBudget = TimeSpan.FromSeconds(60);\n    public static readonly TimeSpan ProbeInterval = TimeSpan.FromSeconds(2);\n\n    /// <summary>在 HealthBudget 内每隔 ProbeInterval 读一次后台状态；读到应答成功且版本等于 expectedVersion 才返回 true。</summary>\n    public static async Task<bool> WaitHealthyAsync(Func<CancellationToken, Task<ControlResponse?>> readStatus,\n        string expectedVersion, Func<DateTimeOffset> now, Func<TimeSpan, CancellationToken, Task> delay,\n        CancellationToken token = default)\n    {\n        var deadline = now() + HealthBudget;\n        while (now() < deadline)\n        {\n            token.ThrowIfCancellationRequested();\n            var started = now();\n            using var probe = CancellationTokenSource.CreateLinkedTokenSource(token);\n            probe.CancelAfter(Shorter(ProbeInterval, deadline - started));\n            ControlResponse? response;\n            try { response = await readStatus(probe.Token).ConfigureAwait(false); }\n            catch (OperationCanceledException) when (!token.IsCancellationRequested) { response = null; }\n            if (response is { Ok: true, Snapshot: { } snapshot } && snapshot.ServiceVersion == expectedVersion) return true;\n            var pause = Shorter(deadline - now(), started + ProbeInterval - now());\n            if (pause > TimeSpan.Zero) await delay(pause, token).ConfigureAwait(false);\n        }\n        return false;\n    }\n\n    /// <summary>previousAvailable：旧程序文件还在、做了改回；previousRunning：改回后旧后台起来了。</summary>\n    public static string FailureMessage(bool previousAvailable, bool previousRunning) =>\n        !previousAvailable ? NoPreviousMessage : previousRunning ? RolledBackMessage : RollbackNotRunningMessage;\n\n    private static TimeSpan Shorter(TimeSpan left, TimeSpan right) => left < right ? left : right;\n}\n```\n\n第二段(InstallerRunner.cs 里 StartSwitchedAsync 连同 summary 注释的全文):\n\n```csharp\n    /// <summary>服务原来登记的是另一份程序：先停服务，再启动新版并确认它真的起来了；没起来就改回旧版，并如实说明结果。</summary>\n    private async Task StartSwitchedAsync(string? previous, string version)\n    {\n        await StopServiceAsync();\n        try\n        {\n            await StartAsync();\n            var host = new UpdateWindowsHost();\n            // 读到新版本的状态应答才算起来了：后台要过了数据目录核验、内核文件校验、运行时创建才会开管道。\n            if (await SwitchedStart.WaitHealthyAsync(host.ReadStatusAsync, version, () => host.Now, host.DelayAsync)) return;\n            throw new TimeoutException();\n        }\n        catch (Exception ex) when (ex is InvalidOperationException or IOException or UnauthorizedAccessException or\n            Win32Exception or TimeoutException or OperationCanceledException)\n        {\n            var available = previous is not null && File.Exists(previous);\n            var running = false;\n            if (available)\n            {\n                // 新版可能还在运行（进程在、管道不通），先停掉再改回，否则旧版起不来。\n                await StopServiceAsync();\n                await RunCommandAsync(ServiceInstaller.Configure(previous!, true), \"改回原来的后台服务失败。\");\n                using (var key = Registry.LocalMachine.CreateSubKey(ServiceInstaller.RunKey, writable: true))\n                    key.SetValue(ServiceInstaller.RunValueName, ServiceInstaller.RunValue(previous!), RegistryValueKind.String);\n                try { await StartAsync(); running = true; }\n                catch (Exception) { /* 旧版没起来：下面如实报，不说成已经好了。 */ }\n            }\n            throw SafeError(SwitchedStart.FailureMessage(available, running));\n        }\n    }\n```\n\n第三段(SwitchedStartTests.cs 全文):\n\n```csharp\nusing WinClient.Core.Hosting;\nusing WinClient.Core.Ipc;\nusing WinClient.Core.State;\nusing Xunit;\n\nnamespace WinClient.Tests;\n\npublic sealed class SwitchedStartTests\n{\n    private const string Version = \"0.2.0\";\n\n    // 假时钟：等待只把钟往前拨，不真的等。\n    private sealed class Clock\n    {\n        public DateTimeOffset Now = DateTimeOffset.UnixEpoch;\n\n        public Task Delay(TimeSpan span, CancellationToken token)\n        {\n            token.ThrowIfCancellationRequested();\n            Now += span;\n            return Task.CompletedTask;\n        }\n    }\n\n    private static ControlResponse Reply(string version) =>\n        new(1, true, Snapshot: new ControlSnapshot(ConnectionState.Disconnected, \"\", \"\", false) { ServiceVersion = version });\n\n    [Fact]\n    public async Task HealthyOnceStatusReportsExpectedVersion()\n    {\n        var clock = new Clock();\n        var calls = 0;\n        var healthy = await SwitchedStart.WaitHealthyAsync(\n            _ => Task.FromResult<ControlResponse?>(++calls < 3 ? null : Reply(Version)), Version, () => clock.Now, clock.Delay);\n        Assert.True(healthy);\n        Assert.Equal(3, calls);\n        Assert.True(clock.Now - DateTimeOffset.UnixEpoch < SwitchedStart.HealthBudget);\n    }\n\n    [Fact]\n    public async Task OtherVersionIsNotHealthy()\n    {\n        var clock = new Clock();\n        var calls = 0;\n        var healthy = await SwitchedStart.WaitHealthyAsync(\n            _ => { calls++; return Task.FromResult<ControlResponse?>(Reply(\"0.1.0\")); }, Version, () => clock.Now, clock.Delay);\n        Assert.False(healthy);\n        Assert.True(clock.Now - DateTimeOffset.UnixEpoch >= SwitchedStart.HealthBudget);\n        Assert.True(calls >= 2);\n    }\n\n    [Theory]\n    [InlineData(\"null\")]\n    [InlineData(\"not-ok\")]\n    [InlineData(\"no-snapshot\")]\n    public async Task FailedResponsesAreNotHealthy(string kind)\n    {\n        var clock = new Clock();\n        ControlResponse? response = kind switch\n        {\n            \"null\" => null,\n            \"not-ok\" => Reply(Version) with { Ok = false },\n            _ => new ControlResponse(1, true),\n        };\n        var healthy = await SwitchedStart.WaitHealthyAsync(_ => Task.FromResult(response), Version, () => clock.Now, clock.Delay);\n        Assert.False(healthy);\n        Assert.True(clock.Now - DateTimeOffset.UnixEpoch >= SwitchedStart.HealthBudget);\n    }\n\n    [Fact]\n    public async Task ProbeTimeoutCountsAsNoResponse()\n    {\n        var clock = new Clock();\n        var calls = 0;\n        var healthy = await SwitchedStart.WaitHealthyAsync(_ =>\n        {\n            if (++calls == 1) throw new OperationCanceledException();\n            return Task.FromResult<ControlResponse?>(Reply(Version));\n        }, Version, () => clock.Now, clock.Delay);\n        Assert.True(healthy);\n        Assert.Equal(2, calls);\n    }\n\n    [Fact]\n    public async Task OuterCancellationStopsWaiting()\n    {\n        var clock = new Clock();\n        using var cancelled = new CancellationTokenSource();\n        cancelled.Cancel();\n        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => SwitchedStart.WaitHealthyAsync(\n            _ => Task.FromResult<ControlResponse?>(null), Version, () => clock.Now, clock.Delay, cancelled.Token));\n    }\n\n    [Theory]\n    [InlineData(false, false, SwitchedStart.NoPreviousMessage)]\n    [InlineData(false, true, SwitchedStart.NoPreviousMessage)]\n    [InlineData(true, true, SwitchedStart.RolledBackMessage)]\n    [InlineData(true, false, SwitchedStart.RollbackNotRunningMessage)]\n    public void FailureMessageSaysWhatHappened(bool available, bool running, string expected)\n    {\n        Assert.Equal(expected, SwitchedStart.FailureMessage(available, running));\n    }\n\n    [Fact]\n    public void MessagesAreTheAgreedTexts()\n    {\n        Assert.Equal(\"新版本的后台服务未能启动，已改回原来的版本。\", SwitchedStart.RolledBackMessage);\n        Assert.Equal(\"新版本的后台服务未能启动，原来的版本已经不在，没有改回。请重新安装，或联系管理员。\", SwitchedStart.NoPreviousMessage);\n        Assert.Equal(\"新版本的后台服务未能启动，已改回原来的版本，但原来的后台服务也没能启动。请重启电脑，或联系管理员。\", SwitchedStart.RollbackNotRunningMessage);\n        Assert.Equal(TimeSpan.FromSeconds(60), SwitchedStart.HealthBudget);\n        Assert.Equal(TimeSpan.FromSeconds(2), SwitchedStart.ProbeInterval);\n    }\n}\n```\n\n【验收怎么对上】\n- BUILD、TEST:整个解决方案构建并跑全部测试。T-SWITCHED:只跑 SwitchedStartTests。\n- SHAPE 逐项核对:InstallerRunner.cs 除 InstallAsync 那一行和 StartSwitchedAsync 之外的成员一个字没动;StartSwitchedAsync 用了 WaitHealthyAsync、FailureMessage、改回前先停服务、先看旧程序文件在不在,没有固定等几秒、没有只看服务在不在运行、没有把连上当条件;SwitchedStart.cs 的常量、时限、签名都在,没有自己看表、自己睡。\n- TESTS 核对:七个用例都在、都有断言、没有跳过、没有真的等时间。\n- SCOPE:只许改上面三个文件。\n- 本仓的 C# 测试项不标「旧代码上必须红」(派单器搬不动 C# 测试文件),由派单方在合并前手工判:新用例引用了基点不存在的 SwitchedStart,旧代码上编译不过。\n\n【交活说明要写】\n逐条对照 ①②③ 写做到了没有;参考实现有改动的地方逐处写明改了什么、为什么。单列只有真机能验的:已装旧版时装一个后台起不来的新包,约一分钟后改回旧版并能用;旧程序目录被删掉后装坏包,提示语是「没有改回」那一句。",
+  "background": "先读(全文):\n- winclient/WinClient.App/Hosting/InstallerRunner.cs:InstallAsync、StartSwitchedAsync、StartAsync、StopServiceAsync、RunCommandAsync、SafeError。\n- winclient/WinClient.App/Hosting/UpdateApplier.cs:RunAsync 里等后台应答新版本号的那一段(本单的 WaitHealthyAsync 是它的简化版:不等连接、不标坏版本)。\n- winclient/WinClient.App/Hosting/UpdateWindowsHost.cs:ReadStatusAsync(连管道、核验后台身份、发 status)、Now、DelayAsync。\n- winclient/WinClient.App/Hosting/ControlService.cs 的 OnStart:后台要过了数据目录核验、更新恢复、ClientRuntime.CreateAsync(其中 installer.Ensure() 校验并解出内核)才建管道;任何一步抛异常都走 Fatal() 非零退出。\n- winclient/WinClient.Core/Ipc/ControlProtocol.cs:ControlResponse、ControlSnapshot(ServiceVersion 可用 init 设置)。\n- winclient/WinClient.Tests/UpdateApplierTests.cs:假时钟、假应答的写法可以参考。\n- docs/plans/checks/yc_overinstall_health_1128.py:验收检查脚本,只读,不许改。\n\n环境与规矩:\n- 本机是开发机:不许安装或启动本产品的后台服务,不许改防火墙和系统设置,不许真的运行安装程序。InstallerRunner 没有单元测试(它直接操作系统服务和注册表),本单的可测部分都在 SwitchedStart 里。\n- 子进程一律隐藏窗口:本单不新增任何起进程的代码。\n- 命令单独一条执行:不要写 cd &&、管道、2>&1。构建与测试用验收里写的 dotnet 命令。\n- 说明文档(docs/winclient/服务化与自启说明.md 的「覆盖安装」一段、口径速查表)由派单方在合并后另改,本单不碰 docs/。\n- 同时在施工的另一张单只改 winclient/WinClient.Core/Client/ClientController.cs 和 winclient/WinClient.Tests/ControllerTests.cs,本单不要碰这两个文件。",
+  "nonGoals": [
+    "不改首次安装和同一份程序重装的流程(StartAsync 那条路)",
+    "不改自动更新(UpdateApplier、UpdateWindowsHost、UpdateRecovery)",
+    "不要求新后台连上隧道才算安装成功",
+    "不改界面上安装失败时显示的文字",
+    "不改文档和口径速查表(合并后派单方补)",
+    "不做真机实测,不打发布包,不改版本号"
+  ],
+  "allowedPaths": [
+    "winclient/WinClient.Core/Hosting/SwitchedStart.cs",
+    "winclient/WinClient.App/Hosting/InstallerRunner.cs",
+    "winclient/WinClient.Tests/SwitchedStartTests.cs"
+  ],
+  "forbiddenPaths": [
+    ".codex/**",
+    ".github/**",
+    ".gitignore",
+    "pyproject.toml",
+    "authserver/**",
+    "node/**",
+    "scripts/**",
+    "docs/**",
+    "winclient/*.sln",
+    "winclient/Directory.Build.props",
+    "winclient/third_party/**",
+    "winclient/WinClient.UiTests/**",
+    "winclient/WinClient.Core/Client/**",
+    "winclient/WinClient.Core/State/**",
+    "winclient/WinClient.Core/Ipc/**",
+    "winclient/WinClient.Core/Firewall/**",
+    "winclient/WinClient.Core/Network/**",
+    "winclient/WinClient.Core/Diagnostics/**",
+    "winclient/WinClient.Core/Update/**",
+    "winclient/WinClient.Core/Kernel/**",
+    "winclient/WinClient.Core/Process/**",
+    "winclient/WinClient.Core/Hosting/ServiceInstaller.cs",
+    "winclient/WinClient.Core/Hosting/EntryPoints.cs",
+    "winclient/WinClient.Core/WinClient.Core.csproj",
+    "winclient/WinClient.App/Hosting/UpdateApplier.cs",
+    "winclient/WinClient.App/Hosting/UpdateWindowsHost.cs",
+    "winclient/WinClient.App/Hosting/ControlService.cs",
+    "winclient/WinClient.App/Hosting/UninstallPrompt.cs",
+    "winclient/WinClient.App/MainViewModel.cs",
+    "winclient/WinClient.Tests/WinClient.Tests.csproj",
+    "winclient/WinClient.Tests/ControllerTests.cs",
+    "winclient/WinClient.Tests/UpdateApplierTests.cs",
+    "winclient/WinClient.Tests/UiHandoverTests.cs",
+    "winclient/WinClient.Tests/HostingTests.cs"
+  ],
+  "expectArtifacts": [],
+  "acceptance": [
+    {
+      "id": "BUILD",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "build",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1200
+    },
+    {
+      "id": "TEST",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "test",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--no-build",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1500
+    },
+    {
+      "id": "T-SWITCHED",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "test",
+        "winclient/WinClient.Tests/WinClient.Tests.csproj",
+        "-c",
+        "Release",
+        "--nologo",
+        "--filter",
+        "FullyQualifiedName~SwitchedStartTests"
+      ],
+      "required": true,
+      "timeoutSec": 1500
+    },
+    {
+      "id": "SHAPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_overinstall_health_1128.py",
+        "shape"
+      ],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "TESTS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_overinstall_health_1128.py",
+        "tests"
+      ],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "SCOPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_overinstall_health_1128.py",
+        "scope"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "timeoutSec": 7200,
+  "repoRoot": "E:/yuanc",
+  "steps": [
+    "读 background 列出的文件与检查脚本。",
+    "先写测试:新增 SwitchedStartTests.cs(goal 第三段);申请 BUILD 以编译失败证红(SwitchedStart 还不存在),之后固定 BUILD→TEST。",
+    "新增 SwitchedStart.cs(goal 第一段),改 InstallerRunner.cs 两处(goal ②)。",
+    "BUILD、TEST、T-SWITCHED、SHAPE、TESTS、SCOPE 全绿后交活;交活说明照 goal 末尾的要求写。"
+  ]
+}
