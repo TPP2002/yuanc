@@ -20,6 +20,9 @@ public sealed class DiagnosticsSources
     public Func<IReadOnlyList<AdapterInfo>?>? Adapters { get; init; }
     public Func<CancellationToken, Task<FirewallStateResult>>? Firewall { get; init; }
     public Func<CancellationToken, Task<NetworkStateResult>>? Network { get; init; }
+    public Func<CancellationToken, Task<ChannelStateResult>>? Channels { get; init; }
+    public Func<CancellationToken, Task<ReachResult>>? NodeReach { get; init; }
+    public Func<CancellationToken, Task<ReachResult>>? Ipv6Reach { get; init; }
     public Func<string?>? Audit { get; init; }
     public Func<string?>? SelfCheck { get; init; }
     public Func<DateTimeOffset> Now { get; init; } = () => DateTimeOffset.UtcNow;
@@ -57,6 +60,49 @@ public static class DiagnosticsCollector
             catch (OperationCanceledException) { throw; }
             catch (Exception ex) { errors["network"] = ex.GetType().Name; }
         }
+        // 三个探测先同时开始，再逐个等结果；任何一条失败不影响其余两条。
+        Task<ChannelStateResult>? channelsTask = null;
+        Task<ReachResult>? nodeReachTask = null;
+        Task<ReachResult>? ipv6ReachTask = null;
+        if (sources.Channels is not null)
+        {
+            try { channelsTask = sources.Channels(token); }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex) { errors["channels"] = ex.GetType().Name; }
+        }
+        if (sources.NodeReach is not null)
+        {
+            try { nodeReachTask = sources.NodeReach(token); }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex) { errors["node_reach"] = ex.GetType().Name; }
+        }
+        if (sources.Ipv6Reach is not null)
+        {
+            try { ipv6ReachTask = sources.Ipv6Reach(token); }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex) { errors["ipv6_reach"] = ex.GetType().Name; }
+        }
+        ChannelStateResult? channels = null;
+        if (channelsTask is not null)
+        {
+            try { channels = await channelsTask.ConfigureAwait(false); }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex) { errors["channels"] = ex.GetType().Name; }
+        }
+        ReachResult? nodeReach = null;
+        if (nodeReachTask is not null)
+        {
+            try { nodeReach = await nodeReachTask.ConfigureAwait(false); }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex) { errors["node_reach"] = ex.GetType().Name; }
+        }
+        ReachResult? ipv6Reach = null;
+        if (ipv6ReachTask is not null)
+        {
+            try { ipv6Reach = await ipv6ReachTask.ConfigureAwait(false); }
+            catch (OperationCanceledException) { throw; }
+            catch (Exception ex) { errors["ipv6_reach"] = ex.GetType().Name; }
+        }
         var audit = sources.Audit is null ? null : Call(sources.Audit, "firewall_audit", errors);
         var selfCheck = sources.SelfCheck is null ? null : Call(sources.SelfCheck, "self_check", errors);
         var auditNode = ParseRedacted(audit, "firewall_audit", errors);
@@ -72,6 +118,24 @@ public static class DiagnosticsCollector
         {
             try { networkNode = RedactNetwork(JsonNode.Parse(networkJson)); }
             catch (JsonException) { errors["network"] = "不是有效的 JSON"; }
+        }
+        JsonNode? channelsNode = null;
+        if (channels?.Json is { } channelsJson)
+        {
+            try { channelsNode = RedactNetwork(JsonNode.Parse(channelsJson)); }
+            catch (JsonException) { errors["channels"] = "不是有效的 JSON"; }
+        }
+        JsonNode? nodeReachNode = null;
+        if (nodeReach?.Json is { } nodeReachJson)
+        {
+            try { nodeReachNode = RedactNetwork(JsonNode.Parse(nodeReachJson)); }
+            catch (JsonException) { errors["node_reach"] = "不是有效的 JSON"; }
+        }
+        JsonNode? ipv6ReachNode = null;
+        if (ipv6Reach?.Json is { } ipv6ReachJson)
+        {
+            try { ipv6ReachNode = RedactNetwork(JsonNode.Parse(ipv6ReachJson)); }
+            catch (JsonException) { errors["ipv6_reach"] = "不是有效的 JSON"; }
         }
 
         var logReads = new List<LogTailResult>();
@@ -117,7 +181,8 @@ public static class DiagnosticsCollector
 
         var omitted = new List<string>();
         var input = new BuildInput(sources, snapshot, desired, wfp, adapters, firewallNode, firewall?.Error,
-            networkNode, network?.Error, logReads,
+            networkNode, network?.Error, channelsNode, channels?.Error,
+            nodeReachNode, nodeReach?.Error, ipv6ReachNode, ipv6Reach?.Error, logReads,
             auditNode, selfCheckNode, omitted, errors, stateExists, stateBytes, stateModified, stateSummary,
             auditExists, auditBytes, auditModified);
         foreach (var maxLines in LineBudgets)
@@ -144,6 +209,8 @@ public static class DiagnosticsCollector
     private sealed record BuildInput(DiagnosticsSources Sources, ClientSnapshot? Snapshot, bool? Desired,
         IReadOnlyList<string>? Wfp, IReadOnlyList<AdapterInfo>? Adapters, JsonNode? Firewall, string? FirewallError,
         JsonNode? Network, string? NetworkError,
+        JsonNode? Channels, string? ChannelsError, JsonNode? NodeReach, string? NodeReachError,
+        JsonNode? Ipv6Reach, string? Ipv6ReachError,
         IReadOnlyList<LogTailResult> Logs, JsonNode? Audit, JsonNode? SelfCheck, IReadOnlyList<string> Omitted,
         IReadOnlyDictionary<string, string> Errors, bool StateExists, long StateBytes, string? StateModified,
         JsonObject? StateSummary, bool AuditExists, long AuditBytes, string? AuditModified);
@@ -196,6 +263,12 @@ public static class DiagnosticsCollector
             ["firewall_error"] = input.FirewallError,
             ["network"] = input.Network?.DeepClone(),
             ["network_error"] = input.NetworkError,
+            ["channels"] = input.Channels?.DeepClone(),
+            ["channels_error"] = input.ChannelsError,
+            ["node_reach"] = input.NodeReach?.DeepClone(),
+            ["node_reach_error"] = input.NodeReachError,
+            ["ipv6_reach"] = input.Ipv6Reach?.DeepClone(),
+            ["ipv6_reach_error"] = input.Ipv6ReachError,
             ["logs"] = BuildLogs(input.Logs, maxLines),
             ["firewall_audit"] = withAudit ? input.Audit?.DeepClone() : null,
             ["self_check"] = withSelfCheck ? input.SelfCheck?.DeepClone() : null,
@@ -207,6 +280,22 @@ public static class DiagnosticsCollector
         {
             result.Remove("network");
             result.Remove("network_error");
+        }
+        // 三个通道探测来源没接时，对应的一对键整对不出现。
+        if (sources.Channels is null)
+        {
+            result.Remove("channels");
+            result.Remove("channels_error");
+        }
+        if (sources.NodeReach is null)
+        {
+            result.Remove("node_reach");
+            result.Remove("node_reach_error");
+        }
+        if (sources.Ipv6Reach is null)
+        {
+            result.Remove("ipv6_reach");
+            result.Remove("ipv6_reach_error");
         }
         return result;
     }
@@ -285,7 +374,9 @@ public static class DiagnosticsCollector
             }
             var array = new JsonArray();
             foreach (var line in lines)
-                array.Add(log.Name == "sing-box.log" ? DiagnosticsRedactor.MaskDomains(line) : line);
+                array.Add(log.Name == "sing-box.log"
+                    ? DiagnosticsRedactor.MaskDomains(DiagnosticsRedactor.StripColorCodes(line))
+                    : line);
             result[log.Name] = new JsonObject
             {
                 ["missing"] = log.Missing,

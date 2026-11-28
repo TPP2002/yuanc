@@ -28,6 +28,7 @@ public sealed class ClientRuntime : IClientFacade, IDisposable
     // 过滤层引擎与测试包标记存下来供诊断采集复用；不改变启动与连接行为。
     private readonly IWfpEngine? wfp;
     private readonly bool testBuild;
+    private readonly TunnelTransport transport;
     /// <summary>防火墙现状与路由 DNS 现状探测各自的时限；超时只让对应诊断段留空。</summary>
     internal static readonly TimeSpan FirewallProbeTimeout = TimeSpan.FromSeconds(10);
     internal static readonly TimeSpan NetworkProbeTimeout = TimeSpan.FromSeconds(10);
@@ -48,8 +49,8 @@ public sealed class ClientRuntime : IClientFacade, IDisposable
         return File.Exists(path) ? File.ReadAllText(path) : null;
     }
     private ClientRuntime(ClientController controller, KillSwitchApplier firewall, HttpClient? http, PairingStore pairingStore, RedactingLog log,
-        string? storeRoot, DataProtectionScope scope, IWfpEngine? wfp, bool testBuild)
-    { Controller = controller; this.firewall = firewall; this.http = http; this.pairingStore = pairingStore; this.log = log; this.storeRoot = storeRoot; this.scope = scope; this.wfp = wfp; this.testBuild = testBuild; }
+        string? storeRoot, DataProtectionScope scope, IWfpEngine? wfp, bool testBuild, TunnelTransport transport)
+    { Controller = controller; this.firewall = firewall; this.http = http; this.pairingStore = pairingStore; this.log = log; this.storeRoot = storeRoot; this.scope = scope; this.wfp = wfp; this.testBuild = testBuild; this.transport = transport; }
 
     public static async Task<ClientRuntime> CreateAsync(IKernelInstaller installer, string? storeRoot = null,
         DataProtectionScope scope = DataProtectionScope.CurrentUser, bool keepProtection = false, bool testBuild = false)
@@ -105,7 +106,7 @@ public sealed class ClientRuntime : IClientFacade, IDisposable
                 proxyProbe: new RegistryProxySettingsProbe(),
                 scopeResolver: path => AppScopeResolver.Resolve(path, AppScopeResolver.SystemFolders(), new SystemAppScopeFileSystem()))
                 { Journal = connectLog.Write, TestBuild = testBuild };
-            return new(controller, firewall, http, pairingStore, log, storeRoot, scope, wfp, testBuild);
+            return new(controller, firewall, http, pairingStore, log, storeRoot, scope, wfp, testBuild, transport);
         }
         catch { http?.Dispose(); throw; }
     }
@@ -115,7 +116,10 @@ public sealed class ClientRuntime : IClientFacade, IDisposable
 
     /// <summary>诊断采集的来源装配;测试直接注入命令、网卡与过滤层替身,生产用真实实现。</summary>
     internal static DiagnosticsSources DiagnosticsSourcesFor(string runDirectory, Func<ClientSnapshot> snapshot, bool testBuild,
-        IWfpEngine? wfp, ICommandRunner runner, IAdapterProbe adapters, Func<string?> audit, Func<string?> selfCheck) => new()
+        IWfpEngine? wfp, ICommandRunner runner, IAdapterProbe adapters, Func<string?> audit, Func<string?> selfCheck,
+        Func<CancellationToken, Task<ChannelStateResult>>? channels = null,
+        Func<CancellationToken, Task<ReachResult>>? nodeReach = null,
+        Func<CancellationToken, Task<ReachResult>>? ipv6Reach = null) => new()
         {
             RunDirectory = runDirectory,
             Snapshot = snapshot,
@@ -126,6 +130,9 @@ public sealed class ClientRuntime : IClientFacade, IDisposable
             Adapters = () => adapters.Snapshot(),
             Firewall = token => FirewallStateProbe.RunAsync(runner, FirewallProbeTimeout, token),
             Network = token => NetworkStateProbe.RunAsync(runner, NetworkProbeTimeout, token),
+            Channels = channels,
+            NodeReach = nodeReach,
+            Ipv6Reach = ipv6Reach,
             Audit = audit,
             SelfCheck = selfCheck
         };
@@ -133,7 +140,11 @@ public sealed class ClientRuntime : IClientFacade, IDisposable
     /// <summary>界面经管道读诊断;采集库自己兜住各段异常,拿不到结果才交给服务端回「不支持的指令」。</summary>
     public Task<string?> ReadDiagnosticsAsync(CancellationToken token = default) =>
         CollectDiagnosticsAsync(DiagnosticsSourcesFor(Path.Combine(ClientSettings.DataDirectory, "run"), () => Controller.Snapshot,
-            testBuild, wfp, new CommandRunner(), new SystemAdapterProbe(), ReadAudit, ReadSelfCheck), token);
+            testBuild, wfp, new CommandRunner(), new SystemAdapterProbe(), ReadAudit, ReadSelfCheck,
+            // 通道与握手探测只有测试包接线；正式包导出里没有那六个键。
+            testBuild ? ct => KernelChannelProbe.RunAsync(transport.StatusEndpoint, null, null, ct) : null,
+            testBuild ? ct => ReachProbe.RunAsync(transport.MainTarget, true, null, ct) : null,
+            testBuild ? ct => ReachProbe.RunAsync(ReachProbe.Ipv6Target, false, null, ct) : null), token);
 
     private static async Task<string?> CollectDiagnosticsAsync(DiagnosticsSources sources, CancellationToken token) =>
         await DiagnosticsCollector.CollectAsync(sources, token).ConfigureAwait(false);

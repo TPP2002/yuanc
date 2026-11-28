@@ -6,7 +6,7 @@ namespace WinClient.Core.Diagnostics;
 
 public sealed record NetworkStateResult(string? Json, string? Error);
 
-/// <summary>只读查询路由与 DNS 现状；脚本不改任何系统设置，只读取两个存储里的路由、网卡、DNS 与内核进程。</summary>
+/// <summary>只读查询路由与 DNS 现状；脚本不改任何系统设置，只读取两个存储里的路由、网卡、DNS、内核进程与系统安全中心登记的安全软件。</summary>
 public static class NetworkStateProbe
 {
     public static readonly TimeSpan DefaultTimeout = TimeSpan.FromSeconds(20);
@@ -21,7 +21,8 @@ public static class NetworkStateProbe
         "$interfaces = try { @(Get-NetIPInterface -ErrorAction SilentlyContinue | ForEach-Object { [ordered]@{ alias = [string]$_.InterfaceAlias; index = [int]$_.ifIndex; family = [string]$_.AddressFamily; metric = [int]$_.InterfaceMetric; state = [string]$_.ConnectionState; dhcp = [string]$_.Dhcp } }) } catch { @() }\n" +
         "$dns = try { @(Get-DnsClientServerAddress -ErrorAction SilentlyContinue | Where-Object { @($_.ServerAddresses).Count -gt 0 } | ForEach-Object { [ordered]@{ alias = [string]$_.InterfaceAlias; family = $(if ([int]$_.AddressFamily -eq 23) { 'IPv6' } else { 'IPv4' }); servers = @($_.ServerAddresses | ForEach-Object { [string]$_ }) } }) } catch { @() }\n" +
         "$kernel = try { @(Get-Process -Name 'sing-box' -ErrorAction SilentlyContinue | ForEach-Object { [ordered]@{ id = [int]$_.Id; started = try { $_.StartTime.ToUniversalTime().ToString('o') } catch { '' }; path = try { [string]$_.Path } catch { '' } } }) } catch { @() }\n" +
-        "$result = [ordered]@{ loopback_index = $lo; routes_active = @(Read-Routes 'ActiveStore'); routes_persistent = @(Read-Routes 'PersistentStore'); interfaces = @($interfaces); dns = @($dns); kernel_processes = @($kernel) }\n" +
+        "function Read-Security($class) { try { @(Get-CimInstance -Namespace 'root/SecurityCenter2' -ClassName $class -ErrorAction SilentlyContinue | ForEach-Object { [ordered]@{ kind = $class; name = [string]$_.displayName; state = [string]$_.productState } }) } catch { @() } }\n" +
+        "$result = [ordered]@{ loopback_index = $lo; routes_active = @(Read-Routes 'ActiveStore'); routes_persistent = @(Read-Routes 'PersistentStore'); interfaces = @($interfaces); dns = @($dns); kernel_processes = @($kernel); security_products = @(@(Read-Security 'AntiVirusProduct') + @(Read-Security 'FirewallProduct')) }\n" +
         "ConvertTo-Json -InputObject $result -Depth 5 -Compress";
 
     public static async Task<NetworkStateResult> RunAsync(ICommandRunner runner, TimeSpan? timeout = null, CancellationToken token = default)

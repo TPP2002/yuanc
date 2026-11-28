@@ -25,12 +25,23 @@ public static class DiagnosticsRedactor
     private static readonly Regex Domain = new(
         @"(?i)\b(?:[a-z0-9-]+\.)+[a-z]{2,}\b",
         RegexOptions.CultureInvariant, TimeSpan.FromSeconds(2));
+    private static readonly Regex ColorCodes = new(
+        @"\x1B\[[0-9;]*[A-Za-z]",
+        RegexOptions.CultureInvariant, TimeSpan.FromSeconds(2));
 
     /// <summary>把主机名换成固定记号；纯数字与内网地址不含字母域名后缀，原样保留。</summary>
     public static string MaskDomains(string? text)
     {
         if (string.IsNullOrEmpty(text)) return "";
         try { return Domain.Replace(text, DomainMark); }
+        catch (RegexMatchTimeoutException) { return TimedOutMark; }
+    }
+
+    /// <summary>删掉终端颜色控制码；超时返回固定记号。</summary>
+    public static string StripColorCodes(string? text)
+    {
+        if (string.IsNullOrEmpty(text)) return "";
+        try { return ColorCodes.Replace(text, ""); }
         catch (RegexMatchTimeoutException) { return TimedOutMark; }
     }
 

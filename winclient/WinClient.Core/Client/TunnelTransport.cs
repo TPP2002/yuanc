@@ -1,6 +1,7 @@
 using System.Net.NetworkInformation;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using WinClient.Core.Diagnostics;
 using WinClient.Core.Firewall;
 using WinClient.Core.Process;
 
@@ -24,6 +25,12 @@ public sealed class TunnelTransport : ITunnelTransport
     private readonly Func<bool> ready;
     private readonly Func<TimeSpan, CancellationToken, Task> delay;
     private bool exited;
+    private KernelStatusEndpoint? statusEndpoint;
+    private ReachTarget? mainTarget;
+    /// <summary>当前这次内核的状态口；没开或已停为 null。</summary>
+    public KernelStatusEndpoint? StatusEndpoint => Volatile.Read(ref statusEndpoint);
+    /// <summary>最近一次起内核时主通道的目标。</summary>
+    public ReachTarget? MainTarget => Volatile.Read(ref mainTarget);
     /// <summary>测试包打开连接内核的 warn 级日志；正式包保持配置里写死的关闭状态。</summary>
     public bool KernelLog { get; init; }
     public event EventHandler? TunnelDown;
@@ -34,7 +41,13 @@ public sealed class TunnelTransport : ITunnelTransport
         ready = readyProbe ?? (() => NetworkInterface.GetAllNetworkInterfaces().Any(i =>
             i.Name == KillSwitchPlanner.TunAlias && i.OperationalStatus == OperationalStatus.Up));
         this.delay = delay ?? Task.Delay;
-        manager.TunnelDown += (_, _) => { Volatile.Write(ref exited, true); TunnelDown?.Invoke(this, EventArgs.Empty); };
+        manager.TunnelDown += (_, _) =>
+        {
+            Volatile.Write(ref exited, true);
+            // 内核自己退出时状态口随之失效；主通道目标留着给下一次诊断参考。
+            Volatile.Write(ref statusEndpoint, null);
+            TunnelDown?.Invoke(this, EventArgs.Empty);
+        };
     }
 
     public async Task StartAsync(JsonElement configuration, CancellationToken cancellationToken)
@@ -57,7 +70,15 @@ public sealed class TunnelTransport : ITunnelTransport
                 break;
             }
         }
-        manager.Start(RenderConfiguration(configuration, KernelLog));
+        // 测试包起内核前现取一个回环状态口；正式包不开状态口，交给内核的配置保持原样。
+        KernelStatusEndpoint? status = null;
+        if (KernelLog)
+        {
+            status = KernelStatusEndpoint.Create();
+            Volatile.Write(ref mainTarget, ReachProbe.MainTargetFrom(configuration));
+        }
+        Volatile.Write(ref statusEndpoint, status);
+        manager.Start(RenderConfiguration(configuration, KernelLog, status));
         // A child process merely existing is not readiness: wait for its TUN interface.
         var settled = 0;
         for (var attempt = 0; attempt < ReadyPolls; attempt++)
@@ -83,6 +104,9 @@ public sealed class TunnelTransport : ITunnelTransport
     public static JsonElement RenderConfiguration(JsonElement configuration) => RenderConfiguration(configuration, false);
 
     public static JsonElement RenderConfiguration(JsonElement configuration, bool kernelLog)
+        => RenderConfiguration(configuration, kernelLog, null);
+
+    public static JsonElement RenderConfiguration(JsonElement configuration, bool kernelLog, KernelStatusEndpoint? status)
     {
         var node = JsonNode.Parse(configuration.GetRawText()) as JsonObject
             ?? throw new InvalidDataException("服务器连接配置无效。");
@@ -95,8 +119,27 @@ public sealed class TunnelTransport : ITunnelTransport
         tuns[0]["route_address"] = new JsonArray(RouteGuard.TunRoutes.Select(value => (JsonNode?)JsonValue.Create(value)).ToArray());
         // 只有测试包把顶层 log 换成 warn 级；正式包不碰配置里的 log 段，输出与改动前逐字节相同。
         if (kernelLog) node["log"] = new JsonObject { ["disabled"] = false, ["level"] = "warn", ["timestamp"] = true };
+        // 状态口只在测试包加；原有 experimental 对象直接在它上面加键，其余键原样保留。
+        if (status is not null)
+        {
+            if (node["experimental"] is not JsonObject experimental)
+            {
+                experimental = new JsonObject();
+                node["experimental"] = experimental;
+            }
+            experimental["clash_api"] = new JsonObject
+            {
+                ["external_controller"] = $"127.0.0.1:{status.Port}",
+                ["secret"] = status.Secret
+            };
+        }
         return JsonSerializer.SerializeToElement(node);
     }
-    public void Stop() => manager.Stop();
+    public void Stop()
+    {
+        // 主动停止时状态口先失效；主通道目标不清。
+        Volatile.Write(ref statusEndpoint, null);
+        manager.Stop();
+    }
     public void Dispose() => manager.Dispose();
 }
