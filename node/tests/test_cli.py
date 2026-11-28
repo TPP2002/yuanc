@@ -285,6 +285,16 @@ def test_runner_log_and_diagnostic_archive_do_not_read_secrets(capsys):
     assert "诊断包已保存" in capsys.readouterr().out
 
 
+def test_diagnose_archive_has_same_layers_as_check(capsys):
+    runner = fake()
+    main(["check", "--json"], runner)
+    expected = [x["layer"] for x in json.loads(capsys.readouterr().out)["layers"]]
+    assert main(["diagnose", "--output", "/diagnose.zip"], runner) == 0
+    with zipfile.ZipFile(io.BytesIO(runner.files["/diagnose.zip"])) as archive:
+        layers = json.loads(archive.read("诊断.json").decode("utf-8"))["check"]["layers"]
+    assert len(expected) > 6 and [x["layer"] for x in layers] == expected
+
+
 def test_repeated_init_does_not_repeat_commands_and_uninstall_keeps_secrets():
     runner = fake(pairing=True)
     runner.files["/var/lib/exitnode/secrets/identity"] = "保留"
