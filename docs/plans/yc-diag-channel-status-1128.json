@@ -1,0 +1,178 @@
+{
+  "schemaVersion": 1,
+  "taskId": "WINCLIENT-DIAG-CHANNEL-STATUS-1128",
+  "slug": "yc-diag-channel-status-1128",
+  "title": "测试包导出的诊断补四样取证:内核当前选中的通道与主备测速、对节点主通道端口的直连握手探测、对 IPv6 探测点的握手探测、本机安全软件清单;内核日志去颜色码。正式包不变",
+  "workbuddyTier": "hard",
+  "goal": "目标:测试包导出的诊断补四样取证,让一份诊断就能回答「现在走的是哪条通道、主通道卡在哪一环、IPv6 自检是不是误报、机器上登记了哪些安全软件」。正式包交给连接内核的配置、正式包导出的诊断键名与内容,一律与现在相同。不改连接逻辑、断网保护逻辑、环境自检的判定和界面。\n\n① 新建 winclient/WinClient.Core/Diagnostics/KernelChannelProbe.cs(命名空间 WinClient.Core.Diagnostics),三个类型:\n- public sealed record KernelStatusEndpoint(int Port, string Secret),带 public static KernelStatusEndpoint Create():在回环口取一个空闲端口(new TcpListener(IPAddress.Loopback, 0) 启动、读出端口、停掉),口令 = Convert.ToHexString(RandomNumberGenerator.GetBytes(16))(32 个十六进制字符)。重写 ToString() 只返回 127.0.0.1:<端口>,不带口令。\n- public sealed record ChannelStateResult(string? Json, string? Error);\n- public static class KernelChannelProbe,成员:\n  public static readonly TimeSpan DefaultTimeout = TimeSpan.FromSeconds(6);\n  public const int DelayTimeoutMs = 3000;\n  public const string TestUrl = \"https://www.gstatic.com/generate_204\";\n  public const string NotRunning = \"通道状态没有读到：连接内核没有在运行。\";\n  public const string TimedOut = \"通道状态没有读到：超过时限没有返回。\";\n  public const string Failed = \"通道状态没有读到：内核的状态口没有正常应答。\";\n  public static Task<ChannelStateResult> RunAsync(KernelStatusEndpoint? endpoint, HttpMessageHandler? handler = null, TimeSpan? timeout = null, CancellationToken token = default)\n  行为:\n  - endpoint 为空 → new(null, NotRunning),不发任何请求。\n  - 用 HttpClient 发请求。handler 为空时用 new SocketsHttpHandler { UseProxy = false }(不走系统代理),用完释放;handler 不为空时用它且不释放它。所有请求都发往 http://127.0.0.1:<Port>,都带请求头 Authorization: Bearer <Secret>。\n  - 第一步 GET /proxies。状态码不是 2xx、正文不是 JSON、或正文里没有对象 proxies.proxy → new(null, Failed)。取 proxies.proxy.now(字符串,没有就是 null)作 selected。对 main、backup 两个名字,各取 proxies.<名字>.history 数组最后一项的 delay(整数)与 time(字符串)作 last_delay_ms、last_test_at;数组为空、或没有这个出站时两者都是 null。\n  - 第二步(第一步成功后才做)同时发两条:GET /proxies/main/delay?url=<Uri.EscapeDataString(TestUrl)>&timeout=3000 与 GET /proxies/backup/delay?url=<同上>&timeout=3000。每条:状态码 200 且正文有整数 delay → test_ok=true、test_delay_ms=<delay>、test_status=200;别的状态码 → test_ok=false、test_delay_ms=null、test_status=<状态码>;抛 HttpRequestException → test_ok=false、test_delay_ms=null、test_status=0。\n  - 成功返回 new(<紧凑 JSON>, null)。JSON 的键名与次序照这个例子:{\"selected\":\"backup\",\"main\":{\"last_delay_ms\":null,\"last_test_at\":null,\"test_ok\":false,\"test_delay_ms\":null,\"test_status\":503},\"backup\":{\"last_delay_ms\":181,\"last_test_at\":\"2026-11-28T05:20:35Z\",\"test_ok\":true,\"test_delay_ms\":158,\"test_status\":200}}\n  - 本方法自己的计时器(timeout ?? DefaultTimeout)到点 → new(null, TimedOut);外部令牌取消照旧抛 OperationCanceledException(分辨办法照 NetworkStateProbe.RunAsync);第一步抛 HttpRequestException、JsonException、InvalidOperationException → new(null, Failed)。\n  - 口令不许出现在返回的 JSON、错误文字或任何日志里。\n\n② 新建 winclient/WinClient.Core/Diagnostics/ReachProbe.cs(同一命名空间),三个类型:\n- public sealed record ReachTarget(string Host, int Port, string ServerName);\n- public sealed record ReachResult(string? Json, string? Error);\n- public static class ReachProbe,成员:\n  public static readonly TimeSpan StepTimeout = TimeSpan.FromSeconds(4);\n  public static readonly ReachTarget Ipv6Target = new(\"2606:4700:4700::1111\", 443, \"one.one.one.one\");(与环境自检 SocketIpv6Probe 连的是同一个地址)\n  public const string NoTarget = \"直连握手探测没有做：后台服务这次启动以来还没有连接过，没有可测的目标。\";\n  public static ReachTarget? MainTargetFrom(JsonElement configuration):在顶层 outbounds 数组里找 tag 为 main 的对象,取 server(非空字符串)、server_port(1~65535 的整数)、tls.server_name(非空字符串)组成目标;配置不是对象、没有这个出站、三样缺任何一样 → null;不抛异常。\n  public static Task<ReachResult> RunAsync(ReachTarget? target, bool bindPhysical, TimeSpan? stepTimeout = null, CancellationToken token = default)\n  行为(整个过程只做一次 TCP 连接和一次标准 TLS 握手,握手完立刻关闭,不发也不收任何应用数据):\n  - target 为空 → new(null, NoTarget)。\n  - 目标地址:Host 能解析成 IP 就直接用;否则 Dns.GetHostAddressesAsync 取第一个 IPv4(没有 IPv4 取第一个);解析失败按「TCP 步骤 failed」收场。\n  - 按地址族建 TCP 套接字。bindPhysical 为真且地址是 IPv4 时,用 DefaultRouteBinding.Pick(DefaultRouteBinding.ReadSystem(), NetworkInterface.LoopbackInterfaceIndex) 取物理默认出口的接口序号,取到就照 DefaultRouteBinding.ConnectAsync 的写法设 IP_UNICAST_IF(SocketOptionLevel.IP、(SocketOptionName)31、IPAddress.HostToNetworkOrder(序号)),bound 记 true;没取到、或 bindPhysical 为假、或地址是 IPv6,bound 记 false。\n  - TCP 步骤:限时 stepTimeout ?? StepTimeout,记用时毫秒 tcp_ms(整数)。结果 tcp 取值:ok;refused(SocketError.ConnectionRefused);reset(ConnectionReset、ConnectionAborted);unreachable(NetworkUnreachable、HostUnreachable);timeout(本步计时器到点或 SocketError.TimedOut);failed(其余)。tcp 不是 ok 时不做 TLS 步骤,tls、tls_ms、tls_protocol、cert_errors、cert_issuer 都是 null。\n  - TLS 步骤:在同一条连接上用 SslStream 做客户端握手,TargetHost = target.ServerName;证书校验回调一律返回 true(只记录、不拦),回调里记下 SslPolicyErrors 的文字(cert_errors,例如 None、RemoteCertificateChainErrors)和证书的 Issuer(cert_issuer,超过 200 字截断;证书为空记空串);限时同上,记用时毫秒 tls_ms。结果 tls 取值:ok(另记 tls_protocol = SslStream.SslProtocol 的文字);timeout(本步计时器到点);reset(异常链里有 SocketErrorCode 为 ConnectionReset 或 ConnectionAborted 的 SocketException);closed(其余 IOException,例如对端直接关了连接);failed(其余,例如 AuthenticationException)。tls 不是 ok 时 tls_protocol、cert_errors、cert_issuer 为 null。\n  - 返回 new(<紧凑 JSON>, null),键名与次序:bound、tcp、tcp_ms、tls、tls_ms、tls_protocol、cert_errors、cert_issuer。JSON 里不许出现目标地址、端口、主机名、证书主题。\n  - 外部令牌取消照旧抛 OperationCanceledException;各步自己的计时器到点只算该步 timeout。套接字与流用完即释放。本文件不起任何子进程。\n\n③ TunnelTransport(winclient/WinClient.Core/Client/TunnelTransport.cs):\n- 加两个只读属性(各配一个私有字段,用 Volatile 读写):public KernelStatusEndpoint? StatusEndpoint(当前这次内核的状态口;没开或已停为 null)、public ReachTarget? MainTarget(最近一次起内核时主通道的目标)。\n- 加重载 public static JsonElement RenderConfiguration(JsonElement configuration, bool kernelLog, KernelStatusEndpoint? status):原有处理全部照旧;status 不为空时,在顶层 experimental 对象里(原来没有就新建,原来有就保留它别的键)写入 clash_api = {\"external_controller\": \"127.0.0.1:<Port>\", \"secret\": \"<Secret>\"}。原来的双参数重载改成调 RenderConfiguration(configuration, kernelLog, null),单参数重载不动;status 为空时三个重载的输出与现在逐字节相同。(提示:JsonNode 已经挂在父节点上就不能再赋给别的键,原有的 experimental 对象直接在它上面加键。)\n- StartAsync:紧挨着 manager.Start 之前,KernelLog 为真时取 status = KernelStatusEndpoint.Create(),并把 MainTarget 设成 ReachProbe.MainTargetFrom(configuration);KernelLog 为假时 status 为 null,MainTarget 不动(保持 null)。把 StatusEndpoint 设成 status,然后 manager.Start(RenderConfiguration(configuration, KernelLog, status))。\n- Stop() 先把 StatusEndpoint 清成 null 再 manager.Stop();构造函数里订阅 manager.TunnelDown 的那个回调里也把 StatusEndpoint 清成 null(内核自己退出时)。MainTarget 不清。\n- 别的行为(清残留、旧网卡等待、就绪等待、异常文字)一行不改。正式包(KernelLog 为假)交给内核的配置与现在完全一样。\n\n④ NetworkStateProbe(winclient/WinClient.Core/Diagnostics/NetworkStateProbe.cs)的脚本改两处,其余行与 RunAsync 不动:\n- 在 $kernel = … 那一行之后插入一行(逐字照抄):\nfunction Read-Security($class) { try { @(Get-CimInstance -Namespace 'root/SecurityCenter2' -ClassName $class -ErrorAction SilentlyContinue | ForEach-Object { [ordered]@{ kind = $class; name = [string]$_.displayName; state = [string]$_.productState } }) } catch { @() } }\n- 把 $result = … 那一行换成(逐字照抄):\n$result = [ordered]@{ loopback_index = $lo; routes_active = @(Read-Routes 'ActiveStore'); routes_persistent = @(Read-Routes 'PersistentStore'); interfaces = @($interfaces); dns = @($dns); kernel_processes = @($kernel); security_products = @(@(Read-Security 'AntiVirusProduct') + @(Read-Security 'FirewallProduct')) }\n- 类上面那句注释补上「与系统安全中心登记的安全软件」。脚本仍然只读。\n\n⑤ 采集库(DiagnosticsRedactor.cs、DiagnosticsCollector.cs):\n- DiagnosticsRedactor 加 public static string StripColorCodes(string? text):空返回空串;用正则 \\x1B\\[[0-9;]*[A-Za-z](2 秒超时)把命中的删掉;超时返回 TimedOutMark。\n- DiagnosticsCollector 的 BuildLogs:名字是 sing-box.log 的那份日志,每行先过 StripColorCodes 再过 MaskDomains;其余日志不变。\n- DiagnosticsSources 加三个来源:public Func<CancellationToken, Task<ChannelStateResult>>? Channels { get; init; }、public Func<CancellationToken, Task<ReachResult>>? NodeReach { get; init; }、public Func<CancellationToken, Task<ReachResult>>? Ipv6Reach { get; init; }。\n- CollectAsync:取完 Network 之后取这三个。三条要同时开始(先把不为空的各调用一次拿到任务,再逐个等),不许等完一条才开始下一条。每条:取消照旧抛;调用时同步抛出的与等待时抛出的其余异常都记 errors[\"channels\"](另两条是 errors[\"node_reach\"]、errors[\"ipv6_reach\"])= 异常类型名,采集继续。结果的 Json 解析成 JSON 后,所有字符串值过 DiagnosticsRedactor.Redact(与 network 段同一个办法);解析不了记 errors[<同名>] = \"不是有效的 JSON\"。\n- service 段在 network_error 之后、logs 之前依次加六个键:channels、channels_error、node_reach、node_reach_error、ipv6_reach、ipv6_reach_error(对象没有就是 null;_error 是结果里的 Error,没有就是 null)。对应来源为空时,这一对键不出现(办法同 network 那一对),所以没接这三个来源时根键清单与次序和现在完全一样。这六个键不参加超限裁剪。\n- 别的采集逻辑、键名、次序、大小裁剪不变。\n\n⑥ ClientRuntime(winclient/WinClient.Core/Client/ClientRuntime.cs):\n- 把 CreateAsync 里建的 TunnelTransport 存进一个私有只读字段(私有构造函数加一个参数)。\n- DiagnosticsSourcesFor 在现有八个参数之后加三个可选参数:Func<CancellationToken, Task<ChannelStateResult>>? channels = null, Func<CancellationToken, Task<ReachResult>>? nodeReach = null, Func<CancellationToken, Task<ReachResult>>? ipv6Reach = null,原样填进来源的 Channels、NodeReach、Ipv6Reach。现有八个参数与填法不动。\n- ReadDiagnosticsAsync:testBuild 为真时传 channels = token => KernelChannelProbe.RunAsync(<传输>.StatusEndpoint, null, null, token)、nodeReach = token => ReachProbe.RunAsync(<传输>.MainTarget, true, null, token)、ipv6Reach = token => ReachProbe.RunAsync(ReachProbe.Ipv6Target, false, null, token);testBuild 为假时三个都传 null(正式包导出里没有那六个键)。\n- ClientRuntime 别的行为一律不变。\n\n⑦ 文档 docs/winclient/诊断导出说明.md(只改这一份):\n- 「service 段逐键说明」的表里,在 network_error 之后加六行(channels、channels_error、node_reach、node_reach_error、ipv6_reach、ipv6_reach_error),写明只有测试包有。\n- network 段的键清单加 security_products(kind、name、state:系统安全中心登记的杀毒软件与防火墙产品)。\n- 新加一节「### channels、node_reach、ipv6_reach 三段（只有测试包有）」,照实现逐键写:channels 的 selected、main 与 backup 各自的 last_delay_ms、last_test_at、test_ok、test_delay_ms、test_status;node_reach 与 ipv6_reach 的 bound、tcp、tcp_ms、tls、tls_ms、tls_protocol、cert_errors、cert_issuer 以及 tcp、tls 各有哪些取值。并写怎么读:selected 是内核当前选中的通道;某条通道 test_ok 为假说明导出那一刻它测不通。node_reach 是从物理网卡直连节点主通道端口:tcp_ms 只有几毫秒到十几毫秒而节点在海外,说明连接被本机或本地网络里的设备先接走了;tcp 为 ok 而 tls 是 reset 或 closed,说明握手中途被关掉;tls 为 ok 且 cert_issuer 是正规签发机构,说明这条路对标准握手是通的;cert_issuer 是安全软件或网关的名字,说明中间有设备在拆看加密连接。ipv6_reach 是按系统默认路由连 IPv6 探测点(与环境自检「IPv6 已封堵」那一项连的是同一个地址):tcp 为 ok 而 tls 不是 ok,说明 IPv6 连接被隧道接走后拒绝,并没有真的通出去;tls 为 ok 说明 IPv6 真的能直连。这三段都不含目标地址、端口、主机名与证书主题;后台服务这次启动以来没连接过时 node_reach 为 null、node_reach_error 写明原因。\n- 「五份日志各记什么」里 sing-box.log 那段补一句:导出时去掉颜色码。\n- 「测试包与正式包」补:测试包另在内核配置里加 experimental.clash_api,只听本机回环口 127.0.0.1,端口每次起内核时现取,口令每次随机,不写进日志与诊断;正式包不加,导出里也没有上面六个键。\n- 「真机待验证（本单未执行）」补四条:测试包连上后导出,channels.selected 与真实走的通道一致;node_reach 在线路正常的机器上是 tcp ok、tls ok;连接期间 ipv6_reach 的读数;后台服务以系统账户运行时 security_products 读得到。\n- 文档别的内容不动;与代码对不上的地方以代码为准。\n\n⑧ 测试:新建 winclient/WinClient.Tests/DiagnosticsChannelTests.cs,既有测试文件一个都不许改(需要的替身若是别的测试文件里的私有类,就在新文件里另写等价的)。用例名照下面写:\n1. StatusEndpointOffKeepsConfigurationUnchanged:同一份配置,RenderConfiguration(x) 与 RenderConfiguration(x, false, null) 的 GetRawText() 相等;RenderConfiguration(x, true) 与 RenderConfiguration(x, true, null) 的 GetRawText() 相等,且都没有 experimental。\n2. StatusEndpointOnAddsLoopbackStatusApi:RenderConfiguration(x, true, new KernelStatusEndpoint(23456, \"abc\")) 的 experimental.clash_api.external_controller 等于 127.0.0.1:23456、secret 等于 abc;去掉 experimental 后与 status 为空的结果相等。配置本来带 experimental.cache_file 时,cache_file 原样保留。\n3. StatusEndpointCreatePicksLoopbackPortAndRandomSecret:Create() 两次,端口都在 1024~65535,口令都是 32 个十六进制字符且两次不同;ToString() 不含口令。\n4. MainTargetReadsMainOutbound:outbounds 里有 tag 为 main(server 203.0.113.9、server_port 443、tls.server_name www.example.com)和 backup 两项 → 得到 new ReachTarget(\"203.0.113.9\", 443, \"www.example.com\");没有 main、缺 server_port、缺 tls.server_name、配置是数组 → 都是 null。\n5. TransportOpensStatusApiOnlyWhenKernelLogOn:用启动器替身、进程表替身、临时目录造 SingBoxProcessManager 与 TunnelTransport(写法照 KernelLifetimeTests.cs 里造传输的那几个用例)。KernelLog 为真:StartAsync 后 StatusEndpoint 不为空,manager.ConfigPath 那份文件里 experimental.clash_api 的 external_controller 等于 127.0.0.1:<StatusEndpoint.Port>、secret 等于 StatusEndpoint.Secret,MainTarget 等于配置里 main 的目标;Stop() 之后 StatusEndpoint 为空、MainTarget 还在。KernelLog 为假:StartAsync 后 StatusEndpoint 与 MainTarget 都为空,配置文件里没有 experimental。\n6. ChannelProbeReportsSelectedAndDelays:HttpMessageHandler 替身。/proxies 回 {\"proxies\":{\"proxy\":{\"now\":\"backup\"},\"main\":{\"history\":[]},\"backup\":{\"history\":[{\"time\":\"2026-11-28T05:20:35Z\",\"delay\":181}]}}};/proxies/main/delay 回 503;/proxies/backup/delay 回 200 与 {\"delay\":158}。结果 Error 为空,Json 解析后 selected 为 backup;main 的 last_delay_ms 与 last_test_at 为 null、test_ok 为假、test_status 为 503;backup 的 last_delay_ms 为 181、last_test_at 为那个时间、test_ok 为真、test_delay_ms 为 158、test_status 为 200。替身收到三条请求,主机都是 127.0.0.1、端口是给的端口,都带 Authorization: Bearer <口令>;两条测速请求的查询串含 timeout=3000 与转义后的 TestUrl。Json 里不含口令。\n7. ChannelProbeReturnsFixedErrors:endpoint 为空 → Error 等于 KernelChannelProbe.NotRunning 且替身没收到请求;/proxies 回 401 → Failed;/proxies 回的正文没有 proxies.proxy → Failed;替身抛 HttpRequestException → Failed;替身一直不返回、时限 50 毫秒 → TimedOut;外部令牌已取消 → 抛 OperationCanceledException。\n8. ReachProbeWithoutTargetReturnsFixedError:target 为空 → Json 为空、Error 等于 ReachProbe.NoTarget。\n9. ReachProbeReportsRefused:在回环口起一个 TcpListener 读出端口后停掉,对 new ReachTarget(\"127.0.0.1\", <端口>, \"localhost\") 用 bindPhysical: false 探测 → tcp 为 refused,tls 为 null,bound 为假。(Windows 上连本机没人听的端口要 2 秒左右才返回拒绝,这条用默认时限,不要缩短。)\n10. ReachProbeReportsHandshakeCutByPeer:回环口的监听端接受连接后立刻关掉 → tcp 为 ok,tcp_ms 不小于 0,tls 是 closed 或 reset,cert_issuer 为 null。\n11. ReachProbeReportsHandshakeTimeout:监听端接受连接后一直不说话,stepTimeout 300 毫秒 → tcp 为 ok、tls 为 timeout;另核:外部令牌已取消时抛 OperationCanceledException。\n12. ReachProbeReportsIssuerOnSuccess:回环口起一个 TLS 服务端(测试里现造自签证书,主题 CN=YuanC-Test-CA;用 CertificateRequest.CreateSelfSigned 造出后,先导出成 PFX 再用 X509CertificateLoader.LoadPkcs12 读回来才能给 SslStream.AuthenticateAsServerAsync 用),目标 ServerName 写 localhost → tcp 为 ok、tls 为 ok、tls_protocol 非空、cert_errors 不等于 None、cert_issuer 含 YuanC-Test-CA;Json 里不含 127.0.0.1 与 localhost。\n13. CollectorEmbedsChannelSectionsAndRedacts:三个来源都接上(Network 也接上)。Channels 返回 Json {\"selected\":\"backup\",\"note\":\"8.8.8.8\"} → channels.selected 为 backup、channels.note 为 [公网地址]、channels_error 为 null;NodeReach 返回 Error 为 ReachProbe.NoTarget → node_reach 为 null、node_reach_error 等于那段文字;Ipv6Reach 抛 InvalidOperationException → errors.ipv6_reach 为 InvalidOperationException,ipv6_reach 与 ipv6_reach_error 都是 null,logs 段照常在。根键次序里 network_error 之后紧跟 channels、channels_error、node_reach、node_reach_error、ipv6_reach、ipv6_reach_error,再是 logs。\n14. CollectorOmitsChannelSectionsWhenNotWired:三个来源都不接 → 根键里没有这六个键;只接 Channels → 只多出 channels 与 channels_error 两个键。\n15. CollectorStartsProbesTogether:三个来源各自进入后计数并等一个「三条都进来了才放行」的信号;CollectAsync 要在 5 秒内完成(一条等完才开始下一条的实现会卡死在这里)。\n16. KernelLogLinesLoseColorCodes:临时目录里 sing-box.log 写一行 <ESC>[31mERROR<ESC>[0m[0000] dial www.example.com(<ESC> 是字符 \\u001b)→ 采集结果里那行等于 ERROR[0000] dial [域名];service.log 写同样一行,采集结果里颜色码还在;DiagnosticsRedactor.StripColorCodes(null) 是空串。\n17. NetworkScriptListsSecurityProducts:NetworkStateProbe.Script 含 root/SecurityCenter2、AntiVirusProduct、FirewallProduct、security_products;不含 Set-、New-、Remove-、Enable-、Disable-、Stop-、Restart-、Add-、Clear- 任何一个。\n18. SourcesCarryChannelProbesOnlyWhenGiven:DiagnosticsSourcesFor 只传原来八个参数 → Channels、NodeReach、Ipv6Reach 都为空;多传三个委托 → 三个来源就是传进去的那三个。\n\n交活说明逐条对照第①~⑧条写做到了没有,并单列哪些只有真机能验。",
+  "background": "项目:外包「澳洲出口节点 + Windows 一键客户端」。客户端 .NET 9(winclient/WinClient.sln:Core + App + Tests + UiTests)。后台服务用 sing-box 作连接内核:TunnelTransport 把配置交给 SingBoxProcessManager 落盘并起内核。配置里有三个出站:main(主通道,TCP)、backup(备用通道,UDP)、proxy(在 main 与 backup 之间按测速自动选一条),见 winclient/WinClient.Core/Pairing/LocalConfigRenderer.cs(本单不改它)。测试包(BuildInfo.TestBuild 为真)已经有两处与正式包不同:断网保护不执行、内核开 warn 级日志(TunnelTransport.KernelLog)。\n\n2026-11-28 国内测试电脑用 0.1.2 测试包连上了,但内核日志显示走主通道的连接头一秒全部被对面关掉,只能推断现在靠备用通道;诊断里看不到当前选中的通道,也看不出连接是在哪一环被关掉的。环境自检的「IPv6 已封堵」一项在那台电脑上报未通过,怀疑是误报(连接期间 IPv6 被路由进隧道,系统先在本地完成 TCP 握手,内核随后拒绝),需要握手层面的证据。本单给测试包的诊断补这些证据。sing-box 官方包带一个只读写本机的状态接口(配置键 experimental.clash_api),已在开发机用 1.13.21 实测:GET /proxies 返回 proxies.proxy.now(当前选中的出站名)与各出站的 history(最近一次测速成功时为 [{\"time\":\"…\",\"delay\":181}],失败时为空数组);GET /proxies/<名字>/delay?url=…&timeout=3000 成功回 200 与 {\"delay\":158},失败回 503;不带口令回 401。ReachProbe 的做法也已在开发机对节点实测:线路正常时 TCP 与 TLS 都是 ok,证书签发方是正规机构。\n\n先读(都读全文):winclient/WinClient.Core/Client/TunnelTransport.cs、ClientRuntime.cs;winclient/WinClient.Core/Diagnostics/ 下的 DiagnosticsCollector.cs、DiagnosticsRedactor.cs、NetworkStateProbe.cs、FirewallStateProbe.cs;winclient/WinClient.Core/Network/DefaultRouteBinding.cs(物理默认出口怎么取、IP_UNICAST_IF 怎么设,只读不改);winclient/WinClient.Core/Process/SingBoxProcessManager.cs(ConfigPath、Start,只读不改);winclient/WinClient.Core/Environment/EnvironmentSelfCheck.cs 里的 SocketIpv6Probe(只读不改);winclient/WinClient.Core/Pairing/LocalConfigRenderer.cs(出站长什么样,只读不改);winclient/WinClient.Tests/DiagnosticsWiringTests.cs(采集与来源装配的既有用例,新用例的写法照它)、DiagnosticsCollectorTests.cs(钉了没接可选来源时的根键清单)、KernelLifetimeTests.cs(怎么用启动器替身、进程表替身和临时目录造 SingBoxProcessManager 与 TunnelTransport)、TcpResetLiveTests.cs(测试里用回环口监听的写法)、FirewallTests.cs 里的 TempDirectory;docs/winclient/诊断导出说明.md;检查脚本 docs/plans/checks/yc_diag_channel_status_1128.py(它就是 SHAPE、TESTS-NEW、DOCS、SCOPE 四项验收,照它的字样写)。\n\n注意名字:Core 里有命名空间 WinClient.Core.Process 和 WinClient.Core.Diagnostics,进程与计时类一律写全名(System.Diagnostics.Process、System.Diagnostics.Stopwatch),不要在 Core 的这些文件里加 using System.Diagnostics。\n\n硬规矩:①只改允许清单里的文件;②既有测试文件一个都不许改,既有用例不删不改,只加新文件;既有用例若因为本单变红,停下交 blocked 并在 forks 里写出用例名和断言;③不许 git 写操作,不许自己跑 dotnet(build / test / restore 一律按验收编号申请),命令单独一条执行(不用 cd &&、管道、2>&1);④每次 Edit / Write 的新内容控制在 150 行以内;⑤goal 里的成员名、提示语、JSON 键名、脚本行、正则照原文一字不差(含全角标点),新增注释用中文;⑥本单不新增任何子进程(路由与 DNS 现状探测还是原来那一个隐藏窗口的子进程);⑦测试不许起真进程、不许读写真的数据目录、不许查或改真防火墙与过滤层(不许调 ClientRuntime.CreateAsync、WfpEngine.CreateProduction、new CommandRunner、new KillSwitchApplier);测试里的网络连接只许连本机回环口上测试自己起的监听端,ReachProbe.RunAsync 在测试里一律 bindPhysical: false,不许连任何外部地址;文件只写在测试自己建的临时目录里并在结束时清掉;⑧不许读写 secrets/,工位里不许装依赖(缺依赖停下交 blocked);⑨不改界面工程、截图基线、连接与断网保护逻辑、环境自检的判定、LocalConfigRenderer;⑩状态口的口令、节点地址、端口、主机名不许进日志和诊断;⑪拿不准停下交 blocked 并写 forks,不猜。\n\n项目红线:只管本项目自己建的服务、路由、防火墙规则(本单对系统只读);凭据不落库不落日志(诊断里不写出口地址、节点公网地址、令牌、配对内容、用户目录名);隧道断了不许悄悄退回直连(本单不碰连接逻辑;直连握手探测只握手、不传数据,只在测试包导出诊断时做);安装更新幂等可回退;真机没测的不标通过;Windows 子进程一律隐藏窗口。",
+  "nonGoals": [
+    "不改界面工程(WinClient.App)、截图基线、更新页文字",
+    "不改连接逻辑、断网保护逻辑、状态机、ClientController",
+    "不改环境自检(EnvironmentSelfCheck、SocketIpv6Probe)的判定办法",
+    "不改 LocalConfigRenderer;正式包交给内核的配置不许有任何变化,正式包导出的诊断不多不少",
+    "不改既有测试文件",
+    "不做真机实测,不打包"
+  ],
+  "allowedPaths": [
+    "winclient/WinClient.Core/Client/ClientRuntime.cs",
+    "winclient/WinClient.Core/Client/TunnelTransport.cs",
+    "winclient/WinClient.Core/Diagnostics/DiagnosticsCollector.cs",
+    "winclient/WinClient.Core/Diagnostics/DiagnosticsRedactor.cs",
+    "winclient/WinClient.Core/Diagnostics/NetworkStateProbe.cs",
+    "winclient/WinClient.Core/Diagnostics/KernelChannelProbe.cs",
+    "winclient/WinClient.Core/Diagnostics/ReachProbe.cs",
+    "winclient/WinClient.Tests/DiagnosticsChannelTests.cs",
+    "docs/winclient/诊断导出说明.md"
+  ],
+  "forbiddenPaths": [
+    ".codex/**",
+    ".github/**",
+    ".gitignore",
+    "pyproject.toml",
+    "authserver/**",
+    "node/**",
+    "scripts/**",
+    "docs/plans/**",
+    "docs/design/**",
+    "docs/node/**",
+    "winclient/*.sln",
+    "winclient/Directory.Build.props",
+    "winclient/third_party/**",
+    "winclient/WinClient.App/**",
+    "winclient/WinClient.UiTests/**",
+    "winclient/WinClient.Core/Firewall/**",
+    "winclient/WinClient.Core/Network/**",
+    "winclient/WinClient.Core/State/**",
+    "winclient/WinClient.Core/Update/**",
+    "winclient/WinClient.Core/Logging/**",
+    "winclient/WinClient.Core/Process/**",
+    "winclient/WinClient.Core/Pairing/**",
+    "winclient/WinClient.Core/Environment/**",
+    "winclient/WinClient.Core/Ipc/**",
+    "winclient/WinClient.Core/WinClient.Core.csproj",
+    "winclient/WinClient.Core/Client/ClientController.cs",
+    "winclient/WinClient.Core/Client/IClientFacade.cs",
+    "winclient/WinClient.Core/Client/ConnectJournal.cs",
+    "winclient/WinClient.Core/Client/BuildInfo.cs",
+    "winclient/WinClient.Core/Client/DesiredStateStore.cs",
+    "winclient/WinClient.Core/Diagnostics/LogTail.cs",
+    "winclient/WinClient.Core/Diagnostics/FirewallStateProbe.cs",
+    "winclient/WinClient.Tests/WinClient.Tests.csproj",
+    "winclient/WinClient.Tests/DiagnosticsWiringTests.cs",
+    "winclient/WinClient.Tests/DiagnosticsCollectorTests.cs",
+    "winclient/WinClient.Tests/DiagnosticsRedactorTests.cs",
+    "winclient/WinClient.Tests/KernelLifetimeTests.cs",
+    "winclient/WinClient.Tests/ProcessStorageTests.cs",
+    "winclient/WinClient.Tests/PairingTests.cs",
+    "winclient/WinClient.Tests/RouteGuardTests.cs",
+    "winclient/WinClient.Tests/TcpResetLiveTests.cs",
+    "winclient/WinClient.Tests/FirewallTests.cs",
+    "docs/winclient/服务化与自启说明.md",
+    "docs/winclient/环境一致性说明.md",
+    "docs/winclient/界面说明.md",
+    "docs/winclient/连接记录说明.md",
+    "docs/winclient/断网保护加固说明.md",
+    "docs/winclient/架构说明.md",
+    "docs/winclient/打包与发布说明.md",
+    "docs/口径速查表.md"
+  ],
+  "expectArtifacts": [
+    "winclient/WinClient.Core/Diagnostics/KernelChannelProbe.cs",
+    "winclient/WinClient.Core/Diagnostics/ReachProbe.cs",
+    "winclient/WinClient.Tests/DiagnosticsChannelTests.cs"
+  ],
+  "acceptance": [
+    {
+      "id": "BUILD",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "build",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1200
+    },
+    {
+      "id": "TEST",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "test",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--no-build",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1500
+    },
+    {
+      "id": "SHAPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_diag_channel_status_1128.py",
+        "shape"
+      ],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "TESTS-NEW",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_diag_channel_status_1128.py",
+        "tests"
+      ],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_diag_channel_status_1128.py",
+        "docs"
+      ],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "SCOPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_diag_channel_status_1128.py",
+        "scope"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "timeoutSec": 10800,
+  "repoRoot": "E:/yuanc",
+  "steps": [
+    "读 background 列出的文件与检查脚本。",
+    "先写测试:DiagnosticsChannelTests.cs 十八个用例;申请 BUILD 以编译失败证红,之后固定 BUILD→TEST。",
+    "按 goal 第①②条新建 KernelChannelProbe.cs 与 ReachProbe.cs。",
+    "按 goal 第③条改 TunnelTransport.cs。",
+    "按 goal 第④⑤条改 NetworkStateProbe.cs、DiagnosticsRedactor.cs、DiagnosticsCollector.cs。",
+    "按 goal 第⑥条改 ClientRuntime.cs。",
+    "按 goal 第⑦条改文档;BUILD、TEST、SHAPE、TESTS-NEW、DOCS、SCOPE 绿后交活。",
+    "交活说明逐条对照 goal 第①~⑧条写做到了没有,并单列哪些只有真机能验。"
+  ]
+}
