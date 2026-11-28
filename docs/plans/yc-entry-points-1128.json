@@ -1,0 +1,179 @@
+{
+  "schemaVersion": 1,
+  "taskId": "WINCLIENT-NO-SHORTCUT-NO-UNINSTALL-1127",
+  "slug": "yc-entry-points-1128",
+  "title": "安装后有开始菜单和桌面图标,系统「应用和功能」里能卸载;自动更新后图标和卸载入口跟着指到新程序",
+  "workbuddyTier": "hard",
+  "goal": "以派单时 origin/main 头为基点。看板卡 WINCLIENT-NO-SHORTCUT-NO-UNINSTALL-1127。下面的名字、常量、提示语照原文一字不差(全角标点照抄)。\n\n【问题】安装只复制程序、登记后台服务和开机自启。没有开始菜单和桌面图标,客户从托盘点了「退出界面」后只能去找当初下载的文件;系统「应用和功能」里没有它,卸载只能用管理员命令行。\n【改成】安装时在开始菜单和公共桌面各建一个图标,并登记卸载入口;自动更新换了程序后,图标和卸载入口跟着指到新程序;卸载时一并删掉。从系统里点卸载时有确认框和结果框。\n\n一、新文件 winclient/WinClient.Core/Hosting/ShellShortcut.cs\n① 命名空间 WinClient.Core.Hosting;类上标 [SupportedOSPlatform(\"windows\")];`public static class ShellShortcut`。只用系统自带的 ShellLink 组件读写 .lnk 文件,不起子进程,不用 PowerShell,不用 WScript。\n② 类里声明(签名照抄):\n `public sealed record Link(string Target, string Arguments, string WorkingDirectory, string Description);`\n `public static void Write(string linkPath, Link link)`:新建 ShellLink 对象,依次 SetPath(link.Target)、SetArguments(link.Arguments)、SetWorkingDirectory(link.WorkingDirectory)、SetDescription(link.Description)、SetIconLocation(link.Target, 0),再把同一个对象转成 System.Runtime.InteropServices.ComTypes.IPersistFile 调 Save(linkPath, true);finally 里 Marshal.FinalReleaseComObject。失败的异常原样往外抛。\n `public static Link? Read(string linkPath)`:文件不存在返回 null;否则新建 ShellLink 对象,转成 IPersistFile 调 Load(linkPath, 0),再用容量 1024 的 StringBuilder 依次 GetPath(缓冲, 1024, IntPtr.Zero, 0)、GetArguments、GetWorkingDirectory、GetDescription,拼成 Link 返回;finally 里释放。\n③ 组件声明照抄。方法的个数和先后就是系统接口的布局,一个都不能少、不能换位置(SHAPE 验收会逐个核):\n```\n[ComImport, Guid(\"00021401-0000-0000-C000-000000000046\")]\nprivate class ShellLinkObject { }\n\n[ComImport, InterfaceType(ComInterfaceType.InterfaceIsIUnknown), Guid(\"000214F9-0000-0000-C000-000000000046\")]\nprivate interface IShellLinkW\n{\n    void GetPath([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder file, int capacity, IntPtr findData, uint flags);\n    void GetIDList(out IntPtr list);\n    void SetIDList(IntPtr list);\n    void GetDescription([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder name, int capacity);\n    void SetDescription([MarshalAs(UnmanagedType.LPWStr)] string name);\n    void GetWorkingDirectory([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder directory, int capacity);\n    void SetWorkingDirectory([MarshalAs(UnmanagedType.LPWStr)] string directory);\n    void GetArguments([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder arguments, int capacity);\n    void SetArguments([MarshalAs(UnmanagedType.LPWStr)] string arguments);\n    void GetHotkey(out short hotkey);\n    void SetHotkey(short hotkey);\n    void GetShowCmd(out int show);\n    void SetShowCmd(int show);\n    void GetIconLocation([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder path, int capacity, out int index);\n    void SetIconLocation([MarshalAs(UnmanagedType.LPWStr)] string path, int index);\n    void SetRelativePath([MarshalAs(UnmanagedType.LPWStr)] string path, uint reserved);\n    void Resolve(IntPtr window, uint flags);\n    void SetPath([MarshalAs(UnmanagedType.LPWStr)] string file);\n}\n```\n 用法:`var shell = (IShellLinkW)new ShellLinkObject();`,存取文件时 `((IPersistFile)shell)`。这一段派单方 2026-11-28 在本机实跑过:中文文件名能写能读;文件设成只读后再写抛 UnauthorizedAccessException;目录建不出来时写抛 DirectoryNotFoundException。\n\n二、新文件 winclient/WinClient.Core/Hosting/EntryPoints.cs\n④ 命名空间 WinClient.Core.Hosting;类上标 [SupportedOSPlatform(\"windows\")];声明照抄:`public sealed class EntryPoints(string programsDirectory, string desktopDirectory, RegistryKey hive)`。\n⑤ 常量(十四个,照抄):\n `public const string DisplayName = \"澳洲出口客户端\";`\n `public const string ShortcutFileName = \"澳洲出口客户端.lnk\";`\n `public const string Publisher = \"YuanC\";`\n `public const string UninstallParentPath = @\"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\";`\n `public const string UninstallKeyName = \"YuanC\";`\n `public const string UninstallRole = \"--uninstall-prompt\";`\n `public const string StartMenuItem = \"开始菜单图标\";`\n `public const string DesktopItem = \"桌面图标\";`\n `public const string UninstallItem = \"卸载入口\";`\n `public const string ApplyFailedSuffix = \"没有建成，重新安装一次可以补上。\";`\n `public const string RemoveFailedSuffix = \"没有删掉，可以手动删除。\";`\n `public const string UninstallConfirmText = \"确定卸载澳洲出口客户端吗？卸载会断开连接并撤掉断网保护，电脑恢复原来的网络。配对文件和日志会保留。\";`\n `public const string UninstallDoneText = \"已卸载。配对文件和日志还留在电脑上，重新安装后可以接着用。\";`\n `public const string UninstallFailedText = \"卸载没有完成。请再试一次，或联系管理员。\";`\n⑥ 成员(签名照抄):\n - `public string StartMenuShortcut`、`public string DesktopShortcut`:分别是 Path.Combine(Path.GetFullPath(对应目录), ShortcutFileName)。\n - `public static string UninstallCommand(string executable)`:返回 英文双引号 + Path.GetFullPath(executable) + 英文双引号 + 一个空格 + UninstallRole。\n - `public static EntryPoints ForMachine()`:new(Environment.GetFolderPath(Environment.SpecialFolder.CommonPrograms), Environment.GetFolderPath(Environment.SpecialFolder.CommonDesktopDirectory), Registry.LocalMachine)。\n - `public static string? Describe(IReadOnlyList<string> failed, string suffix)`:failed 为空返回 null;否则返回用「、」连起来的项名加 suffix。\n - `public IReadOnlyList<string> Apply(string executable, string version)`:开始菜单图标、桌面图标、卸载入口三项各做各的,一项失败不影响另外两项,不往外抛;返回没做成的项名(顺序:StartMenuItem、DesktopItem、UninstallItem),全做成返回空列表。\n   · 两个图标:要写的内容是 new ShellShortcut.Link(Path.GetFullPath(executable), \"\", 程序所在目录, DisplayName)。先 ShellShortcut.Read(图标路径);读到的内容和要写的一样就不动(Target、WorkingDirectory 不分大小写比,Arguments、Description 逐字比);不一样、读不到或读的时候出错,就先 Directory.CreateDirectory(图标所在目录) 再 ShellShortcut.Write。\n   · 卸载入口:hive.CreateSubKey(UninstallParentPath + \"\\\\\" + UninstallKeyName, writable: true),写下面九个值,已有且值相同的不重写。字符串六个(RegistryValueKind.String):DisplayName = DisplayName;DisplayVersion = version;Publisher = Publisher;DisplayIcon = 程序完整路径;InstallLocation = 程序所在目录;UninstallString = UninstallCommand(executable)。整数三个(RegistryValueKind.DWord,int):NoModify = 1;NoRepair = 1;EstimatedSize = 程序文件字节数除以 1024 取整(文件不存在记 0)。\n   · 每项各包一层 try,catch 只接这七种:IOException、UnauthorizedAccessException、System.Security.SecurityException、System.Runtime.InteropServices.COMException、ArgumentException、NotSupportedException、InvalidCastException;接住就把项名记进返回列表。\n - `public IReadOnlyList<string> Remove()`:两个图标文件存在就删;卸载入口用 hive.OpenSubKey(UninstallParentPath, writable: true) 打开父键后 DeleteSubKeyTree(UninstallKeyName, throwOnMissingSubKey: false),父键打不开(null)算本来就没有。三项同样各包一层 try(同一组七种异常),返回没删掉的项名;本来就没有算成功。\n\n三、winclient/WinClient.App/Hosting/InstallerRunner.cs\n⑦ InstallAsync 的最后(`else await StartAsync();` 那一行之后)加一行:\n `Report(EntryPoints.ForMachine().Apply(destination, ServiceInstaller.ReleaseVersion(version)), EntryPoints.ApplyFailedSuffix);`\n 上面写一行中文注释:图标与卸载入口建不成只提示,不让安装失败(有的安全软件会拦桌面图标)。\n⑧ UninstallAsync 的最后(删掉登录自启值那一行之后)加一行:\n `Report(EntryPoints.ForMachine().Remove(), EntryPoints.RemoveFailedSuffix);`\n 卸载中途失败抛出时走不到这一行,图标和卸载入口留着,用户还能再点一次卸载。\n⑨ 加私有静态方法(签名照抄)`private static void Report(IReadOnlyList<string> failed, string suffix)`:EntryPoints.Describe(failed, suffix) 不为 null 就 Console.Error.WriteLine 它。\n⑩ 别的不动:RunAsync、ElevationInfo(仍只认 --install、--repair、--uninstall)、StartSwitchedAsync、StartAsync、撤销断网保护的两段、所有既有提示语。--repair 不建图标。\n\n四、新文件 winclient/WinClient.App/Hosting/UninstallPrompt.cs,以及 winclient/WinClient.App/Program.cs\n⑪ `public static class UninstallPrompt`,`public static int Run()`:\n - 先问:System.Windows.MessageBox.Show(EntryPoints.UninstallConfirmText, EntryPoints.DisplayName, MessageBoxButton.YesNo, MessageBoxImage.Question, MessageBoxResult.No)。答的不是 Yes 就 return 0,什么都不做。\n - 答 Yes:当前进程已经是管理员(判法照 InstallerRunner.RunAsync 开头那两行)就 `new InstallerRunner().RunAsync(\"--uninstall\").GetAwaiter().GetResult() == 0`;不是管理员就 `InstallerRunner.ElevateAsync(\"--uninstall\").GetAwaiter().GetResult()`。用户在系统的权限确认框里点「否」会抛 Win32Exception,连同 InvalidOperationException 一起接住,按没完成算。\n - 完成了:先关掉还开着的本产品界面(下一条),再 MessageBox.Show(EntryPoints.UninstallDoneText, EntryPoints.DisplayName),return 0。\n - 没完成:MessageBox.Show(EntryPoints.UninstallFailedText, EntryPoints.DisplayName),return 1。\n⑫ 关界面:System.Diagnostics.Process.GetProcessesByName(Path.GetFileNameWithoutExtension(InstallerRunner.CurrentExecutable)) 逐个看。进程号等于 Environment.ProcessId 的跳过;取得到程序完整路径(MainModule?.FileName)且 CallerIdentity.IsTrusted(路径, UpdatePlanner.DefaultAppRoot) 为真的调 Kill()。每个进程各包一层 try,接 Win32Exception、InvalidOperationException、NotSupportedException 后不处理;每个 Process 对象用完 Dispose。安装目录之外的同名程序不动。本文件不许出现 Process.Start 与 ProcessStartInfo(提权只走 InstallerRunner.ElevateAsync)。\n⑬ Program.cs 的 switch 加一路,放在 `case \"--install\":` 之前:`case \"--uninstall-prompt\": return UninstallPrompt.Run();`。别的一个字不动。\n\n五、自动更新后图标跟着换:winclient/WinClient.App/Hosting/UpdateApplier.cs、UpdateWindowsHost.cs\n⑭ IUpdateHost 在 SetRunValue 后面加一个成员(照抄):`void SetEntryPoints(string executable, string version);`,上面一行中文注释:把开始菜单图标、桌面图标、卸载入口指到这份程序。\n⑮ UpdateApplier 加私有静态方法(签名照抄):\n `private static void RefreshEntryPoints(IUpdateHost host, string executable, string version, ILog log)`\n 方法体:try 里调 host.SetEntryPoints(executable, version);`catch (Exception)` 里 log.Write(\"开始菜单图标、桌面图标或卸载入口未能更新。\"),不往外抛。上面一行中文注释:图标和卸载入口只是入口,更新不成不能连累已经换好的后台服务。\n 只调两处:Complete 里 `host.SetRunValue(pending.NewExe);` 的下一行写 `RefreshEntryPoints(host, pending.NewExe, pending.NewVersion, log);`;RunAsync 回滚段里 `host.SetRunValue(pending.OldExe);` 的下一行写 `RefreshEntryPoints(host, pending.OldExe, pending.OldVersion, log);`。host.SetEntryPoints 只许在 RefreshEntryPoints 里出现一次。更新流程其余的命令、次序、判断一个字不动。\n⑯ UpdateWindowsHost 加实现(签名照抄)`public void SetEntryPoints(string executable, string version)`:`if (EntryPoints.Describe(EntryPoints.ForMachine().Apply(executable, version), EntryPoints.ApplyFailedSuffix) is { } text) Log.Write(text);`。\n\n六、测试\n⑰ 新文件 winclient/WinClient.Tests/EntryPointTests.cs:`[SupportedOSPlatform(\"windows\")] public sealed class EntryPointTests`。\n - 工作目录:每个用例在 Path.Combine(AppContext.BaseDirectory, \"entry-points-tests\", Guid.NewGuid().ToString(\"N\")) 下新建,finally 里整个删掉。不许用系统临时目录、不许用文件里现成的 TempDirectory:本机系统临时目录是短路径(C:\\Users\\ADMINI~1\\…),系统读回快捷方式的目标时会换成长路径,比较会对不上。\n - 注册表:只许用 Registry.CurrentUser.CreateSubKey(@\"Software\\YuanC-Tests\\\" + Guid) 当 hive,finally 里 Registry.CurrentUser.DeleteSubKeyTree 删掉。不许出现 Registry.LocalMachine、ForMachine()、SpecialFolder.。\n - 假程序:工作目录里写 4096 个字节的 YuanC-Client.exe。\n 用例名照抄,六个:\n - ConstantsAndCommandAreExact:⑤ 的十四个常量逐个 Assert.Equal 原文;UninstallCommand(exe) 等于 英文双引号 + Path.GetFullPath(exe) + 英文双引号 + \" --uninstall-prompt\";Describe(空列表, ApplyFailedSuffix) 为 null;Describe([\"开始菜单图标\", \"桌面图标\"], ApplyFailedSuffix) 等于「开始菜单图标、桌面图标没有建成，重新安装一次可以补上。」;Describe([\"卸载入口\"], RemoveFailedSuffix) 等于「卸载入口没有删掉，可以手动删除。」。\n - ShortcutRoundTripsThroughShellLink:在工作目录写「澳洲出口客户端.lnk」,内容 Link(假程序完整路径, \"--tray\", 工作目录, \"澳洲出口客户端\");Read 回来四个字段都相等(Target、WorkingDirectory 用 OrdinalIgnoreCase 比);Read 一个不存在的路径返回 null。\n - ApplyCreatesShortcutsAndUninstallEntry:new EntryPoints(工作目录下的 programs, 工作目录下的 desktop, hive),两个子目录事先不建;Apply(exe, \"1.2.3\") 返回空;StartMenuShortcut、DesktopShortcut 两个文件都在,Read 出来 Target 等于 exe 完整路径(OrdinalIgnoreCase)、Arguments 是空串、WorkingDirectory 等于 exe 所在目录(OrdinalIgnoreCase)、Description 等于 DisplayName;hive 下 UninstallParentPath\\UninstallKeyName 里六个字符串值分别等于:DisplayName、\"1.2.3\"、Publisher、exe 完整路径、exe 所在目录、UninstallCommand(exe);NoModify、NoRepair 等于 1,EstimatedSize 等于 4,这三个的 GetValueKind 是 DWord。\n - ApplyTwiceDoesNotRewriteAndFollowsNewExecutable:Apply(exeA, \"1.0.0\") 之后把两个图标文件设成只读(FileAttributes.ReadOnly);再 Apply(exeA, \"1.0.0\") 返回空(同值没去重写,所以只读也不报失败);去掉只读,Apply(exeB, \"2.0.0\") 返回空,两个图标 Read 出来 Target 等于 exeB(OrdinalIgnoreCase),DisplayVersion 等于 \"2.0.0\",UninstallString 等于 UninstallCommand(exeB)。exeB 是工作目录另一个子目录里同样写出来的假程序。finally 里先把只读去掉再删工作目录。\n - RemoveDeletesAllAndToleratesMissing:Apply 之后 Remove 返回空;两个图标文件不在;hive 下 UninstallParentPath\\UninstallKeyName 打不开(null);再 Remove 一次仍返回空;另建一个从没 Apply 过的 EntryPoints(它的 hive 下连 UninstallParentPath 都没有),Remove 也返回空。\n - ApplyReportsOnlyTheFailedItem:工作目录里先写一个文件 blocker,programs 目录给 Path.Combine(blocker 的路径, \"sub\")(这个目录建不出来);Apply 返回的列表等于 [EntryPoints.StartMenuItem];桌面图标文件在;卸载入口的 DisplayName 值在。\n⑱ winclient/WinClient.Tests/UpdateApplierTests.cs:\n - 文件末尾的假件 Host 补三个成员(照抄),别的成员不动:`public (string Exe, string Version)? Entries;`、`public bool EntriesThrow;`、`public void SetEntryPoints(string exe, string version) { if (EntriesThrow) throw new IOException(); Entries = (exe, version); }`。\n - 新用例 EntryPointsFollowServiceExecutable(Theory,两行数据 \"ok\"、\"silent\"):搭法照 CommandsAndRecoveryBranches,Runner 的 rollbackFails 给 false;\"ok\" 跑完 host.Entries 等于 (pending.NewExe, \"1.0.0\");\"silent\" 跑完等于 (pending.OldExe, \"0.1.0\")。\n - 新用例 EntryPointFailureCannotUndoSuccessfulServiceSwitch(Fact):host.EntriesThrow = true,模式 \"ok\";RunAsync 返回 0;runner.Commands.Count 等于 3;最后一条历史的 Status 是 \"ok\";store.HasPending 为假。\n - 既有五个用例(CommandsAndRecoveryBranches、SilentPipeChecksRunningServiceImageBeforeMarkingBad、LogWriteFailureCannotUndoSuccessfulServiceSwitch、MissingOrCorruptPendingReturnsTwoWithoutCommands、StartupRecoversOnlyStalePending)的名字、数据行、断言一个字不许动。",
+  "background": "项目:外包「澳洲出口节点 + Windows 一键客户端」。客户端 .NET 9(winclient/WinClient.sln:Core + App + Tests + UiTests),单文件程序 YuanC-Client.exe,同一个程序按启动参数分角色(界面、--tray、--service、--install、--uninstall、--repair、--apply-update、--leak-check)。安装把程序复制到 Program Files\\YuanC\\app\\<版本>\\YuanC-Client.exe,登记后台服务和登录自启;自动更新由 --apply-update 把服务切到新版本目录,切好后旧版本目录会被清理。卸载后程序文件和 %ProgramData%\\YuanC 保留(现行口径),所以卸载程序可以从安装目录里自己跑。\n\n先读(全文):winclient/WinClient.App/Hosting/InstallerRunner.cs、winclient/WinClient.App/Program.cs、winclient/WinClient.App/Hosting/UpdateApplier.cs、winclient/WinClient.App/Hosting/UpdateWindowsHost.cs、winclient/WinClient.Tests/UpdateApplierTests.cs;只读参考:winclient/WinClient.App/Hosting/UpdateRecovery.cs(它也调 UpdateApplier.Complete)、winclient/WinClient.Core/Hosting/ServiceInstaller.cs、winclient/WinClient.Core/Ipc/CallerIdentity.cs、winclient/WinClient.Core/Update/UpdatePlanner.cs、winclient/WinClient.App/App.xaml.cs(MessageBox 的现成用法)、winclient/WinClient.Tests/WinClient.Tests.csproj;检查脚本 docs/plans/checks/yc_entry_points_1128.py(SHAPE、TESTS、SCOPE 三项验收照它判)。\n\n要知道的事实:\n- 测试项目 WinClient.Tests 只引用 Core,另外把 App 的 UpdateApplier.cs、UpdateRecovery.cs 两个源文件链接进来一起编译。所以 UpdateApplier.cs 里不许引用 App 项目里别的类型;EntryPoints、ShellShortcut 放在 Core 就是为了这个。csproj 不用改也不许改(SDK 项目自动收新文件)。\n- IUpdateHost 只有两个实现:UpdateWindowsHost 和 UpdateApplierTests.cs 里的假件 Host。\n- UpdateApplier 里的 log 是 UpdateLog,写失败它自己吞。\n- Core 的目标框架是 net9.0(不带 -windows),用注册表和系统组件的类要标 [SupportedOSPlatform(\"windows\")],Core 里已有先例。\n- 系统的快捷方式组件线程模型是 Both,派单方 2026-11-28 在多线程单元里实跑过读写,后台服务和测试线程里都能用。\n\n已定的取舍(不要改):\n- 图标建在所有用户的开始菜单和公共桌面,不建在当前用户名下:安装、卸载跑在管理员账户,后台更新跑在系统账户,只有公共位置三方都写得到。\n- 图标和卸载入口建不成只提示,不让安装或更新失败;删不掉只提示,不让卸载失败。\n- 不沿用仓里给浏览器建快捷方式的那套写法(起脚本进程);本单直接调系统组件。\n- --repair 不建图标;界面里不加卸载按钮。\n- 文档本单不改(另一张在施工的单正在改 docs/winclient/服务化与自启说明.md),合并后由派单方补。\n\n硬规矩(做不到就停下交 blocked + forks,不猜):①只改允许清单里的九个文件;②既有测试不改、不删、不跳过;UpdateApplierTests.cs 既有五个用例的正文一个字不动(TESTS 会和改动前逐字比),只许在假件 Host 里补 goal ⑱ 的三个成员、在文件里加两个新用例;不许加重试、不许放宽断言;③不许 git 写操作,不许自己跑 dotnet(build / test / restore 一律按验收编号走派单器自测通道),命令单独一条执行(不用 cd &&、管道、2>&1);不许装依赖;④每次 Edit / Write 的新内容控制在 150 行以内;⑤goal 里的常量、提示语照原文一字不差(含全角标点),新增注释用中文大白话;⑥本单不新起任何子进程,提权只走现成的 InstallerRunner.ElevateAsync,不弹黑窗口;⑦测试不许碰真的开始菜单、公共桌面、机器注册表,只用 goal ⑰ 说的工作目录和当前用户下的测试键,用完删干净;⑧SHAPE、TESTS 按字面查,注释也算:ShellShortcut.cs、EntryPoints.cs 里不要出现 Process.Start、ProcessStartInfo、PowerShell、WScript、cmd.exe 这些字样;UninstallPrompt.cs 里不要出现 Process.Start( 和 ProcessStartInfo;EntryPointTests.cs 里不要出现 Registry.LocalMachine、ForMachine()、SpecialFolder.、GetTempPath、TempDirectory、Skip、Process.Start;⑨不许读写 secrets/;⑩遇到契约没写到、要自己拍板的地方,停下交 blocked 并写清岔路。",
+  "nonGoals": [
+    "不改文档和口径速查表(合并后派单方补)",
+    "不做界面里的卸载按钮",
+    "卸载不删程序文件和数据目录(现行口径不变)",
+    "--repair 不建图标;ElevationInfo 认的参数不变",
+    "不改更新流程的命令、次序、判定",
+    "不改给浏览器建快捷方式的那套代码",
+    "不做真机实测,不打发布包,不改版本号"
+  ],
+  "allowedPaths": [
+    "winclient/WinClient.Core/Hosting/EntryPoints.cs",
+    "winclient/WinClient.Core/Hosting/ShellShortcut.cs",
+    "winclient/WinClient.App/Hosting/InstallerRunner.cs",
+    "winclient/WinClient.App/Hosting/UninstallPrompt.cs",
+    "winclient/WinClient.App/Program.cs",
+    "winclient/WinClient.App/Hosting/UpdateApplier.cs",
+    "winclient/WinClient.App/Hosting/UpdateWindowsHost.cs",
+    "winclient/WinClient.Tests/EntryPointTests.cs",
+    "winclient/WinClient.Tests/UpdateApplierTests.cs"
+  ],
+  "forbiddenPaths": [
+    ".codex/**",
+    ".github/**",
+    ".gitignore",
+    "pyproject.toml",
+    "authserver/**",
+    "node/**",
+    "scripts/**",
+    "docs/**",
+    "winclient/*.sln",
+    "winclient/Directory.Build.props",
+    "winclient/third_party/**",
+    "winclient/WinClient.UiTests/**",
+    "winclient/WinClient.Core/Client/**",
+    "winclient/WinClient.Core/State/**",
+    "winclient/WinClient.Core/Ipc/**",
+    "winclient/WinClient.Core/Firewall/**",
+    "winclient/WinClient.Core/Network/**",
+    "winclient/WinClient.Core/Diagnostics/**",
+    "winclient/WinClient.Core/Update/**",
+    "winclient/WinClient.Core/Kernel/**",
+    "winclient/WinClient.Core/Process/**",
+    "winclient/WinClient.Core/Hosting/ServiceInstaller.cs",
+    "winclient/WinClient.Core/Hosting/DataDirectorySecurity.cs",
+    "winclient/WinClient.Core/WinClient.Core.csproj",
+    "winclient/WinClient.App/WinClient.App.csproj",
+    "winclient/WinClient.App/App.xaml",
+    "winclient/WinClient.App/App.xaml.cs",
+    "winclient/WinClient.App/Hosting/UpdateRecovery.cs",
+    "winclient/WinClient.App/Hosting/ControlService.cs",
+    "winclient/WinClient.App/Hosting/LeakCheckRunner.cs",
+    "winclient/WinClient.Tests/WinClient.Tests.csproj",
+    "winclient/WinClient.Tests/UpdateCoordinatorTests.cs"
+  ],
+  "expectArtifacts": [
+    "winclient/WinClient.Core/Hosting/EntryPoints.cs",
+    "winclient/WinClient.Core/Hosting/ShellShortcut.cs",
+    "winclient/WinClient.App/Hosting/UninstallPrompt.cs",
+    "winclient/WinClient.Tests/EntryPointTests.cs"
+  ],
+  "acceptance": [
+    {
+      "id": "BUILD",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "build",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1200
+    },
+    {
+      "id": "TEST",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "test",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--no-build",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1500
+    },
+    {
+      "id": "T-ENTRY",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "test",
+        "winclient/WinClient.Tests/WinClient.Tests.csproj",
+        "-c",
+        "Release",
+        "--nologo",
+        "--filter",
+        "FullyQualifiedName~EntryPointTests"
+      ],
+      "required": true,
+      "timeoutSec": 1500
+    },
+    {
+      "id": "T-UPDATE",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "test",
+        "winclient/WinClient.Tests/WinClient.Tests.csproj",
+        "-c",
+        "Release",
+        "--nologo",
+        "--filter",
+        "FullyQualifiedName~UpdateApplierTests"
+      ],
+      "required": true,
+      "timeoutSec": 1500
+    },
+    {
+      "id": "SHAPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_entry_points_1128.py",
+        "shape"
+      ],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "TESTS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_entry_points_1128.py",
+        "tests"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "SCOPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_entry_points_1128.py",
+        "scope"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "timeoutSec": 10800,
+  "repoRoot": "E:/yuanc",
+  "steps": [
+    "读 background 列出的文件与检查脚本。",
+    "先写测试:新文件 EntryPointTests.cs(goal ⑰),UpdateApplierTests.cs 补假件成员和两个新用例(goal ⑱);申请 BUILD 以编译失败证红,之后固定 BUILD→TEST。",
+    "按 goal ①~⑥ 写 ShellShortcut.cs、EntryPoints.cs,T-ENTRY 转绿。",
+    "按 goal ⑭~⑯ 改 UpdateApplier.cs、UpdateWindowsHost.cs,T-UPDATE 转绿。",
+    "按 goal ⑦~⑬ 改 InstallerRunner.cs、Program.cs,新写 UninstallPrompt.cs。",
+    "BUILD、TEST、T-ENTRY、T-UPDATE、SHAPE、TESTS、SCOPE 全绿后交活;交活说明逐条对照 goal ①~⑱ 写做到了没有,并单列只有真机能验的(图标真的出现在开始菜单和桌面、从系统里点卸载的整条流程、更新后图标指向新程序)。"
+  ]
+}
