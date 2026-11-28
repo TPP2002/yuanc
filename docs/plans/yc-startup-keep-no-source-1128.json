@@ -1,0 +1,170 @@
+{
+  "schemaVersion": 1,
+  "taskId": "SEC-WIN-STARTUP-NO-SOURCE-DROPS-PROTECTION-1127",
+  "slug": "yc-startup-keep-no-source-1128",
+  "title": "上次连着、启动时找不到配对文件或登录凭据:断网保护保持并停在需人工处理,不再悄悄恢复直连",
+  "workbuddyTier": "hard",
+  "goal": "以派单时 origin/main 头为基点。看板卡 SEC-WIN-STARTUP-NO-SOURCE-DROPS-PROTECTION-1127。下面的提示语、记录文字照原文一字不差(全角标点照抄)。\n\n【问题】上次是连接状态(期望状态不是「断开」、断网保护的恢复记录还在),后台服务启动时如果找不到配对文件,或邀请码版找不到登录凭据,ClientController.InitializeAsync 会走恢复分支:撤掉防火墙、过滤层、兜底路由,电脑回到直连,界面只显示「未配置服务器」。用户没点断开,保护却没了,违反项目红线「隧道断了不静默回落」。\n【改成】这种情况保护保持,状态停在「需人工处理」,提示用户点「断开」;只有用户点了断开才撤保护。\n\n一、winclient/WinClient.Core/Client/ClientController.cs\n① 在常量 TestBuildDisconnected 那一行后面加两句:\n `internal const string KeptWithoutPairingMessage = \"上次的连接没有断开，但现在找不到配对文件。断网保护保持，电脑暂时上不了网。请点「断开」恢复原来的网络，重新导入配对文件后再连接。\";`\n `internal const string KeptWithoutCredentialsMessage = \"上次的连接没有断开，但现在找不到登录凭据。断网保护保持，电脑暂时上不了网。请点「断开」恢复原来的网络，重新兑换邀请码后再连接。\";`\n② InitializeAsync 里现在的判断 `if (keepProtection && firewall.HasPendingState && (sessionSource is PairingSessionSource or AuthServerSessionSource { HasCredentials: true }))` 拆成三路(都在现有的 try 里、gate 之内):\n (a) keepProtection 为真、有恢复记录、会话来源可用(是 PairingSessionSource,或是 AuthServerSessionSource 且 HasCredentials 为真):照现在那五行原样执行(protection = true、protectionVerified = true、message = protectionNotice、keptProtection = true、environmentApplied 赋值、写「启动：接回断网保护，随后自动连接」),一个字不改。\n (b) keepProtection 为真、有恢复记录、会话来源找不到(sessionSource 为 null;或是 AuthServerSessionSource 但 HasCredentials 为假;或读 HasCredentials 时抛出 IsOperational 认得的异常,这种也按找不到算,不让异常落进外层 catch):\n   - `protection = true;`,`environmentApplied = environment?.HasPendingState ?? false;`,protectionVerified 不动(保持 false);\n   - 不调 firewall.RecoverAsync、firewall.RemoveAsync、nicGuard.RestoreAsync、RestoreEnvironmentAsync;\n   - `await ExecuteAsync(machine.Handle(new(ConnectionEventKind.OperationFailed)));` 让状态进「需人工处理」;\n   - 然后 `message = sessionSource is AuthServerSessionSource ? KeptWithoutCredentialsMessage : KeptWithoutPairingMessage;`\n   - `WriteJournal(\"启动：找不到配对文件或登录凭据，断网保护保持，停在需人工处理\");`\n   - 不自动连接(后面那段自动连接的条件里已有 `machine.State != ConnectionState.NeedsManual`,不用另加)。\n (c) 其余情况(keepProtection 为假;没有恢复记录;或会话来源是生产代码里没有的别的类型):走现在的 else 恢复分支,一个字不改。\n③ ConnectAsync 里 `if (sessionSource is null)` 那一行:message 改成 `protection ? KeptWithoutPairingMessage : \"未配置服务器\"`,记录「连接未开始：未配置服务器」不变,照旧 return。\n④ 不改的:(a) 路里的 protectionVerified = true;DisconnectAsync(停住后点断开走现有流程:停隧道、撤保护、恢复网卡与环境);ChangeSessionSourceAsync(保护在的时候仍然拒绝更换配对文件,所以提示语叫用户先点断开);FailAsync、AbandonAsync、首次尝试相关逻辑;ConnectionStateMachine.cs 一个字不动。\n\n二、测试(winclient/WinClient.Tests/ControllerTests.cs;替身用文件里现成的 Firewall、Tunnel、InMemoryCredentialStore、AuthTests.Handler)\n⑤ 行为按红线变了,下面两个既有用例改名并改断言;别的既有用例的名字、数据行、断言一个字不许动:\n - StartupPendingProtectionWithoutServerRecovers 改名 StartupKeptWithoutServerParksWithProtection:InitializeAsync(true, true) 之后,order 里没有 \"recover\"、\"remove\"、\"apply\"、\"start\";Snapshot.ProtectionActive 为真;Snapshot.State 等于 ConnectionState.NeedsManual;Snapshot.Message 等于 ClientController.KeptWithoutPairingMessage。\n - StartupPendingProtectionWithoutCredentialsRecovers 改名 StartupKeptWithoutCredentialsParksWithProtection:构造不变(http 替身仍是「不应请求会话」那个,证明没去取会话);断言同上,Message 等于 ClientController.KeptWithoutCredentialsMessage。\n⑥ 新用例(名字照抄,紧跟在上面两个后面):\n - StartupKeptCredentialReadFailureParksWithProtection:本文件里加一个私有假件实现 ICredentialStore,Load() 抛 IOException,其余成员按接口补齐;用它构造 AuthServerSessionSource,Firewall 的 HasPendingState = true;InitializeAsync(true, true) 不抛异常;order 里没有 \"recover\"、\"remove\";ProtectionActive 为真;State 为 NeedsManual;Message 等于 KeptWithoutCredentialsMessage。\n - StartupKeptParkedDisconnectRestoresNetwork:会话来源为 null、HasPendingState = true,InitializeAsync(true, true) 后调 DisconnectAsync():order 里有 \"remove\";ProtectionActive 为假;State 为 Disconnected;Message 以「已断开」开头。\n - StartupKeptParkedConnectKeepsGuidance:同样停住后调 ConnectAsync():State 仍是 NeedsManual;ProtectionActive 为真;Message 等于 KeptWithoutPairingMessage;order 里没有 \"apply\"、\"start\"、\"recover\"、\"remove\"。\n - StartupKeptParkedWritesJournalLine:用控制器的 Journal 收记录(写法照本文件或 ConnectJournalFlowTests 里已有的),来源为 null、HasPendingState = true,InitializeAsync(true, true) 后:记录里有一行等于「启动：找不到配对文件或登录凭据，断网保护保持，停在需人工处理」,没有以「启动：已做启动恢复」开头的行。\n - StartupKeptWithoutRecordStillRecovers:来源为 null、HasPendingState 为假,InitializeAsync(true, true):order 等于 [\"recover\"];ProtectionActive 为假;State 为 Disconnected;Message 含「未配置服务器」。\n - StartupKeptFlagOffStillRecovers:来源为 null、HasPendingState = true,InitializeAsync(true, false):order 等于 [\"recover\"];ProtectionActive 为假;State 为 Disconnected。\n⑦ 既有用例 StartupKeepsPairingProtectionAndConnectsRegardlessOfAutoConnect、HeldProtectionKeepsTunnelWhenRoutesFail、StartupWithoutPendingStateStillRecoversThenAutomaticallyConnects、StartupAuthNetworkRetriesExhaustWithoutEverRemovingProtection 不许改,改完代码后必须照样过。\n\n三、文档(字照抄,别处一字不动)\n⑧ docs/winclient/断网保护加固说明.md「## 服务重启时保持保护」一节:\n - 「只有期望明确为断开，或没有配对／鉴权凭据、没有服务器配置时，才走原有恢复网络路径；」改成「只有期望明确为断开，或没有恢复记录时，才走原有恢复网络路径；」。这一段后面的话不动。\n - 在「真机待验证项（本单未执行）：」这一行之前加小节,标题「### 上次连着、启动时找不到配对文件或登录凭据」,正文三段:\n   第一段:期望不是 false、存在恢复记录，但后台服务启动时找不到配对文件，或分发版找不到登录凭据（含凭据读不出来）、没有服务器配置：启动不执行 RecoverAsync、RemoveAsync，不恢复网卡与时区浏览器设置，断网保护保持，状态停在「需人工处理」，不自动连接。原来这种情况走恢复路径、回到直连，违反「隧道断了不静默回落」。\n   第二段:界面提示，自用版（含没有服务器配置）：「上次的连接没有断开，但现在找不到配对文件。断网保护保持，电脑暂时上不了网。请点「断开」恢复原来的网络，重新导入配对文件后再连接。」；分发版：「上次的连接没有断开，但现在找不到登录凭据。断网保护保持，电脑暂时上不了网。请点「断开」恢复原来的网络，重新兑换邀请码后再连接。」。连接记录写一行「启动：找不到配对文件或登录凭据，断网保护保持，停在需人工处理」。\n   第三段:用户点「断开」走既有撤防与恢复网络流程，之后重新导入配对文件或重新兑换邀请码再连接。保护保持期间不能更换配对文件，这一条不变。没有恢复记录，或期望明确为断开时，仍走原有恢复路径。测试包启动时不保持保护，不走这条路。\n - 「真机待验证项（本单未执行）：」的列表末尾加一条:「- 连接中删掉 `secure/pairing.bin` 后重启电脑，期间另开程序持续 ping 公网，应全程无回应；界面显示「需人工处理」和上面的提示；点「断开」后网络恢复。」\n⑨ docs/winclient/服务化与自启说明.md「## 安全存储与期望状态」一节讲 desired.json 的那一段:「没有配对／凭据或服务器配置时走既有恢复路径；」改成「有恢复记录但找不到配对文件、登录凭据或服务器配置时，保护保持并停在「需人工处理」，用户点「断开」才恢复网络，详见 [服务重启时保持保护](断网保护加固说明.md#服务重启时保持保护)；」。",
+  "background": "项目:外包「澳洲出口节点 + Windows 一键客户端」。客户端 .NET 9(winclient/WinClient.sln:Core + App + Tests + UiTests)。后台服务启动时由 ControlService 读期望状态:keep = 不是测试包且期望不是「断开」;随后 ClientRuntime.CreateAsync(keepProtection: keep) 选会话来源(有配对文件用 PairingSessionSource;否则有 server.json 用 AuthServerSessionSource;都没有为 null),再调 Controller.InitializeAsync(autoConnect: keep, keepProtection: keep)。断网保护的恢复记录在就是 firewall.HasPendingState 为真。\n\n先读(全文):winclient/WinClient.Core/Client/ClientController.cs(重点 InitializeAsync、ConnectAsync、DisconnectAsync、ExecuteAsync、FailAsync、IsOperational)、winclient/WinClient.Core/State/ConnectionStateMachine.cs(只读,看 OperationFailed 的效果)、winclient/WinClient.Core/Client/ISessionSource.cs;winclient/WinClient.Tests/ControllerTests.cs 里名字以 Startup 开头的用例、HeldProtectionKeepsTunnelWhenRoutesFail、文件末尾的 Firewall、Tunnel、Timers、InMemoryCredentialStore 替身;两份文档的对应小节;检查脚本 docs/plans/checks/yc_startup_keep_no_source_1128.py(SHAPE、TESTS、DOCS、SCOPE 四项验收照它判)。\n\n已定的取舍(不要改):停住用现成的 OperationFailed 事件,不给状态机加新事件;保护在的时候仍不许更换配对文件,提示语让用户先点断开;(a) 路仍把保护当成已验证(HeldProtectionKeepsTunnelWhenRoutesFail 那条行为保留)。\n\n硬规矩(做不到就停下交 blocked + forks,不猜):①只改允许清单里的四个文件;②除 goal ⑤ 点名的两个,既有测试的名字、数据行、断言不改、不删、不跳过;不许加重试、不许放宽断言;③不许 git 写操作,不许自己跑 dotnet(build / test / restore 一律按验收编号走派单器自测通道),命令单独一条执行(不用 cd &&、管道、2>&1);不许装依赖;④每次 Edit / Write 的新内容控制在 150 行以内;⑤goal 里的提示语、记录文字、文档正文照原文一字不差(含全角标点),新增注释用中文大白话;⑥本单不起任何子进程;测试不许碰真防火墙、过滤层、路由、网卡,只用替身;⑦不许读写 secrets/;测试只许写临时目录;⑧遇到契约没写到、要自己拍板的地方,停下交 blocked 并写清岔路。",
+  "nonGoals": [
+    "不改状态机 ConnectionStateMachine.cs,不加新事件",
+    "不放开「保护保持期间更换配对文件」",
+    "不改可用来源那一路的行为(保持保护、自动连接、保护按已验证)",
+    "不改巡检(停住后巡检照旧不跑,另一张卡 SEC-WIN-PATROL-STOPS-WHEN-PARKED-1127 做)",
+    "不改界面、管道协议、ClientRuntime、ControlService",
+    "不做真机实测,不打发布包,不改版本号",
+    "不改口径速查表(收官时另改)"
+  ],
+  "allowedPaths": [
+    "winclient/WinClient.Core/Client/ClientController.cs",
+    "winclient/WinClient.Tests/ControllerTests.cs",
+    "docs/winclient/断网保护加固说明.md",
+    "docs/winclient/服务化与自启说明.md"
+  ],
+  "forbiddenPaths": [
+    ".codex/**",
+    ".github/**",
+    ".gitignore",
+    "pyproject.toml",
+    "authserver/**",
+    "node/**",
+    "scripts/**",
+    "docs/plans/**",
+    "docs/design/**",
+    "docs/node/**",
+    "docs/acceptance/**",
+    "docs/口径速查表.md",
+    "winclient/*.sln",
+    "winclient/Directory.Build.props",
+    "winclient/third_party/**",
+    "winclient/WinClient.App/**",
+    "winclient/WinClient.UiTests/**",
+    "winclient/WinClient.Core/State/**",
+    "winclient/WinClient.Core/Ipc/**",
+    "winclient/WinClient.Core/Firewall/**",
+    "winclient/WinClient.Core/Network/**",
+    "winclient/WinClient.Core/Diagnostics/**",
+    "winclient/WinClient.Core/Update/**",
+    "winclient/WinClient.Core/Kernel/**",
+    "winclient/WinClient.Core/Process/**",
+    "winclient/WinClient.Core/Client/ClientRuntime.cs",
+    "winclient/WinClient.Core/Client/ISessionSource.cs",
+    "winclient/WinClient.Core/Client/TunnelTransport.cs",
+    "winclient/WinClient.Core/Client/BuildInfo.cs",
+    "winclient/WinClient.Core/WinClient.Core.csproj",
+    "winclient/WinClient.Tests/WinClient.Tests.csproj",
+    "winclient/WinClient.Tests/ConnectJournalFlowTests.cs",
+    "winclient/WinClient.Tests/ConnectAbandonTests.cs",
+    "winclient/WinClient.Tests/StateTests.cs"
+  ],
+  "expectArtifacts": [
+    "winclient/WinClient.Core/Client/ClientController.cs",
+    "winclient/WinClient.Tests/ControllerTests.cs"
+  ],
+  "acceptance": [
+    {
+      "id": "BUILD",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "build",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1200
+    },
+    {
+      "id": "TEST",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "test",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--no-build",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1500
+    },
+    {
+      "id": "T-STARTUP",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "test",
+        "winclient/WinClient.Tests/WinClient.Tests.csproj",
+        "-c",
+        "Release",
+        "--nologo",
+        "--filter",
+        "FullyQualifiedName~ControllerTests.StartupKept"
+      ],
+      "required": true,
+      "timeoutSec": 1500,
+      "failsOnBase": true
+    },
+    {
+      "id": "SHAPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_startup_keep_no_source_1128.py",
+        "shape"
+      ],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "DOCS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_startup_keep_no_source_1128.py",
+        "docs"
+      ],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "TESTS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_startup_keep_no_source_1128.py",
+        "tests"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "SCOPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_startup_keep_no_source_1128.py",
+        "scope"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "timeoutSec": 10800,
+  "repoRoot": "E:/yuanc",
+  "steps": [
+    "读 background 列出的文件与检查脚本。",
+    "先改测试:goal ⑤ 两个用例改名改断言,加 ⑥ 的六个新用例;申请 BUILD 以编译失败证红,之后固定 BUILD→TEST。",
+    "按 goal ①~③ 改 ClientController.cs。",
+    "按 goal ⑧⑨ 改两份文档;BUILD、TEST、T-STARTUP、SHAPE、DOCS、TESTS、SCOPE 全绿后交活。",
+    "交活说明逐条对照 goal ①~⑨ 写做到了没有,并单列只有真机能验的。"
+  ]
+}

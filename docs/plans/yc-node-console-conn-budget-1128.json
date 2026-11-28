@@ -1,0 +1,125 @@
+{
+  "schemaVersion": 1,
+  "taskId": "NODE-CONSOLE-SLOW-CONN-SLOTS-1128",
+  "slug": "yc-node-console-conn-budget-1128",
+  "title": "节点管理网页:每条连接读请求有总时限,通用 404 之后读字节有上限,每个来源地址有并发上限,慢连接占不住名额",
+  "goal": "以派单时 origin/main 头为基点。看板卡 NODE-CONSOLE-SLOW-CONN-SLOTS-1128。\n\n【问题】节点管理网页(node/exitnode/console/server.py,标准库 http.server,HTTP/1.0)同时只收 32 条连接。读请求头、读请求体(_take_body)、通用 404 之后读掉后到的字节(_drain_input)这三处都只有「每次读」的超时(15 秒、0.2 秒),没有总时限:对方每隔几秒送来一个字节,这条连接就一直占着名额。一台设备挂 32 条这样的连接,管理网页就打不开。\n【改成】加三样:每条连接读请求的总时限;通用 404 之后读字节的总时长与总字节上限;每个来源地址的并发上限。\n\n一、每条连接读请求的总时限\n① ConsoleHandler 加类属性 `total_timeout = 30`(秒)。含义:一条连接上,服务端等对方字节(请求行、请求头、请求体、通用 404 之后读掉的字节)加起来最多等这么久,从 setup() 起算。\n② 做法固定:覆盖 setup(),先调父类,再把 self.rfile 换成 `io.BufferedReader(读取器, io.DEFAULT_BUFFER_SIZE)`。读取器是本文件里新增的私有类,继承 io.RawIOBase,readable() 返回 True;readinto(buffer) 里:剩余时间 = 截止时刻 - time.monotonic();剩余 ≤ 0 直接抛 TimeoutError;否则把套接字超时设成 min(本次读的超时, 剩余) 再 recv_into,读完(放在 finally 里)把套接字超时设回 handler 的 timeout,让后面写应答仍按 15 秒算。「本次读的超时」平时是 handler 的 timeout,_drain_input 期间是 0.2 秒(见二)。\n   不许用另开线程、threading.Timer、看门狗去关套接字的办法顶替(Windows 上关不醒卡在读上的线程)。\n③ 到点以后:卡在读请求行或请求头的,标准库 handle_one_request 自己接住 TimeoutError 后断开,不回应答;卡在读请求体的,由 _take_body 现有的 except OSError 接住,断开,不回应答。两种都不记「管理网页请求处理失败」。\n④ timeout(每次读 15 秒)的含义和数值不变。\n\n二、通用 404 之后读掉后到的字节:加上限\n⑤ ConsoleHandler 加类属性 `drain_seconds = 1.0`、`drain_bytes = 65536`。_drain_input 改成:每次读最多等 0.2 秒;累计读满 drain_bytes 字节或累计过了 drain_seconds 秒,哪个先到就停;读到空、超时、出 OSError 照旧安静结束。它同样受一的总时限约束。_decoy 里「回完 404 → close_connection = True → _drain_input()」的次序不变。\n\n三、每个来源地址的并发上限\n⑥ ConsoleServer 加类属性 `per_source = 8`。process_request 里,下面任一条成立就照现有做法 shutdown_request 直接关连接(不写任何字节、不开线程):总名额(现有 _slots)拿不到;这个来源地址(client_address[0])正在处理的连接数已经达到 self.per_source。来源计数用一把锁保护的字典;两种名额成对进出:因来源超限被拒时把已拿到的总名额还回去;连接处理完(process_request_thread 的 finally)和线程没起来(现有 except BaseException)两处都把来源计数减一,减到 0 就把这个键删掉。\n⑦ 每次接受连接时读 self.per_source(测试会在实例上改它)。max_connections=32 不变。\n\n四、不改的:接口路径、状态码、应答正文、响应头、Cookie;登录限流与验密码并发闸;_take_body、_read_body 的判断与次序;HTTP 版本(仍是 HTTP/1.0);create_server、serve、check、load_credentials 的签名与行为。server.py 里不许用 time.sleep、threading.Timer,不许新增线程(serve 里已有的那一处 threading.Thread 不算)。\n\n五、测试(node/tests/test_console_server.py;用例名与辅助函数名固定;只连本机回环地址,不联网)\n辅助函数 wait_closed(sock, feed, interval, limit):循环做下面的事,直到判定已断开或过了 limit 秒:feed 不是空字节串就 sock.sendall(feed),发的时候出 OSError 算已断开;然后把套接字超时设成 interval 读一次,读到空字节串算已断开,出 TimeoutError 算还连着,出别的 OSError 算已断开,读到数据就累加起来继续。返回 (是否已断开, 从进函数起的用时秒数, 累加收到的全部字节)。本单新增的测试代码里只有这个函数允许写 except。\n\n- test_slow_header_is_cut_at_total_deadline(tmp_path, caplog, monkeypatch):照 test_stalled_body_closes_without_reply 的办法收 exitnode 这个 logger 的记录。在 with monkeypatch.context() 块里把 console_server.ConsoleHandler.total_timeout 改成 1.0;连上后先发 b\"GET /api/session HTTP/1.0\\r\\nHost: 127.0.0.1\\r\\nX-Pad: \"(后面没有结束的空行),再调 wait_closed(sock, b\"a\", 0.2, 6):必须已断开;用时不少于 0.7 秒、不多于 4 秒;收到的字节为空。出了块,用 call() 发 GET /api/session 返回 200。日志里没有「管理网页请求处理失败」。\n- test_slow_body_is_cut_at_total_deadline(tmp_path, caplog, monkeypatch):同样把 total_timeout 改成 1.0;发不带 Cookie 的 POST /api/invites,带 Host: 127.0.0.1:<端口>、Content-Type: application/json、Content-Length: 200,请求头完整,请求体一个字节不带;wait_closed(sock, b\"a\", 0.2, 6):必须已断开;用时 0.7~4 秒;收到的字节为空;日志里没有「管理网页请求处理失败」。\n- test_decoy_drain_is_bounded(tmp_path):total_timeout 不改(默认 30)。发完整的 GET /nope 请求(带 Host: 127.0.0.1:<端口>),循环 recv 到通用 404 收全(状态行以 b\"HTTP/1.0 404\" 开头,正文长度等于 Content-Length);接着调 wait_closed(sock, b\"a\", 0.05, 5):必须已断开,用时不多于 4 秒。\n- test_source_quota_refuses_extra_connection(tmp_path):起服务前在实例上设 server.per_source = 2。开两条连接,各发 b\"GET \" 后不动;等 0.3 秒;开第三条连接,wait_closed(第三条, b\"\", 0.2, 3):必须已断开,收到的字节为空。关掉前两条里的一条,等 0.5 秒,call(server, \"/api/session\") 返回 200。\n- test_other_source_is_not_blocked_by_full_quota(tmp_path):server.per_source = 2;从 127.0.0.1 开两条连接,各发 b\"GET \" 后不动;等 0.3 秒;另建一个套接字先 bind((\"127.0.0.2\", 0)) 再连服务,发完整的 GET /api/session(Host: 127.0.0.1:<端口>),循环 recv 到返回空,状态行以 b\"HTTP/1.0 200\" 开头。\n- test_idle_connections_release_quota_at_deadline(tmp_path, monkeypatch):with monkeypatch.context() 块里把 total_timeout 改成 1.0,server.per_source = 2;开两条连接,各发 b\"GET \" 后不动;等 2.5 秒;call(server, \"/api/session\") 返回 200(两条闲着的连接到点被断,名额还回来了)。\n\n测试里的等待用 time.sleep 可以(只限测试文件)。既有 25 个用例和 make()、Running、call()、login()、origin_of()、read_until_close() 一个字都不改;它们在改完后必须照样全过,其中 test_stalled_body_closes_without_reply 把 timeout 改成 0.5 的那条尤其要过。",
+  "background": "项目:外包「澳洲出口节点 + Windows 一键客户端」。节点端 Python 3.11 起(node/exitnode,测试 node/tests);自动检查在 Windows 上用 Python 3.14 跑,节点真机是 Debian 12 的 Python 3.11,两边都要过(两边 io.DEFAULT_BUFFER_SIZE 不一样,别把缓冲大小写死成数字,也别让用例依赖它)。\n\n先读(全文):node/exitnode/console/server.py、node/tests/test_console_server.py;检查脚本 docs/plans/checks/yc_node_console_conn_budget_1128.py(SHAPE、TESTS、SCOPE 三项验收照它判)。\n\n已定的取舍(不要改):总时限在读的那条线程里自己算(每次读只等「剩余时间」那么久),不靠别的线程去关套接字;总时限只管「等对方字节」的时间,处理请求和写应答不算在内;来源并发上限按对方地址算,经隧道进来的设备共用一个地址,这一点接受;三个数值 30 秒、1 秒 / 65536 字节、8 条照契约写成类属性。\n\n硬规矩(做不到就停下交 blocked + forks,不猜):①只改允许清单里的两个文件。②测试里的密码沿用文件里已有的测试值,不写真实凭据。③既有用例与辅助函数不删、不改、不跳过、不放宽;不许加重试、不许标 flaky;新用例正文里不许写 except(只有 wait_closed 可以)。④工人不许 git 写操作,不许自己跑 pytest / ruff / python(按验收编号走派单器自测通道,命令单独一条执行,不写 cd &&、管道、2>&1);不许装依赖。⑤新增注释用中文大白话,写清「为什么要有总时限、为什么不用另一条线程去关」;每次 Edit / Write 的新内容不超过 150 行。⑥ruff 的行宽与规则照仓库现有配置,新代码要过 python -m ruff check .。⑦本单不起子进程。",
+  "nonGoals": [
+    "不改接口路径、状态码、应答正文、响应头与 Cookie",
+    "不改 _take_body、_read_body 的判断与次序,不改登录限流",
+    "不改 HTTP 版本,不做连接复用",
+    "不改客户端包托管服务 node/exitnode/admin/server.py(另一张卡 NODE-ADMIN-HALFOPEN-1127)",
+    "不改 auth.py、authclient.py、snapshot.py、static/ 页面与 cli.py",
+    "不写 docs/ 下任何文档(收官时另改)"
+  ],
+  "allowedPaths": [
+    "node/exitnode/console/server.py",
+    "node/tests/test_console_server.py"
+  ],
+  "forbiddenPaths": [
+    ".codex/**",
+    ".github/**",
+    ".gitignore",
+    "pyproject.toml",
+    "requirements-dev.txt",
+    "winclient/**",
+    "scripts/**",
+    "authserver/**",
+    "docs/**",
+    "node/exitnode/cli.py",
+    "node/exitnode/admin/**",
+    "node/exitnode/console/auth.py",
+    "node/exitnode/console/authclient.py",
+    "node/exitnode/console/snapshot.py",
+    "node/exitnode/console/install.py",
+    "node/exitnode/console/static/**",
+    "node/exitnode/templates/**",
+    "node/examples/**",
+    "node/tests/golden/**",
+    "node/tests/test_console_auth.py",
+    "node/tests/test_admin_server.py"
+  ],
+  "expectArtifacts": [
+    "node/exitnode/console/server.py",
+    "node/tests/test_console_server.py"
+  ],
+  "acceptance": [
+    {
+      "id": "T-SERVER",
+      "kind": "test:targeted",
+      "target": "node/tests/test_console_server.py",
+      "required": true,
+      "failsOnBase": true
+    },
+    {
+      "id": "PYTEST",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "pytest",
+        "-q"
+      ],
+      "required": true,
+      "timeoutSec": 1500
+    },
+    {
+      "id": "RUFF",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "ruff",
+        "check",
+        "."
+      ],
+      "required": true,
+      "timeoutSec": 300
+    },
+    {
+      "id": "SHAPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_node_console_conn_budget_1128.py",
+        "shape"
+      ],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "TESTS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_node_console_conn_budget_1128.py",
+        "tests"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "SCOPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_node_console_conn_budget_1128.py",
+        "scope"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "timeoutSec": 7200,
+  "repoRoot": "E:/yuanc",
+  "steps": [
+    "读 background 列出的两个文件与检查脚本。",
+    "先写 wait_closed 与六个新用例(此时在现有代码上,前四个应当是红的),再改 server.py:读取器与 setup、_drain_input 的上限、来源并发上限。",
+    "T-SERVER 绿后跑 PYTEST、RUFF、SHAPE、TESTS、SCOPE,全绿后交活;交活说明写清六个新用例各证了什么,以及哪些只有节点真机能验。"
+  ]
+}
