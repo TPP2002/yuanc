@@ -1,12 +1,16 @@
 """无目录浏览、无访问日志的只读 HTTP 服务。"""
 
+import collections
 import http.client
+import io
 import logging
 import os
 import re
+import selectors
 import signal
 import stat
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote
@@ -14,32 +18,115 @@ from urllib.parse import unquote
 from ..log import redact
 from .publish import FILENAME, releases
 
+# 请求头最多收这么多字节;超过还没收完的连接直接关掉。
+MAX_HEADER_BYTES = 8192
+HEADER_END = (b"\r\n\r\n", b"\n\n")
+
 
 class PackageServer(ThreadingHTTPServer):
     daemon_threads = True
     request_queue_size = 64
 
-    def __init__(self, *args, max_connections=32, **kwargs):
-        # 必须先建好槽位:父类构造会开始监听,但不会处理连接。
+    def __init__(self, *args, max_connections=32, header_timeout=5, max_waiting=256, **kwargs):
+        # 必须先建好这些:父类构造会开始监听,但不会处理连接。
         self._slots = threading.BoundedSemaphore(max_connections)
+        self._header_timeout = header_timeout
+        self._max_waiting = max_waiting
+        self._heads = {}
+        self._stop = threading.Event()
+        self._stopped = threading.Event()
         super().__init__(*args, **kwargs)
 
-    def process_request(self, request, client_address):
-        if not self._slots.acquire(blocking=False):
-            # 超限:直接关闭,不开线程、不写任何响应字节。
-            self.shutdown_request(request)
+    def serve_forever(self, poll_interval=0.5):
+        """一条线程管监听口和等候区:连接发完请求头之前不占并发名额、不开线程。"""
+        self._stopped.clear()
+        # 连接 -> [到期时刻, 已收到的字节, 来源地址],按接入先后排,最前面的等得最久。
+        waiting = collections.OrderedDict()
+        try:
+            with selectors.DefaultSelector() as selector:
+                self.socket.setblocking(False)
+                selector.register(self.socket, selectors.EVENT_READ)
+                try:
+                    while not self._stop.is_set():
+                        wait = poll_interval
+                        if waiting:
+                            oldest = next(iter(waiting.values()))[0]
+                            wait = max(0, min(wait, oldest - time.monotonic()))
+                        for key, _ in selector.select(wait):
+                            if key.fileobj is self.socket:
+                                self._admit(selector, waiting)
+                            else:
+                                self._read_head(selector, waiting, key.fileobj)
+                        now = time.monotonic()
+                        while waiting and next(iter(waiting.values()))[0] <= now:
+                            self._drop(selector, waiting, next(iter(waiting)))
+                finally:
+                    for sock in list(waiting):
+                        self._drop(selector, waiting, sock)
+        finally:
+            self._stop.clear()
+            self._stopped.set()
+
+    def shutdown(self):
+        self._stop.set()
+        self._stopped.wait()
+
+    def _admit(self, selector, waiting):
+        try:
+            sock, address = self.get_request()
+        except OSError:
+            return
+        if len(waiting) >= self._max_waiting:
+            # 等候区满了:关掉等得最久的那一条,给新来的让位。
+            self._drop(selector, waiting, next(iter(waiting)))
+        sock.setblocking(False)
+        waiting[sock] = [time.monotonic() + self._header_timeout, bytearray(), address]
+        selector.register(sock, selectors.EVENT_READ)
+
+    def _drop(self, selector, waiting, sock):
+        del waiting[sock]
+        selector.unregister(sock)
+        self.shutdown_request(sock)
+
+    def _read_head(self, selector, waiting, sock):
+        entry = waiting.get(sock)
+        if entry is None:
+            # 同一轮里先被挤掉或已到期的连接。
             return
         try:
-            super().process_request(request, client_address)
-        except BaseException:
-            # 线程没能启动时槽位不会被 process_request_thread 归还。
+            data = sock.recv(4096)
+        except (BlockingIOError, InterruptedError):
+            return
+        except OSError:
+            data = b""
+        if not data:
+            self._drop(selector, waiting, sock)
+            return
+        entry[1] += data
+        if not any(mark in entry[1] for mark in HEADER_END):
+            if len(entry[1]) > MAX_HEADER_BYTES:
+                self._drop(selector, waiting, sock)
+            return
+        del waiting[sock]
+        selector.unregister(sock)
+        if not self._slots.acquire(blocking=False):
+            # 并发名额用完:直接关闭,不开线程、不写任何响应字节。
+            self.shutdown_request(sock)
+            return
+        self._heads[sock] = bytes(entry[1])
+        try:
+            self.process_request(sock, entry[2])
+        except Exception:
+            # 线程没能启动时名额不会被 process_request_thread 归还。
+            self._heads.pop(sock, None)
             self._slots.release()
-            raise
+            self.shutdown_request(sock)
 
     def process_request_thread(self, request, client_address):
         try:
             super().process_request_thread(request, client_address)
         finally:
+            self._heads.pop(request, None)
             self._slots.release()
 
     def handle_error(self, request, client_address):
@@ -49,6 +136,12 @@ class PackageServer(ThreadingHTTPServer):
 class PackageHandler(BaseHTTPRequestHandler):
     # 每连接套接字超时(秒):读请求头或写响应卡住超过它就断开该连接。
     timeout = 15
+
+    def setup(self):
+        super().setup()
+        # 请求头已经由服务线程收齐,这里不再从连接上读。
+        self.rfile.close()
+        self.rfile = io.BytesIO(self.server._heads.pop(self.connection, b""))
 
     def log_message(self, format, *args):
         pass
@@ -125,10 +218,12 @@ class PackageHandler(BaseHTTPRequestHandler):
             self.close_connection = True
 
 
-def create_server(bind, port, root, *, max_connections=32, timeout=15):
+def create_server(bind, port, root, *, max_connections=32, timeout=15, header_timeout=5, max_waiting=256):
     # 派生子类承载本实例的超时,不改全局 PackageHandler.timeout。
     handler = type("PackageHandler", (PackageHandler,), {"timeout": timeout})
-    server = PackageServer((bind, port), handler, max_connections=max_connections)
+    # 等请求头的时限不超过套接字超时。
+    server = PackageServer((bind, port), handler, max_connections=max_connections,
+                           header_timeout=min(header_timeout, timeout), max_waiting=max_waiting)
     server.root = Path(root).absolute()
     return server
 
