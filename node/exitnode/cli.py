@@ -386,13 +386,21 @@ def _install(config, config_path, runner, manifest):
             if not runner.exists(source + "/__main__.py"):
                 raise ValueError("救援源码不完整")
             runner.mkdir(rescue_probes.RESCUE, 0o755)
-            for src, dst in ((source, rescue_probes.RESCUE + "/exitnode_rescue"),
-                             (current, rescue_probes.FACTORY)):
-                if runner.exists(dst):
-                    if layout.hashes(runner, src) != layout.hashes(runner, dst):
-                        raise ValueError("已有救援包内容不同，请维护人员确认；更新代码请用 rescue refresh")
-                else:
-                    runner.copy_tree(src, dst)
+            code = rescue_probes.RESCUE + "/exitnode_rescue"
+            if not runner.exists(code):
+                runner.copy_tree(source, code)
+            elif layout.hashes(runner, source) != layout.hashes(runner, code):
+                # 独立救援代码只由 rescue refresh 更新，安装不替维护人员换。
+                raise ValueError("独立救援代码与当前程序自带的不一致，请先运行 exitnode rescue refresh，再重跑安装")
+            factory = rescue_probes.FACTORY
+            if not runner.exists(factory):
+                runner.copy_tree(current, factory)
+            elif not layout.valid_release(runner, factory):
+                # 上次复制到一半就停了，或文件坏了：救援用不了这一份，按当前程序重建。
+                runner.remove_tree(factory)
+                runner.copy_tree(current, factory)
+                successful.append("出厂包不完整，已按当前程序重建")
+            # 出厂包完整时不管版本和当前程序是否相同都不动：换成新版本是救援「提升」的事。
             for unit in sorted(rescue_units):
                 path = "/etc/systemd/system/" + unit
                 text = systemd.render(unit, {"config_path": config_path, "program_path": program_path})
