@@ -1180,6 +1180,15 @@ public sealed class ControllerTests
         await controller.RefreshSessionAsync(); // 串行锁屏障;没连着时它什么都不做。
     }
 
+    /// <summary>触发地址变化后的网卡收紧等待;触发后会停住或回到未连接的用它,屏障用 RefreshSessionAsync。</summary>
+    private static async Task FireNicSweep(ClientController controller, Timers timers)
+    {
+        var published = Volatile.Read(ref timers.Published);
+        timers.Fire("网卡收紧", d => d == ClientController.NicSweepDelay);
+        await Until(() => Volatile.Read(ref timers.Published) > published);
+        await controller.RefreshSessionAsync(); // 串行锁屏障;没连着时它什么都不做。
+    }
+
     /// <summary>第一次启动抛「找不到内核」,之后成功。</summary>
     private sealed class FirstStartMissingTunnel(List<string> order) : ITunnelTransport
     {
@@ -1189,6 +1198,21 @@ public sealed class ControllerTests
         {
             order.Add("start");
             if (Interlocked.Increment(ref starts) == 1) throw new FileNotFoundException("测试:找不到内核");
+            return Task.CompletedTask;
+        }
+        public void Stop() => order.Add("stop");
+        public void Dispose() { }
+    }
+
+    /// <summary>第一次启动抛 IOException(模拟断网),之后成功;用来停在首次尝试的退避里。</summary>
+    private sealed class FirstStartBrokenTunnel(List<string> order) : ITunnelTransport
+    {
+        private int starts;
+        public event EventHandler? TunnelDown { add { } remove { } }
+        public Task StartAsync(JsonElement configuration, CancellationToken token)
+        {
+            order.Add("start");
+            if (Interlocked.Increment(ref starts) == 1) throw new IOException("测试断网");
             return Task.CompletedTask;
         }
         public void Stop() => order.Add("stop");
@@ -2207,6 +2231,15 @@ public sealed class ControllerTests
         public Task<string?> RestoreAsync() { order.Add("nic-restore"); return Task.FromResult(RestoreWarning); }
     }
 
+    private sealed class FakeAddressChanges : IAddressChangeSource, IDisposable
+    {
+        public event Action? Changed;
+        public bool Disposed { get; private set; }
+        public int Subscribers => Changed?.GetInvocationList().Length ?? 0;
+        public void Raise() => Changed?.Invoke();
+        public void Dispose() => Disposed = true;
+    }
+
     private sealed class FakeReaper(List<string> order) : IConnectionReaper
     {
         public List<ReapPolicy> Policies { get; } = [];
@@ -2217,12 +2250,13 @@ public sealed class ControllerTests
     }
 
     private static ClientController NicController(List<string> order, FakeNic? nic, FakeReaper? reaper, Timers? timers = null,
-        Firewall? firewall = null, MemoryRouting? routing = null, SessionResponse? session = null)
+        Firewall? firewall = null, MemoryRouting? routing = null, SessionResponse? session = null, FakeAddressChanges? changes = null)
     {
         timers ??= new Timers();
         var source = new ScriptedSource(); source.Enqueue(Ok(session ?? TestData.Session()));
         var controller = new ClientController(source, firewall ?? new Firewall(order), new Tunnel(order), Path.GetFullPath("fake.exe"),
-            TestData.Device, timers.Delay, routingSettings: routing, serviceProcessPath: RoutingTests.Service, nicGuard: nic, reaper: reaper)
+            TestData.Device, timers.Delay, routingSettings: routing, serviceProcessPath: RoutingTests.Service, nicGuard: nic, reaper: reaper,
+            addressChanges: changes)
             { DelayWithPurposeAsync = timers.Delay };
         controller.Changed += _ => Interlocked.Increment(ref timers.Published);
         return controller;
@@ -2332,7 +2366,7 @@ public sealed class ControllerTests
     }
 
     [Fact]
-    public async Task PatrolReportsNewPublicIpv4AdapterWithoutDisconnect()
+    public async Task PatrolDisablesNewIpv6AdapterAndReportsNicFailure()
     {
         var order = new List<string>();
         var timers = new Timers();
@@ -2341,20 +2375,193 @@ public sealed class ControllerTests
         await controller.ConnectAsync();
         await FireAndPublish(controller, timers, "巡检", TimeSpan.FromSeconds(60));
         Assert.Equal("正常,已关闭新出现公网 IPv6 的网卡 1 个", controller.Snapshot.GuardStatus);
-        nic.PatrolResult = new([], ["拨号连接"]);
-        await FireAndPublish(controller, timers, "巡检", TimeSpan.FromSeconds(60));
-        const string ipv4 = "网卡「拨号连接」出现公网 IPv4 地址,部分软件可能读到它;连接与断网保护保持,请改由路由器拨号或联系管理员";
-        Assert.Equal(ipv4, controller.Snapshot.Message);
-        Assert.Equal(ipv4, controller.Snapshot.GuardStatus);
-        Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
-        Assert.True(controller.Snapshot.ProtectionActive);
-        Assert.DoesNotContain("remove", order);
         nic.PatrolError = new NicGuardException("巡检失败文案");
         await FireAndPublish(controller, timers, "巡检", TimeSpan.FromSeconds(60));
         Assert.Equal("巡检失败文案", controller.Snapshot.Message);
         Assert.Equal("巡检失败文案", controller.Snapshot.GuardStatus);
         Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
         Assert.DoesNotContain("remove", order);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task PublicIpv4MidSessionStopsTunnelAndKeepsProtection(bool apps)
+    {
+        var order = new List<string>();
+        var timers = new Timers();
+        var nic = new FakeNic(order);
+        using var controller = NicController(order, nic, new FakeReaper(order), timers,
+            routing: new MemoryRouting { Policy = apps ? RoutingTests.Apps : RoutingPolicy.Global },
+            session: apps ? AppsSession() : null);
+        await controller.ConnectAsync();
+        nic.PatrolResult = new([], ["拨号连接"]);
+        await FireParkedPatrol(controller, timers);
+        Assert.Equal(ConnectionState.NeedsManual, controller.Snapshot.State);
+        Assert.True(controller.Snapshot.ProtectionActive);
+        Assert.Contains("stop", order);
+        Assert.DoesNotContain("remove", order);
+        Assert.Equal(ClientController.PublicIpv4ParkedMessage("拨号连接", apps), controller.Snapshot.Message);
+        Assert.Equal(ClientController.PublicIpv4GuardStatus("拨号连接"), controller.Snapshot.GuardStatus);
+        await FireParkedPatrol(controller, timers);
+        Assert.Equal(ConnectionState.NeedsManual, controller.Snapshot.State);
+        Assert.Equal(ClientController.PublicIpv4ParkedMessage("拨号连接", apps), controller.Snapshot.Message);
+        Assert.Equal(1, order.Count(x => x == "stop"));
+    }
+
+    [Fact]
+    public async Task ParkedPatrolReportsPublicIpv4InStatusOnly()
+    {
+        var order = new List<string>();
+        var timers = new Timers();
+        var nic = new FakeNic(order);
+        var tunnel = new ObservableTunnel(order);
+        var source = new ScriptedSource(); source.Enqueue(Ok(TestData.Session()));
+        using var controller = new ClientController(source, new Firewall(order), tunnel, Path.GetFullPath("fake.exe"),
+            TestData.Device, timers.Delay, nicGuard: nic, reaper: new FakeReaper(order)) { DelayWithPurposeAsync = timers.Delay };
+        controller.Changed += _ => Interlocked.Increment(ref timers.Published);
+        await controller.ConnectAsync();
+        tunnel.FailStop = true;
+        source.Enqueue(new AuthResponse<SessionResponse>(AuthResult.InvalidToken));
+        await controller.RefreshSessionAsync();
+        Assert.Equal(ConnectionState.NeedsManual, controller.Snapshot.State);
+        var parked = controller.Snapshot.Message;
+        nic.PatrolResult = new([], ["拨号连接"]);
+        await FireParkedPatrol(controller, timers);
+        Assert.Equal(ClientController.PublicIpv4GuardStatus("拨号连接"), controller.Snapshot.GuardStatus);
+        Assert.Equal(parked, controller.Snapshot.Message);
+        Assert.Equal(ConnectionState.NeedsManual, controller.Snapshot.State);
+    }
+
+    [Fact]
+    public async Task PublicIpv4DuringFirstAttemptRestoresNetwork()
+    {
+        var order = new List<string>();
+        var timers = new Timers();
+        var changes = new FakeAddressChanges();
+        var nic = new FakeNic(order);
+        var source = new ScriptedSource(); source.Enqueue(Ok(TestData.Session()));
+        using var controller = new ClientController(source, new Firewall(order), new FirstStartBrokenTunnel(order),
+            Path.GetFullPath("fake.exe"), TestData.Device, timers.Delay, nicGuard: nic, reaper: new FakeReaper(order),
+            addressChanges: changes) { DelayWithPurposeAsync = timers.Delay };
+        controller.Changed += _ => Interlocked.Increment(ref timers.Published);
+        await controller.ConnectAsync();
+        Assert.Equal(ConnectionState.Reconnecting, controller.Snapshot.State);
+        Assert.True(controller.Snapshot.ProtectionActive);
+        nic.PatrolResult = new([], ["拨号连接"]);
+        changes.Raise();
+        await FireNicSweep(controller, timers);
+        Assert.Equal(ConnectionState.Disconnected, controller.Snapshot.State);
+        Assert.False(controller.Snapshot.ProtectionActive);
+        Assert.Contains("remove", order);
+        Assert.Equal("连接失败，已恢复原来的网络，当前没有走澳洲出口。原因：网卡「拨号连接」上出现了公网 IPv4 地址。",
+            controller.Snapshot.Message);
+    }
+
+    [Fact]
+    public async Task AddressChangeTightensNicWithinSeconds()
+    {
+        var order = new List<string>();
+        var timers = new Timers();
+        var changes = new FakeAddressChanges();
+        var nic = new FakeNic(order) { PatrolResult = new(["以太网"], []) };
+        using var controller = NicController(order, nic, new FakeReaper(order), timers, changes: changes);
+        await controller.ConnectAsync();
+        var before = order.Count(x => x == "nic-patrol");
+        changes.Raise();
+        changes.Raise();
+        changes.Raise();
+        Assert.Single(timers.For("网卡收紧"));
+        Assert.Equal(ClientController.NicSweepDelay, Assert.Single(timers.For("网卡收紧")));
+        await FireAndPublish(controller, timers, "网卡收紧", ClientController.NicSweepDelay);
+        Assert.Equal(before + 1, order.Count(x => x == "nic-patrol"));
+        Assert.Equal("已关闭新出现公网 IPv6 的网卡 1 个", controller.Snapshot.GuardStatus);
+        Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
+        changes.Raise();
+        Assert.Equal(2, timers.For("网卡收紧").Length);
+    }
+
+    [Fact]
+    public async Task AddressChangeParksOnPublicIpv4()
+    {
+        var order = new List<string>();
+        var timers = new Timers();
+        var changes = new FakeAddressChanges();
+        var nic = new FakeNic(order);
+        using var controller = NicController(order, nic, new FakeReaper(order), timers, changes: changes);
+        await controller.ConnectAsync();
+        nic.PatrolResult = new([], ["拨号连接"]);
+        changes.Raise();
+        await FireNicSweep(controller, timers);
+        Assert.Equal(ConnectionState.NeedsManual, controller.Snapshot.State);
+        Assert.Equal(ClientController.PublicIpv4ParkedMessage("拨号连接", false), controller.Snapshot.Message);
+        Assert.True(controller.Snapshot.ProtectionActive);
+    }
+
+    [Fact]
+    public async Task AddressChangeIgnoredWithoutProtection()
+    {
+        var order = new List<string>();
+        var timers = new Timers();
+        var changes = new FakeAddressChanges();
+        using var controller = NicController(order, new FakeNic(order), new FakeReaper(order), timers, changes: changes);
+        changes.Raise();
+        Assert.Empty(timers.For("网卡收紧"));
+        await controller.ConnectAsync();
+        Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
+        await controller.DisconnectAsync();
+        Assert.Equal(ConnectionState.Disconnected, controller.Snapshot.State);
+        var before = timers.For("网卡收紧").Length;
+        changes.Raise();
+        Assert.Equal(before, timers.For("网卡收紧").Length);
+    }
+
+    [Fact]
+    public async Task DisposeUnsubscribesAddressChanges()
+    {
+        var order = new List<string>();
+        var changes = new FakeAddressChanges();
+        var controller = NicController(order, new FakeNic(order), new FakeReaper(order), changes: changes);
+        Assert.Equal(1, changes.Subscribers);
+        controller.Dispose();
+        Assert.Equal(0, changes.Subscribers);
+        Assert.True(changes.Disposed);
+        await Task.CompletedTask;
+    }
+
+    [Fact]
+    public async Task HeldFirewallFailureStillTightensNic()
+    {
+        var order = new List<string>();
+        var firewall = new Firewall(order) { HasPendingState = true,
+            ApplyError = new WfpUnavailableException(KillSwitchApplier.WfpConnectRefused) };
+        using var controller = new ClientController(new PairingSessionSource(PairingTests.ValidPairing()),
+            firewall, new Tunnel(order), Path.GetFullPath("fake.exe"), TestData.Device,
+            nicGuard: new FakeNic(order), reaper: new FakeReaper(order));
+        await controller.InitializeAsync(autoConnect: false, keepProtection: true);
+        Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
+        Assert.True(order.IndexOf("nic-apply") > order.IndexOf("apply"));
+        Assert.True(order.IndexOf("nic-apply") < order.IndexOf("start"));
+        Assert.DoesNotContain("reap", order);
+        Assert.Equal("断网保护未能重新套用:系统过滤层的过滤器未能建立,隧道保持,但缺少这道断网兜底;请联系管理员", controller.Snapshot.Message);
+    }
+
+    [Fact]
+    public async Task HeldFirewallAndNicFailuresBothReported()
+    {
+        var order = new List<string>();
+        var firewall = new Firewall(order) { HasPendingState = true,
+            ApplyError = new WfpUnavailableException(KillSwitchApplier.WfpConnectRefused) };
+        var nic = new FakeNic(order) { ApplyError = new NicGuardException("拒绝文案") { AdapterName = "以太网" } };
+        using var controller = new ClientController(new PairingSessionSource(PairingTests.ValidPairing()),
+            firewall, new Tunnel(order), Path.GetFullPath("fake.exe"), TestData.Device,
+            nicGuard: nic, reaper: new FakeReaper(order));
+        await controller.InitializeAsync(autoConnect: false, keepProtection: true);
+        const string fw = "断网保护未能重新套用:系统过滤层的过滤器未能建立,隧道保持,但缺少这道断网兜底;请联系管理员";
+        const string nicText = "未能关闭网卡「以太网」的 IPv6,隧道保持,但该网卡的公网 IPv6 地址可能被网页读到;请联系管理员。";
+        Assert.Equal(ConnectionState.Connected, controller.Snapshot.State);
+        Assert.Equal(fw + " " + nicText, controller.Snapshot.Message);
+        Assert.Equal(controller.Snapshot.Message, controller.Snapshot.GuardStatus);
     }
 
     [Theory]

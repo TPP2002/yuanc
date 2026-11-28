@@ -103,6 +103,7 @@ public sealed class ClientRuntime : IClientFacade, IDisposable
                 browserProbe: new SystemBrowserProcessProbe(),
                 nicGuard: testBuild ? new DisabledNicGuard(nic) : nic,
                 reaper: testBuild ? null : new ConnectionReaper(new SystemTcpTable()),
+                addressChanges: testBuild ? null : new SystemAddressChangeSource(),
                 proxyProbe: new RegistryProxySettingsProbe(),
                 scopeResolver: path => AppScopeResolver.Resolve(path, AppScopeResolver.SystemFolders(), new SystemAppScopeFileSystem()))
                 { Journal = connectLog.Write, TestBuild = testBuild };

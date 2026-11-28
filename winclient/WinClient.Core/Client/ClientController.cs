@@ -111,6 +111,10 @@ public sealed class ClientController : IDisposable
     public const string RouteKeepTunnelWarning = "兜底路由未能建立,隧道保持,但隧道中断时虚拟机与 WSL 的流量可能直连;请联系管理员。";
     private readonly INicGuard? nicGuard;
     private readonly IConnectionReaper? reaper;
+    // 地址变化后等 2 秒再收紧:一次换网会连着来好几次通知,合成一次。
+    internal static readonly TimeSpan NicSweepDelay = TimeSpan.FromSeconds(2);
+    private readonly IAddressChangeSource? addressChanges;
+    private int nicSweepQueued;
     private string? reapWarning;
     private string? nicRestoreWarning;
     private string? removeWarning;
@@ -147,11 +151,13 @@ public sealed class ClientController : IDisposable
         IIpv6Probe? ipv6Probe = null, Action<EnvironmentReport>? reportSink = null,
         IRoutingSettingsStore? routingSettings = null, string? serviceProcessPath = null, IAdapterProbe? adapterProbe = null,
         IBrowserProcessProbe? browserProbe = null, INicGuard? nicGuard = null, IConnectionReaper? reaper = null,
-        Func<string, AppScope>? scopeResolver = null, IProxySettingsProbe? proxyProbe = null)
+        Func<string, AppScope>? scopeResolver = null, IProxySettingsProbe? proxyProbe = null,
+        IAddressChangeSource? addressChanges = null)
         : this(auth is null ? null : new AuthServerSessionSource(auth, credentials), firewall, tunnel, program, device,
             authEndpoint: authEndpoint, exitProbe: exitProbe, environment: environment, environmentSettings: environmentSettings,
             ipv6Probe: ipv6Probe, reportSink: reportSink, routingSettings: routingSettings, serviceProcessPath: serviceProcessPath, adapterProbe: adapterProbe,
-            browserProbe: browserProbe, nicGuard: nicGuard, reaper: reaper, scopeResolver: scopeResolver, proxyProbe: proxyProbe) { }
+            browserProbe: browserProbe, nicGuard: nicGuard, reaper: reaper, scopeResolver: scopeResolver, proxyProbe: proxyProbe,
+            addressChanges: addressChanges) { }
 
     public ClientController(ISessionSource? sessionSource, IKillSwitch firewall,
         ITunnelTransport tunnel, string program, DeviceInfo device, Func<TimeSpan, CancellationToken, Task>? delayAsync = null,
@@ -160,7 +166,8 @@ public sealed class ClientController : IDisposable
         IIpv6Probe? ipv6Probe = null, Action<EnvironmentReport>? reportSink = null,
         IRoutingSettingsStore? routingSettings = null, string? serviceProcessPath = null, IAdapterProbe? adapterProbe = null,
         IBrowserProcessProbe? browserProbe = null, INicGuard? nicGuard = null, IConnectionReaper? reaper = null,
-        Func<string, AppScope>? scopeResolver = null, IProxySettingsProbe? proxyProbe = null)
+        Func<string, AppScope>? scopeResolver = null, IProxySettingsProbe? proxyProbe = null,
+        IAddressChangeSource? addressChanges = null)
     {
         this.scopeResolver = scopeResolver ?? AppScope.Exact;
         this.nicGuard = nicGuard;
@@ -183,6 +190,8 @@ public sealed class ClientController : IDisposable
         this.routingSettings = routingSettings;
         this.serviceProcessPath = serviceProcessPath ?? Environment.ProcessPath ?? "WinClient.App.exe";
         tunnel.TunnelDown += OnTunnelDown;
+        this.addressChanges = addressChanges;
+        if (addressChanges is not null) addressChanges.Changed += OnAddressChanged;
     }
 
     public async Task InitializeAsync(bool autoConnect = true, bool keepProtection = false)
@@ -707,6 +716,7 @@ public sealed class ClientController : IDisposable
                     case EffectKind.ApplyKillSwitch:
                         var held = protectionVerified;
                         protection = true; // Even partial Apply must be treated as requiring explicit recovery.
+                        var firewallApplied = false;
                         try
                         {
                             if (activeRouting.Mode == RoutingMode.Apps) await ApplyAppsAsync();
@@ -715,18 +725,30 @@ public sealed class ClientController : IDisposable
                             protectionVerified = true;
                             firewallWarning = null;
                             reapWarning = null;
-                            if (nicGuard is not null) await nicGuard.ApplyAsync(lifetime.Token);
-                            ReapStaleConnections();
+                            firewallApplied = true;
                         }
                         catch (FirewallIneffectiveException ex) when (held)
                         {
                             WriteJournal("套用断网保护没成功，隧道保持：" + ConnectJournal.Describe(ex));
-                            var keep = ex is NicGuardException nicFailure ? NicKeepTunnelWarning(nicFailure)
-                                : ex is WfpUnavailableException ? WfpKeepTunnelWarning
+                            var keep = ex is WfpUnavailableException ? WfpKeepTunnelWarning
                                 : ex is RouteGuardUnavailableException ? RouteKeepTunnelWarning : KeepTunnelWarning;
                             firewallWarning = keep;
                             guardStatus = keep;
                             message = keep;
+                        }
+                        // 网卡收紧和防火墙那步分开做:防火墙没套成、隧道保持时,带公网 IPv6 的网卡也要关。
+                        try
+                        {
+                            if (nicGuard is not null) await nicGuard.ApplyAsync(lifetime.Token);
+                            if (firewallApplied) ReapStaleConnections();
+                        }
+                        catch (NicGuardException ex) when (held)
+                        {
+                            WriteJournal("套用断网保护没成功，隧道保持：" + ConnectJournal.Describe(ex));
+                            var keep = NicKeepTunnelWarning(ex);
+                            firewallWarning = firewallWarning is null ? keep : firewallWarning + " " + keep;
+                            guardStatus = firewallWarning;
+                            message = firewallWarning;
                         }
                         break;
                     case EffectKind.UpdateKillSwitchNode:
@@ -1035,22 +1057,90 @@ public sealed class ClientController : IDisposable
         return $"已为新出现的 {added} 个程序文件补上保护";
     }
 
-    /// <summary>网卡巡检:任何结果都不断开、不撤保护,只更新提示。</summary>
-    private async Task PatrolNicAsync()
+    internal static string PublicIpv4ParkedMessage(string adapter, bool apps) =>
+        $"网卡「{adapter}」上出现了公网 IPv4 地址(通常是电脑自己拨号上网,或换了网络),部分软件和网页可以直接读到这个地址,已停止连接。断网保护保持,{(apps ? "名单里的程序" : "电脑")}暂时上不了网。请点「断开」恢复原来的网络,改由路由器拨号上网后再连接,或联系管理员。";
+    internal static string PublicIpv4GuardStatus(string adapter) => $"网卡「{adapter}」出现公网 IPv4 地址,连接已停止,断网保护保持";
+
+    /// <summary>巡检里的网卡收紧。</summary>
+    private Task PatrolNicAsync() => TightenNicAsync(fromPatrol: true);
+
+    /// <summary>
+    /// 读一次网卡:新出现公网 IPv6 的先记后关;出现公网 IPv4 时,隧道可能在跑就停掉、保护保持。
+    /// 巡检和地址变化通知共用;只在串行锁内调用。
+    /// </summary>
+    private async Task TightenNicAsync(bool fromPatrol)
     {
         if (nicGuard is null || patrolLifetime.IsCancellationRequested || disposed) return;
+        string? publicIpv4 = null;
         try
         {
             var nic = await nicGuard.PatrolAsync(patrolLifetime.Token);
-            if (nic.NewlyDisabled.Count > 0) guardStatus += $",已关闭新出现公网 IPv6 的网卡 {nic.NewlyDisabled.Count} 个";
-            if (nic.PublicIpv4Adapters.Count > 0)
+            if (nic.NewlyDisabled.Count > 0)
             {
-                guardStatus = $"网卡「{nic.PublicIpv4Adapters[0]}」出现公网 IPv4 地址,部分软件可能读到它;连接与断网保护保持,请改由路由器拨号或联系管理员";
-                if (PatrolMaySpeak) message = guardStatus;
+                var closed = $"已关闭新出现公网 IPv6 的网卡 {nic.NewlyDisabled.Count} 个";
+                guardStatus = fromPatrol && guardStatus.Length > 0 ? guardStatus + "," + closed : closed;
             }
+            if (nic.PublicIpv4Adapters.Count > 0) publicIpv4 = nic.PublicIpv4Adapters[0];
         }
         catch (NicGuardException ex) { guardStatus = ex.Message; if (PatrolMaySpeak) message = guardStatus; }
         catch (Exception ex) when (IsOperational(ex)) { }
+        if (publicIpv4 is not null) await ParkForPublicIpv4Async(publicIpv4);
+    }
+
+    /// <summary>网卡上出现公网 IPv4:和连接前拒连同一个口径。隧道可能在跑就停掉,保护保持;已经停住的只更新巡检状态。</summary>
+    private async Task ParkForPublicIpv4Async(string adapter)
+    {
+        if (machine.State is not (ConnectionState.Connecting or ConnectionState.Connected or ConnectionState.Reconnecting))
+        {
+            guardStatus = PublicIpv4GuardStatus(adapter);
+            return;
+        }
+        if (firstAttempt)
+        {
+            // 从没连上的那次尝试:照既有口径放弃并恢复原来的网络。
+            await AbandonAsync(null, phrase: "网卡出现公网 IPv4", reason: $"原因：网卡「{adapter}」上出现了公网 IPv4 地址。");
+            return;
+        }
+        WriteJournal("网卡出现公网 IPv4：停止隧道，断网保护保持");
+        lifetime.Cancel();
+        try
+        {
+            await ExecuteAsync(machine.Handle(new(ConnectionEventKind.OperationFailed)));
+            message = PublicIpv4ParkedMessage(adapter, activeRouting.Mode == RoutingMode.Apps);
+        }
+        catch (Exception ex) when (IsOperational(ex)) { message = "连接内核未能停止，请联系管理员；断网保护保留。"; }
+        guardStatus = PublicIpv4GuardStatus(adapter);
+    }
+
+    /// <summary>系统线程上的回调:只排一次网卡收紧,不读网卡、不拿锁。</summary>
+    private void OnAddressChanged()
+    {
+        if (disposed || !protection || nicGuard is null) return;
+        if (Interlocked.Exchange(ref nicSweepQueued, 1) == 1) return;
+        _ = RunNicSweepAsync(patrolLifetime.Token);
+    }
+
+    /// <summary>等 2 秒后在串行锁内做一次网卡收紧。用巡检的取消口:断开时让路,保护撤掉就作废。</summary>
+    private async Task RunNicSweepAsync(CancellationToken token)
+    {
+        var entered = false;
+        try
+        {
+            await DelayForPurposeAsync(NicSweepDelay, token, "网卡收紧");
+            await gate.WaitAsync(token);
+            entered = true;
+            try
+            {
+                // 进锁就把排队标记放掉:收紧期间再来的通知要能再排一次。
+                Interlocked.Exchange(ref nicSweepQueued, 0);
+                if (disposed || !protection) return;
+                await TightenNicAsync(fromPatrol: false);
+                JournalPatrol();
+            }
+            finally { Publish(); gate.Release(); }
+        }
+        catch (OperationCanceledException) when (token.IsCancellationRequested) { }
+        finally { if (!entered) Interlocked.Exchange(ref nicSweepQueued, 0); }
     }
 
     private static string NicKeepTunnelWarning(NicGuardException ex) =>
@@ -1364,6 +1454,8 @@ public sealed class ClientController : IDisposable
         patrolLifetime.Cancel();
         Interlocked.Increment(ref generation);
         tunnel.TunnelDown -= OnTunnelDown;
+        if (addressChanges is not null) addressChanges.Changed -= OnAddressChanged;
+        if (addressChanges is IDisposable disposableChanges) disposableChanges.Dispose();
         tunnel.Dispose();
         if (exitProbe is IDisposable disposableProbe) disposableProbe.Dispose();
         // Closing the UI is not UserDisconnect. Leave the firewall snapshot for next-start recovery.
