@@ -79,7 +79,10 @@ def test_uninstall_removes_mappings_first():
     assert runs[2][0] == "systemctl"
 
 CONFIG = "/etc/exitnode/config.toml"
-TEXT = (Path(__file__).parents[1] / "examples" / "config.example.toml").read_text(encoding="utf-8")
+EXAMPLE = (Path(__file__).parents[1] / "examples" / "config.example.toml").read_text(encoding="utf-8")
+# 示例配置不写内核路径（默认用版本目录里的内核）；共用夹具固定用 /usr/bin/sing-box，在这里补上这一行。
+TEXT = EXAMPLE.replace('hy2_server_name = "exitnode"\n',
+                       'hy2_server_name = "exitnode"\nbinary = "/usr/bin/sing-box"\n')
 # 示例配置默认开着管理网页，共用夹具默认切掉那一段：检查类用例少一层，
 # 需要管理网页的用例自己把 CONFIG 换成完整示例。
 BASE = TEXT.split("\n[console]\n")[0]
@@ -565,6 +568,12 @@ def test_check_includes_authsync_layer_only_when_enabled(enabled, monkeypatch, c
     main(["check", "--json"], runner)
     layers = json.loads(capsys.readouterr().out)["layers"]
     assert any(layer["layer"] == "authsync" for layer in layers) is enabled
+
+
+def test_example_config_leaves_kernel_path_to_default():
+    # 照示例装的节点要用版本目录里的内核，更新和回退才换得到它。
+    config = load(CONFIG, FakeRunner(files={CONFIG: EXAMPLE}))
+    assert config.proxy.binary == "/opt/exitnode/current/bin/sing-box"
 
 
 @pytest.mark.parametrize("binary", ["/usr/bin/sing-box", "/usr/local/bin/sing-box", None])

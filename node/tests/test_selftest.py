@@ -10,8 +10,11 @@ from exitnode.config import load
 from exitnode.runner import CompletedResult, FakeRunner
 
 CONFIG = "/etc/exitnode/config.toml"
-TEXT = (Path(__file__).parents[1] / "examples" / "config.example.toml").read_text(encoding="utf-8")
 BINARY = "/usr/bin/sing-box"
+# 示例配置不写内核路径，这里补上夹具用的那一行。
+TEXT = (Path(__file__).parents[1] / "examples" / "config.example.toml").read_text(
+    encoding="utf-8").replace('hy2_server_name = "exitnode"\n',
+                              f'hy2_server_name = "exitnode"\nbinary = "{BINARY}"\n')
 SECRETS = "/var/lib/exitnode/secrets"
 PROBE = SECRETS + "/" + selftest.PROBE_NAME
 TRACE = CompletedResult(out="ip=203.0.113.9\nloc=AU\n")
