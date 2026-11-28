@@ -1,0 +1,67 @@
+{
+  "schemaVersion": 1,
+  "taskId": "CI-WINCLIENT-PUBLISH-GATE-1127",
+  "slug": "yc-package-gate-1128",
+  "title": "出包检查进自动检查:新增一个流程文件,动了客户端或出包脚本的合并请求照发布命令打一遍正式包",
+  "goal": "一、要解决什么\n\n安装包打不打得出来,现在只有手工跑出包脚本那天才知道,合并请求的自动检查只编译和跑测试。10-24 连接内核升级后包超过了当时的大小上限,11-27 第一次打测试包才发现,中间隔了一个多月。本单把「照发布时的命令打一遍正式包」放进自动检查:动了客户端、出包脚本、第三方件清单的合并请求,打不出包当场就红。\n\n二、做什么\n\n新增一个文件 .github/workflows/winclient-package.yml,内容照抄下面两条分隔线之间的这一段。一个字符不改,缩进用空格;行尾空格和文件末尾的空行不算。存成不带 BOM 的 UTF-8。这一段和验收脚本 docs/plans/checks/yc_package_gate_1128.py 里的 EXPECTED 是同一份,也可以直接从那里取。\n\n-----8<-----\nname: 客户端出包检查\n\n# 照发布时的命令把正式包打一遍:打不出来、发布目录里多出外置文件、包超过自动更新肯收的大小,这里就红。\n# 只改文档、节点、登录服务器或说明文件时不跑(改动的文件全都落在 paths-ignore 里才跳过),别的改动都跑。\n# push 和 pull_request 两处 paths-ignore 保持一样。\n# 跑在哪和 ci.yml 一样由仓库变量 CI_RUNS_ON 定(见 docs/开工须知.md §5.1)。不签名,不上传安装包。\non:\n  push:\n    branches: [main]\n    paths-ignore:\n      - 'docs/**'\n      - 'node/**'\n      - 'authserver/**'\n      - '**.md'\n  pull_request:\n    paths-ignore:\n      - 'docs/**'\n      - 'node/**'\n      - 'authserver/**'\n      - '**.md'\n\npermissions:\n  contents: read\n\njobs:\n  package:\n    name: Windows 客户端出包检查\n    runs-on: ${{ vars.CI_RUNS_ON || 'windows-latest' }}\n    timeout-minutes: 20\n    steps:\n      - name: 获取代码\n        uses: actions/checkout@v4\n      - name: 准备客户端编译工具\n        if: vars.CI_RUNS_ON == ''\n        uses: actions/setup-dotnet@v4\n        with:\n          dotnet-version: '9.0.x'\n      - name: 打一遍正式包并检查\n        run: powershell -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File scripts/release/build-winclient.ps1\n-----8<-----\n\n别的文件一个不动。\n\n三、帮你看懂这个文件(不用另外做事)\n\n- 为什么单独一个流程文件、不加进 ci.yml:GitHub 的 paths-ignore 只能写在整个流程上。单独放,只改文档、节点、登录服务器时这个流程整个不跑,ci.yml 里的检查照常。\n- paths-ignore 的意思是「改动的文件全都落在这几条里才跳过」。没列进去的路径(客户端、出包脚本、第三方件清单、流程文件、仓库根目录的配置)只要动了一个就跑。\n- 出包脚本 scripts/release/build-winclient.ps1 已有三项检查:发布目录里只有 exe 和 pdb、有客户端程序、不超过 1 GiB;任一项不过退出码是 1,这一步就红。本单不改它。\n- 这一步打的是正式包(不带 -TestBuild),版本号取 winclient/Directory.Build.props 里的默认值。不签名,不上传安装包。\n- 命令带 -WindowStyle Hidden:本仓规定子进程一律不弹窗口。\n\n四、验收(派单器跑)\n\n- SHAPE:python docs/plans/checks/yc_package_gate_1128.py shape。流程文件逐行等于定稿(不计行尾空格和文件末尾空行),没有制表符,不带 BOM。\n- SCOPE:python docs/plans/checks/yc_package_gate_1128.py scope。相对主干只新增 .github/workflows/winclient-package.yml 这一个文件。\n\n五、做的时候守这几条\n\n- 只新增这一个文件。不改 ci.yml、出包脚本、第三方件清单、任何代码和文档。\n- 不用构建,不用跑测试,不要在工位里跑出包脚本(一次两三分钟,合并请求的检查会跑)。\n- 验收命令单独一条执行,不要拼 cd &&、管道或重定向。\n- 觉得定稿内容有错(比如某一行的 YAML 写法),交 blocked 写成结构化岔路,写清哪一行、为什么,不自己改。\n\n六、交活说明要写\n\n- 新增了哪个文件。\n- 没验的:这个流程在检查机上真跑的结果,要等合并请求的检查。",
+  "background": "项目:澳洲出口节点与 Windows 客户端。自动检查跑在 GitHub Actions 上,现有流程文件是 .github/workflows/ci.yml(Python 检查和客户端测试两个作业),跑在哪由仓库变量 CI_RUNS_ON 定,现在是负责人本机的自托管检查机。\n\n开工先读(都在本仓,只读):\n- .github/workflows/ci.yml:新文件的写法(作业名、runs-on、准备编译工具那一步)跟它一致。\n- scripts/release/build-winclient.ps1:出包脚本,本单让检查机照原样跑它。\n- docs/winclient/打包与发布说明.md 的「维护人员出包」一节:出包命令和三项检查的说明。\n- docs/plans/checks/yc_package_gate_1128.py:验收脚本,定稿内容在 EXPECTED 里。\n\n卡面:看板 yuanc 项目 CI-WINCLIENT-PUBLISH-GATE-1127。安装包大小不设硬上限(负责人 2026-11-27 定),出包脚本里的 1 GiB 只是防呆线,本单不动。",
+  "nonGoals": [
+    "不改 .github/workflows/ci.yml",
+    "不改出包脚本 scripts/release/build-winclient.ps1 和它的三项检查",
+    "不加「打完包点一遍界面」(另一张卡 WINCLIENT-PACKAGE-UI-SMOKE-1128)",
+    "不签名、不上传安装包、不改版本号",
+    "不改文档和口径速查表(合并后派单方补)"
+  ],
+  "allowedPaths": [
+    ".github/workflows/winclient-package.yml"
+  ],
+  "forbiddenPaths": [
+    ".codex/**",
+    ".github/workflows/ci.yml",
+    ".gitignore",
+    "pyproject.toml",
+    "requirements-dev.txt",
+    "NuGet.Config",
+    "authserver/**",
+    "node/**",
+    "scripts/**",
+    "docs/**",
+    "winclient/**"
+  ],
+  "expectArtifacts": [],
+  "acceptance": [
+    {
+      "id": "SHAPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_package_gate_1128.py",
+        "shape"
+      ],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "SCOPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_package_gate_1128.py",
+        "scope"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "timeoutSec": 3600,
+  "repoRoot": "E:/yuanc",
+  "steps": [
+    "读 background 列出的文件与检查脚本。",
+    "新建 .github/workflows/winclient-package.yml,内容照抄 goal 二里的定稿。",
+    "SHAPE、SCOPE 全绿后交活;交活说明照 goal 六的要求写。"
+  ]
+}
