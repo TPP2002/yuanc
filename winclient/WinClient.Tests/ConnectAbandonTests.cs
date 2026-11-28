@@ -151,6 +151,7 @@ public sealed class ConnectAbandonTests
             await Task.Delay(20);
         }
         await Until(() => controller.Snapshot.State == ConnectionState.Disconnected);
+        await controller.RefreshSessionAsync(); // 串行锁屏障:状态先变,提示语晚一步写,等放弃并恢复整段做完再读。
         Assert.False(controller.Snapshot.ProtectionActive);
         Assert.Equal(Restored + "原因：连续 4 次都没连上澳洲出口。", controller.Snapshot.Message);
         Assert.Equal(4, order.Count(x => x == "start"));
@@ -179,6 +180,7 @@ public sealed class ConnectAbandonTests
             await Task.Delay(20);
         }
         await Until(() => controller.Snapshot.State == ConnectionState.Disconnected);
+        await controller.RefreshSessionAsync(); // 串行锁屏障:等放弃并恢复整段做完再读提示语。
         Assert.Equal(Restored + "原因：连续 4 次都没连上澳洲出口。", controller.Snapshot.Message);
         Assert.DoesNotContain("apply", order);
         Assert.DoesNotContain("remove", order);
@@ -376,6 +378,7 @@ public sealed class ConnectAbandonTests
         for (var attempt = 1; attempt < 5; attempt++)
             await FireAndSettle(controller, timers, "出口核验", TimeSpan.FromSeconds(5));
         await Until(() => controller.Snapshot.State == ConnectionState.Disconnected);
+        await controller.RefreshSessionAsync(); // 串行锁屏障:等放弃并恢复整段做完再读提示语。
         Assert.False(controller.Snapshot.ProtectionActive);
         Assert.Equal("测试包：出口核验不了，已自动断开并恢复原来的网络。", controller.Snapshot.Message);
         Assert.True(order.IndexOf("stop") < order.IndexOf("remove"));
