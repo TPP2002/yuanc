@@ -1,0 +1,124 @@
+{
+  "schemaVersion": 1,
+  "taskId": "NODE-CONSOLE-REJECT-RESET-1128",
+  "slug": "yc-node-console-reject-body-1128",
+  "title": "节点管理网页:走到接口层的 POST 先读完请求体再判断登录、来源页、防伪头、限流;请求体没到齐,超时后不回应直接断开",
+  "goal": "以派单时 origin/main 头为基点。看板卡 NODE-CONSOLE-REJECT-RESET-1128。\n\n背景与根因(已用实验钉死,不用再查):节点管理网页(node/exitnode/console/server.py,标准库 http.server,HTTP/1.0,每条请求回完就关连接)拒绝一条带请求体的 POST 时,没读请求体就回应答并关连接。标准库客户端把请求头和请求体分两次写出;请求体落到已经关掉的连接上,系统回 RST,客户端缓冲区里那份还没读的应答被一起丢掉,读应答时报 WinError 10054 或 10053。实测(Windows,Python 3.14):请求体比请求头晚 0.05 秒到,401 和 403 的应答一个字节都收不到;照 test_post_requires_csrf_and_same_origin 的写法连发 5000 条会被 403 的 POST,断 5 次;服务端读完请求体的 5000 条断 0 次。主干自动检查 11-28 因此红过一次。未知路径那条路(_decoy)回完会等一小会儿把后到的字节读掉,不在本单范围。\n\n一、server.py:走到接口这一层的 POST 先读请求体,再做判断\n1. 新增方法 _take_body()。_api 处理 POST 时第一件事就是调它,排在登录检查、Origin 检查、防伪头检查、登录限流之前。来源不合规、Host 不合规、路径不认识这三种仍旧先走 _decoy,不读请求体,行为和现在完全一样。\n2. _take_body 按 Content-Length 读:\n   - 没带这个头,或值是 0:请求体记为空字节串,不读套接字。\n   - 值是 1~16384 的整数:self.rfile.read(长度) 读进来存到实例上。连接提前结束时读到多少算多少,后面照现有规则当格式不对处理。\n   - 值不是整数、是负数、或大于 16384:记为「读不了」,不读套接字;后面的判断次序和应答照旧(该 401 的 401,该 403 的 403,走到 _read_body 的回 422)。\n3. 读请求体的过程里出 OSError(含套接字超时 TimeoutError、对方重置):这条连接不回任何应答,置 close_connection = True 后直接结束本次处理;不记「管理网页请求处理失败」这条错误日志,不让异常落进 _handle 的 except Exception。\n4. 套接字超时沿用 ConsoleHandler.timeout,不新增超时参数;16384 的上限不改。\n\n二、server.py:_read_body(allowed) 名字和签名不变,不再读套接字,只判断并解析 _take_body 存下的内容。每种情形的状态码与正文和现在逐字节相同:\n   - 长度读不了 → 422 BAD_REQUEST,并置 close_connection = True;\n   - 没带长度或长度为 0 → 返回 {};\n   - Content-Type 不以 application/json 开头 → 422 BAD_REQUEST;\n   - 不是合法 UTF-8 JSON、不是对象、带了 allowed 以外的键 → 422 BAD_REQUEST。\n\n三、不改的:接口路径、状态码、应答正文、响应头、Cookie;登录限流与验密码并发闸的次序和数值;_decoy 与 _drain_input;GET 与其余方法的处理;HTTP 版本(仍是 HTTP/1.0,回完就关)。server.py 里不许用 time.sleep,不许用「回完应答后等一小会儿再关」顶替先读请求体。\n\n四、测试(node/tests/test_console_server.py;两个用例名固定,可再加辅助函数;只连 127.0.0.1 本机端口,不联网;两个新用例的正文里不许出现 except,不许用 read_until_close,连接被重置就该让用例红)\n\n- test_rejected_post_waits_for_body_then_answers:登录拿到 Cookie 与 csrf 后,用原始套接字逐个发下面六种会被拒的 POST。请求行用 HTTP/1.0,带 Host: 127.0.0.1:<端口>,Content-Length 写请求体的真实字节数;没另外说明的,Content-Type 是 application/json、请求体是 {\"days\":1,\"max_uses\":1,\"note\":\"\"}。\n  ① 不带 Cookie 的 /api/invites → 401,正文 JSON 等于 {\"detail\":\"请先登录\",\"code\":\"login_required\"};\n  ② 带 Cookie、不带 X-Console-CSRF 的 /api/logout,请求体 {} → 403,正文 code 为 csrf;\n  ③ 带 Cookie 与正确的 X-Console-CSRF、Origin: http://evil.example 的 /api/invites → 403,code 为 csrf;\n  ④ Origin: http://evil.example 的 /api/login,请求体带正确密码 → 403,code 为 csrf;\n  ⑤ 带 Cookie 与正确的 X-Console-CSRF、Content-Type: text/plain 的 /api/invites → 422,正文 JSON 等于 {\"detail\":\"请求格式不对\",\"code\":\"bad_request\"};\n  ⑥ 先用 call() 拿错密码登录 5 次(每次 401),再发 /api/login(请求体带正确密码)→ 429,code 为 throttled。这一种放最后。\n  每一种都照这个顺序做:先只发请求头;把套接字超时设成 0.3 秒读一次,必须超时(with pytest.raises(TimeoutError)),证明请求体没到之前服务端一个字节都不回;再发请求体;把超时改回 5 秒,循环 recv 到返回空为止;然后断言状态行以 b\"HTTP/1.0 <状态码>\" 开头、正文符合上面的期望。\n\n- test_stalled_body_closes_without_reply:照 test_secrets_never_logged 的办法收 exitnode 这个 logger 的记录。在 with monkeypatch.context() 块里把 console_server.ConsoleHandler.timeout 改成 0.5(每条新连接建立时读这个类属性),用原始套接字发不带 Cookie 的 POST /api/invites,Content-Length: 10,请求头和 3 个字节拼成一个 bytes 一次发出;循环 recv 到返回空为止(客户端套接字超时 5 秒),收到的总字节数是 0。出了这个块(超时回到原值)再用 call() 发一条 GET /api/session,返回 200,证明服务还在。收到的日志里没有「管理网页请求处理失败」。\n\n- 既有 23 个用例和 call()、read_until_close() 两个辅助函数一个字都不改;它们在改完后必须照样全过。\n",
+  "background": "项目:外包「澳洲出口节点 + Windows 一键客户端」。节点端 Python 3.11 起(node/exitnode,测试 node/tests);自动检查在 Windows 上用 Python 3.14 跑,节点真机是 Debian 12 的 Python 3.11,两边都要过。\n\n先读(全文):node/exitnode/console/server.py、node/tests/test_console_server.py;检查脚本 docs/plans/checks/yc_node_console_reject_body_1128.py(SHAPE、TESTS-NEW、SCOPE 三项验收照它判)。\n\n已定的取舍(不要改):先读完请求体再判断,不用「回完应答后等一小会儿再关」来顶替(那是靠时间碰运气,机器一忙照样丢)。_take_body、_read_body 两个方法名固定。请求体没到齐时不回应、不记错误日志。声明长度读不了的请求,应答和断开方式照旧。\n\n硬规矩(做不到就停下交 blocked + forks,不猜):①只改允许清单里的两个文件。②测试里的密码沿用文件里已有的测试值,不写真实凭据。③既有用例与两个辅助函数不删、不改、不跳过、不放宽;不许加重试、不许标 flaky、不许把新用例里的异常吞掉。④工人不许 git 写操作,不许自己跑 pytest / ruff / python(按验收编号走派单器自测通道,命令单独一条执行,不写 cd &&、管道、2>&1);不许装依赖。⑤新增注释用中文大白话,写清「为什么先读完再回」;每次 Edit / Write 的新内容不超过 150 行。⑥ruff 的行宽与规则照仓库现有配置,新代码要过 python -m ruff check .。",
+  "nonGoals": [
+    "不改接口路径、状态码、应答正文、响应头与 Cookie",
+    "不改 _decoy 与 _drain_input,不改未知路径、不合规来源、不合规 Host 的处理",
+    "不改声明长度读不了(不是整数、负数、超过 16384)时的应答与断开方式",
+    "不改 HTTP 版本,不做连接复用",
+    "不改 auth.py、authclient.py、snapshot.py、static/ 页面与 cli.py",
+    "不写 docs/ 下任何文档"
+  ],
+  "allowedPaths": [
+    "node/exitnode/console/server.py",
+    "node/tests/test_console_server.py"
+  ],
+  "forbiddenPaths": [
+    ".codex/**",
+    ".github/**",
+    ".gitignore",
+    "pyproject.toml",
+    "requirements-dev.txt",
+    "winclient/**",
+    "scripts/**",
+    "authserver/**",
+    "docs/**",
+    "node/exitnode/cli.py",
+    "node/exitnode/console/auth.py",
+    "node/exitnode/console/authclient.py",
+    "node/exitnode/console/snapshot.py",
+    "node/exitnode/console/install.py",
+    "node/exitnode/console/static/**",
+    "node/exitnode/templates/**",
+    "node/examples/**",
+    "node/tests/golden/**",
+    "node/tests/test_console_auth.py"
+  ],
+  "expectArtifacts": [
+    "node/exitnode/console/server.py",
+    "node/tests/test_console_server.py"
+  ],
+  "acceptance": [
+    {
+      "id": "T-SERVER",
+      "kind": "test:targeted",
+      "target": "node/tests/test_console_server.py",
+      "required": true,
+      "failsOnBase": true
+    },
+    {
+      "id": "PYTEST",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "pytest",
+        "-q"
+      ],
+      "required": true,
+      "timeoutSec": 1500
+    },
+    {
+      "id": "RUFF",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "ruff",
+        "check",
+        "."
+      ],
+      "required": true,
+      "timeoutSec": 300
+    },
+    {
+      "id": "SHAPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_node_console_reject_body_1128.py",
+        "shape"
+      ],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "TESTS-NEW",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_node_console_reject_body_1128.py",
+        "tests"
+      ],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "SCOPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_node_console_reject_body_1128.py",
+        "scope"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "timeoutSec": 7200,
+  "repoRoot": "E:/yuanc",
+  "steps": [
+    "读 BACKGROUND 列出的两个文件与检查脚本。",
+    "先写两个新用例(此时在现有代码上应当是红的),再改 server.py:加 _take_body、_api 处理 POST 时先调它、_read_body 改成只解析。",
+    "T-SERVER 绿后跑 PYTEST、RUFF、SHAPE、TESTS-NEW、SCOPE,全绿后交活;交活说明写清两个新用例各证了什么。"
+  ]
+}
