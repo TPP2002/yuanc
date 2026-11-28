@@ -1,0 +1,39 @@
+name: 客户端出包检查
+
+# 照发布时的命令把正式包打一遍:打不出来、发布目录里多出外置文件、包超过自动更新肯收的大小,这里就红。
+# 只改文档、节点、登录服务器或说明文件时不跑(改动的文件全都落在 paths-ignore 里才跳过),别的改动都跑。
+# push 和 pull_request 两处 paths-ignore 保持一样。
+# 跑在哪和 ci.yml 一样由仓库变量 CI_RUNS_ON 定(见 docs/开工须知.md §5.1)。不签名,不上传安装包。
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - 'node/**'
+      - 'authserver/**'
+      - '**.md'
+  pull_request:
+    paths-ignore:
+      - 'docs/**'
+      - 'node/**'
+      - 'authserver/**'
+      - '**.md'
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Windows 客户端出包检查
+    runs-on: ${{ vars.CI_RUNS_ON || 'windows-latest' }}
+    timeout-minutes: 20
+    steps:
+      - name: 获取代码
+        uses: actions/checkout@v4
+      - name: 准备客户端编译工具
+        if: vars.CI_RUNS_ON == ''
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+      - name: 打一遍正式包并检查
+        run: powershell -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File scripts/release/build-winclient.ps1
