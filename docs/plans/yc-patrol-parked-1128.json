@@ -1,0 +1,147 @@
+{
+  "schemaVersion": 1,
+  "taskId": "SEC-WIN-PATROL-STOPS-WHEN-PARKED-1127",
+  "slug": "yc-patrol-parked-1128",
+  "title": "连接停在「需人工处理」或「需重新登录」时,断网保护还在,每分钟一次的巡检照常跑",
+  "workbuddyTier": "hard",
+  "goal": "以派单时 origin/main 头为基点。看板卡 SEC-WIN-PATROL-STOPS-WHEN-PARKED-1127。下面的名字、代码、文字照原文一字不差(含全角标点)。\n\n【问题】连接停在「需人工处理」或「需重新登录」时,断网保护还在,但每 60 秒一次的巡检整套停掉:防火墙规则、过滤层、兜底路由、网卡 IPv6 都不再查。原因两处:ShouldPatrol 要求状态是已连接或重连中;巡检定时走 Schedule,绑着连接的 lifetime 和代数,FailAsync 一取消 lifetime 巡检就排不上。\n【改成】只要断网保护在,巡检就按 60 秒一次照常跑,和连接状态无关;保护撤掉才停。停住期间巡检不改界面提示语(那句是告诉用户怎么处理的),结果只写进保护状态(GuardStatus)。巡检只按「当初套保护时的代理范围」去查:和恢复记录里的范围对不上时,不做防火墙那一段(全部流量的巡检会把系统默认出站改成阻断,按错的范围查会把整台电脑的网断掉)。\n\n一、winclient/WinClient.Core/Client/ClientController.cs\n① 常量 KeptWithoutCredentialsMessage 那一行下面加:\n```\n    internal const string PatrolModeMismatchStatus = \"代理范围与断网保护记录不一致，本轮没有检查防火墙规则\";\n```\n字段 `private object? patrolCycle;` 下面加(注释照抄):\n```\n    // 巡检自己的取消源:只跟「断网保护在不在」走,不跟连接的 lifetime 和代数走。\n    // FailAsync 取消 lifetime 之后连接停住,保护还在,巡检要照常跑。\n    private CancellationTokenSource patrolLifetime = new();\n```\n② `private bool ShouldPatrol => protection && machine.State is ConnectionState.Connected or ConnectionState.Reconnecting;` 这一行换成下面四段(照抄):\n```\n    /// <summary>巡检只看断网保护在不在,和连接状态无关。</summary>\n    private bool ShouldPatrol => protection;\n\n    /// <summary>巡检只在已连接或重连中才改提示语;停住时那句处理指引不能被巡检的话盖掉,巡检结果只写进保护状态。</summary>\n    private bool PatrolMaySpeak => machine.State is ConnectionState.Connected or ConnectionState.Reconnecting;\n\n    /// <summary>保护是按哪种代理范围套上的,以恢复记录为准;和控制器手里的范围对不上时,防火墙巡检会按错的范围去收紧系统设置,整段不做。</summary>\n    private bool PatrolModeMismatch => firewall.HasPendingState && (firewall.PendingMode ?? \"global\") != ModeName(activeRouting);\n\n    /// <summary>让巡检定时和「保护在不在」对齐:保护没了或巡检被取消过,就丢掉旧定时;保护在而没有定时,就排一个。只在串行锁内调用。</summary>\n    private void SyncPatrol()\n    {\n        if (patrolLifetime.IsCancellationRequested || (!ShouldPatrol && patrolScheduled))\n        {\n            // 旧取消源只取消、不释放:迟到的定时任务拿旧令牌等锁时不会撞上已释放的对象。\n            patrolLifetime.Cancel();\n            patrolLifetime = new();\n            patrolScheduled = false;\n            patrolCycle = null;\n        }\n        if (ShouldPatrol && !patrolScheduled && !disposed)\n        {\n            patrolCycle = new object();\n            SchedulePatrol(patrolCycle);\n        }\n    }\n```\n③ UpdateMonitoring 末尾从 `if (!ShouldPatrol)` 到方法结束前的那十行(清空 patrolScheduled、patrolCycle 或新排一轮)整段换成一行 `SyncPatrol();`。UpdateMonitoring 其余部分一个字不动。\n④ SchedulePatrol 改成下面这样,并在它后面加 RunPatrolAsync(照抄):\n```\n    private void SchedulePatrol(object cycle)\n    {\n        patrolScheduled = true;\n        _ = RunPatrolAsync(cycle, patrolLifetime.Token);\n    }\n\n    /// <summary>等 60 秒后在串行锁内跑一轮巡检。不走 Schedule:那条路绑着连接的 lifetime 和代数,连接停住后就排不上了。</summary>\n    private async Task RunPatrolAsync(object cycle, CancellationToken token)\n    {\n        try\n        {\n            await DelayForPurposeAsync(PatrolInterval, token, \"巡检\");\n            await gate.WaitAsync(token);\n            try { if (!disposed) await PatrolAsync(cycle); }\n            finally { Publish(); gate.Release(); }\n        }\n        catch (OperationCanceledException) when (token.IsCancellationRequested) { }\n    }\n```\nRunPatrolAsync 里不查代数,不调 FailAsync,不调 MaybeAbandonAfterLoginFailureAsync:巡检出什么结果都不改连接状态。\n⑤ PatrolAsync 只做下面四处改动,其余(规则缺失时有会话就重建、没有会话写「巡检失败,下一轮重试」,各 catch 的文字,finally 里的次序)一个字不动:\n - 开头那一行 `if (!ReferenceEquals(cycle, patrolCycle) || !ShouldPatrol) return;` 换成两行:\n   `if (!ReferenceEquals(cycle, patrolCycle)) return;`\n   `if (!ShouldPatrol) { SyncPatrol(); return; }`\n - try 块的第一行(`var addedNote = await PatrolNewExecutablesAsync();` 之前)加一行:\n   `if (PatrolModeMismatch) { guardStatus = PatrolModeMismatchStatus; return; }`\n   (return 之后 finally 照常执行:网卡巡检、写记录、发快照、排下一轮。)\n - 方法里所有 `lifetime.` 换成 `patrolLifetime.`(两处 `lifetime.Token`、两处 `lifetime.IsCancellationRequested`)。\n - 三处给 message 赋值的地方前面各加 `if (PatrolMaySpeak) `,写在同一行:`if (PatrolMaySpeak) message = \"断网保护已重新生效。\";`,两处 `message = guardStatus;` 改成 `if (PatrolMaySpeak) message = guardStatus;`。guardStatus、firewallWarning、protectionVerified 的赋值照旧,不加条件。\n⑥ PatrolNicAsync 只做两处改动:所有 `lifetime.` 换成 `patrolLifetime.`(一处 IsCancellationRequested、一处 Token);两处 `message = guardStatus;` 改成 `if (PatrolMaySpeak) message = guardStatus;`。\n⑦ DisconnectAsync:`lifetime.Cancel();` 的下一行加 `patrolLifetime.Cancel();`,上面写一行中文注释:正在跑的巡检要立刻让路;断开没成功、保护还在时,状态迁移后的 SyncPatrol 会重新排上。只加这两行,别的不动。\n⑧ RemoveProtectionAsync:`reapWarning = null;` 的下一行加 `SyncPatrol();`(这条路撤保护不经过状态迁移,要自己把巡检停掉)。只加这一行(可带一行注释)。\n⑨ InitializeAsync 只加两处,别的不动:\n - `WriteJournal(\"启动：接回断网保护，随后自动连接\");` 的下一行加 `SyncPatrol();`(保护接回来就开始巡检,不等连接走到哪一步)。\n - 「找不到配对文件或登录凭据」那一路(`else if (keptMissing)`)里,`environmentApplied = environment?.HasPendingState ?? false;` 的下一行加(照抄):\n```\n                // 这条路不经过 ConnectAsync:巡检要按上次套保护时的代理范围去查,在这里读一次;读不到就留默认,由巡检里的范围核对兜住。\n                try\n                {\n                    activeRouting = routingSettings?.Read() ?? RoutingPolicy.Global;\n                    activeScopes = activeRouting.Mode == RoutingMode.Apps ? activeRouting.Apps.Select(scopeResolver).ToArray() : [];\n                }\n                catch (Exception ex) when (IsOperational(ex)) { WriteJournal(\"启动：读不到代理范围设置：\" + ConnectJournal.Describe(ex)); }\n```\n⑩ Dispose:`lifetime.Cancel();` 的下一行加 `patrolLifetime.Cancel();`。只加这一行。\n⑪ 不许动的方法(SHAPE 会和改动前逐字比):Schedule、RunScheduledAsync、FailAsync、AbandonAsync、MaybeAbandonAfterLoginFailureAsync、ConnectAsync(bool fromUser)、RefreshSessionAsync、ChangeSessionSourceAsync、ExecuteAsync、ExecuteEffectsAsync、FetchSessionAsync、ApplySessionAsync、RenewAsync、CheckExitAsync、CheckEnvironmentAsync、PatrolNewExecutablesAsync、JournalPatrol。巡检间隔 60 秒不变。文件里不许再出现 `Schedule(PatrolInterval`。\n\n二、测试(winclient/WinClient.Tests/ControllerTests.cs;替身用文件里现成的 Timers、Firewall、Tunnel、ObservableTunnel、ScriptedSource、MemoryRouting、Ok(...)、Until(...)、ScopeOf(...)、ScopeDir、ScopeSelected、TestData)\n⑫ 加两个私有成员(照抄),放在 FireAndPublish 后面。停住时不能用 FireAndPublish,它拿 ConnectAsync 当屏障,会真的去连:\n```\n    private static async Task FireParkedPatrol(ClientController controller, Timers timers)\n    {\n        var published = Volatile.Read(ref timers.Published);\n        timers.Fire(\"巡检\", d => d == TimeSpan.FromSeconds(60));\n        await Until(() => Volatile.Read(ref timers.Published) > published);\n        await controller.RefreshSessionAsync(); // 串行锁屏障;没连着时它什么都不做。\n    }\n\n    /// <summary>第一次启动抛「找不到内核」,之后成功。</summary>\n    private sealed class FirstStartMissingTunnel(List<string> order) : ITunnelTransport\n    {\n        private int starts;\n        public event EventHandler? TunnelDown { add { } remove { } }\n        public Task StartAsync(JsonElement configuration, CancellationToken token)\n        {\n            order.Add(\"start\");\n            if (Interlocked.Increment(ref starts) == 1) throw new FileNotFoundException(\"测试:找不到内核\");\n            return Task.CompletedTask;\n        }\n        public void Stop() => order.Add(\"stop\");\n        public void Dispose() { }\n    }\n```\n⑬ 新用例八个,名字照抄。除非另说,控制器都这样建:order、`var timers = new Timers();`、`var firewall = new Firewall(order);`、`var tunnel = new ObservableTunnel(order);`、ScriptedSource 先放一个 `Ok(TestData.Session())`,构造时第六个参数传 timers.Delay 并设 `DelayWithPurposeAsync = timers.Delay`,订阅 Changed 给 timers.Published 加一(写法照 LeavingConnectedClearsExitEvenWhenStoppingThrows),不传出口探测。「巡检定时几条」都指 `timers.For(\"巡检\").Length`。\n a. PatrolContinuesWhileParkedWithProtection(Theory,两行数据:(\"rejection\", ConnectionState.NeedsLogin)、(\"failure\", ConnectionState.NeedsManual)):ConnectAsync 之后,照 LeavingConnectedClearsExitEvenWhenStoppingThrows 的 else 分支把连接弄停(source 再放一个 `new AuthResponse<SessionResponse>(AuthResult.InvalidToken)`;`tunnel.FailStop = reason == \"failure\";`;调 RefreshSessionAsync)。断言:State 等于期望值;ProtectionActive 为真。记下 `var parked = controller.Snapshot.Message;`。调 FireParkedPatrol 一次:firewall.PatrolCalls 恰好一条;GuardStatus 等于 \"正常\";State 等于期望值;Message 等于 parked;order 里没有 \"remove\"。再调一次 FireParkedPatrol:firewall.PatrolCalls.Count 等于 2。\n b. PatrolRearmsAfterFailedDisconnect:ConnectAsync 之后 `tunnel.FailStop = true;`,调 DisconnectAsync。断言:State 是 NeedsManual;ProtectionActive 为真;巡检定时 2 条(第一条被断开取消,保护还在所以又排了一条)。记下 parked。往 firewall.PatrolResults 放 `new PatrolReport([], [], [\"YuanC-KS-Tun\"])`,调 FireParkedPatrol:GuardStatus 等于 \"已重建 1 条本项目规则\";order 里 \"apply\" 出现 2 次;Message 等于 parked;State 是 NeedsManual;巡检定时 3 条。\n c. ParkedPatrolWarningStaysOutOfMessage:同 b 那样用断开失败停住,记下 parked;往 firewall.PatrolResults 放 `new FirewallIneffectiveException(\"防火墙失效\")`,调 FireParkedPatrol:GuardStatus 含 \"防火墙\";Message 等于 parked;State 是 NeedsManual;ProtectionActive 为真。\n d. StartupParkedWithoutSourceStillPatrols:会话来源传 `(ISessionSource?)null`,`new Firewall(order) { HasPendingState = true }`,隧道用 `new Tunnel(order)`,InitializeAsync(true, true)。断言:State 是 NeedsManual;巡检定时恰好 1 条。调 FireParkedPatrol:firewall.PatrolCalls 恰好一条;`Assert.True(Assert.Single(firewall.EnforceDefaultCalls))`;GuardStatus 等于 \"正常\";Message 等于 ClientController.KeptWithoutPairingMessage。再往 PatrolResults 放 `new PatrolReport([], [], [\"YuanC-KS-Tun\"])`,调 FireParkedPatrol:GuardStatus 等于 \"巡检失败,下一轮重试\";order 里没有 \"apply\"、\"recover\"、\"remove\";Message 仍等于 KeptWithoutPairingMessage。\n e. StartupParkedAppsModePatrolsAppRules:会话来源传 null,`new Firewall(order) { HasPendingState = true, PendingMode = \"apps\" }`,隧道用 `new Tunnel(order)`,`var files = new List<string> { ScopeDir + @\"\\Update.exe\" };`,构造时加 `routingSettings: new MemoryRouting { Policy = RoutingPolicy.Create(\"apps\", [ScopeSelected]) }, scopeResolver: ScopeOf(files)`,InitializeAsync(true, true)。断言:State 是 NeedsManual;Snapshot.RoutingMode 等于 \"apps\"。调 FireParkedPatrol:`Assert.Equal(KillSwitchPlanner.AppRuleNames(1), Assert.Single(firewall.PatrolCalls))`;`Assert.False(Assert.Single(firewall.EnforceDefaultCalls))`;GuardStatus 等于 \"正常\";firewall.AppliedFilters 为空。然后 `files.Add(ScopeDir + @\"\\helper.exe\");`,调 FireParkedPatrol:firewall.AppliedFilters 恰好一条;GuardStatus 等于 \"已为新出现的 1 个程序文件补上保护\";Message 等于 KeptWithoutPairingMessage。\n f. ParkedPatrolSkipsFirewallWhenRecordModeDiffers:会话来源传 null,`new Firewall(order) { HasPendingState = true, PendingMode = \"apps\" }`,隧道用 `new Tunnel(order)`,不传 routingSettings(控制器手里是全部流量),InitializeAsync(true, true)。调 FireParkedPatrol:firewall.PatrolCalls 为空;firewall.EnforceDefaultCalls 为空;GuardStatus 等于 ClientController.PatrolModeMismatchStatus;Message 等于 KeptWithoutPairingMessage;巡检定时 2 条;order 里没有 \"apply\"、\"apply-apps\"。\n g. PatrolStopsOnceProtectionRemoved:照 a 的 \"failure\" 那样停住;然后 `tunnel.FailStop = false;`,调 DisconnectAsync:State 是 Disconnected;ProtectionActive 为假。记下 `var count = timers.For(\"巡检\").Length;`,调 `timers.Advance(TimeSpan.FromMinutes(10));`,再 `await controller.RefreshSessionAsync();`:firewall.PatrolCalls 为空;巡检定时仍是 count 条。然后 source 再放一个 `Ok(TestData.Session())`,ConnectAsync:State 是 Connected;巡检定时 count + 1 条。\n h. AbandonedFirstAttemptLeavesPatrolReadyForNextConnect:隧道用 `new FirstStartMissingTunnel(order)`,source 放两个 `Ok(TestData.Session())`。第一次 ConnectAsync 之后:State 是 Disconnected;ProtectionActive 为假;order 里有 \"remove\"。第二次 ConnectAsync:State 是 Connected。调现成的 `FireAndPublish(controller, timers, \"巡检\", TimeSpan.FromSeconds(60))`:firewall.PatrolCalls 恰好一条;GuardStatus 等于 \"正常\"。\n⑭ 既有用例:名字不改、不删、不跳过;每个既有用例里带 `Assert.` 的行一个字不许动(TESTS 会和改动前逐行比)。派单方已逐个核过 ControllerTests.cs 里数巡检定时、触发巡检的既有用例,按本契约改完都应照样通过,不需要动它们。如果有既有用例(本文件或别的测试文件)过不了:先查是不是自己的实现和 ①~⑩ 有出入;确认实现照抄无误仍然过不了,停下交 blocked,写清用例名、现在的断言、你看到的实际值,不许改断言、不许加重试、不许动别的测试文件。\n⑮ 下面这些既有用例卡的正是本单容易弄坏的地方,改完必须照样过:PatrolUsesModeSpecificRulesAfterSixtySeconds、PatrolRepairsOrWarnsWithoutStoppingAndAlwaysSchedulesNext、DisconnectedTimersCannotProbeOrPatrolEvenAfterTenMinutes、ReconnectKeepsOnePatrolAndInvalidatesPreviousExitCycle、ReconnectingWithoutSessionSkipsMissingRuleRebuildAndKeepsPatrolling、DisconnectCancelsRunningPatrolAndFinishesPromptly、LeavingConnectedClearsExitEvenWhenStoppingThrows、AppsPatrolRebuildsWithoutDefaultBlockAndSelfCheckSkipsIpv6、PatrolAddsProtectionForNewExecutables、PairingModeNeverSchedulesRenew,以及名字以 StartupKept 开头的八个。",
+  "background": "项目:外包「澳洲出口节点 + Windows 一键客户端」。客户端 .NET 9(winclient/WinClient.sln:Core + App + Tests + UiTests)。连接控制器 ClientController 管连接状态机、断网保护的套用与撤销、各种定时(出口核验、巡检、退避、到期、续期)。所有改状态的动作都在串行锁 gate 里做。巡检每 60 秒一次:查防火墙规则与过滤层、兜底路由(firewall.PatrolAsync),再查网卡(PatrolNicAsync),结果写进保护状态 guardStatus。\n\n先读(全文):winclient/WinClient.Core/Client/ClientController.cs;winclient/WinClient.Tests/ControllerTests.cs 里的这些段:Timers、Firewall、Tunnel、ObservableTunnel、ScriptedSource、MemoryRouting、FireAndPublish、Until、ScopeOf、ConnectMonitored,以及 goal ⑮ 点名的既有用例。只读参考:winclient/WinClient.Core/Firewall/KillSwitchApplier.cs(PendingMode 从恢复记录读范围;巡检脚本在全部流量下会把防火墙三档的默认出站设成阻断)、winclient/WinClient.Core/State 下的连接状态机。检查脚本 docs/plans/checks/yc_patrol_parked_1128.py(SHAPE、TESTS、SCOPE 三项验收照它判)。\n\n要知道的事实:\n- 现在巡检定时走 Schedule,回调绑着连接的 lifetime 令牌和代数 generation。FailAsync(连接落到「需人工处理」)会取消 lifetime 且不换新;ConnectAsync 开头才换新。所以停住以后巡检既不该排(ShouldPatrol 为假)也排不上。\n- 断网保护在不在看字段 protection。它在套用保护的动作里置真,在撤销动作(状态迁移里的 RemoveKillSwitch)或 RemoveProtectionAsync(首次连接失败放弃时用)里置假。ExecuteAsync 每次状态迁移结束都会调 UpdateMonitoring。\n- 启动时「上次没断开、有恢复记录、但找不到配对文件或登录凭据」会直接停在「需人工处理」并保持保护(InitializeAsync 里 keptMissing 那一路,PR #104 刚合并)。这条路不经过 ConnectAsync,控制器手里的代理范围 activeRouting 还是默认的全部流量,所以 goal ⑨ 要在这里读一次设置。\n- 代理范围两种:全部流量(global)、仅指定程序(apps)。恢复记录里记着套保护时的范围(firewall.PendingMode,读不到算 global)。ConnectAsync 里已有同样的核对式子(「上次的断网保护记录与当前代理范围不一致」那一行),goal ② 的 PatrolModeMismatch 用的是同一个式子。\n- 测试替身 Timers 不会自己到点:每个定时都是手动触发的任务,token 取消时任务跟着取消。Timers.Fire(\"巡检\", …) 触发的是第一条还没完成的巡检定时。测试里没有「立即完成」的延时替身。\n- DisconnectAsync 在拿串行锁之前取消 lifetime;本单让它同时取消巡检的取消源,既有用例 DisconnectCancelsRunningPatrolAndFinishesPromptly 要求断开能打断正在跑的巡检、2 秒内完成、断开后不再多排一条巡检。\n\n已定的取舍(不要改):\n- 巡检出任何结果都不改连接状态、不撤保护、不调 FailAsync。\n- 停住时巡检不改提示语 message,只更新 guardStatus;已连接或重连中的行为不变。\n- 没有会话时规则缺失不重建,仍写「巡检失败,下一轮重试」(既有用例断言这句)。\n- 范围对不上时整段防火墙巡检不做(含给新出现的程序文件补保护那一步),网卡巡检照做。\n- 旧的巡检取消源只取消、不释放。\n- 文档和口径速查表本单不改,合并后由派单方补。\n\n硬规矩(做不到就停下交 blocked + forks,不猜):①只改允许清单里的两个文件;②既有测试不改名、不删、不跳过,带 Assert. 的行一个字不动,不许加重试、不许放宽断言;③不许 git 写操作,不许自己跑 dotnet(build / test / restore 一律按验收编号走派单器自测通道),命令单独一条执行(不用 cd &&、管道、2>&1);不许装依赖;④每次 Edit / Write 的新内容控制在 150 行以内;⑤goal 里的代码、常量、提示语照原文一字不差(含全角标点),新增注释用中文大白话;⑥本单不新起任何子进程;⑦SHAPE 按字面和方法正文查:goal ⑪ 列的方法正文一个字不能变(连空格和注释),PatrolAsync、PatrolNicAsync、UpdateMonitoring、SchedulePatrol 改完要和 goal 写的逐字一致(只忽略空白),InitializeAsync、DisconnectAsync、RemoveProtectionAsync、Dispose 只许加行、不许删改原有的行;⑧不许读写 secrets/;⑨遇到契约没写到、要自己拍板的地方,停下交 blocked 并写清岔路。",
+  "nonGoals": [
+    "不改文档和口径速查表(合并后派单方补)",
+    "不改巡检间隔、巡检查什么、各句提示语",
+    "不改状态机和 WinClient.Core/State 下的文件",
+    "不改防火墙、过滤层、网卡那几层的巡检实现",
+    "没有会话时规则缺失不重建(另一张卡的事)",
+    "不做真机实测,不打发布包,不改版本号"
+  ],
+  "allowedPaths": [
+    "winclient/WinClient.Core/Client/ClientController.cs",
+    "winclient/WinClient.Tests/ControllerTests.cs"
+  ],
+  "forbiddenPaths": [
+    ".codex/**",
+    ".github/**",
+    ".gitignore",
+    "pyproject.toml",
+    "authserver/**",
+    "node/**",
+    "scripts/**",
+    "docs/**",
+    "winclient/*.sln",
+    "winclient/Directory.Build.props",
+    "winclient/third_party/**",
+    "winclient/WinClient.UiTests/**",
+    "winclient/WinClient.App/**",
+    "winclient/WinClient.Core/State/**",
+    "winclient/WinClient.Core/Ipc/**",
+    "winclient/WinClient.Core/Firewall/**",
+    "winclient/WinClient.Core/Network/**",
+    "winclient/WinClient.Core/Diagnostics/**",
+    "winclient/WinClient.Core/Update/**",
+    "winclient/WinClient.Core/Kernel/**",
+    "winclient/WinClient.Core/Process/**",
+    "winclient/WinClient.Core/Hosting/**",
+    "winclient/WinClient.Core/Client/ClientRuntime.cs",
+    "winclient/WinClient.Core/WinClient.Core.csproj",
+    "winclient/WinClient.Tests/WinClient.Tests.csproj",
+    "winclient/WinClient.Tests/ConnectAbandonTests.cs",
+    "winclient/WinClient.Tests/ConnectJournalFlowTests.cs",
+    "winclient/WinClient.Tests/KillSwitchRecoveryTests.cs",
+    "winclient/WinClient.Tests/PairingTests.cs",
+    "winclient/WinClient.Tests/IpcTests.cs"
+  ],
+  "expectArtifacts": [],
+  "acceptance": [
+    {
+      "id": "BUILD",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "build",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1200
+    },
+    {
+      "id": "TEST",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "test",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--no-build",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1500
+    },
+    {
+      "id": "T-CONTROLLER",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "test",
+        "winclient/WinClient.Tests/WinClient.Tests.csproj",
+        "-c",
+        "Release",
+        "--nologo",
+        "--filter",
+        "FullyQualifiedName~ControllerTests"
+      ],
+      "required": true,
+      "timeoutSec": 1500
+    },
+    {
+      "id": "SHAPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_patrol_parked_1128.py",
+        "shape"
+      ],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "TESTS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_patrol_parked_1128.py",
+        "tests"
+      ],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "SCOPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_patrol_parked_1128.py",
+        "scope"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "timeoutSec": 10800,
+  "repoRoot": "E:/yuanc",
+  "steps": [
+    "读 background 列出的文件与检查脚本。",
+    "先写测试:ControllerTests.cs 加 goal ⑫ 的两个成员和 ⑬ 的八个新用例;申请 BUILD 以编译失败证红(新用例用到 ClientController.PatrolModeMismatchStatus),之后固定 BUILD→TEST。",
+    "按 goal ①~⑩ 改 ClientController.cs,每改完一处对一遍 SHAPE。",
+    "BUILD、TEST、T-CONTROLLER、SHAPE、TESTS、SCOPE 全绿后交活;交活说明逐条对照 goal ①~⑮ 写做到了没有,并单列只有真机能验的(停在「需人工处理」时手工删一条本项目防火墙规则,一分钟内保护状态显示已重建)。"
+  ]
+}
