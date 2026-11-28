@@ -24,6 +24,8 @@ public static class Program
                     return Environment.ExitCode;
                 case "--apply-update":
                     return UpdateWindowsHost.ApplyAsync().GetAwaiter().GetResult();
+                case "--uninstall-prompt":
+                    return UninstallPrompt.Run();
                 case "--install":
                 case "--uninstall":
                 case "--repair":

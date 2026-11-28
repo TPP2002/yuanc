@@ -16,6 +16,8 @@ public interface IUpdateHost
     Task<bool> WaitServiceAsync(bool running, TimeSpan timeout, CancellationToken token);
     Task<ControlResponse?> ReadStatusAsync(CancellationToken token);
     void SetRunValue(string executable);
+    // 把开始菜单图标、桌面图标、卸载入口指到这份程序。
+    void SetEntryPoints(string executable, string version);
     /// <summary>服务正在运行且能查到服务进程的程序完整路径时返回规范化路径，否则 null。</summary>
     string? RunningServiceExecutable();
 }
@@ -126,6 +128,7 @@ public sealed class UpdateApplier(UpdateStore store, ICommandRunner runner, IUpd
                 await CommandAsync(UpdatePlanner.Start(), CancellationToken.None).ConfigureAwait(false);
                 if (!await host.WaitServiceAsync(true, TimeSpan.FromSeconds(30), CancellationToken.None).ConfigureAwait(false)) throw new InvalidOperationException();
                 host.SetRunValue(pending.OldExe);
+                RefreshEntryPoints(host, pending.OldExe, pending.OldVersion, log);
                 if (badProcess) store.MarkBad(pending.NewVersion);
                 store.AppendHistory(pending.NewVersion, "rolled_back", host.Now, badProcess ? "新版后台未能响应，已恢复旧版。" : "更新未完成，已恢复旧版，下次再试。");
                 store.DeletePending();
@@ -149,6 +152,7 @@ public sealed class UpdateApplier(UpdateStore store, ICommandRunner runner, IUpd
     internal static void Complete(UpdateStore store, UpdatePending pending, IUpdateHost host, string appRoot, ILog log)
     {
         host.SetRunValue(pending.NewExe);
+        RefreshEntryPoints(host, pending.NewExe, pending.NewVersion, log);
         store.AppendHistory(pending.NewVersion, "ok", host.Now);
         store.DeletePending();
         try
@@ -175,5 +179,11 @@ public sealed class UpdateApplier(UpdateStore store, ICommandRunner runner, IUpd
         foreach (var item in directory.EnumerateFileSystemInfos())
             if (item.Attributes.HasFlag(FileAttributes.ReparsePoint) || item is DirectoryInfo child && HasLinks(child)) return true;
         return false;
+    }
+    // 图标和卸载入口只是入口，更新不成不能连累已经换好的后台服务。
+    private static void RefreshEntryPoints(IUpdateHost host, string executable, string version, ILog log)
+    {
+        try { host.SetEntryPoints(executable, version); }
+        catch (Exception) { log.Write("开始菜单图标、桌面图标或卸载入口未能更新。"); }
     }
 }
