@@ -19,6 +19,7 @@
     <PublishTrimmed>false</PublishTrimmed>
   </PropertyGroup>
   <ItemGroup><ProjectReference Include="../WinClient.Core/WinClient.Core.csproj" /></ItemGroup>
+  <ItemGroup><Content Include="../../NuGet.Config" Link="extra.config" CopyToPublishDirectory="Always" ExcludeFromSingleFile="true" /></ItemGroup>
   <ItemGroup>
     <Resource Include="Assets/*.ico" />
     <InternalsVisibleTo Include="WinClient.UiTests" />
