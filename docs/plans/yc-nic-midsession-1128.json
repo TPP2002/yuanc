@@ -1,0 +1,150 @@
+{
+  "schemaVersion": 1,
+  "taskId": "SEC-WIN-NIC-PUBLIC-ADDR-MIDSESSION-1127",
+  "slug": "yc-nic-midsession-1128",
+  "title": "连着时网卡新出现公网 IPv4 就停连接并保持保护;网卡地址一变两秒内收紧,不等巡检",
+  "workbuddyTier": "hard",
+  "goal": "以派单时 origin/main 头为基点(已含 PR #107「停住后巡检照常跑」)。看板卡 SEC-WIN-NIC-PUBLIC-ADDR-MIDSESSION-1127。\n\n【问题】\n连接前,网卡上直接有公网 IPv4 会拒绝连接;带公网 IPv6 的网卡在套保护时关掉 IPv6。连上以后才出现的,现在处理得比连接前松,三处:\n1. 巡检发现网卡新出现公网 IPv4,只把提示换成一句话,连接照旧。不走系统代理设置的软件能读到这块网卡上的地址。\n2. 新出现的公网 IPv6 要等每 60 秒一轮的巡检才关,最长暴露 60 秒。\n3. 重新套保护时,防火墙那步没套成、走「隧道保持并告警」分支,后面的网卡收紧整个被跳过。\n\n【要的行为】\n① 连着时网卡出现公网 IPv4:和连接前同一个口径,停掉隧道、断网保护保持、点名网卡。\n   - 发现时状态是 连接中 / 已连接 / 重连中:不是首次尝试的,取消连接的 lifetime,走 OperationFailed 迁移(停隧道、进「需人工处理」),保护不撤;主消息换成下面定稿的停住提示,巡检状态行换成定稿的状态句。首次尝试期间(从没连上过)的,照既有口径放弃并恢复原来的网络(AbandonAsync),原因句用定稿的那句。\n   - 发现时已经停住(需人工处理、需重新登录等):只换巡检状态行,不动主消息,不再迁移、不再停隧道。\n   - 停隧道那步自己出错:主消息用既有的「连接内核未能停止，请联系管理员；断网保护保留。」\n   - 连接前拒连那句和它的判断一个字不动。\n② 网卡地址一变就收紧,不等巡检:新增地址变化通知的来源(IAddressChangeSource),控制器订阅。保护在时收到通知,等 2 秒(一次换网会连着来好几次通知,合成一次),进串行锁做一次网卡收紧(和巡检里那一步是同一个方法):新出现公网 IPv6 的网卡先记后关,出现公网 IPv4 按 ① 处理。通知回调在系统线程上,只排队,不读网卡、不拿锁。保护不在时不排。巡检里的网卡收紧照旧保留作兜底。\n③ 重新套保护时,防火墙那步没套成、隧道保持,网卡收紧也照做;它自己没关成(NicGuardException)且原来持有保护的,隧道同样保持,两条告警用一个空格接起来都显示。防火墙那步没成时不做「重置旧连接」(ReapStaleConnections),和现在一样。网卡那步的其他异常照旧往外抛,和防火墙成功时一样。\n\n【定稿的字(一字不差,标点是半角逗号的照抄)】\n- 停住提示,全部流量:网卡「<网卡名>」上出现了公网 IPv4 地址(通常是电脑自己拨号上网,或换了网络),部分软件和网页可以直接读到这个地址,已停止连接。断网保护保持,电脑暂时上不了网。请点「断开」恢复原来的网络,改由路由器拨号上网后再连接,或联系管理员。\n- 停住提示,仅指定程序:同上,只把「电脑暂时上不了网」换成「名单里的程序暂时上不了网」。\n- 巡检状态句:网卡「<网卡名>」出现公网 IPv4 地址,连接已停止,断网保护保持\n- 首次尝试放弃时的原因句:原因：网卡「<网卡名>」上出现了公网 IPv4 地址。(放弃记录里的短语:网卡出现公网 IPv4)\n- 地址变化触发的收紧关掉了网卡:巡检状态行写「已关闭新出现公网 IPv6 的网卡 n 个」(整句替换);巡检里关掉的照旧接在本轮结果后面,如「正常,已关闭新出现公网 IPv6 的网卡 1 个」。\n- 旧提示「网卡「…」出现公网 IPv4 地址,部分软件可能读到它;连接与断网保护保持,请改由路由器拨号或联系管理员」删掉,不再出现。\n- 写进连接记录的行不带任何地址。\n\n【怎么改(名字、签名照抄;下面的代码是派单方写的参考实现,没编译过,编译不过或用例不过按上面的行为意图修,名字、签名、定稿的字不许改)】\n\n一、新增 winclient/WinClient.Core/Network/AddressChangeSource.cs:\n\n```csharp\nusing System.Net.NetworkInformation;\n\nnamespace WinClient.Core.Network;\n\n/// <summary>本机网卡地址有变化时发一次通知;只是个信号,不带任何地址。</summary>\npublic interface IAddressChangeSource\n{\n    event Action? Changed;\n}\n\n/// <summary>接系统的地址变化通知。回调在系统线程上,订阅者不能在里面做重活。</summary>\npublic sealed class SystemAddressChangeSource : IAddressChangeSource, IDisposable\n{\n    public event Action? Changed;\n    public SystemAddressChangeSource() => NetworkChange.NetworkAddressChanged += OnChanged;\n    private void OnChanged(object? sender, EventArgs e) => Changed?.Invoke();\n    public void Dispose() => NetworkChange.NetworkAddressChanged -= OnChanged;\n}\n```\n\n二、winclient/WinClient.Core/Client/ClientController.cs:\n\n1. 两个构造函数的参数表最后各加 `IAddressChangeSource? addressChanges = null`;第一个构造函数转给第二个时带上 `addressChanges: addressChanges`;第二个构造函数在 `tunnel.TunnelDown += OnTunnelDown;` 之后存下来并订阅(`addressChanges.Changed += OnAddressChanged`,为空不订阅)。Dispose 里退订(`addressChanges.Changed -= OnAddressChanged`),来源若是 IDisposable 一并释放。\n\n2. 新增字段、常量和两句定稿的字:\n\n```csharp\n    // 地址变化后等 2 秒再收紧:一次换网会连着来好几次通知,合成一次。\n    internal static readonly TimeSpan NicSweepDelay = TimeSpan.FromSeconds(2);\n    private readonly IAddressChangeSource? addressChanges;\n    private int nicSweepQueued;\n\n    internal static string PublicIpv4ParkedMessage(string adapter, bool apps) =>\n        $\"网卡「{adapter}」上出现了公网 IPv4 地址(通常是电脑自己拨号上网,或换了网络),部分软件和网页可以直接读到这个地址,已停止连接。断网保护保持,{(apps ? \"名单里的程序\" : \"电脑\")}暂时上不了网。请点「断开」恢复原来的网络,改由路由器拨号上网后再连接,或联系管理员。\";\n    internal static string PublicIpv4GuardStatus(string adapter) => $\"网卡「{adapter}」出现公网 IPv4 地址,连接已停止,断网保护保持\";\n```\n\n3. 原来的 PatrolNicAsync 整个换成下面三个方法(PatrolAsync 不动,它照旧调 PatrolNicAsync()):\n\n```csharp\n    /// <summary>巡检里的网卡收紧。</summary>\n    private Task PatrolNicAsync() => TightenNicAsync(fromPatrol: true);\n\n    /// <summary>\n    /// 读一次网卡:新出现公网 IPv6 的先记后关;出现公网 IPv4 时,隧道可能在跑就停掉、保护保持。\n    /// 巡检和地址变化通知共用;只在串行锁内调用。\n    /// </summary>\n    private async Task TightenNicAsync(bool fromPatrol)\n    {\n        if (nicGuard is null || patrolLifetime.IsCancellationRequested || disposed) return;\n        string? publicIpv4 = null;\n        try\n        {\n            var nic = await nicGuard.PatrolAsync(patrolLifetime.Token);\n            if (nic.NewlyDisabled.Count > 0)\n            {\n                var closed = $\"已关闭新出现公网 IPv6 的网卡 {nic.NewlyDisabled.Count} 个\";\n                guardStatus = fromPatrol && guardStatus.Length > 0 ? guardStatus + \",\" + closed : closed;\n            }\n            if (nic.PublicIpv4Adapters.Count > 0) publicIpv4 = nic.PublicIpv4Adapters[0];\n        }\n        catch (NicGuardException ex) { guardStatus = ex.Message; if (PatrolMaySpeak) message = guardStatus; }\n        catch (Exception ex) when (IsOperational(ex)) { }\n        if (publicIpv4 is not null) await ParkForPublicIpv4Async(publicIpv4);\n    }\n\n    /// <summary>网卡上出现公网 IPv4:和连接前拒连同一个口径。隧道可能在跑就停掉,保护保持;已经停住的只更新巡检状态。</summary>\n    private async Task ParkForPublicIpv4Async(string adapter)\n    {\n        if (machine.State is not (ConnectionState.Connecting or ConnectionState.Connected or ConnectionState.Reconnecting))\n        {\n            guardStatus = PublicIpv4GuardStatus(adapter);\n            return;\n        }\n        if (firstAttempt)\n        {\n            // 从没连上的那次尝试:照既有口径放弃并恢复原来的网络。\n            await AbandonAsync(null, phrase: \"网卡出现公网 IPv4\", reason: $\"原因：网卡「{adapter}」上出现了公网 IPv4 地址。\");\n            return;\n        }\n        WriteJournal(\"网卡出现公网 IPv4：停止隧道，断网保护保持\");\n        lifetime.Cancel();\n        try\n        {\n            await ExecuteAsync(machine.Handle(new(ConnectionEventKind.OperationFailed)));\n            message = PublicIpv4ParkedMessage(adapter, activeRouting.Mode == RoutingMode.Apps);\n        }\n        catch (Exception ex) when (IsOperational(ex)) { message = \"连接内核未能停止，请联系管理员；断网保护保留。\"; }\n        guardStatus = PublicIpv4GuardStatus(adapter);\n    }\n```\n\n4. 新增地址变化的回调和收紧任务:\n\n```csharp\n    /// <summary>系统线程上的回调:只排一次网卡收紧,不读网卡、不拿锁。</summary>\n    private void OnAddressChanged()\n    {\n        if (disposed || !protection || nicGuard is null) return;\n        if (Interlocked.Exchange(ref nicSweepQueued, 1) == 1) return;\n        _ = RunNicSweepAsync(patrolLifetime.Token);\n    }\n\n    /// <summary>等 2 秒后在串行锁内做一次网卡收紧。用巡检的取消口:断开时让路,保护撤掉就作废。</summary>\n    private async Task RunNicSweepAsync(CancellationToken token)\n    {\n        var entered = false;\n        try\n        {\n            await DelayForPurposeAsync(NicSweepDelay, token, \"网卡收紧\");\n            await gate.WaitAsync(token);\n            entered = true;\n            try\n            {\n                // 进锁就把排队标记放掉:收紧期间再来的通知要能再排一次。\n                Interlocked.Exchange(ref nicSweepQueued, 0);\n                if (disposed || !protection) return;\n                await TightenNicAsync(fromPatrol: false);\n                JournalPatrol();\n            }\n            finally { Publish(); gate.Release(); }\n        }\n        catch (OperationCanceledException) when (token.IsCancellationRequested) { }\n        finally { if (!entered) Interlocked.Exchange(ref nicSweepQueued, 0); }\n    }\n```\n\n5. ExecuteEffectsAsync 里只改 `case EffectKind.ApplyKillSwitch:` 这一个分支,别的分支一个字不动。改成:\n\n```csharp\n                    case EffectKind.ApplyKillSwitch:\n                        var held = protectionVerified;\n                        protection = true; // Even partial Apply must be treated as requiring explicit recovery.\n                        var firewallApplied = false;\n                        try\n                        {\n                            if (activeRouting.Mode == RoutingMode.Apps) await ApplyAppsAsync();\n                            else await firewall.ApplyAsync(NodeIps(session!), program, session!.Node.Hy2Port, session.Node.RealityPort,\n                                    sessionSource is AuthServerSessionSource ? authEndpoint : null);\n                            protectionVerified = true;\n                            firewallWarning = null;\n                            reapWarning = null;\n                            firewallApplied = true;\n                        }\n                        catch (FirewallIneffectiveException ex) when (held)\n                        {\n                            WriteJournal(\"套用断网保护没成功，隧道保持：\" + ConnectJournal.Describe(ex));\n                            var keep = ex is WfpUnavailableException ? WfpKeepTunnelWarning\n                                : ex is RouteGuardUnavailableException ? RouteKeepTunnelWarning : KeepTunnelWarning;\n                            firewallWarning = keep;\n                            guardStatus = keep;\n                            message = keep;\n                        }\n                        // 网卡收紧和防火墙那步分开做:防火墙没套成、隧道保持时,带公网 IPv6 的网卡也要关。\n                        try\n                        {\n                            if (nicGuard is not null) await nicGuard.ApplyAsync(lifetime.Token);\n                            if (firewallApplied) ReapStaleConnections();\n                        }\n                        catch (NicGuardException ex) when (held)\n                        {\n                            WriteJournal(\"套用断网保护没成功，隧道保持：\" + ConnectJournal.Describe(ex));\n                            var keep = NicKeepTunnelWarning(ex);\n                            firewallWarning = firewallWarning is null ? keep : firewallWarning + \" \" + keep;\n                            guardStatus = firewallWarning;\n                            message = firewallWarning;\n                        }\n                        break;\n```\n\n6. 下面这些方法一个字不动:Schedule、RunScheduledAsync、FailAsync、AbandonAsync、RemoveProtectionAsync、MaybeAbandonAfterLoginFailureAsync、InitializeAsync、ConnectAsync(bool fromUser)、DisconnectAsync、RefreshSessionAsync、ChangeSessionSourceAsync、ExecuteAsync、FetchSessionAsync、ApplySessionAsync、RenewAsync、CheckExitAsync、CheckEnvironmentAsync、PatrolNewExecutablesAsync、JournalPatrol、UpdateMonitoring、SyncPatrol、SchedulePatrol、RunPatrolAsync、PatrolAsync、ReapStaleConnections。\n\n三、winclient/WinClient.Core/Client/ClientRuntime.cs:创建控制器的参数里正好加一行 `addressChanges: testBuild ? null : new SystemAddressChangeSource(),`(放在 `reaper:` 那一行后面),别的不动。测试包的网卡收紧本来就是不执行的外壳,不用接通知。\n\n四、测试(winclient/WinClient.Tests/ControllerTests.cs;用例名照抄,不许改名):\n- 加替身:\n```csharp\n    private sealed class FakeAddressChanges : IAddressChangeSource, IDisposable\n    {\n        public event Action? Changed;\n        public bool Disposed { get; private set; }\n        public int Subscribers => Changed?.GetInvocationList().Length ?? 0;\n        public void Raise() => Changed?.Invoke();\n        public void Dispose() => Disposed = true;\n    }\n```\n- 既有辅助方法 NicController 只许在参数表最后加一个可选参数 `FakeAddressChanges? changes = null` 并传给控制器的 `addressChanges:`,别的不动。\n- 既有用例 PatrolReportsNewPublicIpv4AdapterWithoutDisconnect 断言的是旧行为:改名为 PatrolDisablesNewIpv6AdapterAndReportsNicFailure,去掉中间「出现公网 IPv4 只提示」那一段(从 `nic.PatrolResult = new([], [\"拨号连接\"]);` 到 `Assert.DoesNotContain(\"remove\", order);`),前面关 IPv6 的断言和后面「巡检失败文案」的断言原样保留。别的既有用例一个字不动。\n- 新用例(每个至少三条断言):\n  1. PublicIpv4MidSessionStopsTunnelAndKeepsProtection(Theory,两组:全部流量 / 仅指定程序;仅指定程序的写法照 ConnectRefusedWhenAdapterHasPublicIpv4):连上 → nic.PatrolResult = new([], [\"拨号连接\"]) → FireParkedPatrol → 状态 NeedsManual、ProtectionActive 为真、order 里有 \"stop\"、没有 \"remove\"、Message 等于 ClientController.PublicIpv4ParkedMessage(\"拨号连接\", apps)、GuardStatus 等于 ClientController.PublicIpv4GuardStatus(\"拨号连接\");再 FireParkedPatrol 一次:状态和 Message 不变,\"stop\" 还是一次。\n  2. ParkedPatrolReportsPublicIpv4InStatusOnly:用带 FailStop 的隧道替身(变量名 tunnel),连上后 `tunnel.FailStop = true`、断开失败停在 NeedsManual;记下 Message;nic.PatrolResult 给公网 IPv4;FireParkedPatrol → GuardStatus 等于 PublicIpv4GuardStatus、Message 不变、状态不变。\n  3. PublicIpv4DuringFirstAttemptRestoresNetwork:让第一次启动隧道抛 IOException(用现成替身,没有就在测试文件里加一个小的),连接后处在首次尝试的退避里、保护已套上;nic.PatrolResult 给公网 IPv4;FakeAddressChanges.Raise() 后触发「网卡收紧」那个等待 → 状态 Disconnected、ProtectionActive 为假、order 里有 \"remove\"、Message 等于「连接失败，已恢复原来的网络，当前没有走澳洲出口。原因：网卡「拨号连接」上出现了公网 IPv4 地址。」\n  4. AddressChangeTightensNicWithinSeconds:连上;nic.PatrolResult = new([\"以太网\"], []);连着 Raise() 三次 → timers.For(\"网卡收紧\") 只有一个且等于 ClientController.NicSweepDelay;触发它 → order 里多了一次 \"nic-patrol\"、GuardStatus 等于 \"已关闭新出现公网 IPv6 的网卡 1 个\"、状态仍是 Connected;再 Raise() 一次 → 「网卡收紧」的等待变成两个。\n  5. AddressChangeParksOnPublicIpv4:连上;nic.PatrolResult 给公网 IPv4;Raise() 后触发「网卡收紧」→ 状态 NeedsManual、Message 等于 PublicIpv4ParkedMessage、ProtectionActive 为真。不用等 60 秒的巡检。\n  6. AddressChangeIgnoredWithoutProtection:还没连接时 Raise() → Assert.Empty(timers.For(\"网卡收紧\"));连上再正常断开后 Raise() → 「网卡收紧」的等待数不增加。\n  7. DisposeUnsubscribesAddressChanges:构造后 Subscribers 为 1;Dispose 后 Subscribers 为 0、Disposed 为真。\n  8. HeldFirewallFailureStillTightensNic:照 HeldWfpFailureKeepsTunnelAndShowsExactWarning 的搭法(Firewall 的 HasPendingState = true、ApplyError 是 WfpUnavailableException,InitializeAsync(autoConnect: false, keepProtection: true)),另加 FakeNic → 状态 Connected、order 里 \"nic-apply\" 在 \"apply\" 之后 \"start\" 之前、没有 \"reap\"、Message 等于既有那句过滤层告警。\n  9. HeldFirewallAndNicFailuresBothReported:同上,FakeNic 的 ApplyError 是带 AdapterName = \"以太网\" 的 NicGuardException → 状态 Connected、Message 等于「过滤层告警 + 一个空格 + 未能关闭网卡「以太网」的 IPv6,隧道保持,但该网卡的公网 IPv6 地址可能被网页读到;请联系管理员。」、GuardStatus 等于 Message。\n- 触发等待的办法:预计触发后仍是已连接的,用现成的 FireAndPublish(controller, timers, \"网卡收紧\", ClientController.NicSweepDelay);预计触发后会停住或回到未连接的,不要用 FireAndPublish(它拿 ConnectAsync 当锁屏障,会重新发起连接),照 FireParkedPatrol 的写法用 RefreshSessionAsync 当屏障(没连着时它什么都不做),需要的话加一个同样写法的小辅助方法。测试只用 Timers 触发等待,不许真的等时间。\n- 新增 winclient/WinClient.Tests/AddressChangeSourceTests.cs:类 AddressChangeSourceTests,一个用例 SystemSourceSubscribesAndDisposesCleanly:new SystemAddressChangeSource()、订阅 Changed、Dispose()、再 Dispose() 一次都不抛,至少一条断言。\n\n【验收怎么对上】\n- BUILD、TEST:整个解决方案构建并跑全部测试。T-CONTROLLER:只跑 ControllerTests 与 AddressChangeSourceTests。\n- SHAPE:逐项核对上面「怎么改」的名字、签名、定稿的字、不许动的方法、套用保护那个分支的次序、ClientRuntime 只加一行。\n- TESTS:九个新用例和改名的那个都在、断言够数、别的既有用例的断言行没动、没有新增跳过、没有真的等时间。\n- SCOPE:只许改这五个文件。\n- 本仓的 C# 测试项不标「旧代码上必须红」(派单器搬不动 C# 测试文件),由派单方在合并前手工判:新用例引用了基点不存在的 PublicIpv4ParkedMessage 等符号,旧代码上编译不过。\n\n【交活说明要写】\n逐条对照 ①②③ 写做到了没有;参考实现有改动的地方逐处写明改了什么、为什么。单列只有真机能验的:连着时让电脑网卡拿到公网 IPv4,几秒内不再显示已连接、提示点名网卡、网页打不开;连着时换到带公网 IPv6 的网络,几秒内那块网卡的 IPv6 被关。",
+  "background": "先读(全文):\n- winclient/WinClient.Core/Client/ClientController.cs:构造函数、ConnectAsync 里连接前拒连那一段、ExecuteEffectsAsync 的 ApplyKillSwitch 分支、PatrolAsync、PatrolNicAsync、SyncPatrol / RunPatrolAsync(巡检自己的取消口 patrolLifetime)、FailAsync、AbandonAsync、Dispose。\n- winclient/WinClient.Core/Network/NicGuard.cs:PatrolAsync 已经会「新出现公网 IPv6 的先记后关、列出带公网 IPv4 的网卡」,本单不改它。DisabledNicGuard.cs 是测试包用的不执行外壳。\n- winclient/WinClient.Core/State/ConnectionStateMachine.cs:OperationFailed(任何状态 → 需人工处理,带停隧道)、AttemptAbandoned。\n- winclient/WinClient.Core/Client/ClientRuntime.cs:创建控制器那一段。\n- winclient/WinClient.Tests/ControllerTests.cs:FakeNic、NicController、Timers、FireAndPublish、FireParkedPatrol、ObservableTunnel(带 FailStop)、ConnectRefusedWhenAdapterHasPublicIpv4、HeldWfpFailureKeepsTunnelAndShowsExactWarning、HeldProtectionKeepsTunnelWhenNicGuardFails、PatrolReportsNewPublicIpv4AdapterWithoutDisconnect。\n- winclient/WinClient.Tests/ConnectAbandonTests.cs:首次尝试、退避、放弃并恢复的搭法(TestTunnel 的 FailStart)。\n- docs/plans/checks/yc_nic_midsession_1128.py:验收检查脚本,只读,不许改。\n\n环境与规矩:\n- 本机是开发机:不许安装或启动本产品的后台服务,不许改防火墙、网卡和系统设置。本单的行为全部用替身测。\n- 子进程一律隐藏窗口:本单不新增任何起进程的代码。\n- 任何地址都不进连接记录、异常文字和测试以外的字符串;网卡名可以出现在界面提示里,不写进连接记录。\n- 测试里等控制器做完,用串行锁屏障(ConnectAsync 或 RefreshSessionAsync,见 goal 的说明),不要只等到状态变了就读提示语:状态先变,提示语晚一步才写。不许用真的等时间凑。\n- 命令单独一条执行:不要写 cd &&、管道、2>&1。构建与测试用验收里写的 dotnet 命令,不许自己另跑 dotnet build / test / restore。\n- 说明文档(docs/winclient/断网保护加固说明.md「网卡公网地址收紧」一节、口径速查表)由派单方在合并后另改,本单不碰 docs/。\n- 同时在施工的另一张单只改 winclient/WinClient.Core/Hosting/SwitchedStart.cs、winclient/WinClient.App/Hosting/InstallerRunner.cs、winclient/WinClient.Tests/SwitchedStartTests.cs,本单不要碰。",
+  "nonGoals": [
+    "不改连接前拒连的判断和那句提示",
+    "不改 NicGuard 本身(怎么判公网地址、怎么关和恢复 IPv6)",
+    "不改巡检的间隔和防火墙巡检的内容",
+    "不改测试包(断网保护关闭)的行为",
+    "不改文档和口径速查表(合并后派单方补)",
+    "不做真机实测,不打发布包,不改版本号"
+  ],
+  "allowedPaths": [
+    "winclient/WinClient.Core/Client/ClientController.cs",
+    "winclient/WinClient.Core/Client/ClientRuntime.cs",
+    "winclient/WinClient.Core/Network/AddressChangeSource.cs",
+    "winclient/WinClient.Tests/ControllerTests.cs",
+    "winclient/WinClient.Tests/AddressChangeSourceTests.cs"
+  ],
+  "forbiddenPaths": [
+    ".codex/**",
+    ".github/**",
+    ".gitignore",
+    "pyproject.toml",
+    "authserver/**",
+    "node/**",
+    "scripts/**",
+    "docs/**",
+    "winclient/*.sln",
+    "winclient/Directory.Build.props",
+    "winclient/third_party/**",
+    "winclient/WinClient.UiTests/**",
+    "winclient/WinClient.App/**",
+    "winclient/WinClient.Core/State/**",
+    "winclient/WinClient.Core/Ipc/**",
+    "winclient/WinClient.Core/Firewall/**",
+    "winclient/WinClient.Core/Diagnostics/**",
+    "winclient/WinClient.Core/Update/**",
+    "winclient/WinClient.Core/Kernel/**",
+    "winclient/WinClient.Core/Process/**",
+    "winclient/WinClient.Core/Hosting/**",
+    "winclient/WinClient.Core/Network/NicGuard.cs",
+    "winclient/WinClient.Core/Network/DisabledNicGuard.cs",
+    "winclient/WinClient.Core/WinClient.Core.csproj",
+    "winclient/WinClient.Tests/WinClient.Tests.csproj",
+    "winclient/WinClient.Tests/ConnectAbandonTests.cs",
+    "winclient/WinClient.Tests/ConnectJournalFlowTests.cs",
+    "winclient/WinClient.Tests/NicGuardTests.cs",
+    "winclient/WinClient.Tests/DisabledGuardTests.cs",
+    "winclient/WinClient.Tests/SwitchedStartTests.cs"
+  ],
+  "expectArtifacts": [],
+  "acceptance": [
+    {
+      "id": "BUILD",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "build",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1200
+    },
+    {
+      "id": "TEST",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "test",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--no-build",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1500
+    },
+    {
+      "id": "T-CONTROLLER",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "test",
+        "winclient/WinClient.Tests/WinClient.Tests.csproj",
+        "-c",
+        "Release",
+        "--nologo",
+        "--filter",
+        "FullyQualifiedName~ControllerTests|FullyQualifiedName~AddressChangeSourceTests"
+      ],
+      "required": true,
+      "timeoutSec": 1500
+    },
+    {
+      "id": "SHAPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_nic_midsession_1128.py",
+        "shape"
+      ],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "TESTS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_nic_midsession_1128.py",
+        "tests"
+      ],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "SCOPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_nic_midsession_1128.py",
+        "scope"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "timeoutSec": 10800,
+  "repoRoot": "E:/yuanc",
+  "steps": [
+    "读 background 列出的文件与检查脚本。",
+    "先写测试:ControllerTests.cs 的替身、改名的那个用例、九个新用例,AddressChangeSourceTests.cs;申请 BUILD 以编译失败证红(新符号还不存在),之后固定 BUILD→TEST。",
+    "新增 AddressChangeSource.cs,改 ClientController.cs(goal 二的 1 到 5),ClientRuntime.cs 加一行。",
+    "BUILD、TEST、T-CONTROLLER、SHAPE、TESTS、SCOPE 全绿后交活;交活说明照 goal 末尾的要求写。"
+  ]
+}
