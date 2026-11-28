@@ -1,0 +1,137 @@
+{
+  "schemaVersion": 1,
+  "taskId": "NODE-ADMIN-HALFOPEN-1127",
+  "slug": "yc-admin-halfopen-1128",
+  "title": "只连不发的连接不再占满客户端包托管服务:连接发完请求头之前不占并发名额、不开线程",
+  "goal": "一、要解决什么\n\n卡 NODE-ADMIN-HALFOPEN-1127。节点上的客户端包托管服务(exitnode-admin,node/exitnode/admin/server.py)现在是「一条连接一接进来就占一个并发名额、开一条线程」,名额 32 个,每条连接最长等 15 秒。2026-11-27 真机实测:开 1100 条只连不发请求的连接,名额被占光,正常请求当场被拒,`exitnode check` 的「客户端托管服务」一层失败。经隧道连进来的任何一台设备都能这样让别人取不到更新。\n\n做法:连接接进来先放进「等候区」,不占名额、不开线程;一条线程用 selectors 同时盯着监听口和等候区里的所有连接,等某条连接把请求头发完整了,才取名额、开线程去办。只连不发、发一半就停的连接到时限就关,占不到名额。\n\n只动两个文件:node/exitnode/admin/server.py、node/tests/test_admin_server.py。\n\n二、改完以后对外是什么样(判据就是测试文件,见四)\n\n- 新连接进等候区:不占并发名额,不开线程。\n- 等候区里的连接要在时限内把请求头发完整(以空行结束)。时限是 header_timeout 和 timeout 里小的那个,默认 5 秒;到时限没发完就关,不写任何字节。\n- 请求头最多 8192 字节;超过还没发完就关,不写任何字节。\n- 等候区最多 max_waiting 条(默认 256);满了再来新连接,关掉等得最久的那一条(不写任何字节),新连接进等候区。\n- 请求头发完整后取并发名额(不等):取不到就关,不写任何字节(和现在超限时一样);取到就开线程处理,处理时每次读写最长等 timeout 秒(和现在一样)。\n- 关服务时,等候区里的连接全部关掉。\n- 取文件的逻辑、响应头、`exitnode check` 的探测逻辑、启动和收停止信号的逻辑都不变;一条连接仍然只办一个请求。\n- 不靠睡眠轮询,不另开常驻线程(盯等候区的就是跑 serve_forever 的那条线程),不用有 1024 上限的老式 select。\n\n两处行为和以前不一样,是这张卡要的,不是放宽:\n1. 以前「空连接也占名额,超过名额的空连接马上被关」;现在空连接不占名额,在等候区等到时限才关。占名额的只有发完请求、正在办的连接;名额用完时,新来的完整请求照旧马上被关、不写任何字节。\n2. 以前只发了半截请求头的连接占着名额最多 15 秒;现在它在等候区,最多等 5 秒就关。\n\n三、node/exitnode/admin/server.py 怎么改\n\n下面的写法已在派单方的机器上配四里的测试文件连跑三遍全过,全量测试和规范检查也过。名字照这个写;跑不通可以调实现,但不许动测试。\n\n(1) import:在现有 import 里按字母序加四个:collections、io、selectors、time。\n\n(2) 「from .publish import FILENAME, releases」之后到「class PackageHandler」之前,整段换成:\n\n# 请求头最多收这么多字节;超过还没收完的连接直接关掉。\nMAX_HEADER_BYTES = 8192\nHEADER_END = (b\"\\r\\n\\r\\n\", b\"\\n\\n\")\n\n\nclass PackageServer(ThreadingHTTPServer):\n    daemon_threads = True\n    request_queue_size = 64\n\n    def __init__(self, *args, max_connections=32, header_timeout=5, max_waiting=256, **kwargs):\n        # 必须先建好这些:父类构造会开始监听,但不会处理连接。\n        self._slots = threading.BoundedSemaphore(max_connections)\n        self._header_timeout = header_timeout\n        self._max_waiting = max_waiting\n        self._heads = {}\n        self._stop = threading.Event()\n        self._stopped = threading.Event()\n        super().__init__(*args, **kwargs)\n\n    def serve_forever(self, poll_interval=0.5):\n        \"\"\"一条线程管监听口和等候区:连接发完请求头之前不占并发名额、不开线程。\"\"\"\n        self._stopped.clear()\n        # 连接 -> [到期时刻, 已收到的字节, 来源地址],按接入先后排,最前面的等得最久。\n        waiting = collections.OrderedDict()\n        try:\n            with selectors.DefaultSelector() as selector:\n                self.socket.setblocking(False)\n                selector.register(self.socket, selectors.EVENT_READ)\n                try:\n                    while not self._stop.is_set():\n                        wait = poll_interval\n                        if waiting:\n                            oldest = next(iter(waiting.values()))[0]\n                            wait = max(0, min(wait, oldest - time.monotonic()))\n                        for key, _ in selector.select(wait):\n                            if key.fileobj is self.socket:\n                                self._admit(selector, waiting)\n                            else:\n                                self._read_head(selector, waiting, key.fileobj)\n                        now = time.monotonic()\n                        while waiting and next(iter(waiting.values()))[0] <= now:\n                            self._drop(selector, waiting, next(iter(waiting)))\n                finally:\n                    for sock in list(waiting):\n                        self._drop(selector, waiting, sock)\n        finally:\n            self._stop.clear()\n            self._stopped.set()\n\n    def shutdown(self):\n        self._stop.set()\n        self._stopped.wait()\n\n    def _admit(self, selector, waiting):\n        try:\n            sock, address = self.get_request()\n        except OSError:\n            return\n        if len(waiting) >= self._max_waiting:\n            # 等候区满了:关掉等得最久的那一条,给新来的让位。\n            self._drop(selector, waiting, next(iter(waiting)))\n        sock.setblocking(False)\n        waiting[sock] = [time.monotonic() + self._header_timeout, bytearray(), address]\n        selector.register(sock, selectors.EVENT_READ)\n\n    def _drop(self, selector, waiting, sock):\n        del waiting[sock]\n        selector.unregister(sock)\n        self.shutdown_request(sock)\n\n    def _read_head(self, selector, waiting, sock):\n        entry = waiting.get(sock)\n        if entry is None:\n            # 同一轮里先被挤掉或已到期的连接。\n            return\n        try:\n            data = sock.recv(4096)\n        except (BlockingIOError, InterruptedError):\n            return\n        except OSError:\n            data = b\"\"\n        if not data:\n            self._drop(selector, waiting, sock)\n            return\n        entry[1] += data\n        if not any(mark in entry[1] for mark in HEADER_END):\n            if len(entry[1]) > MAX_HEADER_BYTES:\n                self._drop(selector, waiting, sock)\n            return\n        del waiting[sock]\n        selector.unregister(sock)\n        if not self._slots.acquire(blocking=False):\n            # 并发名额用完:直接关闭,不开线程、不写任何响应字节。\n            self.shutdown_request(sock)\n            return\n        self._heads[sock] = bytes(entry[1])\n        try:\n            self.process_request(sock, entry[2])\n        except Exception:\n            # 线程没能启动时名额不会被 process_request_thread 归还。\n            self._heads.pop(sock, None)\n            self._slots.release()\n            self.shutdown_request(sock)\n\n    def process_request_thread(self, request, client_address):\n        try:\n            super().process_request_thread(request, client_address)\n        finally:\n            self._heads.pop(request, None)\n            self._slots.release()\n\n    def handle_error(self, request, client_address):\n        logging.getLogger(\"exitnode\").error(redact(\"客户端包请求处理失败\"))\n\n   (原来 PackageServer 里重写的 process_request 整个删掉:并发名额改到收齐请求头之后再取。process_request_thread 和 handle_error 留着,process_request_thread 的 finally 里多一行清掉请求头。)\n\n(3) PackageHandler 里,在「timeout = 15」之后、log_message 之前加一个方法:\n\n    def setup(self):\n        super().setup()\n        # 请求头已经由服务线程收齐,这里不再从连接上读。\n        self.rfile.close()\n        self.rfile = io.BytesIO(self.server._heads.pop(self.connection, b\"\"))\n\n(4) create_server 整个函数换成:\n\ndef create_server(bind, port, root, *, max_connections=32, timeout=15, header_timeout=5, max_waiting=256):\n    # 派生子类承载本实例的超时,不改全局 PackageHandler.timeout。\n    handler = type(\"PackageHandler\", (PackageHandler,), {\"timeout\": timeout})\n    # 等请求头的时限不超过套接字超时。\n    server = PackageServer((bind, port), handler, max_connections=max_connections,\n                           header_timeout=min(header_timeout, timeout), max_waiting=max_waiting)\n    server.root = Path(root).absolute()\n    return server\n\n(5) 别的函数(PackageServer.handle_error、PackageHandler 的 log_message、_headers、send_error、do_HEAD、do_GET、_serve,以及 serve、check)一个字不动。\n\n四、node/tests/test_admin_server.py:用命令写出,不许手改\n\n测试文件的正本在 docs/plans/checks/yc_admin_halfopen_1128_tests.txt。单独执行这一条命令,把它原样写成测试文件:\n\npython docs/plans/checks/yc_admin_halfopen_1128.py write-tests\n\n这份测试在改动前的代码上是 7 条红、17 条绿(红的 7 条:test_idle_connections_do_not_take_slots、test_partial_header_does_not_take_slot、test_header_timeout_closes_idle_connection_early、test_oversized_header_is_closed_without_response、test_waiting_room_evicts_oldest_connection、test_flood_of_idle_connections_keeps_service_available、test_shutdown_closes_waiting_connections)。原来的两条 test_connection_limit_closes_extra_connection_and_recovers、test_rejected_connection_does_not_start_thread 改成了 test_connection_limit_closes_extra_request_and_recovers、test_rejected_request_does_not_start_thread:占名额的从空连接换成「发完请求、收了响应开头就不再读」的连接,断言的还是「名额用完时多出来的请求马上被关、不写字节、不开线程,名额让出来后恢复」。\n\n五、检查脚本逐条核对的写法(脚本:docs/plans/checks/yc_admin_halfopen_1128.py,只读)\n\nSHAPE 核 node/exitnode/admin/server.py:能解析;下面每一条都要原样出现:\n      import selectors\n      MAX_HEADER_BYTES = 8192\n      class PackageServer(ThreadingHTTPServer):\n      daemon_threads = True\n      request_queue_size = 64\n      def __init__(self, *args, max_connections=32, header_timeout=5, max_waiting=256, **kwargs):\n      self._slots = threading.BoundedSemaphore(max_connections)\n      def serve_forever(self, poll_interval=0.5):\n      selectors.DefaultSelector()\n      def shutdown(self):\n      def process_request_thread(self, request, client_address):\n      def setup(self):\n      def create_server(bind, port, root, *, max_connections=32, timeout=15, header_timeout=5, max_waiting=256):\n      min(header_timeout, timeout)\n    不许出现:\n      time.sleep(\n      print(\n      select.select(\n      threading.Timer\n      socketserver.ForkingMixIn\n      os.fork(\n    threading.Thread( 整份只许有改动前那一处(serve 里收到停止信号时用的)。\n    PackageServer 里不再有 process_request 这个方法。\n    下面这些函数和改动前逐字一样(只忽略行尾空格):\n      PackageServer.handle_error\n      PackageHandler.log_message\n      PackageHandler._headers\n      PackageHandler.send_error\n      PackageHandler.do_HEAD\n      PackageHandler.do_GET\n      PackageHandler._serve\n      serve\n      check\n\nTESTS 核 node/tests/test_admin_server.py:和 docs/plans/checks/yc_admin_halfopen_1128_tests.txt 逐行一样(只忽略行尾空格和文件末尾的空行)。\n\nSTABLE:把 node/tests/test_admin_server.py 连跑三遍,每遍都要全过。\n\nSCOPE 核这些:相对主干只许改动下面这些文件,别的一个都不许动:\n  - node/exitnode/admin/server.py\n  - node/tests/test_admin_server.py\n\n六、做的时候守这几条\n\n- 只动 allowedPaths 里的两个文件。发现非改别的文件不可,交 blocked 写清是哪一个、为什么。\n- 测试文件只用四里的命令写出,不手改一个字;某条测试你认为写错了、或在你的实现上时过时不过,交 blocked 写成结构化岔路(哪条、现象、你的判断),不改测试、不加重试、不调测试里的秒数。\n- 不放宽、不删、不跳过任何断言;实现里不许 time.sleep、不许另开常驻线程、不许 print。\n- 不记请求路径、来源地址、异常原文;现有的日志写法(redact)不动。\n- 不改单元文件、配置项、文档(合并后派单方补文档)。\n- 验收命令单独一条执行,不要拼 cd &&、管道或重定向。\n- 次序:先执行四里的命令写出测试文件,申请 T 看到 7 条红作为证红;再改 server.py;之后按 T → STABLE → PYTEST → RUFF → SHAPE → TESTS → SCOPE 跑。STABLE 是把这份测试连跑三遍,每遍都要全过。\n- 工位里不许装依赖,缺依赖停下交 blocked;不许读写 secrets/。\n\n七、交活说明要写\n\n- server.py 改了哪几处(一两句一处)。\n- 和三里的参考写法不一样的地方、为什么(没有就写没有)。\n- STABLE 三遍各用了多少秒。\n- 没做、没验的:真机(Debian,1100 条半开连接加一条慢读连接)没测;32 条慢读连接同时占满名额的情形本单不处理。",
+  "background": "项目:澳洲出口节点(Python 3.11+,只用标准库)。客户端包托管服务 exitnode-admin 是节点上一个只读的 HTTP 服务,只在本机回环地址监听;隧道里的设备访问更新地址时,由本机的转发程序连到这个回环端口,所以服务看到的来源地址全是本机,没法按来源地址限并发。\n\n开工先读:\n- node/exitnode/admin/server.py(160 行,整份读)\n- node/tests/test_admin_server.py(192 行,整份读;会被四里的命令整份换掉)\n- docs/plans/checks/yc_admin_halfopen_1128_tests.txt(新测试的正本,只读)\n- docs/plans/checks/yc_admin_halfopen_1128.py(验收脚本,只读)\n- docs/node/客户端包托管说明.md 的「连接限制」一节(现状和真机实测结论;本单不改它)\n\n现状(主干 86dfc89):\n- PackageServer 继承 ThreadingHTTPServer:process_request 里取并发名额(取不到就关),每条连接一条线程;PackageHandler.timeout = 15。\n- 服务单元带 TasksMax=64、LimitNOFILE=1024、MemoryMax=256M。等候区默认 256 条加并发 32 条,用的线程和文件描述符都在这些上限以内。\n- 测试在 Windows 上跑(检查机和工位都是 Windows),真机是 Debian;selectors.DefaultSelector 在 Windows 上是 select(一次最多 512 个),在 Linux 上是 epoll。\n\n项目红线(任何任务都生效):只动本项目自己的服务、路由、防火墙规则;凭据不入库、不入日志;隧道断了不静默回落;安装更新幂等可回退;真机没测的不标通过;Windows 上拉起的子进程一律隐藏窗口(本单不新增子进程)。\n\n本仓跑法:没有 package.json,按 Python 仓跑;pytest 配置在根目录 pyproject.toml(testpaths 含 node/tests,pythonpath 含 node)。验收命令由派单器在工位里跑。",
+  "nonGoals": [
+    "不处理 32 条慢读连接同时占满并发名额的情形(另记观察项)",
+    "不按来源地址限并发(服务看到的来源全是本机)",
+    "不改取文件的逻辑、响应头、exitnode check 的探测逻辑",
+    "不改服务单元的资源上限、配置项和文档(合并后派单方补文档)",
+    "不做真机实测,不发节点包"
+  ],
+  "allowedPaths": [
+    "node/exitnode/admin/server.py",
+    "node/tests/test_admin_server.py"
+  ],
+  "forbiddenPaths": [
+    ".codex/**",
+    ".github/**",
+    ".gitignore",
+    ".gitattributes",
+    "pyproject.toml",
+    "requirements-dev.txt",
+    "winclient/**",
+    "scripts/**",
+    "authserver/**",
+    "docs/**",
+    "node/examples/**",
+    "node/exitnode/templates/**",
+    "node/exitnode/rescue/**",
+    "node/exitnode/updater/**",
+    "node/exitnode/watchdog/**",
+    "node/exitnode/console/**",
+    "node/exitnode/admin/publish.py",
+    "node/exitnode/admin/__init__.py",
+    "node/exitnode/cli.py",
+    "node/exitnode/runner.py",
+    "node/exitnode/manifest.py",
+    "node/exitnode/config.py",
+    "node/exitnode/service.py",
+    "node/exitnode/systemd.py"
+  ],
+  "expectArtifacts": [],
+  "acceptance": [
+    {
+      "id": "T",
+      "kind": "test:targeted",
+      "target": "node/tests/test_admin_server.py",
+      "required": true,
+      "failsOnBase": true
+    },
+    {
+      "id": "STABLE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_admin_halfopen_1128.py",
+        "stable"
+      ],
+      "required": true,
+      "timeoutSec": 900
+    },
+    {
+      "id": "PYTEST",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "pytest",
+        "-q"
+      ],
+      "required": true,
+      "timeoutSec": 1500
+    },
+    {
+      "id": "RUFF",
+      "kind": "command",
+      "argv": [
+        "python",
+        "-m",
+        "ruff",
+        "check",
+        "node",
+        "authserver"
+      ],
+      "required": true,
+      "timeoutSec": 300
+    },
+    {
+      "id": "SHAPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_admin_halfopen_1128.py",
+        "shape"
+      ],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "TESTS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_admin_halfopen_1128.py",
+        "tests"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    },
+    {
+      "id": "SCOPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_admin_halfopen_1128.py",
+        "scope"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "timeoutSec": 7200,
+  "repoRoot": "E:/yuanc",
+  "steps": [
+    "读 background 列出的文件与检查脚本。",
+    "执行 goal 四里的命令写出测试文件;申请 T,看到 7 条红作为证红。",
+    "照 goal 三改 node/exitnode/admin/server.py。",
+    "T、STABLE、PYTEST、RUFF、SHAPE、TESTS、SCOPE 全绿后交活;交活说明照 goal 七的要求写。"
+  ]
+}
