@@ -17,7 +17,7 @@ public interface ITunnelTransport : IDisposable
 public sealed class TunnelTransport : ITunnelTransport
 {
     internal const int StaleAdapterPolls = 20;
-    internal const int ReadyPolls = 40;
+    internal const int ReadyPolls = 120;
     internal const int SettlePolls = 8;
     private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(250);
 

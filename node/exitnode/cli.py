@@ -18,7 +18,6 @@ from .admin import server as admin_server
 from .config import ConfigError, load
 from .log import redact
 from .manifest import UNITS, Manifest
-from .netinfo import check
 from .proxy.kernel import require_kernel
 from .rescue import probes as rescue_probes
 from .rescue import state as rescue_state
@@ -655,7 +654,7 @@ def main(argv=None, runner=None, rescue_runner=None):
             elif args.command == "status":
                 status = report.status_result(config, runner)
             else:
-                result = check(runner, config)
+                result = report.check_result(config, runner)
             if args.command == "check":
                 if args.json:
                     print(json.dumps(result, ensure_ascii=False))

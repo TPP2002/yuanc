@@ -207,7 +207,7 @@ public sealed class KernelLifetimeTests
         using (var transport = new TunnelTransport(manager, unstableProbe.Read, (_, _) => Task.CompletedTask))
             await Assert.ThrowsAsync<TimeoutException>(() => transport.StartAsync(TestData.Config, CancellationToken.None));
         Assert.Equal(1, unstableLauncher.LaunchCount);
-        Assert.Equal(21 + 40, unstableProbe.Calls);
+        Assert.Equal(21 + 120, unstableProbe.Calls);
     }
 
     [Fact]
