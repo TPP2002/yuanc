@@ -1,0 +1,160 @@
+{
+  "schemaVersion": 1,
+  "taskId": "WINCLIENT-ERROR-HINT-ONLY-ON-CONNECT-PAGE-1127",
+  "slug": "yc-page-notice-1128",
+  "title": "别的页出错也看得到提示语:窗口底部加提示条;更新页「诊断」那句说明改字(同单带 WINCLIENT-DIAG-HINT-TEXT-OUTDATED-1128)",
+  "goal": "一、要解决什么\n\n本单带两张卡:WINCLIENT-ERROR-HINT-ONLY-ON-CONNECT-PAGE-1127、WINCLIENT-DIAG-HINT-TEXT-OUTDATED-1128。\n\n1. 界面只有「连接」页显示提示语(MainViewModel.Message)。在「代理范围」「环境一致」「账号与配对」「更新与诊断」四页点按钮出了错(导入配对、兑换邀请码、清除配对、改代理范围、环境开关、检查更新),失败原因写进了 Message,当前页看不到,用户以为点了没反应。\n   做法:窗口右侧内容区底部加一条提示条,不在「连接」页时显示同一句提示语;没有提示语时不占位置。「连接」页自己的消息槽不动,在「连接」页提示条不显示。\n2. 「更新与诊断」页「诊断」下面那句说明写的还是旧内容(只说防火墙审计和环境自检),现在导出的文件还带连接状态、日志末尾、防火墙与网卡现状。只换这一句文字。\n\n改三个产品文件,新增两个测试文件,别的文件一个不动。\n\n二、逐个文件怎么改\n\n(1) winclient/WinClient.App/Views/MainShell.xaml\n\n把现在的内容区(从 <ContentControl x:Name=\"PageHost\" Grid.Column=\"1\" … 到 </ContentControl> 共 8 行)换成下面这一段。变化只有三处:外面包一层 DockPanel(Grid.Column=\"1\" 从 ContentControl 挪到 DockPanel 上);DockPanel 里先放提示条 Border(停靠在底部),再放 ContentControl;ContentControl 里面的 Style 那 6 行一个字不动。缩进随意。\n\n  <DockPanel Grid.Column=\"1\" LastChildFill=\"True\">\n   <Border x:Name=\"PageNotice\" DockPanel.Dock=\"Bottom\" BorderBrush=\"{DynamicResource Yc.Line}\" BorderThickness=\"0,1,0,0\" Padding=\"32,8,32,12\" Visibility=\"{Binding PageNoticeText, Converter={x:Static t:VisibilityConverter.Instance}}\">\n    <TextBlock Text=\"{Binding PageNoticeText}\" FontSize=\"{DynamicResource Yc.FontSize.Sm}\" TextWrapping=\"Wrap\" t:SemanticText.NormalKey=\"Yc.Text2\" t:SemanticText.Tone=\"{Binding Hero.SubtitleTone}\" AutomationProperties.LiveSetting=\"Polite\"/>\n   </Border>\n   <ContentControl x:Name=\"PageHost\" Margin=\"32,24\" Content=\"{Binding}\" HorizontalContentAlignment=\"Stretch\" VerticalContentAlignment=\"Stretch\">\n    <ContentControl.Style><Style TargetType=\"ContentControl\"><Setter Property=\"ContentTemplate\" Value=\"{DynamicResource Connect}\"/><Style.Triggers>\n     <DataTrigger Binding=\"{Binding CurrentPage}\" Value=\"{x:Static p:PageKind.Routing}\"><Setter Property=\"ContentTemplate\" Value=\"{DynamicResource Routing}\"/></DataTrigger>\n     <DataTrigger Binding=\"{Binding CurrentPage}\" Value=\"{x:Static p:PageKind.Environment}\"><Setter Property=\"ContentTemplate\" Value=\"{DynamicResource Environment}\"/></DataTrigger>\n     <DataTrigger Binding=\"{Binding CurrentPage}\" Value=\"{x:Static p:PageKind.Account}\"><Setter Property=\"ContentTemplate\" Value=\"{DynamicResource Account}\"/></DataTrigger>\n     <DataTrigger Binding=\"{Binding CurrentPage}\" Value=\"{x:Static p:PageKind.Update}\"><Setter Property=\"ContentTemplate\" Value=\"{DynamicResource Update}\"/></DataTrigger>\n    </Style.Triggers></Style></ContentControl.Style>\n   </ContentControl>\n  </DockPanel>\n\n(2) winclient/WinClient.App/MainViewModel.cs(只加行,原来的行一个字不动、不删、不挪)\n\na) 在 Message 属性(两行,第二行是 ? $\" 后台已更新到 {serviceVersion}，下次打开界面将使用新版\" : \"\"); )后面加:\n\n    // 「连接」页自己有消息槽;别的页由窗口底部的提示条显示同一句。\n    public string PageNoticeText => CurrentPage == PageKind.Connect ? \"\" : Message.Trim();\n\nb) 在 CurrentPage 的 set 里,「currentPage = value; Notify();」和「if (value == PageKind.Environment) _ = LoadSelfCheckAsync();」两行之间加一行:\n\n            Notify(nameof(PageNoticeText));\n\nc) 在 Refresh() 里,以 Notify(nameof(Hero)); Notify(nameof(Status)); Notify(nameof(Message)); 开头的那一行后面加一行:\n\n        Notify(nameof(PageNoticeText));\n\n这三行代码各占一行,不要和别的语句写在同一行。除这三行代码(注释行随意)以外不加别的代码。\n\n(3) winclient/WinClient.App/Views/UpdatePage.xaml\n\n只换一句文字,别的属性和别的行不动。原文:\n\n把防火墙审计和环境自检报告合成一个文件(不含出口 IP),发给管理员排查。\n\n换成(标点是全角逗号、顿号、句号,「出口 IP」中间有一个半角空格):\n\n把连接状态、日志末尾、防火墙与网卡现状、环境自检合成一个文件，发给管理员排查。不含出口 IP、节点地址和配对内容。\n\n(4) winclient/WinClient.UiTests/ViewModelPageNoticeTests.cs(新文件,参考写法,没编译过)\n\nusing WinClient.App;\nusing WinClient.App.Presentation;\nusing WinClient.Core.Ipc;\nusing WinClient.Core.State;\nusing Xunit;\n\nnamespace WinClient.UiTests;\n\n[Collection(\"界面线程\")]\npublic class ViewModelPageNoticeTests(UiThreadFixture ui)\n{\n    private static MainViewModel Model(string message, string serviceVersion)\n    {\n        var model = new MainViewModel(() => null, () => null);\n        model.ApplyPreview(new ControlSnapshot(ConnectionState.Disconnected, \"未连接\", message, false) { ServiceVersion = serviceVersion },\n            ServiceAvailability.Ready, connectionUsable: true);\n        return model;\n    }\n\n    [Fact]\n    public void NoticeEmptyOnConnectPage() => ui.Invoke(() =>\n    {\n        using var model = Model(\"节点暂时连不上\", ControlSnapshot.CurrentVersion);\n        Assert.Equal(PageKind.Connect, model.CurrentPage);\n        Assert.Equal(\"节点暂时连不上\", model.Message);\n        Assert.Equal(\"\", model.PageNoticeText);\n    });\n\n    [Theory]\n    [InlineData(PageKind.Routing)]\n    [InlineData(PageKind.Environment)]\n    [InlineData(PageKind.Account)]\n    [InlineData(PageKind.Update)]\n    public void NoticeMirrorsMessageOnOtherPages(PageKind page) => ui.Invoke(() =>\n    {\n        using var model = Model(\"节点暂时连不上\", ControlSnapshot.CurrentVersion);\n        model.CurrentPage = page;\n        Assert.Equal(\"节点暂时连不上\", model.PageNoticeText);\n        Assert.Equal(model.Message.Trim(), model.PageNoticeText);\n    });\n\n    [Fact]\n    public void NoticeEmptyWhenNoMessage() => ui.Invoke(() =>\n    {\n        using var model = Model(\"\", ControlSnapshot.CurrentVersion);\n        model.CurrentPage = PageKind.Update;\n        Assert.Equal(\"\", model.Message);\n        Assert.Equal(\"\", model.PageNoticeText);\n    });\n\n    [Fact]\n    public void NoticeCarriesVersionReminderWithoutLeadingSpace() => ui.Invoke(() =>\n    {\n        using var model = Model(\"\", \"9.9.9\");\n        model.CurrentPage = PageKind.Routing;\n        Assert.StartsWith(\" 后台已更新到 9.9.9\", model.Message);\n        Assert.StartsWith(\"后台已更新到 9.9.9\", model.PageNoticeText);\n        Assert.Equal(model.Message.Trim(), model.PageNoticeText);\n    });\n\n    [Fact]\n    public void SwitchingPageRaisesNoticeChange() => ui.Invoke(() =>\n    {\n        using var model = Model(\"节点暂时连不上\", ControlSnapshot.CurrentVersion);\n        var notified = new List<string?>();\n        model.PropertyChanged += (_, args) => notified.Add(args.PropertyName);\n        model.CurrentPage = PageKind.Account;\n        Assert.Contains(nameof(MainViewModel.PageNoticeText), notified);\n        Assert.Equal(\"节点暂时连不上\", model.PageNoticeText);\n        notified.Clear();\n        model.CurrentPage = PageKind.Connect;\n        Assert.Contains(nameof(MainViewModel.PageNoticeText), notified);\n        Assert.Equal(\"\", model.PageNoticeText);\n    });\n\n    [Fact]\n    public void FailedOperationOnAccountPageShowsNotice() => ui.Invoke(() =>\n    {\n        using var model = Model(\"\", ControlSnapshot.CurrentVersion);\n        model.CurrentPage = PageKind.Account;\n        Assert.Equal(\"\", model.PageNoticeText);\n        var notified = new List<string?>();\n        model.PropertyChanged += (_, args) => notified.Add(args.PropertyName);\n        model.Code = \"ABCD-1234\";\n        model.RedeemCommand.Execute(null);\n        Assert.False(model.IsBusy);\n        Assert.Equal(\"操作未完成，请检查后台服务或联系管理员。\", model.PageNoticeText);\n        Assert.Contains(nameof(MainViewModel.PageNoticeText), notified);\n    });\n}\n\n(5) winclient/WinClient.UiTests/ShellPageNoticeTests.cs(新文件,参考写法,没编译过)\n\nusing System.Windows;\nusing System.Windows.Controls;\nusing System.Windows.Media;\nusing System.Windows.Threading;\nusing WinClient.App;\nusing WinClient.App.Presentation;\nusing WinClient.App.Themes;\nusing WinClient.App.Views;\nusing WinClient.Core.Ipc;\nusing WinClient.Core.State;\nusing Xunit;\n\nnamespace WinClient.UiTests;\n\n[Collection(\"界面线程\")]\npublic class ShellPageNoticeTests(UiThreadFixture ui)\n{\n    private static MainViewModel Model(string message, string serviceVersion)\n    {\n        var model = new MainViewModel(() => null, () => null);\n        model.ApplyPreview(new ControlSnapshot(ConnectionState.Disconnected, \"未连接\", message, false) { ServiceVersion = serviceVersion },\n            ServiceAvailability.Ready, connectionUsable: true);\n        return model;\n    }\n\n    private static IEnumerable<DependencyObject> Descendants(DependencyObject parent)\n    {\n        for (var i = 0; i < VisualTreeHelper.GetChildrenCount(parent); i++)\n        {\n            var child = VisualTreeHelper.GetChild(parent, i); yield return child;\n            foreach (var descendant in Descendants(child)) yield return descendant;\n        }\n    }\n\n    // 照 RenderTests.Arrange 的做法把界面排好版(880×600,不开窗口),排完交给 check,最后卸掉。\n    private static void WithShell(MainViewModel model, Action<MainShell> check)\n    {\n        var resources = Application.Current.Resources;\n        foreach (var name in new[] { \"Base\", \"Glyphs\", \"Controls\" })\n        {\n            var merged = resources.MergedDictionaries.Any(item => item.Source is not null && item.Source.OriginalString.EndsWith(\"/\" + name + \".xaml\", StringComparison.Ordinal));\n            if (!merged) resources.MergedDictionaries.Add(new ResourceDictionary { Source = new Uri($\"/WinClient.App;component/Themes/{name}.xaml\", UriKind.Relative) });\n        }\n        ThemeManager.Apply(resources, ThemeKind.Light);\n        MotionSettings.Override = false;\n        var shell = new MainShell { DataContext = model, Width = 880, Height = 600 };\n        try\n        {\n            shell.Measure(new Size(880, 600)); shell.Arrange(new Rect(0, 0, 880, 600)); shell.UpdateLayout();\n            foreach (var element in Descendants(shell).OfType<FrameworkElement>().Prepend(shell).ToArray())\n                element.RaiseEvent(new RoutedEventArgs(FrameworkElement.LoadedEvent, element));\n            Dispatcher.CurrentDispatcher.Invoke(() => { }, DispatcherPriority.ContextIdle);\n            shell.UpdateLayout();\n            check(shell);\n        }\n        finally\n        {\n            foreach (var element in Descendants(shell).OfType<FrameworkElement>().Prepend(shell).ToArray())\n                element.RaiseEvent(new RoutedEventArgs(FrameworkElement.UnloadedEvent, element));\n            shell.DataContext = null;\n            MotionSettings.Override = null;\n        }\n    }\n\n    [Theory]\n    [InlineData(PageKind.Routing)]\n    [InlineData(PageKind.Environment)]\n    [InlineData(PageKind.Account)]\n    [InlineData(PageKind.Update)]\n    public void NoticeDockedAtBottomOnOtherPages(PageKind page) => ui.Invoke(() =>\n    {\n        using var model = Model(\"节点暂时连不上\", ControlSnapshot.CurrentVersion);\n        model.CurrentPage = page;\n        WithShell(model, shell =>\n        {\n            var notice = Descendants(shell).OfType<Border>().Single(element => element.Name == \"PageNotice\");\n            var host = Descendants(shell).OfType<ContentControl>().Single(element => element.Name == \"PageHost\");\n            Assert.Equal(Visibility.Visible, notice.Visibility);\n            var noticeTop = notice.TranslatePoint(new Point(), shell);\n            Assert.Equal(200, noticeTop.X, 3);\n            Assert.Equal(680, notice.ActualWidth, 3);\n            Assert.True(notice.ActualHeight > 0, \"提示条要有高度\");\n            Assert.Equal(600, noticeTop.Y + notice.ActualHeight, 3);\n            var hostTop = host.TranslatePoint(new Point(), shell);\n            Assert.True(hostTop.Y + host.ActualHeight <= noticeTop.Y + 0.001, \"页面内容不能压在提示条上\");\n            var text = Descendants(notice).OfType<TextBlock>().Single();\n            Assert.Equal(model.PageNoticeText, text.Text);\n            Assert.Equal(\"节点暂时连不上\", text.Text);\n        });\n    });\n\n    [Fact]\n    public void NoticeCollapsedOnConnectPage() => ui.Invoke(() =>\n    {\n        using var model = Model(\"节点暂时连不上\", ControlSnapshot.CurrentVersion);\n        WithShell(model, shell =>\n        {\n            var notice = Descendants(shell).OfType<Border>().Single(element => element.Name == \"PageNotice\");\n            var host = Descendants(shell).OfType<ContentControl>().Single(element => element.Name == \"PageHost\");\n            Assert.Equal(PageKind.Connect, model.CurrentPage);\n            Assert.Equal(Visibility.Collapsed, notice.Visibility);\n            Assert.Equal(552, host.ActualHeight, 3);\n        });\n    });\n\n    [Fact]\n    public void NoticeCollapsedWithoutMessageKeepsPageArea() => ui.Invoke(() =>\n    {\n        using var model = Model(\"\", ControlSnapshot.CurrentVersion);\n        model.CurrentPage = PageKind.Update;\n        WithShell(model, shell =>\n        {\n            var notice = Descendants(shell).OfType<Border>().Single(element => element.Name == \"PageNotice\");\n            var host = Descendants(shell).OfType<ContentControl>().Single(element => element.Name == \"PageHost\");\n            Assert.Equal(Visibility.Collapsed, notice.Visibility);\n            Assert.Equal(552, host.ActualHeight, 3);\n            Assert.Equal(616, host.ActualWidth, 3);\n        });\n    });\n\n    [Fact]\n    public void NoticeAppearsAfterFailedOperation() => ui.Invoke(() =>\n    {\n        using var model = Model(\"\", ControlSnapshot.CurrentVersion);\n        model.CurrentPage = PageKind.Account;\n        WithShell(model, shell =>\n        {\n            var notice = Descendants(shell).OfType<Border>().Single(element => element.Name == \"PageNotice\");\n            Assert.Equal(Visibility.Collapsed, notice.Visibility);\n            model.Code = \"ABCD-1234\";\n            model.RedeemCommand.Execute(null);\n            shell.UpdateLayout();\n            Assert.Equal(Visibility.Visible, notice.Visibility);\n            var text = Descendants(notice).OfType<TextBlock>().Single();\n            Assert.Equal(\"操作未完成，请检查后台服务或联系管理员。\", text.Text);\n            Assert.Equal(600, notice.TranslatePoint(new Point(), shell).Y + notice.ActualHeight, 3);\n        });\n    });\n}\n\n三、帮你看懂\n\n- 为什么测试里点一下兑换就能同步拿到失败提示:测试里的 MainViewModel 没连后台服务(client 为空)。ApplyPreview(…, ServiceAvailability.Ready, connectionUsable: true) 让按钮可用;RedeemCommand.Execute(null) 走到 SendAsync 时抛 IOException,RunAsync 接住后把提示语写成「操作未完成，请检查后台服务或联系管理员。」。整条路没有真正的等待,又都在界面线程上(ui.Invoke),所以 Execute 返回时提示语已经写好。\n- 为什么要在 CurrentPage 的 set 里另加一行通知:切页不经过 Refresh(),不加这一行,切到别的页时提示条不会出现,切回「连接」页时不会收起。\n- 数字从哪来:窗口 880×600,左边导航栏宽 200,所以内容区左边界 200、宽 680;ContentControl 上下各留 24,提示条不显示时它高 600−48=552、宽 680−64=616。\n- 提示条收起时(Visibility.Collapsed)它和里面的 TextBlock 仍在可视树里,Descendants 找得到。\n- 版本提醒:后台服务版本和界面版本不一样时,Message 末尾会接一句「 后台已更新到 X，下次打开界面将使用新版」(开头带一个空格)。没有别的提示语时 Message 就以空格开头,所以 PageNoticeText 要 Trim()。测试里把 ServiceVersion 设成 ControlSnapshot.CurrentVersion 就不带这句。\n- RenderTests(截图比对)会因为 16 张 page-*.png 和基准图对不上而失败,这是预期的:四个页面底部多了提示条、更新页还改了字。基准图只能在检查机上重出,派单方收单时做。你不要动 winclient/WinClient.UiTests/Baselines/ 目录,不要改 RenderTests.cs,也不要为了让它过去改别的东西;验收命令 TEST 已经把 RenderTests 排除在外。\n\n四、检查脚本逐条核对的写法(脚本:docs/plans/checks/yc_page_notice_1128.py,只读)\n\nSHAPE 核这些:\n(1) winclient/WinClient.App/Views/MainShell.xaml:去掉缩进和空行后逐行比对。原来的这一行:\n      <ContentControl x:Name=\"PageHost\" Grid.Column=\"1\" Margin=\"32,24\" Content=\"{Binding}\" HorizontalContentAlignment=\"Stretch\" VerticalContentAlignment=\"Stretch\">\n    换成下面五行,别的行一个字不动:\n      <DockPanel Grid.Column=\"1\" LastChildFill=\"True\">\n      <Border x:Name=\"PageNotice\" DockPanel.Dock=\"Bottom\" BorderBrush=\"{DynamicResource Yc.Line}\" BorderThickness=\"0,1,0,0\" Padding=\"32,8,32,12\" Visibility=\"{Binding PageNoticeText, Converter={x:Static t:VisibilityConverter.Instance}}\">\n      <TextBlock Text=\"{Binding PageNoticeText}\" FontSize=\"{DynamicResource Yc.FontSize.Sm}\" TextWrapping=\"Wrap\" t:SemanticText.NormalKey=\"Yc.Text2\" t:SemanticText.Tone=\"{Binding Hero.SubtitleTone}\" AutomationProperties.LiveSetting=\"Polite\"/>\n      </Border>\n      <ContentControl x:Name=\"PageHost\" Margin=\"32,24\" Content=\"{Binding}\" HorizontalContentAlignment=\"Stretch\" VerticalContentAlignment=\"Stretch\">\n    并在 </ContentControl> 那一行后面加一行 </DockPanel>。\n(2) winclient/WinClient.App/Views/UpdatePage.xaml:只许把下面第一句换成第二句,别的行不动:\n      把防火墙审计和环境自检报告合成一个文件(不含出口 IP),发给管理员排查。\n      把连接状态、日志末尾、防火墙与网卡现状、环境自检合成一个文件，发给管理员排查。不含出口 IP、节点地址和配对内容。\n(3) winclient/WinClient.App/MainViewModel.cs:只许加行,改动前的每一行都要按原顺序原样留着。加的代码行(以 // 开头的注释行不算)只能是:\n      一行:public string PageNoticeText => CurrentPage == PageKind.Connect ? \"\" : Message.Trim();\n      两行:Notify(nameof(PageNoticeText));\n    第一行 Notify(nameof(PageNoticeText)); 在「currentPage = value; Notify();」和「if (value == PageKind.Environment) _ = LoadSelfCheckAsync();」之间;第二行在「private void Refresh()」和「public Task ExportDiagnosticsAsync(string path) => RunAsync(async () =>」之间。\n\nTESTS 核这些:两个测试文件都在;测试类标 [Collection(\"界面线程\")];每个用例前是 [Fact] 或 [Theory](后面可跟 [InlineData(…)] 行)、签名是 public void 名字( 或 public async Task 名字(、至少两处 Assert.;文件里不许出现 Skip、Task.Delay(、Thread.Sleep(。每个用例(连同它的 InlineData 行,到下一个用例之前)里必须原样出现:\n  - winclient/WinClient.UiTests/ViewModelPageNoticeTests.cs\n      NoticeEmptyOnConnectPage:\n          PageNoticeText\n          Assert.Equal(\"\", \n      NoticeMirrorsMessageOnOtherPages:\n          [InlineData(PageKind.Routing)]\n          [InlineData(PageKind.Environment)]\n          [InlineData(PageKind.Account)]\n          [InlineData(PageKind.Update)]\n          model.Message.Trim()\n          PageNoticeText\n      NoticeEmptyWhenNoMessage:\n          ControlSnapshot.CurrentVersion\n          PageNoticeText\n      NoticeCarriesVersionReminderWithoutLeadingSpace:\n          StartsWith(\"后台已更新到\n          PageNoticeText\n      SwitchingPageRaisesNoticeChange:\n          PropertyChanged\n          nameof(MainViewModel.PageNoticeText)\n          PageKind.Account\n      FailedOperationOnAccountPageShowsNotice:\n          RedeemCommand.Execute(null)\n          操作未完成，请检查后台服务或联系管理员。\n          PageKind.Account\n  - winclient/WinClient.UiTests/ShellPageNoticeTests.cs\n      NoticeDockedAtBottomOnOtherPages:\n          [InlineData(PageKind.Routing)]\n          [InlineData(PageKind.Environment)]\n          [InlineData(PageKind.Account)]\n          [InlineData(PageKind.Update)]\n          \"PageNotice\"\n          \"PageHost\"\n          notice.TranslatePoint(\n          notice.ActualWidth\n          host.ActualHeight\n          PageNoticeText\n      NoticeCollapsedOnConnectPage:\n          \"PageNotice\"\n          Assert.Equal(Visibility.Collapsed, notice.Visibility)\n          Assert.Equal(552, host.ActualHeight\n      NoticeCollapsedWithoutMessageKeepsPageArea:\n          ControlSnapshot.CurrentVersion\n          Assert.Equal(Visibility.Collapsed, notice.Visibility)\n          Assert.Equal(552, host.ActualHeight\n      NoticeAppearsAfterFailedOperation:\n          RedeemCommand.Execute(null)\n          UpdateLayout()\n          Assert.Equal(Visibility.Visible, notice.Visibility)\n          操作未完成，请检查后台服务或联系管理员。\n\nSCOPE 核这些:相对主干只许改动或新增下面这些文件,别的一个都不许动:\n  - winclient/WinClient.App/MainViewModel.cs\n  - winclient/WinClient.App/Views/MainShell.xaml\n  - winclient/WinClient.App/Views/UpdatePage.xaml\n  - winclient/WinClient.UiTests/ShellPageNoticeTests.cs\n  - winclient/WinClient.UiTests/ViewModelPageNoticeTests.cs\n\n五、做的时候守这几条\n\n- 只动 allowedPaths 里的五个文件。发现非改别的文件不可,交 blocked 写清是哪一个、为什么。\n- 不动 winclient/WinClient.UiTests/Baselines/ 目录,不改 RenderTests.cs;RenderTests 因基准图对不上而失败是预期的,不用管。\n- 不放宽、不删、不跳过任何现有断言;不加重试;测试里不许 Skip、Task.Delay、Thread.Sleep。\n- 界面上的字照契约逐字写,不改字、不加字、不留占位符。\n- 本单不新增子进程调用,不弹任何窗口;测试不开真窗口(照参考写法只做排版)。\n- 验收命令单独一条执行,不要拼 cd &&、管道或重定向。\n- 先写两个测试文件,申请 BUILD 看到编译失败(PageNoticeText 还不存在)作为证红;之后固定按 BUILD → TEST → T-NOTICE → SHAPE → TESTS → SCOPE 的次序跑。\n- 参考代码和验收脚本对不上、或照契约写编译不过且改法不唯一时,交 blocked 写成结构化岔路,不自己改契约里定稿的名字、文字和布局数字。测试里的排版断言(200、680、600、552、616)跑出来对不上时同样交 blocked,写明实际读数,不要改断言去凑。\n\n六、交活说明要写\n\n- 五个文件各改了什么(一两句)。\n- 参考代码里哪几处为了编译通过或跑通做了改动、怎么改的。\n- 没做、没验的:截图基准图没重出(RenderTests 预期失败);真机上没点过。",
+  "background": "项目:Windows 客户端(.NET 9、C# 13、WPF),界面程序 winclient/WinClient.App,界面测试 winclient/WinClient.UiTests(xUnit,测试都跑在一条界面线程上,类标 [Collection(\"界面线程\")],用 UiThreadFixture.Invoke 进界面线程)。\n\n开工先读:\n- winclient/WinClient.App/Views/MainShell.xaml(窗口骨架:左边导航栏,右边内容区 PageHost)\n- winclient/WinClient.App/MainViewModel.cs(Message、CurrentPage、Refresh、RunAsync、SendAsync、ApplyPreview)\n- winclient/WinClient.App/Views/UpdatePage.xaml(「诊断」那句说明)\n- winclient/WinClient.App/Views/ConnectPage.xaml 第 17 行(「连接」页现有的消息槽,提示条的字号、颜色照它)\n- winclient/WinClient.UiTests/RenderTests.cs(Arrange、Descendants 的写法;本单不改它)\n- winclient/WinClient.UiTests/ViewModelLeakCheckTests.cs(视图模型测试的写法)\n- winclient/WinClient.UiTests/UiThreadFixture.cs\n- docs/plans/checks/yc_page_notice_1128.py(验收脚本,只读)\n\n现状(主干 495f452):\n- Message 只绑在 ConnectPage.xaml 的消息槽上。别的页出错时,SendAsync 里 response.Ok 为假、RunAsync 的 catch 都是把原因写进 Message,当前页没有地方显示。\n- 「账号与配对」「代理范围」「环境一致」「更新与诊断」四页各自只有按钮不可用时的原因提示(ConnectionDisabledReason 等),没有操作失败的提示。\n- 导出诊断现在带什么见 docs/winclient/诊断导出说明.md;更新页那句说明还是早期写法。\n\n本仓跑法:dotnet 9.0.102;构建前会自动取两个第三方件(工位的 winclient/third_party/cache/ 里已备好压缩包时不联网)。验收命令由派单器在工位里跑。",
+  "nonGoals": [
+    "不改「连接」页和它的消息槽,不改另外三页的版面",
+    "不改提示语的内容和产生提示语的逻辑(Message、RunAsync、SendAsync 原样)",
+    "不区分提示语是报错还是状态,不加关闭按钮、不加自动消失",
+    "不重出截图基准图(派单方收单时在检查机上重出),不改 RenderTests.cs",
+    "不改文档和口径速查表(合并后派单方补)",
+    "不做真机实测,不打发布包,不改版本号"
+  ],
+  "allowedPaths": [
+    "winclient/WinClient.App/MainViewModel.cs",
+    "winclient/WinClient.App/Views/MainShell.xaml",
+    "winclient/WinClient.App/Views/UpdatePage.xaml",
+    "winclient/WinClient.UiTests/ShellPageNoticeTests.cs",
+    "winclient/WinClient.UiTests/ViewModelPageNoticeTests.cs"
+  ],
+  "forbiddenPaths": [
+    ".codex/**",
+    ".github/**",
+    ".gitignore",
+    "pyproject.toml",
+    "authserver/**",
+    "node/**",
+    "scripts/**",
+    "docs/**",
+    "winclient/*.sln",
+    "winclient/Directory.Build.props",
+    "winclient/third_party/**",
+    "winclient/WinClient.Core/**",
+    "winclient/WinClient.Tests/**",
+    "winclient/WinClient.UiTests/Baselines/**",
+    "winclient/WinClient.UiTests/RenderTests.cs",
+    "winclient/WinClient.UiTests/UiThreadFixture.cs",
+    "winclient/WinClient.UiTests/WinClient.UiTests.csproj",
+    "winclient/WinClient.UiTests/ScreenshotBaseline.cs",
+    "winclient/WinClient.UiTests/ScreenshotBaselineTests.cs",
+    "winclient/WinClient.UiTests/ViewModelTests.cs",
+    "winclient/WinClient.UiTests/ViewModelLeakCheckTests.cs",
+    "winclient/WinClient.UiTests/ViewModelDiagnosticsTests.cs",
+    "winclient/WinClient.UiTests/DiagnosticsExportTests.cs",
+    "winclient/WinClient.UiTests/MonoTextTests.cs",
+    "winclient/WinClient.UiTests/StatusPresentationTests.cs",
+    "winclient/WinClient.UiTests/ThemeAndMotionTests.cs",
+    "winclient/WinClient.App/WinClient.App.csproj",
+    "winclient/WinClient.App/App.xaml",
+    "winclient/WinClient.App/App.xaml.cs",
+    "winclient/WinClient.App/Themes/**",
+    "winclient/WinClient.App/Presentation/**",
+    "winclient/WinClient.App/Hosting/**",
+    "winclient/WinClient.App/Controls/**",
+    "winclient/WinClient.App/Assets/**",
+    "winclient/WinClient.App/Views/MainShell.xaml.cs",
+    "winclient/WinClient.App/Views/ConnectPage.xaml",
+    "winclient/WinClient.App/Views/AccountPage.xaml",
+    "winclient/WinClient.App/Views/RoutingPage.xaml",
+    "winclient/WinClient.App/Views/EnvironmentPage.xaml"
+  ],
+  "expectArtifacts": [],
+  "acceptance": [
+    {
+      "id": "BUILD",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "build",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--nologo"
+      ],
+      "required": true,
+      "timeoutSec": 1200
+    },
+    {
+      "id": "TEST",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "test",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--no-build",
+        "--nologo",
+        "--filter",
+        "FullyQualifiedName!~RenderTests"
+      ],
+      "required": true,
+      "timeoutSec": 1500
+    },
+    {
+      "id": "T-NOTICE",
+      "kind": "command",
+      "argv": [
+        "dotnet",
+        "test",
+        "winclient/WinClient.sln",
+        "-c",
+        "Release",
+        "--nologo",
+        "--filter",
+        "FullyQualifiedName~PageNotice"
+      ],
+      "required": true,
+      "timeoutSec": 1500
+    },
+    {
+      "id": "SHAPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_page_notice_1128.py",
+        "shape"
+      ],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "TESTS",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_page_notice_1128.py",
+        "tests"
+      ],
+      "required": true,
+      "timeoutSec": 120,
+      "failsOnBase": true
+    },
+    {
+      "id": "SCOPE",
+      "kind": "command",
+      "argv": [
+        "python",
+        "docs/plans/checks/yc_page_notice_1128.py",
+        "scope"
+      ],
+      "required": true,
+      "timeoutSec": 120
+    }
+  ],
+  "sandbox": "workspace-write",
+  "cwd": null,
+  "worktree": true,
+  "timeoutSec": 10800,
+  "repoRoot": "E:/yuanc",
+  "steps": [
+    "读 background 列出的文件与检查脚本。",
+    "先写两个测试文件;申请 BUILD 以编译失败证红(PageNoticeText 还不存在),之后固定 BUILD→TEST。",
+    "照 goal 二改三个产品文件:MainShell.xaml 加提示条、MainViewModel.cs 加三行、UpdatePage.xaml 换一句。",
+    "BUILD、TEST、T-NOTICE、SHAPE、TESTS、SCOPE 全绿后交活;交活说明照 goal 六的要求写。"
+  ]
+}
