@@ -1040,3 +1040,97 @@ def test_diagnose_journal_failure_is_reported(response, expected):
     with zipfile.ZipFile(io.BytesIO(runner.files["/diagnose.zip"])) as archive:
         content = archive.read("最近日志.txt").decode("utf-8")
     assert expected in content
+
+
+def simulate_upgrade(runner, version):
+    """模拟更新器换版本：复制当前版本目录、改一个文件、重写清单、切 current。"""
+    from exitnode.updater import layout
+
+    old = runner.readlink("/opt/exitnode/current")
+    new = "/opt/exitnode/releases/" + version
+    runner.copy_tree(old, new)
+    runner.write_file(new + "/exitnode/__init__.py", f'__version__ = "{version}"\n', 0o644)
+    files = layout.hashes(runner, new)
+    files.pop("manifest.json")
+    manifest = json.loads(runner.read_file(new + "/manifest.json"))
+    manifest.update(version=version, files=files)
+    runner.write_file(new + "/manifest.json", json.dumps(manifest), 0o644)
+    runner.links["/opt/exitnode/current"] = new
+    assert layout.valid_release(runner, new)
+
+
+def rescue_tree(runner, name):
+    prefix = "/opt/exitnode-rescue/" + name + "/"
+    return {p: v for p, v in runner.files.items() if p.startswith(prefix)}
+
+
+@pytest.mark.parametrize("command", ["rollback", "uninstall"])
+def test_reinit_after_upgrade_and_removal_keeps_older_factory(command, capsys):
+    from exitnode.updater import layout
+
+    runner = fake(pairing=True)
+    assert main(["init"], runner) == 0
+    simulate_upgrade(runner, "0.2.0")
+    factory = rescue_tree(runner, "factory")
+    assert main([command], runner) == 0
+    capsys.readouterr()
+    assert main(["init"], runner) == 0
+    out = capsys.readouterr().out
+    assert "安装救援单元：已完成；" in out
+    assert "出厂包不完整" not in out
+    # 出厂包还是升级前那一版，一个字节不动；换成新版本是救援「提升」的事。
+    assert rescue_tree(runner, "factory") == factory
+    assert json.loads(runner.read_file("/opt/exitnode-rescue/factory/manifest.json"))["version"] == "0.1.0"
+    assert layout.valid_release(runner, "/opt/exitnode-rescue/factory")
+    assert runner.readlink("/opt/exitnode/current") == "/opt/exitnode/releases/0.2.0"
+
+
+def test_init_rebuilds_incomplete_factory(capsys):
+    from exitnode.updater import layout
+
+    runner = fake(pairing=True)
+    runner.write_file("/opt/exitnode-rescue/factory/exitnode/__init__.py", "半截", 0o644)
+    assert main(["init"], runner) == 0
+    assert "出厂包不完整，已按当前程序重建" in capsys.readouterr().out
+    current = runner.readlink("/opt/exitnode/current")
+    assert layout.valid_release(runner, "/opt/exitnode-rescue/factory")
+    assert layout.hashes(runner, "/opt/exitnode-rescue/factory") == layout.hashes(runner, current)
+    # 完整的出厂包再跑一遍安装不会被重建。
+    factory = rescue_tree(runner, "factory")
+    assert main(["rollback"], runner) == 0
+    capsys.readouterr()
+    assert main(["init"], runner) == 0
+    assert "出厂包不完整" not in capsys.readouterr().out
+    assert rescue_tree(runner, "factory") == factory
+
+
+def test_init_points_to_refresh_when_rescue_code_differs(capsys):
+    runner = fake(pairing=True)
+    assert main(["init"], runner) == 0
+    assert main(["rollback"], runner) == 0
+    path = "/opt/exitnode-rescue/exitnode_rescue/actions.py"
+    original = runner.files[path]
+    runner.files[path] = "# older rescue code\n"
+    factory = rescue_tree(runner, "factory")
+    capsys.readouterr()
+    assert main(["init"], runner) == 1
+    out = capsys.readouterr().out
+    assert "独立救援代码与当前程序自带的不一致，请先运行 exitnode rescue refresh，再重跑安装" in out
+    assert "已有救援包内容不同" not in out
+    # 安装不替维护人员换救援代码，出厂包也不动。
+    assert runner.files[path] == "# older rescue code\n"
+    assert rescue_tree(runner, "factory") == factory
+    # 刷新之后（这里直接放回一致的内容）重跑安装能走完。
+    runner.files[path] = original
+    assert main(["init"], runner) == 0
+
+
+def test_reinit_after_upgrade_skips_finished_rescue_step(capsys):
+    runner = fake(pairing=True)
+    assert main(["init"], runner) == 0
+    simulate_upgrade(runner, "0.2.0")
+    factory = rescue_tree(runner, "factory")
+    capsys.readouterr()
+    assert main(["init"], runner) == 0
+    assert "安装救援单元：已完成，跳过" in capsys.readouterr().out
+    assert rescue_tree(runner, "factory") == factory
