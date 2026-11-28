@@ -54,6 +54,9 @@ public sealed class ClientController : IDisposable
     private const string AbandonRestored = "连接失败，已恢复原来的网络，当前没有走澳洲出口。";
     private const string AbandonNotRestored = "连接失败，原来的网络没能恢复：请点「断开」再试一次，还不行就重启电脑。";
     private const string TestBuildDisconnected = "测试包：出口核验不了，已自动断开并恢复原来的网络。";
+    // 上次没断开但启动时找不到配对文件或登录凭据:保护保持,停在需人工处理,提示用户点断开。
+    internal const string KeptWithoutPairingMessage = "上次的连接没有断开，但现在找不到配对文件。断网保护保持，电脑暂时上不了网。请点「断开」恢复原来的网络，重新导入配对文件后再连接。";
+    internal const string KeptWithoutCredentialsMessage = "上次的连接没有断开，但现在找不到登录凭据。断网保护保持，电脑暂时上不了网。请点「断开」恢复原来的网络，重新兑换邀请码后再连接。";
     internal static readonly TimeSpan PatrolInterval = TimeSpan.FromSeconds(60);
     // 测试可同时记录所有用途；未注入时仍使用原有 delayAsync，不改变调度行为。
     internal Func<TimeSpan, CancellationToken, string, Task>? DelayWithPurposeAsync { get; set; }
@@ -188,8 +191,21 @@ public sealed class ClientController : IDisposable
         {
             WriteJournal($"启动：保持保护={(keepProtection ? "是" : "否")}，自动连接={(autoConnect ? "是" : "否")}，" +
                 $"恢复记录={PendingRecordText()}，模式={sessionSource?.Mode ?? "未配置"}");
-            if (keepProtection && firewall.HasPendingState &&
-                (sessionSource is PairingSessionSource or AuthServerSessionSource { HasCredentials: true }))
+            // 先判断「上次没断开且有恢复记录」时会话来源还能不能用:凭据读不出来也按找不到处理。
+            var keptUsable = false;
+            var keptMissing = false;
+            if (keepProtection && firewall.HasPendingState)
+            {
+                if (sessionSource is PairingSessionSource) keptUsable = true;
+                else if (sessionSource is AuthServerSessionSource authSource)
+                {
+                    try { keptUsable = authSource.HasCredentials; }
+                    catch (Exception ex) when (IsOperational(ex)) { keptUsable = false; }
+                    keptMissing = !keptUsable;
+                }
+                else if (sessionSource is null) keptMissing = true;
+            }
+            if (keptUsable)
             {
                 protection = true;
                 protectionVerified = true;
@@ -197,6 +213,15 @@ public sealed class ClientController : IDisposable
                 keptProtection = true;
                 environmentApplied = environment?.HasPendingState ?? false;
                 WriteJournal("启动：接回断网保护，随后自动连接");
+            }
+            else if (keptMissing)
+            {
+                // 上次没断开但现在找不到配对文件或登录凭据:保护保持,停在需人工处理,只等用户点断开。
+                protection = true;
+                environmentApplied = environment?.HasPendingState ?? false;
+                await ExecuteAsync(machine.Handle(new(ConnectionEventKind.OperationFailed)));
+                message = sessionSource is AuthServerSessionSource ? KeptWithoutCredentialsMessage : KeptWithoutPairingMessage;
+                WriteJournal("启动：找不到配对文件或登录凭据，断网保护保持，停在需人工处理");
             }
             else
             {
@@ -302,7 +327,7 @@ public sealed class ClientController : IDisposable
         {
             WriteJournal($"连接请求：来源={(fromUser ? "用户" : "自动")}，状态={ConnectJournal.StateName(machine.State)}，" +
                 $"保护={(protection ? "有" : "无")}，恢复记录={PendingRecordText()}");
-            if (sessionSource is null) { message = "未配置服务器"; WriteJournal("连接未开始：未配置服务器"); return; }
+            if (sessionSource is null) { message = protection ? KeptWithoutPairingMessage : "未配置服务器"; WriteJournal("连接未开始：未配置服务器"); return; }
             if (machine.State is ConnectionState.Connected or ConnectionState.Connecting or ConnectionState.Reconnecting)
             { WriteJournal("连接未开始：已在连接或已连接"); return; }
             activeRouting = routingSettings?.Read() ?? RoutingPolicy.Global;

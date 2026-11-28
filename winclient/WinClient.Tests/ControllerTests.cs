@@ -1379,19 +1379,23 @@ public sealed class ControllerTests
     }
 
     [Fact]
-    public async Task StartupPendingProtectionWithoutServerRecovers()
+    public async Task StartupKeptWithoutServerParksWithProtection()
     {
         var order = new List<string>();
         using var controller = new ClientController((ISessionSource?)null,
             new Firewall(order) { HasPendingState = true }, new Tunnel(order), Path.GetFullPath("fake.exe"), TestData.Device);
         await controller.InitializeAsync(true, true);
-        Assert.Equal(new[] { "recover" }, order);
-        Assert.False(controller.Snapshot.ProtectionActive);
-        Assert.Contains("未配置服务器", controller.Snapshot.Message);
+        Assert.DoesNotContain("recover", order);
+        Assert.DoesNotContain("remove", order);
+        Assert.DoesNotContain("apply", order);
+        Assert.DoesNotContain("start", order);
+        Assert.True(controller.Snapshot.ProtectionActive);
+        Assert.Equal(ConnectionState.NeedsManual, controller.Snapshot.State);
+        Assert.Equal(ClientController.KeptWithoutPairingMessage, controller.Snapshot.Message);
     }
 
     [Fact]
-    public async Task StartupPendingProtectionWithoutCredentialsRecovers()
+    public async Task StartupKeptWithoutCredentialsParksWithProtection()
     {
         var order = new List<string>();
         using var http = new HttpClient(new AuthTests.Handler(_ => throw new InvalidOperationException("不应请求会话")))
@@ -1399,8 +1403,107 @@ public sealed class ControllerTests
         using var controller = new ClientController(new AuthServerSessionSource(new AuthApiClient(http), new InMemoryCredentialStore()),
             new Firewall(order) { HasPendingState = true }, new Tunnel(order), Path.GetFullPath("fake.exe"), TestData.Device);
         await controller.InitializeAsync(true, true);
+        Assert.DoesNotContain("recover", order);
+        Assert.DoesNotContain("remove", order);
+        Assert.DoesNotContain("apply", order);
+        Assert.DoesNotContain("start", order);
+        Assert.True(controller.Snapshot.ProtectionActive);
+        Assert.Equal(ConnectionState.NeedsManual, controller.Snapshot.State);
+        Assert.Equal(ClientController.KeptWithoutCredentialsMessage, controller.Snapshot.Message);
+    }
+
+    /// <summary>读取凭据时抛异常的假件:验证启动时凭据读不出来也按「找不到」停在需人工处理。</summary>
+    private sealed class ThrowingCredentialStore : ICredentialStore
+    {
+        public void Save(string refreshToken) { }
+        public string? Load() => throw new IOException("测试:凭据读不出来");
+        public void Clear() { }
+    }
+
+    [Fact]
+    public async Task StartupKeptCredentialReadFailureParksWithProtection()
+    {
+        var order = new List<string>();
+        using var http = new HttpClient(new AuthTests.Handler(_ => throw new InvalidOperationException("不应请求会话")))
+        { BaseAddress = new("https://192.0.2.1") };
+        using var controller = new ClientController(new AuthServerSessionSource(new AuthApiClient(http), new ThrowingCredentialStore()),
+            new Firewall(order) { HasPendingState = true }, new Tunnel(order), Path.GetFullPath("fake.exe"), TestData.Device);
+        await controller.InitializeAsync(true, true);
+        Assert.DoesNotContain("recover", order);
+        Assert.DoesNotContain("remove", order);
+        Assert.True(controller.Snapshot.ProtectionActive);
+        Assert.Equal(ConnectionState.NeedsManual, controller.Snapshot.State);
+        Assert.Equal(ClientController.KeptWithoutCredentialsMessage, controller.Snapshot.Message);
+    }
+
+    [Fact]
+    public async Task StartupKeptParkedDisconnectRestoresNetwork()
+    {
+        var order = new List<string>();
+        using var controller = new ClientController((ISessionSource?)null,
+            new Firewall(order) { HasPendingState = true }, new Tunnel(order), Path.GetFullPath("fake.exe"), TestData.Device);
+        await controller.InitializeAsync(true, true);
+        await controller.DisconnectAsync();
+        Assert.Contains("remove", order);
+        Assert.False(controller.Snapshot.ProtectionActive);
+        Assert.Equal(ConnectionState.Disconnected, controller.Snapshot.State);
+        Assert.StartsWith("已断开", controller.Snapshot.Message);
+    }
+
+    [Fact]
+    public async Task StartupKeptParkedConnectKeepsGuidance()
+    {
+        var order = new List<string>();
+        using var controller = new ClientController((ISessionSource?)null,
+            new Firewall(order) { HasPendingState = true }, new Tunnel(order), Path.GetFullPath("fake.exe"), TestData.Device);
+        await controller.InitializeAsync(true, true);
+        await controller.ConnectAsync();
+        Assert.Equal(ConnectionState.NeedsManual, controller.Snapshot.State);
+        Assert.True(controller.Snapshot.ProtectionActive);
+        Assert.Equal(ClientController.KeptWithoutPairingMessage, controller.Snapshot.Message);
+        Assert.DoesNotContain("apply", order);
+        Assert.DoesNotContain("start", order);
+        Assert.DoesNotContain("recover", order);
+        Assert.DoesNotContain("remove", order);
+    }
+
+    [Fact]
+    public async Task StartupKeptParkedWritesJournalLine()
+    {
+        var order = new List<string>();
+        var journal = new System.Collections.Concurrent.ConcurrentQueue<string>();
+        using var controller = new ClientController((ISessionSource?)null,
+            new Firewall(order) { HasPendingState = true }, new Tunnel(order), Path.GetFullPath("fake.exe"), TestData.Device)
+            { Journal = journal.Enqueue };
+        await controller.InitializeAsync(true, true);
+        var lines = journal.ToArray();
+        Assert.Contains("启动：找不到配对文件或登录凭据，断网保护保持，停在需人工处理", lines);
+        Assert.DoesNotContain(lines, line => line.StartsWith("启动：已做启动恢复", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task StartupKeptWithoutRecordStillRecovers()
+    {
+        var order = new List<string>();
+        using var controller = new ClientController((ISessionSource?)null,
+            new Firewall(order), new Tunnel(order), Path.GetFullPath("fake.exe"), TestData.Device);
+        await controller.InitializeAsync(true, true);
         Assert.Equal(new[] { "recover" }, order);
         Assert.False(controller.Snapshot.ProtectionActive);
+        Assert.Equal(ConnectionState.Disconnected, controller.Snapshot.State);
+        Assert.Contains("未配置服务器", controller.Snapshot.Message);
+    }
+
+    [Fact]
+    public async Task StartupKeptFlagOffStillRecovers()
+    {
+        var order = new List<string>();
+        using var controller = new ClientController((ISessionSource?)null,
+            new Firewall(order) { HasPendingState = true }, new Tunnel(order), Path.GetFullPath("fake.exe"), TestData.Device);
+        await controller.InitializeAsync(true, false);
+        Assert.Equal(new[] { "recover" }, order);
+        Assert.False(controller.Snapshot.ProtectionActive);
+        Assert.Equal(ConnectionState.Disconnected, controller.Snapshot.State);
     }
 
     [Fact]
